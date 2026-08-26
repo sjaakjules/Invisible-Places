@@ -4492,6 +4492,70 @@ TEST_CASE("Loop Palette round-trips and stays omitted when disabled",
   CHECK(stateJson["timing_effects"][1]["palette_looped"] == true);
 }
 
+TEST_CASE("Palette skew base values and keys round-trip",
+          "[project][serialization][timing][colourise][skew]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::timing::TimingColouriseEffect;
+  using invisible_places::timing::TimingColouriseEffectParameter;
+  using invisible_places::timing::TimingTakeSceneState;
+
+  ProjectDocument document;
+  document.projectName = "palette-skew";
+  TimingTakeSceneState state;
+  TimingColouriseEffect neutral;
+  neutral.id = "effect-1";
+  neutral.name = "Identity";
+  TimingColouriseEffect skewed;
+  skewed.id = "effect-2";
+  skewed.name = "Skewed";
+  skewed.paletteSkewCentre = 0.25F;
+  skewed.paletteSkewLower = -0.5F;
+  skewed.paletteSkewUpper = 0.75F;
+  skewed.effectParameterKeys.push_back({
+      .parameter = TimingColouriseEffectParameter::PaletteSkewCentre,
+      .position = 0.4F,
+      .value = 0.7F,
+  });
+  state.colouriseEffects = {neutral, skewed};
+  document.timingTakeStates = {state};
+
+  TemporaryProjectFile file{"invisible_places_palette_skew.json"};
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(document, file.path, &errorMessage));
+  const auto loaded = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loaded.has_value());
+  REQUIRE(loaded->timingTakeStates.size() == 1U);
+  const auto& effects = loaded->timingTakeStates[0].colouriseEffects;
+  REQUIRE(effects.size() == 2U);
+  CHECK(effects[0].paletteSkewCentre == Catch::Approx(0.5F));
+  CHECK(effects[0].paletteSkewLower == Catch::Approx(0.0F));
+  CHECK(effects[0].paletteSkewUpper == Catch::Approx(0.0F));
+  CHECK(effects[1].paletteSkewCentre == Catch::Approx(0.25F));
+  CHECK(effects[1].paletteSkewLower == Catch::Approx(-0.5F));
+  CHECK(effects[1].paletteSkewUpper == Catch::Approx(0.75F));
+  REQUIRE(effects[1].effectParameterKeys.size() == 1U);
+  CHECK(effects[1].effectParameterKeys[0].parameter ==
+        TimingColouriseEffectParameter::PaletteSkewCentre);
+  CHECK(effects[1].effectParameterKeys[0].value == Catch::Approx(0.7F));
+
+  // Identity skew stays out of the document entirely.
+  std::ifstream savedInput{file.path};
+  REQUIRE(savedInput.is_open());
+  const auto savedJson = nlohmann::json::parse(savedInput);
+  savedInput.close();
+  const auto& stateJson = savedJson["timing_take_states"][0];
+  CHECK_FALSE(stateJson["timing_effects"][0].contains("palette_skew_centre"));
+  CHECK_FALSE(stateJson["timing_effects"][0].contains("palette_skew_lower"));
+  CHECK_FALSE(stateJson["timing_effects"][0].contains("palette_skew_upper"));
+  CHECK(stateJson["timing_effects"][1]["palette_skew_centre"] ==
+        Catch::Approx(0.25));
+  CHECK(stateJson["timing_effects"][1]["effect_parameter_keys"][0]
+                 ["parameter"] == "palette_skew_centre");
+}
+
 TEST_CASE("Legacy takes backfill their scene from single-scene states",
           "[project][serialization][timings][scene-scope][migration]") {
   using invisible_places::serialization::LoadProjectDocument;

@@ -96812,8 +96812,12 @@ void DrawTimingColourisePaletteEditor(
         rawEffect.colouriseAmountOverride = 1.0F;
         rawEffect.palettePhaseOffset = 0.0F;
         // The raw LUT backs stop insertion and legacy materialization, so it
-        // must show the authored stops, not the looped sampling of them.
+        // must show the authored stops, not the looped or skewed sampling
+        // of them.
         rawEffect.paletteLooped = false;
+        rawEffect.paletteSkewCentre = 0.5F;
+        rawEffect.paletteSkewLower = 0.0F;
+        rawEffect.paletteSkewUpper = 0.0F;
         rawEffect.effectParameterKeys.clear();
         return invisible_places::timing::
             EvaluateTimingColourisePaletteLut(

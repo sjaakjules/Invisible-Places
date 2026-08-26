@@ -292,9 +292,16 @@ bool IsValidEffectParameter(
         case TimingColouriseEffectParameter::PalettePhase:
         case TimingColouriseEffectParameter::AmountOverride:
         case TimingColouriseEffectParameter::EmissiveLevel:
+        case TimingColouriseEffectParameter::PaletteSkewCentre:
+        case TimingColouriseEffectParameter::PaletteSkewLower:
+        case TimingColouriseEffectParameter::PaletteSkewUpper:
             return true;
     }
     return false;
+}
+
+float ClampPaletteSkew(float value) {
+    return std::clamp(FiniteOr(value, 0.0F), -1.0F, 1.0F);
 }
 
 bool IsValidPaletteStopParameter(
@@ -438,6 +445,12 @@ float EffectParameterBaseValue(
             return effect.colouriseAmountOverride;
         case TimingColouriseEffectParameter::EmissiveLevel:
             return effect.emissiveLevel;
+        case TimingColouriseEffectParameter::PaletteSkewCentre:
+            return effect.paletteSkewCentre;
+        case TimingColouriseEffectParameter::PaletteSkewLower:
+            return effect.paletteSkewLower;
+        case TimingColouriseEffectParameter::PaletteSkewUpper:
+            return effect.paletteSkewUpper;
     }
     return 0.0F;
 }
@@ -452,6 +465,11 @@ float SanitizeEffectParameterValue(
             return Clamp01(value);
         case TimingColouriseEffectParameter::EmissiveLevel:
             return FiniteOr(value, 1.0F);
+        case TimingColouriseEffectParameter::PaletteSkewCentre:
+            return std::clamp(FiniteOr(value, 0.5F), 0.0F, 1.0F);
+        case TimingColouriseEffectParameter::PaletteSkewLower:
+        case TimingColouriseEffectParameter::PaletteSkewUpper:
+            return ClampPaletteSkew(value);
     }
     return 0.0F;
 }
@@ -3113,6 +3131,9 @@ bool TimingEffectParameterIsSupported(
     switch (parameter) {
         case TimingColouriseEffectParameter::PalettePhase:
         case TimingColouriseEffectParameter::AmountOverride:
+        case TimingColouriseEffectParameter::PaletteSkewCentre:
+        case TimingColouriseEffectParameter::PaletteSkewLower:
+        case TimingColouriseEffectParameter::PaletteSkewUpper:
             return colouriseEnabled;
         case TimingColouriseEffectParameter::EmissiveLevel:
             return emissiveEnabled;
@@ -3283,6 +3304,10 @@ TimingColouriseEffect SanitizeTimingColouriseEffect(
         1.0F);
     effect.palettePhaseOffset =
         FiniteOr(effect.palettePhaseOffset, 0.0F);
+    effect.paletteSkewCentre =
+        std::clamp(FiniteOr(effect.paletteSkewCentre, 0.5F), 0.0F, 1.0F);
+    effect.paletteSkewLower = ClampPaletteSkew(effect.paletteSkewLower);
+    effect.paletteSkewUpper = ClampPaletteSkew(effect.paletteSkewUpper);
     effect.emissiveLevel =
         FiniteOr(effect.emissiveLevel, 1.0F);
     std::erase_if(
@@ -5492,6 +5517,98 @@ TimingColouriseLut ApplyTimingColourisePalettePhase(
     return shifted;
 }
 
+float TimingColourisePaletteSkewCoordinate(
+    float centre,
+    float lowerSkew,
+    float upperSkew,
+    float boundsFraction) {
+    constexpr float kDegenerateHalf = 1.0e-6F;
+    const float t = Clamp01(boundsFraction);
+    const float c = std::clamp(FiniteOr(centre, 0.5F), 0.0F, 1.0F);
+    // 4^skew keeps skew 0 exactly linear and gives each side a symmetric
+    // 1/4x..4x exponent range. An exponent above one holds the coordinate
+    // near the palette midpoint longer, stretching the centre colours.
+    if (t <= c) {
+        if (c <= kDegenerateHalf) {
+            return 0.5F;
+        }
+        const float towardEnd = (c - t) / c;
+        const float gamma =
+            std::pow(4.0F, std::clamp(FiniteOr(lowerSkew, 0.0F), -1.0F, 1.0F));
+        return 0.5F - 0.5F * std::pow(towardEnd, gamma);
+    }
+    if (1.0F - c <= kDegenerateHalf) {
+        return 0.5F;
+    }
+    const float towardEnd = (t - c) / (1.0F - c);
+    const float gamma =
+        std::pow(4.0F, std::clamp(FiniteOr(upperSkew, 0.0F), -1.0F, 1.0F));
+    return 0.5F + 0.5F * std::pow(towardEnd, gamma);
+}
+
+TimingColouriseLut ApplyTimingColourisePaletteSkew(
+    const TimingColouriseLut& lut,
+    float centre,
+    float lowerSkew,
+    float upperSkew) {
+    const bool identity =
+        std::abs(FiniteOr(centre, 0.5F) - 0.5F) <=
+            std::numeric_limits<float>::epsilon() &&
+        std::abs(FiniteOr(lowerSkew, 0.0F)) <=
+            std::numeric_limits<float>::epsilon() &&
+        std::abs(FiniteOr(upperSkew, 0.0F)) <=
+            std::numeric_limits<float>::epsilon();
+    if (identity) {
+        return lut;
+    }
+    TimingColouriseLut skewed{};
+    for (std::size_t index = 0U; index < skewed.size(); ++index) {
+        const float destination =
+            static_cast<float>(index) /
+            static_cast<float>(skewed.size() - 1U);
+        const auto sample = SampleTimingColouriseLut(
+            lut,
+            TimingColourisePaletteSkewCoordinate(
+                centre,
+                lowerSkew,
+                upperSkew,
+                destination));
+        skewed[index] = {
+            sample.colour[0],
+            sample.colour[1],
+            sample.colour[2],
+            sample.colouriseAmount,
+        };
+    }
+    return skewed;
+}
+
+float TimingColourisePaletteSkewFromSideFraction(
+    float sideFraction,
+    float paletteQuantile) {
+    // Solve towardEnd^gamma == paletteQuantile for gamma, then invert
+    // gamma == 4^skew. Fractions at the degenerate ends have no unique
+    // solution and resolve to the nearest representable skew.
+    const float quantile = std::clamp(
+        FiniteOr(paletteQuantile, 0.5F),
+        1.0e-4F,
+        1.0F - 1.0e-4F);
+    const float fraction = FiniteOr(sideFraction, quantile);
+    // A marker dragged to the centre needs gamma -> 0 (skew -1, ends
+    // stretched); dragged to the side's end it needs gamma -> infinity
+    // (skew +1, centre stretched) - independent of which quantile it marks.
+    if (fraction <= 1.0e-4F) {
+        return -1.0F;
+    }
+    if (fraction >= 1.0F - 1.0e-4F) {
+        return 1.0F;
+    }
+    const float gamma =
+        std::log(quantile) / std::log(fraction);
+    return ClampPaletteSkew(
+        std::log(gamma) / std::log(4.0F));
+}
+
 TimingColouriseLut ApplyTimingColourisePaletteLoop(
     const TimingColouriseLut& lut) {
     TimingColouriseLut mirrored{};
@@ -5773,14 +5890,26 @@ TimingColouriseLut EvaluateTimingColourisePaletteLut(
         TimingColouriseEffectParameter::PalettePhase);
     const float amountOverride = evaluatedParameter(
         TimingColouriseEffectParameter::AmountOverride);
+    const float skewCentre = evaluatedParameter(
+        TimingColouriseEffectParameter::PaletteSkewCentre);
+    const float skewLower = evaluatedParameter(
+        TimingColouriseEffectParameter::PaletteSkewLower);
+    const float skewUpper = evaluatedParameter(
+        TimingColouriseEffectParameter::PaletteSkewUpper);
     const auto finalize = [&](TimingColouriseLut lut) {
         // Loop first so the phase rotation cycles a seamless, end-matched
         // palette instead of dragging the mirror seam through the output.
+        // Skew is a bounds-fraction remap, so it wraps the palette-space
+        // transforms: the skew centre stays pinned while phase animates.
         if (sanitized.paletteLooped) {
             lut = ApplyTimingColourisePaletteLoop(lut);
         }
         return ApplyTimingColouriseAmountOverride(
-            ApplyTimingColourisePalettePhase(lut, phaseOffset),
+            ApplyTimingColourisePaletteSkew(
+                ApplyTimingColourisePalettePhase(lut, phaseOffset),
+                skewCentre,
+                skewLower,
+                skewUpper),
             sanitized.colouriseAmountOverrideMode,
             amountOverride);
     };

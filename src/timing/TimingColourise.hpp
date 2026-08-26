@@ -97,6 +97,13 @@ enum class TimingColouriseEffectParameter : std::uint8_t {
     PalettePhase = 0,
     AmountOverride,
     EmissiveLevel,
+    // Palette Skew redistributes how the selected bounds span maps onto the
+    // palette without changing any stop. Centre is the bounds fraction where
+    // the palette's midpoint lands; the per-side skews trade area between
+    // the centre-adjacent and end-adjacent colours of that side.
+    PaletteSkewCentre,
+    PaletteSkewLower,
+    PaletteSkewUpper,
 };
 
 enum class TimingColourisePaletteStopParameter : std::uint8_t {
@@ -296,6 +303,14 @@ struct TimingColouriseEffect {
     // and every stop key keep their positions. The mirrored output is
     // seamless, so phase animation cycles without a visible join.
     bool paletteLooped = false;
+    // Base values for the Palette Skew controls; keys on the matching
+    // TimingColouriseEffectParameter tracks override them. Skew is a pure
+    // sampling remap of the bounds span: 0.5/0/0 is the identity, the centre
+    // moves the palette midpoint, and each side's skew in [-1, 1] stretches
+    // the centre-adjacent colours (positive) or the end colours (negative).
+    float paletteSkewCentre = 0.5F;
+    float paletteSkewLower = 0.0F;
+    float paletteSkewUpper = 0.0F;
     // Base cyclic offset in palette turns. Palette Phase keys below store a
     // signed delta from the preceding phase key (or this base for the first
     // key), constrained to one turn in either direction. Evaluation
@@ -914,6 +929,31 @@ std::size_t MergeLegacyTimingEffectAspects(
 // an end-matched cyclic palette.
 [[nodiscard]] TimingColouriseLut ApplyTimingColourisePaletteLoop(
     const TimingColouriseLut& lut);
+// Palette Skew: maps a normalized bounds fraction onto the palette
+// coordinate it samples. Monotone and continuous, with t == centre always
+// landing on the palette midpoint. Each side follows a power curve whose
+// exponent is 4^skew, so skew 0 is linear, positive skew stretches the
+// centre-adjacent colours of that side and negative skew stretches its end
+// colours. A centre of 0 or 1 collapses that side to a single instant.
+[[nodiscard]] float TimingColourisePaletteSkewCoordinate(
+    float centre,
+    float lowerSkew,
+    float upperSkew,
+    float boundsFraction);
+// Resamples a LUT through the skew map. Identity parameters return the
+// input LUT unchanged.
+[[nodiscard]] TimingColouriseLut ApplyTimingColourisePaletteSkew(
+    const TimingColouriseLut& lut,
+    float centre,
+    float lowerSkew,
+    float upperSkew);
+// Solves the side skew that places the palette coordinate `paletteQuantile`
+// of one side (0..1 measured from the centre toward that side's end) at the
+// side fraction `sideFraction` of the bounds half. Used by the histogram's
+// skew triangles; the result is clamped to the authored [-1, 1] range.
+[[nodiscard]] float TimingColourisePaletteSkewFromSideFraction(
+    float sideFraction,
+    float paletteQuantile);
 [[nodiscard]] float EvaluateTimingColouriseEffectParameter(
     const TimingColouriseEffect& effect,
     TimingColouriseEffectParameter parameter,

@@ -3609,6 +3609,138 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Timing Colourise palette skew remaps sampling without moving stops",
+    "[timing][colourise][palette][skew]") {
+    using invisible_places::timing::TimingColourisePaletteSkewCoordinate;
+
+    SECTION("identity parameters are the linear map") {
+        for (const float t : {0.0F, 0.2F, 0.5F, 0.83F, 1.0F}) {
+            CHECK(
+                TimingColourisePaletteSkewCoordinate(0.5F, 0.0F, 0.0F, t) ==
+                Approx(t).margin(1.0e-6F));
+        }
+    }
+
+    SECTION("the centre always lands on the palette midpoint") {
+        for (const float centre : {0.0F, 0.25F, 0.5F, 0.9F, 1.0F}) {
+            CHECK(
+                TimingColourisePaletteSkewCoordinate(
+                    centre,
+                    0.6F,
+                    -0.3F,
+                    centre) == Approx(0.5F).margin(1.0e-6F));
+        }
+        CHECK(
+            TimingColourisePaletteSkewCoordinate(0.25F, 0.0F, 0.0F, 0.0F) ==
+            Approx(0.0F).margin(1.0e-6F));
+        CHECK(
+            TimingColourisePaletteSkewCoordinate(0.25F, 0.0F, 0.0F, 1.0F) ==
+            Approx(1.0F).margin(1.0e-6F));
+    }
+
+    SECTION("positive skew stretches the centre-adjacent colours") {
+        // With upper skew +1 the exponent is 4, so most of the right half
+        // keeps sampling near the palette midpoint.
+        const float skewed =
+            TimingColourisePaletteSkewCoordinate(0.5F, 0.0F, 1.0F, 0.75F);
+        CHECK(skewed < 0.6F);
+        // With upper skew -1 the end colours claim the same fraction.
+        const float endStretched =
+            TimingColourisePaletteSkewCoordinate(0.5F, 0.0F, -1.0F, 0.75F);
+        CHECK(endStretched > 0.9F);
+    }
+
+    SECTION("the map is monotone for every parameter combination") {
+        for (const float centre : {0.15F, 0.5F, 0.85F}) {
+            for (const float lower : {-1.0F, 0.0F, 0.7F}) {
+                for (const float upper : {-0.6F, 0.0F, 1.0F}) {
+                    float previous = -1.0F;
+                    for (int step = 0; step <= 64; ++step) {
+                        const float t =
+                            static_cast<float>(step) / 64.0F;
+                        const float mapped =
+                            TimingColourisePaletteSkewCoordinate(
+                                centre,
+                                lower,
+                                upper,
+                                t);
+                        CHECK(mapped >= previous - 1.0e-6F);
+                        previous = mapped;
+                    }
+                }
+            }
+        }
+    }
+
+    SECTION("triangle-handle solve inverts the quantile placement") {
+        for (const float skew : {-0.8F, -0.25F, 0.0F, 0.4F, 1.0F}) {
+            for (const float quantile : {0.25F, 0.75F}) {
+                const float gamma = std::pow(4.0F, skew);
+                const float fraction =
+                    std::pow(quantile, 1.0F / gamma);
+                CHECK(
+                    invisible_places::timing::
+                        TimingColourisePaletteSkewFromSideFraction(
+                            fraction,
+                            quantile) == Approx(skew).margin(2.0e-3F));
+            }
+        }
+    }
+
+    SECTION("evaluation applies base and keyed skew to the LUT") {
+        TimingColouriseEffect effect;
+        effect.basePalette = TimingColourisePalette{
+            .stops = {
+                {.id = "left",
+                 .position = 0.0F,
+                 .colour = {0.0F, 0.0F, 0.0F},
+                 .colouriseAmount = 1.0F},
+                {.id = "right",
+                 .position = 1.0F,
+                 .colour = {1.0F, 1.0F, 1.0F},
+                 .colouriseAmount = 1.0F},
+            },
+        };
+        effect.paletteSkewCentre = 0.25F;
+        const auto base =
+            invisible_places::timing::EvaluateTimingColourisePaletteLut(
+                effect,
+                0.0F);
+        // The palette midpoint (grey 0.5) now sits a quarter of the way in.
+        const auto quarter =
+            invisible_places::timing::SampleTimingColouriseLut(base, 0.25F);
+        CHECK(quarter.colour[0] == Approx(0.5F).margin(0.02F));
+
+        // A key on the skew-centre track overrides the base value.
+        REQUIRE(invisible_places::timing::
+                    AddOrUpdateTimingColouriseEffectParameterKey(
+                        &effect,
+                        TimingColouriseEffectParameter::PaletteSkewCentre,
+                        0.0F,
+                        0.75F,
+                        WaterScenarioInterpolation::Hold));
+        const auto keyed =
+            invisible_places::timing::EvaluateTimingColourisePaletteLut(
+                effect,
+                0.0F);
+        const auto threeQuarter =
+            invisible_places::timing::SampleTimingColouriseLut(
+                keyed,
+                0.75F);
+        CHECK(threeQuarter.colour[0] == Approx(0.5F).margin(0.02F));
+
+        // Skew never rewrites the authored stops.
+        const auto authored =
+            invisible_places::timing::EvaluateTimingColourisePalette(
+                effect,
+                0.0F);
+        REQUIRE(authored.stops.size() == 2U);
+        CHECK(authored.stops[0].position == Approx(0.0F));
+        CHECK(authored.stops[1].position == Approx(1.0F));
+    }
+}
+
+TEST_CASE(
     "Timing Colourise phase and amount own independent animated control tracks",
     "[timing][colourise][palette][effect-parameters]") {
     TimingColouriseEffect effect;

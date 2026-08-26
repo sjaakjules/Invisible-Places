@@ -4825,6 +4825,12 @@ std::string TimingColouriseEffectParameterName(
             return "amount_override";
         case TimingColouriseEffectParameter::EmissiveLevel:
             return "emissive_level";
+        case TimingColouriseEffectParameter::PaletteSkewCentre:
+            return "palette_skew_centre";
+        case TimingColouriseEffectParameter::PaletteSkewLower:
+            return "palette_skew_lower";
+        case TimingColouriseEffectParameter::PaletteSkewUpper:
+            return "palette_skew_upper";
     }
     return "palette_phase";
 }
@@ -4844,6 +4850,15 @@ ParseTimingColouriseEffectParameter(const json& parameterJson) {
     }
     if (name == "emissive_level") {
         return TimingColouriseEffectParameter::EmissiveLevel;
+    }
+    if (name == "palette_skew_centre") {
+        return TimingColouriseEffectParameter::PaletteSkewCentre;
+    }
+    if (name == "palette_skew_lower") {
+        return TimingColouriseEffectParameter::PaletteSkewLower;
+    }
+    if (name == "palette_skew_upper") {
+        return TimingColouriseEffectParameter::PaletteSkewUpper;
     }
     return std::nullopt;
 }
@@ -5179,6 +5194,18 @@ json SerializeTimingColouriseEffect(
     if (sanitized.paletteLooped) {
         effectJson["palette_looped"] = true;
     }
+    // Palette Skew base values are written only away from the identity so
+    // untouched documents stay byte-identical; keyed skew rides the shared
+    // effect_parameter_keys list, whose unknown names older readers skip.
+    if (sanitized.paletteSkewCentre != 0.5F) {
+        effectJson["palette_skew_centre"] = sanitized.paletteSkewCentre;
+    }
+    if (sanitized.paletteSkewLower != 0.0F) {
+        effectJson["palette_skew_lower"] = sanitized.paletteSkewLower;
+    }
+    if (sanitized.paletteSkewUpper != 0.0F) {
+        effectJson["palette_skew_upper"] = sanitized.paletteSkewUpper;
+    }
     return effectJson;
 }
 
@@ -5334,6 +5361,15 @@ ParseTimingColouriseEffect(
     }
     effect.paletteLooped =
         effectJson.value("palette_looped", false);
+    effect.paletteSkewCentre = effectJson.value(
+        "palette_skew_centre",
+        effect.paletteSkewCentre);
+    effect.paletteSkewLower = effectJson.value(
+        "palette_skew_lower",
+        effect.paletteSkewLower);
+    effect.paletteSkewUpper = effectJson.value(
+        "palette_skew_upper",
+        effect.paletteSkewUpper);
     effect.palettePhaseOffset = effectJson.value(
         "palette_phase_offset",
         effect.palettePhaseOffset);
