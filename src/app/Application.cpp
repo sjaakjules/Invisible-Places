@@ -787,6 +787,15 @@ enum class TimingColouriseKeyTrack {
     EffectParameter,
 };
 
+// Fade toggle colours: linked fades keep the familiar green, while the
+// separated state gives each edge its bound's warm/cool family so the split
+// is visible at a glance in the histogram and the Bounds table.
+constexpr ImU32 kTimingLinkedFadeColour = IM_COL32(116, 190, 120, 255);
+constexpr ImU32 kTimingSeparatedLowerFadeColour =
+    IM_COL32(255, 174, 96, 255);
+constexpr ImU32 kTimingSeparatedUpperFadeColour =
+    IM_COL32(244, 120, 128, 255);
+
 enum class TimingColouriseHistogramHandle : std::int8_t {
     None = -1,
     Lower,
@@ -100245,8 +100254,14 @@ void DrawTimingColouriseHistogram(
         IM_COL32(255, 190, 74, 255);
     const ImU32 upperColour =
         IM_COL32(242, 104, 96, 255);
-    const ImU32 fadeColour =
-        IM_COL32(116, 190, 120, 255);
+    // Linked fades share the familiar green; separated edges show their
+    // own warm/cool tints so the split state reads immediately.
+    const ImU32 lowerFadeColour = effect->edgeFadesLinked
+        ? kTimingLinkedFadeColour
+        : kTimingSeparatedLowerFadeColour;
+    const ImU32 upperFadeColour = effect->edgeFadesLinked
+        ? kTimingLinkedFadeColour
+        : kTimingSeparatedUpperFadeColour;
     const auto drawBound = [&](float value, ImU32 colour) {
         const float x = xForRaw(value);
         drawList->AddLine(
@@ -100333,20 +100348,20 @@ void DrawTimingColouriseHistogram(
         1.0F);
 
     const auto drawFadeHandle =
-        [&](float boundX, float handleX) {
+        [&](float boundX, float handleX, ImU32 colour) {
             drawList->AddLine(
                 ImVec2{boundX, fadeY},
                 ImVec2{handleX, fadeY},
-                fadeColour,
+                colour,
                 1.5F);
             drawList->AddLine(
                 ImVec2{handleX, fadeY - 4.0F},
                 ImVec2{handleX, fadeY + 4.0F},
-                fadeColour,
+                colour,
                 2.0F);
         };
-    drawFadeHandle(lowerX, lowerFadeX);
-    drawFadeHandle(upperX, upperFadeX);
+    drawFadeHandle(lowerX, lowerFadeX, lowerFadeColour);
+    drawFadeHandle(upperX, upperFadeX, upperFadeColour);
 
     // Palette Skew row: a plum rail above the bounds rail carrying the
     // palette-midpoint dot and each side's quarter/three-quarter triangles,
@@ -100724,10 +100739,17 @@ void DrawTimingColouriseHistogram(
 void DrawTimingColouriseBoundsParameterTrackButtons(
     PreviewRuntimeState* runtimeState,
     invisible_places::timing::TimingColouriseEffect* effect,
-    invisible_places::timing::TimingColouriseBoundsParameter parameter) {
+    invisible_places::timing::TimingColouriseBoundsParameter parameter,
+    bool mirrorLinkedFadePartner = false) {
     if (runtimeState == nullptr || effect == nullptr) {
         return;
     }
+    using invisible_places::timing::TimingColouriseBoundsParameter;
+    // The linked Ends Fade column drives both per-edge tracks as one.
+    const auto fadePartner =
+        parameter == TimingColouriseBoundsParameter::EdgeFadeLower
+            ? TimingColouriseBoundsParameter::EdgeFadeUpper
+            : TimingColouriseBoundsParameter::EdgeFadeLower;
     ImGui::PushStyleVar(
         ImGuiStyleVar_FramePadding,
         ImVec2{2.0F, 1.0F});
@@ -100787,6 +100809,15 @@ void DrawTimingColouriseBoundsParameterTrackButtons(
         // A keyed bounds is a local edit that detaches this feature from
         // the shared Global bounds.
         effect->boundsEdited = true;
+        if (mirrorLinkedFadePartner) {
+            (void)invisible_places::timing::
+                AddOrUpdateTimingColouriseBoundsParameterKey(
+                    effect,
+                    fadePartner,
+                    position,
+                    evaluatedValue,
+                    interpolation);
+        }
         runtimeState->previewRenderStateSignatureValid = false;
     }
     ImGui::EndDisabled();
@@ -100826,6 +100857,13 @@ void DrawTimingColouriseBoundsParameterTrackButtons(
                 effect,
                 parameter,
                 position);
+        if (mirrorLinkedFadePartner) {
+            (void)invisible_places::timing::
+                RemoveTimingColouriseBoundsParameterKeysAtPosition(
+                    effect,
+                    fadePartner,
+                    position);
+        }
         runtimeState->previewRenderStateSignatureValid = false;
     }
     ImGui::EndDisabled();
@@ -100843,7 +100881,9 @@ void DrawTimingColouriseBoundsParameterTrackButtons(
                 "##CurveStyle",
                 &effect->boundsParameterKeys,
                 [&](const auto& key) {
-                    return key.parameter == parameter;
+                    return key.parameter == parameter ||
+                           (mirrorLinkedFadePartner &&
+                            key.parameter == fadePartner);
                 })) {
             runtimeState->previewRenderStateSignatureValid = false;
         }
@@ -100854,7 +100894,8 @@ void DrawTimingColouriseBoundsParameterTrackButtons(
 void DrawTimingColouriseBoundsParameterEditor(
     PreviewRuntimeState* runtimeState,
     invisible_places::timing::TimingColouriseEffect* effect,
-    invisible_places::timing::TimingColouriseBoundsParameter parameter) {
+    invisible_places::timing::TimingColouriseBoundsParameter parameter,
+    bool mirrorLinkedFadePartner = false) {
     if (runtimeState == nullptr || effect == nullptr) {
         return;
     }
@@ -101112,7 +101153,8 @@ void DrawTimingColouriseBoundsParameterEditor(
     DrawTimingColouriseBoundsParameterTrackButtons(
         runtimeState,
         effect,
-        parameter);
+        parameter,
+        mirrorLinkedFadePartner);
     ImGui::PopID();
 }
 
@@ -101214,99 +101256,123 @@ void DrawTimingColouriseBoundsEditor(
         ImGui::TextDisabled(
             "Legacy Bounds snapshot keys remain active as a fallback. New keys below override their individual coordinates.");
     }
-    constexpr std::array parameters{
-        TimingColouriseBoundsParameter::Lower,
-        TimingColouriseBoundsParameter::Upper,
-        TimingColouriseBoundsParameter::Centre,
-        TimingColouriseBoundsParameter::Spread,
-        TimingColouriseBoundsParameter::EdgeFadeLower,
-        TimingColouriseBoundsParameter::EdgeFadeUpper,
+    // While the fades are linked one "Ends Fade" column drives both edge
+    // tracks together; separating them (double-click a fade handle in the
+    // histogram) splits the column in two, each tinted to match its
+    // histogram toggle.
+    const bool linkedFades = effect->edgeFadesLinked;
+    struct BoundsColumn {
+        TimingColouriseBoundsParameter parameter =
+            TimingColouriseBoundsParameter::Lower;
+        const char* label = "";
+        ImU32 laneColour = IM_COL32_WHITE;
+        bool mirrorLinkedFadePartner = false;
+        std::optional<ImU32> labelTint;
     };
-    constexpr std::array<ImU32, parameters.size()> laneColours{
-        IM_COL32(255, 190, 74, 255),
-        IM_COL32(242, 104, 96, 255),
-        IM_COL32(100, 176, 232, 255),
-        IM_COL32(190, 132, 224, 255),
-        IM_COL32(148, 214, 132, 255),
-        IM_COL32(108, 190, 156, 255),
+    std::vector<BoundsColumn> columns{
+        {TimingColouriseBoundsParameter::Lower,
+         "Lower",
+         IM_COL32(255, 190, 74, 255)},
+        {TimingColouriseBoundsParameter::Upper,
+         "Upper",
+         IM_COL32(242, 104, 96, 255)},
+        {TimingColouriseBoundsParameter::Centre,
+         "Centre",
+         IM_COL32(100, 176, 232, 255)},
+        {TimingColouriseBoundsParameter::Spread,
+         "Spacing",
+         IM_COL32(190, 132, 224, 255)},
     };
+    if (linkedFades) {
+        columns.push_back(
+            {TimingColouriseBoundsParameter::EdgeFadeLower,
+             "Ends Fade",
+             kTimingLinkedFadeColour,
+             true});
+    } else {
+        columns.push_back(
+            {TimingColouriseBoundsParameter::EdgeFadeLower,
+             "Lower Fade",
+             kTimingSeparatedLowerFadeColour,
+             false,
+             kTimingSeparatedLowerFadeColour});
+        columns.push_back(
+            {TimingColouriseBoundsParameter::EdgeFadeUpper,
+             "Upper Fade",
+             kTimingSeparatedUpperFadeColour,
+             false,
+             kTimingSeparatedUpperFadeColour});
+    }
     if (ImGui::BeginTable(
             "##BoundsParameters",
-            static_cast<int>(parameters.size()),
+            static_cast<int>(columns.size()),
             ImGuiTableFlags_SizingStretchSame)) {
         ImGui::TableNextRow();
         for (std::size_t index = 0U;
-             index < parameters.size();
+             index < columns.size();
              ++index) {
             ImGui::TableSetColumnIndex(
                 static_cast<int>(index));
-            const auto parameter = parameters[index];
+            const auto& column = columns[index];
             const bool allowed = invisible_places::timing::
                 TimingColouriseBoundsParameterIsAllowed(
                     effect->boundsKeyMode,
-                    parameter);
+                    column.parameter);
             const bool keyed =
                 TimingColouriseBoundsParameterHasKeys(
                     *effect,
-                    parameter);
+                    column.parameter);
             if (!allowed) {
-                ImGui::TextDisabled(
-                    "%s",
-                    TimingColouriseBoundsParameterLabel(
-                        parameter));
+                ImGui::TextDisabled("%s", column.label);
             } else {
                 if (keyed) {
                     ImGui::PushStyleColor(
                         ImGuiCol_Text,
                         kWaterKeyedSettingColour);
+                } else if (column.labelTint.has_value()) {
+                    ImGui::PushStyleColor(
+                        ImGuiCol_Text,
+                        column.labelTint.value());
                 }
-                ImGui::TextUnformatted(
-                    TimingColouriseBoundsParameterLabel(
-                        parameter));
-                if (keyed) {
+                ImGui::TextUnformatted(column.label);
+                if (keyed || column.labelTint.has_value()) {
                     ImGui::PopStyleColor();
                 }
             }
         }
         ImGui::TableNextRow();
         for (std::size_t index = 0U;
-             index < parameters.size();
+             index < columns.size();
              ++index) {
             ImGui::TableSetColumnIndex(
                 static_cast<int>(index));
             DrawTimingColouriseBoundsParameterEditor(
                 runtimeState,
                 effect,
-                parameters[index]);
+                columns[index].parameter,
+                columns[index].mirrorLinkedFadePartner);
         }
         ImGui::EndTable();
     }
-    std::array<std::vector<float>, parameters.size()>
-        boundsKeyPositions;
+    std::vector<std::vector<float>> boundsKeyPositions(columns.size());
     for (const auto& key : effect->boundsParameterKeys) {
-        const auto parameter = std::find(
-            parameters.begin(),
-            parameters.end(),
-            key.parameter);
-        if (parameter != parameters.end()) {
-            boundsKeyPositions[static_cast<std::size_t>(
-                std::distance(parameters.begin(), parameter))]
-                .push_back(key.position);
+        for (std::size_t index = 0U; index < columns.size(); ++index) {
+            if (columns[index].parameter == key.parameter) {
+                boundsKeyPositions[index].push_back(key.position);
+            }
         }
     }
-    std::array<TimingColouriseKeyLaneSeries, parameters.size()>
-        boundsLanes{};
+    std::vector<TimingColouriseKeyLaneSeries> boundsLanes(columns.size());
     for (std::size_t index = 0U;
-         index < parameters.size();
+         index < columns.size();
          ++index) {
         boundsLanes[index] = TimingColouriseKeyLaneSeries{
-            .label = TimingColouriseBoundsParameterLabel(
-                parameters[index]),
+            .label = columns[index].label,
             .track = TimingColouriseKeyTrack::Bounds,
-            .boundsParameter = parameters[index],
+            .boundsParameter = columns[index].parameter,
             .positions =
                 std::span<const float>{boundsKeyPositions[index]},
-            .colour = laneColours[index],
+            .colour = columns[index].laneColour,
         };
     }
     ImGui::TextDisabled("Value over animation position");
