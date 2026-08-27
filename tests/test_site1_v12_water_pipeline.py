@@ -211,6 +211,35 @@ class DensityConfigTests(unittest.TestCase):
             [[0.0001, 0.0001], [0.0021, 0.0001]],
         )
 
+    def test_boundary_support_counts_real_safe_representative_not_cell_centre(self):
+        cells = V12._unique_fillable_support_cells(
+            np.asarray([[0.07999, 0.00199]]),
+            pitch_m=0.002,
+        )
+        centre_count = V12._circle_point_counts(
+            np.asarray([[0.0, 0.0]]),
+            cells.cell_centres_xy,
+            radius_m=0.08,
+        )
+        representative_count = V12._circle_point_counts(
+            np.asarray([[0.0, 0.0]]),
+            cells.representative_xy,
+            radius_m=0.08,
+        )
+        np.testing.assert_array_equal(centre_count, [1])
+        np.testing.assert_array_equal(representative_count, [0])
+
+    def test_support_representative_is_nearest_real_point_to_cell_centre(self):
+        cells = V12._unique_fillable_support_cells(
+            np.asarray([
+                [0.0001, 0.0001],
+                [0.0011, 0.0010],
+                [0.0019, 0.0019],
+            ]),
+            pitch_m=0.002,
+        )
+        np.testing.assert_allclose(cells.representative_xy, [[0.0011, 0.0010]])
+
     def test_vacant_candidate_mask_honours_spacing_boundary_and_tolerance(self):
         candidates = np.asarray([
             [0.00189, 0.0],
@@ -302,6 +331,63 @@ class DensityConfigTests(unittest.TestCase):
         )
         np.testing.assert_array_equal(required, [True])
         np.testing.assert_array_equal(contract.capacity_sufficient_mask, [False])
+
+    def test_density_capacity_preempts_only_conflicting_advisory_fade(self):
+        capacity = np.asarray([
+            [780.0, 820.0],
+            [780.004, 820.0],
+        ], np.float64)
+        fade = np.asarray([
+            [780.001, 820.0],
+            [780.002, 820.0],
+            [780.010, 820.0],
+        ], np.float64)
+        keep = V12._fixed_fade_survival_mask(
+            fade,
+            capacity,
+            spacing_m=0.0018,
+        )
+        np.testing.assert_array_equal(keep, [False, True, True])
+        kept_distance = V12._nearest_distance(fade[keep], capacity)
+        self.assertTrue(np.all(kept_distance >= 0.0018 - 1e-12))
+        preempted_distance = V12._nearest_distance(fade[~keep], capacity)
+        self.assertTrue(np.all(preempted_distance < 0.0018 - 1e-12))
+
+    def test_scarcity_witness_keeps_sole_in_disk_candidate(self):
+        centres = np.asarray([[0.0, 0.0]], np.float64)
+        candidates = np.asarray([
+            [0.0790, 0.0],   # sole row inside the 8 cm audit disk
+            [0.0805, 0.0],   # outside, but close enough to block it
+        ], np.float64)
+        arbitrary = V12.confidence.variable_radius_blue_noise(
+            candidates,
+            0.0018,
+            priority=np.asarray([0.0, 10.0]),
+            seed=17,
+        )
+        self.assertEqual(arbitrary.selected_indices.tolist(), [1])
+        self.assertEqual(
+            int(V12._circle_point_counts(
+                centres,
+                candidates[arbitrary.selected_indices],
+                radius_m=0.08,
+            )[0]),
+            0,
+        )
+
+        witness = V12.refinement.refill_circular_density_dips(
+            centres,
+            np.empty((0, 2), np.float64),
+            candidates,
+            radius_m=0.08,
+            target_density_per_m2=[1.0 / (np.pi * 0.08**2)],
+            water_spacing_m=0.0018,
+            minimum_observed_count=[1],
+            active_centre_mask=[True],
+            seed=17,
+        )
+        self.assertEqual(witness.selected_candidate_indices.tolist(), [0])
+        np.testing.assert_array_equal(witness.remaining_deficit_count, [0])
 
     def test_reference_centres_are_circular_annuli_not_square_cells(self):
         document = json.loads(CONFIG.read_text(encoding="utf-8"))

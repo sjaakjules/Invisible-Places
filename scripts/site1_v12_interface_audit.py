@@ -1826,6 +1826,7 @@ def _declared_density_contract(
         "reference_surface_active_mask", "source_water_active_mask",
         "source_support_active_mask", "vacant_support_active_mask",
         "support_sampling_pitch_m", "support_sample_cell_area_m2",
+        "support_area_window_membership_uses_real_representatives",
         "footprint_full_disk_sample_count", "valid_footprint_sample_count",
         "valid_footprint_area_m2", "raw_support_sample_count",
         "raw_support_area_m2", "vacant_support_sample_count",
@@ -1834,6 +1835,8 @@ def _declared_density_contract(
         "raw_support_representative_archive_key", "vacant_support_archive_key",
         "vacant_support_representative_archive_key",
         "vacant_safe_reservoir_archive_key", "vacant_safe_reservoir_count",
+        "vacant_density_reservoir_archive_key",
+        "vacant_density_reservoir_count",
         "support_pitch_archive_key",
         "immutable_water_spacing_m", "immutable_water_blocker_count",
         "all_surviving_immutable_water_rows_block_placement",
@@ -1846,8 +1849,17 @@ def _declared_density_contract(
         "reference_sample_count", "spacing_feasible_capacity_count",
         "spacing_capacity_selection_count", "spacing_capacity_seed",
         "spacing_capacity_fixed_fade_blocker_count",
+        "spacing_capacity_fixed_fade_input_count",
+        "spacing_capacity_fixed_fade_preempted_count",
+        "spacing_capacity_fixed_fade_input_archive_key",
+        "spacing_capacity_preempted_fixed_fade_archive_key",
+        "spacing_capacity_selection_method",
+        "spacing_capacity_remaining_deficit_count",
         "spacing_capacity_archive_key",
-        "spacing_capacity_uses_complete_safe_reservoir_and_fixed_fade",
+        "spacing_capacity_uses_complete_safe_reservoir",
+        "spacing_capacity_kept_fixed_fade_is_compatible",
+        "spacing_capacity_built_against_surviving_water_before_fixed_fade",
+        "spacing_capacity_preempts_advisory_fixed_fade",
         "spacing_capacity_is_spacing_feasible_reservoir_not_interval_certificate",
         "spacing_capacity_candidate_rows_in_joint_pool",
         "final_selected_additions_are_joint_interval_certificate",
@@ -1885,7 +1897,11 @@ def _declared_density_contract(
     )
     for name in (
         "all_surviving_immutable_water_rows_block_placement",
-        "spacing_capacity_uses_complete_safe_reservoir_and_fixed_fade",
+        "support_area_window_membership_uses_real_representatives",
+        "spacing_capacity_uses_complete_safe_reservoir",
+        "spacing_capacity_kept_fixed_fade_is_compatible",
+        "spacing_capacity_built_against_surviving_water_before_fixed_fade",
+        "spacing_capacity_preempts_advisory_fixed_fade",
         "spacing_capacity_is_spacing_feasible_reservoir_not_interval_certificate",
         "spacing_capacity_candidate_rows_in_joint_pool",
         "final_selected_additions_are_joint_interval_certificate",
@@ -1898,6 +1914,11 @@ def _declared_density_contract(
         value["addition_bounds_rounding"]
         == "ceil-both-on-discrete-point-count-lattice",
         "fine density addition rounding convention differs",
+    )
+    _require(
+        value["spacing_capacity_selection_method"]
+        == "scarcity-aware-overlapping-window-lower-coverage-v1",
+        "fine density capacity selection method differs",
     )
 
     parameters = config_document.get("parameters")
@@ -1975,8 +1996,17 @@ def _declared_density_contract(
         "vacant_support_archive_key": "vacant_support_cell_keys",
         "vacant_support_representative_archive_key": "vacant_support_representative_xy",
         "vacant_safe_reservoir_archive_key": "vacant_safe_reservoir_xy",
+        "vacant_density_reservoir_archive_key": (
+            "vacant_density_reservoir_xy"
+        ),
         "support_pitch_archive_key": "support_pitch_m",
         "spacing_capacity_archive_key": "spacing_capacity_xy",
+        "spacing_capacity_fixed_fade_input_archive_key": (
+            "fixed_fade_input_xy"
+        ),
+        "spacing_capacity_preempted_fixed_fade_archive_key": (
+            "preempted_fixed_fade_xy"
+        ),
     }
     for manifest_key, archive_key in expected_archive_keys.items():
         _require(value[manifest_key] == archive_key, f"fine density archive key {manifest_key} differs")
@@ -2000,8 +2030,17 @@ def _declared_density_contract(
         vacant_safe_reservoir_xy = np.asarray(
             loaded["vacant_safe_reservoir_xy"], np.float64
         ).copy()
+        vacant_density_reservoir_xy = np.asarray(
+            loaded["vacant_density_reservoir_xy"], np.float64
+        ).copy()
         archived_pitch = float(np.asarray(loaded["support_pitch_m"]).reshape(()))
         capacity_xy = np.asarray(loaded["spacing_capacity_xy"], np.float64).copy()
+        fixed_fade_input_xy = np.asarray(
+            loaded["fixed_fade_input_xy"], np.float64
+        ).copy()
+        preempted_fixed_fade_xy = np.asarray(
+            loaded["preempted_fixed_fade_xy"], np.float64
+        ).copy()
         candidate_xy = np.asarray(loaded["candidate_xy"], np.float64).copy()
         candidate_kind = np.asarray(loaded["candidate_kind"], np.uint8).copy()
     _require(abs(archived_pitch - support_pitch) <= 1e-15, "geometry support pitch differs from manifest")
@@ -2026,14 +2065,48 @@ def _declared_density_contract(
         == len(vacant_safe_reservoir_xy),
         "vacant safe reservoir count differs from archive",
     )
+    _require(
+        vacant_density_reservoir_xy.ndim == 2
+        and vacant_density_reservoir_xy.shape[1] == 2
+        and len(vacant_density_reservoir_xy)
+        and np.all(np.isfinite(vacant_density_reservoir_xy)),
+        "vacant density reservoir archive is invalid",
+    )
+    _require(
+        int(value["vacant_density_reservoir_count"])
+        == len(vacant_density_reservoir_xy),
+        "vacant density reservoir count differs from archive",
+    )
+    rebuilt_vacant_cells = water_pipeline._unique_fillable_support_cells(
+        vacant_density_reservoir_xy,
+        pitch_m=support_pitch,
+    )
+    _require(
+        np.array_equal(rebuilt_vacant_cells.cell_keys, vacant_keys)
+        and np.array_equal(
+            rebuilt_vacant_cells.representative_xy,
+            vacant_representatives,
+        ),
+        "vacant support representatives do not reconstruct from safe density reservoir",
+    )
+    _require(
+        np.all(np.isin(
+            _xy_row_view(vacant_density_reservoir_xy),
+            _xy_row_view(vacant_safe_reservoir_xy),
+            assume_unique=False,
+        )),
+        "vacant density reservoir is not a subset of all-kind safe reservoir",
+    )
     raw_view = np.ascontiguousarray(raw_keys).view(np.dtype((np.void, raw_keys.dtype.itemsize * 2))).ravel()
     vacant_view = np.ascontiguousarray(vacant_keys).view(np.dtype((np.void, vacant_keys.dtype.itemsize * 2))).ravel()
     _require(np.all(np.isin(vacant_view, raw_view)), "vacant support is not a subset of raw support")
     _require(int(value["raw_support_cell_count"]) == len(raw_keys) and int(value["vacant_support_cell_count"]) == len(vacant_keys), "global support-cell counts differ from archive")
-    raw_centres = (raw_keys.astype(np.float64) + 0.5) * support_pitch
-    vacant_centres = (vacant_keys.astype(np.float64) + 0.5) * support_pitch
-    independent_raw_count = water_pipeline._circle_point_counts(centres, raw_centres, radius_m=radius)
-    independent_vacant_count = water_pipeline._circle_point_counts(centres, vacant_centres, radius_m=radius)
+    independent_raw_count = water_pipeline._circle_point_counts(
+        centres, raw_representatives, radius_m=radius
+    )
+    independent_vacant_count = water_pipeline._circle_point_counts(
+        centres, vacant_representatives, radius_m=radius
+    )
     independent_raw_area = np.minimum(independent_raw_count * support_cell_area, footprint.valid_footprint_area_m2)
     independent_vacant_area = np.minimum(independent_vacant_count * support_cell_area, footprint.valid_footprint_area_m2)
     raw_support_count = integer_array("raw_support_sample_count")
@@ -2056,12 +2129,12 @@ def _declared_density_contract(
     )
     capacity_membership = np.isin(
         _xy_row_view(capacity_xy),
-        _xy_row_view(vacant_safe_reservoir_xy),
+        _xy_row_view(vacant_density_reservoir_xy),
         assume_unique=False,
     )
     _require(
         np.all(capacity_membership),
-        "spacing-capacity reservoir leaves archived vacant safe support",
+        "spacing-capacity witness leaves archived vacant density support",
     )
     capacity_count = water_pipeline._circle_point_counts(centres, capacity_xy, radius_m=radius)
     declared_capacity_count = integer_array("spacing_feasible_capacity_count")
@@ -2078,12 +2151,80 @@ def _declared_density_contract(
     )
     fixed_fade_xy = candidate_xy[(candidate_kind == 4) & ~in_density_window]
     fixed_fade_count = value["spacing_capacity_fixed_fade_blocker_count"]
+    fixed_fade_input_count = value["spacing_capacity_fixed_fade_input_count"]
+    fixed_fade_preempted_count = value[
+        "spacing_capacity_fixed_fade_preempted_count"
+    ]
     _require(
         isinstance(fixed_fade_count, int)
         and not isinstance(fixed_fade_count, bool)
         and fixed_fade_count >= 0
         and fixed_fade_count == len(fixed_fade_xy),
         "spacing-capacity fixed-fade blocker count differs from archive",
+    )
+    _require(
+        fixed_fade_input_xy.ndim == 2
+        and fixed_fade_input_xy.shape[1] == 2
+        and np.all(np.isfinite(fixed_fade_input_xy)),
+        "fixed-fade input archive is invalid",
+    )
+    _require(
+        len(np.unique(fixed_fade_input_xy, axis=0)) == len(fixed_fade_input_xy),
+        "fixed-fade input archive contains duplicate rows",
+    )
+    _require(
+        preempted_fixed_fade_xy.ndim == 2
+        and preempted_fixed_fade_xy.shape[1] == 2
+        and np.all(np.isfinite(preempted_fixed_fade_xy)),
+        "preempted fixed-fade archive is invalid",
+    )
+    _require(
+        len(np.unique(preempted_fixed_fade_xy, axis=0))
+        == len(preempted_fixed_fade_xy),
+        "preempted fixed-fade archive contains duplicate rows",
+    )
+    _require(
+        isinstance(fixed_fade_input_count, int)
+        and not isinstance(fixed_fade_input_count, bool)
+        and isinstance(fixed_fade_preempted_count, int)
+        and not isinstance(fixed_fade_preempted_count, bool)
+        and fixed_fade_input_count == len(fixed_fade_input_xy)
+        and fixed_fade_preempted_count == len(preempted_fixed_fade_xy)
+        and fixed_fade_input_count == fixed_fade_count + fixed_fade_preempted_count,
+        "fixed-fade capacity-preemption counts differ from archive",
+    )
+    fixed_fade_input_rows = _xy_row_view(fixed_fade_input_xy)
+    kept_fixed_fade_rows = _xy_row_view(fixed_fade_xy)
+    preempted_fixed_fade_rows = _xy_row_view(preempted_fixed_fade_xy)
+    _require(
+        len(np.unique(fixed_fade_xy, axis=0)) == len(fixed_fade_xy),
+        "kept fixed-fade additions contain duplicate rows",
+    )
+    _require(
+        not np.any(np.isin(
+            kept_fixed_fade_rows,
+            preempted_fixed_fade_rows,
+            assume_unique=False,
+        )),
+        "kept and preempted fixed-fade partitions overlap",
+    )
+    partition_rows = np.concatenate((
+        kept_fixed_fade_rows,
+        preempted_fixed_fade_rows,
+    ))
+    _require(
+        len(partition_rows) == len(fixed_fade_input_rows)
+        and np.all(np.isin(
+            partition_rows,
+            fixed_fade_input_rows,
+            assume_unique=False,
+        ))
+        and np.all(np.isin(
+            fixed_fade_input_rows,
+            partition_rows,
+            assume_unique=False,
+        )),
+        "kept/preempted fixed-fade rows do not partition the input archive",
     )
     if len(capacity_xy) and len(fixed_fade_xy):
         fixed_fade_distance = _spatial_index(fixed_fade_xy).query(
@@ -2092,6 +2233,18 @@ def _declared_density_contract(
         _require(
             np.all(np.asarray(fixed_fade_distance, np.float64) >= spacing - 1e-12),
             "spacing-capacity reservoir violates fixed-fade blocker spacing",
+        )
+    if len(preempted_fixed_fade_xy):
+        _require(
+            len(capacity_xy) > 0,
+            "fixed fade was preempted without a density-capacity witness",
+        )
+        preempted_distance = _spatial_index(capacity_xy).query(
+            preempted_fixed_fade_xy, k=1, workers=-1
+        )[0]
+        _require(
+            np.all(np.asarray(preempted_distance, np.float64) < spacing - 1e-12),
+            "preempted fixed-fade row does not conflict with density capacity",
         )
 
     eligibility = water_pipeline.DensityAuditCentres(centres, tuple(spec_id), tuple(spec_kind), spec_label.astype(np.int32))
@@ -2165,6 +2318,18 @@ def _declared_density_contract(
     rebuilt_water_upper = immutable + rebuilt_addition_upper
     rebuilt_capacity_coverage = (
         (~required_mask) | (rebuilt_addition_lower <= capacity_count)
+    )
+    declared_capacity_remaining = integer_array(
+        "spacing_capacity_remaining_deficit_count"
+    )
+    rebuilt_capacity_remaining = np.maximum(
+        rebuilt_addition_lower - capacity_count,
+        0,
+    )
+    _require(
+        np.array_equal(declared_capacity_remaining, rebuilt_capacity_remaining)
+        and not np.any(declared_capacity_remaining[required_mask]),
+        "scarcity-aware capacity witness retains a required lower deficit",
     )
     integer_expected = {
         "addition_lower_count": rebuilt_addition_lower,

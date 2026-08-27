@@ -88,8 +88,11 @@ class Fixture:
             (0.031, 0.001, 0.0),
             (0.051, 0.001, 0.0),
         ]
-        self.capacity_xy = np.asarray(default_additions, np.float64)[:, :2]
         self._set_addition_records(default_additions)
+        self.capacity_xy = np.column_stack((
+            self.addition_records["x"],
+            self.addition_records["y"],
+        )).astype(np.float64)
 
         axis = (np.arange(-40, 40, dtype=np.float64) + 0.5) * self.SUPPORT_PITCH
         xx, yy = np.meshgrid(axis, axis)
@@ -97,6 +100,7 @@ class Fixture:
         support_xy = support_xy[
             np.sum(support_xy * support_xy, axis=1) <= 0.08**2 + 1.0e-12
         ]
+        support_xy = support_xy.astype(np.float32).astype(np.float64)
         self.support = AUDIT.water_pipeline._unique_fillable_support_cells(
             support_xy,
             pitch_m=self.SUPPORT_PITCH,
@@ -198,8 +202,16 @@ class Fixture:
         )
         if self.candidate_kind.shape != (len(candidate_xy),):
             raise ValueError("candidate kinds differ from additions")
+        fixed_fade_input_xy = candidate_xy[
+            (self.candidate_kind == 4)
+            & (np.sum(candidate_xy * candidate_xy, axis=1) > 0.08**2 + 1e-12)
+        ]
         self.vacant_safe_reservoir_xy = np.unique(
-            np.concatenate((self.capacity_xy, candidate_xy), axis=0),
+            np.concatenate((
+                self.capacity_xy,
+                candidate_xy,
+                self.support.representative_xy,
+            ), axis=0),
             axis=0,
         )
         np.savez(
@@ -213,8 +225,11 @@ class Fixture:
             vacant_support_cell_keys=self.support.cell_keys,
             vacant_support_representative_xy=self.support.representative_xy,
             vacant_safe_reservoir_xy=self.vacant_safe_reservoir_xy,
+            vacant_density_reservoir_xy=self.support.representative_xy,
             support_pitch_m=np.asarray(self.SUPPORT_PITCH, np.float64),
             spacing_capacity_xy=self.capacity_xy,
+            fixed_fade_input_xy=fixed_fade_input_xy,
+            preempted_fixed_fade_xy=np.empty((0, 2), np.float64),
         )
 
     def replace_additions(self, xyz, *, labels=None, kinds=None):
@@ -265,7 +280,7 @@ class Fixture:
         )
         raw_count = AUDIT.water_pipeline._circle_point_counts(
             centres,
-            self.support.cell_centres_xy,
+            self.support.representative_xy,
             radius_m=settings.audit_radius_m,
         )
         vacant_count = raw_count.copy()
@@ -463,6 +478,7 @@ class Fixture:
             "vacant_support_active_mask": (vacant_count > 0).tolist(),
             "support_sampling_pitch_m": self.SUPPORT_PITCH,
             "support_sample_cell_area_m2": self.SUPPORT_PITCH**2,
+            "support_area_window_membership_uses_real_representatives": True,
             "footprint_full_disk_sample_count": footprint.full_disk_sample_count,
             "valid_footprint_sample_count": footprint.valid_footprint_sample_count.tolist(),
             "valid_footprint_area_m2": footprint.valid_footprint_area_m2.tolist(),
@@ -479,6 +495,12 @@ class Fixture:
             "vacant_safe_reservoir_archive_key": "vacant_safe_reservoir_xy",
             "vacant_safe_reservoir_count": int(
                 len(self.vacant_safe_reservoir_xy)
+            ),
+            "vacant_density_reservoir_archive_key": (
+                "vacant_density_reservoir_xy"
+            ),
+            "vacant_density_reservoir_count": int(
+                len(self.support.representative_xy)
             ),
             "support_pitch_archive_key": "support_pitch_m",
             "immutable_water_spacing_m": self.WATER_SPACING,
@@ -512,9 +534,40 @@ class Fixture:
                     )
                 )
             ),
+            "spacing_capacity_fixed_fade_input_count": int(
+                np.count_nonzero(
+                    (self.candidate_kind == 4)
+                    & (
+                        np.sum(
+                            np.column_stack((
+                                self.addition_records["x"],
+                                self.addition_records["y"],
+                            )).astype(np.float64) ** 2,
+                            axis=1,
+                        )
+                        > settings.audit_radius_m**2 + 1e-12
+                    )
+                )
+            ),
+            "spacing_capacity_fixed_fade_preempted_count": 0,
+            "spacing_capacity_fixed_fade_input_archive_key": (
+                "fixed_fade_input_xy"
+            ),
+            "spacing_capacity_preempted_fixed_fade_archive_key": (
+                "preempted_fixed_fade_xy"
+            ),
             "spacing_capacity_seed": 120827,
+            "spacing_capacity_selection_method": (
+                "scarcity-aware-overlapping-window-lower-coverage-v1"
+            ),
+            "spacing_capacity_remaining_deficit_count": np.zeros(
+                len(centres), np.int64
+            ).tolist(),
             "spacing_capacity_archive_key": "spacing_capacity_xy",
-            "spacing_capacity_uses_complete_safe_reservoir_and_fixed_fade": True,
+            "spacing_capacity_uses_complete_safe_reservoir": True,
+            "spacing_capacity_kept_fixed_fade_is_compatible": True,
+            "spacing_capacity_built_against_surviving_water_before_fixed_fade": True,
+            "spacing_capacity_preempts_advisory_fixed_fade": True,
             "spacing_capacity_is_spacing_feasible_reservoir_not_interval_certificate": True,
             "spacing_capacity_candidate_rows_in_joint_pool": True,
             "final_selected_additions_are_joint_interval_certificate": True,
@@ -821,6 +874,38 @@ class InterfaceAuditTests(unittest.TestCase):
                 geometry["surviving_base_clearance_streamed_without_materialization"]
             )
 
+    def test_preempted_fixed_fade_requires_a_capacity_conflict_witness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Fixture(directory)
+            with np.load(fixture.archive, allow_pickle=False) as loaded:
+                payload = {
+                    name: np.asarray(loaded[name]).copy()
+                    for name in loaded.files
+                }
+            payload["preempted_fixed_fade_xy"] = np.asarray(
+                [[0.50, 0.50]], np.float64
+            )
+            payload["fixed_fade_input_xy"] = payload[
+                "preempted_fixed_fade_xy"
+            ].copy()
+            np.savez(fixture.archive, **payload)
+            geometry = json.loads(fixture.geometry_manifest.read_text())
+            density = geometry["density_audit"]
+            density["spacing_capacity_fixed_fade_input_count"] = 1
+            density["spacing_capacity_fixed_fade_preempted_count"] = 1
+            geometry["archive_sha256"] = AUDIT._sha256(fixture.archive)
+            fixture.geometry_manifest.write_text(json.dumps(geometry))
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "preempted fixed-fade row does not conflict",
+            ):
+                AUDIT._declared_density_contract(
+                    geometry,
+                    json.loads(fixture.config.read_text()),
+                    AUDIT.water_pipeline.load_circle_specs(fixture.config),
+                    fixture.archive,
+                )
+
     def test_joint_pool_declaration_must_be_true(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = Fixture(directory)
@@ -829,6 +914,79 @@ class InterfaceAuditTests(unittest.TestCase):
                 "spacing_capacity_candidate_rows_in_joint_pool"
             ] = False
             with self.assertRaisesRegex(RuntimeError, "flag.*false"):
+                AUDIT._declared_density_contract(
+                    geometry,
+                    json.loads(fixture.config.read_text()),
+                    AUDIT.water_pipeline.load_circle_specs(fixture.config),
+                    fixture.archive,
+                )
+
+    def test_real_support_representative_membership_flag_must_be_true(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Fixture(directory)
+            geometry = json.loads(fixture.geometry_manifest.read_text())
+            geometry["density_audit"][
+                "support_area_window_membership_uses_real_representatives"
+            ] = False
+            with self.assertRaisesRegex(RuntimeError, "contract flag.*false"):
+                AUDIT._declared_density_contract(
+                    geometry,
+                    json.loads(fixture.config.read_text()),
+                    AUDIT.water_pipeline.load_circle_specs(fixture.config),
+                    fixture.archive,
+                )
+
+    def test_vacant_representative_must_reconstruct_from_density_reservoir(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Fixture(directory)
+            with np.load(fixture.archive, allow_pickle=False) as loaded:
+                payload = {
+                    name: np.asarray(loaded[name]).copy()
+                    for name in loaded.files
+                }
+            payload["vacant_support_representative_xy"][0, 0] += 0.0001
+            np.savez(fixture.archive, **payload)
+            geometry = json.loads(fixture.geometry_manifest.read_text())
+            geometry["archive_sha256"] = AUDIT._sha256(fixture.archive)
+            fixture.geometry_manifest.write_text(json.dumps(geometry))
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "vacant support representatives do not reconstruct",
+            ):
+                AUDIT._declared_density_contract(
+                    geometry,
+                    json.loads(fixture.config.read_text()),
+                    AUDIT.water_pipeline.load_circle_specs(fixture.config),
+                    fixture.archive,
+                )
+
+    def test_capacity_witness_must_come_from_non_fade_density_reservoir(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Fixture(directory)
+            all_kind_only = np.asarray([[0.50, 0.50]], np.float64)
+            with np.load(fixture.archive, allow_pickle=False) as loaded:
+                payload = {
+                    name: np.asarray(loaded[name]).copy()
+                    for name in loaded.files
+                }
+            payload["spacing_capacity_xy"] = all_kind_only
+            payload["vacant_safe_reservoir_xy"] = np.concatenate((
+                payload["vacant_safe_reservoir_xy"],
+                all_kind_only,
+            ))
+            np.savez(fixture.archive, **payload)
+            geometry = json.loads(fixture.geometry_manifest.read_text())
+            density = geometry["density_audit"]
+            density["spacing_capacity_selection_count"] = 1
+            density["vacant_safe_reservoir_count"] = len(
+                payload["vacant_safe_reservoir_xy"]
+            )
+            geometry["archive_sha256"] = AUDIT._sha256(fixture.archive)
+            fixture.geometry_manifest.write_text(json.dumps(geometry))
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "leaves archived vacant density support",
+            ):
                 AUDIT._declared_density_contract(
                     geometry,
                     json.loads(fixture.config.read_text()),

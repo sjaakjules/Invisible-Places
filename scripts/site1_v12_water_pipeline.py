@@ -763,11 +763,19 @@ def _unique_fillable_support_cells(
         representatives = np.empty((0, 2), dtype=np.float64)
     else:
         point_keys = np.floor(points / pitch).astype(np.int64)
-        # Select one real proposal per occupied support cell.  Cell centres are
-        # retained for physical-area quadrature, while representatives let the
-        # independent audit prove that every counted vacant cell really had a
-        # source-compatible, immutable-WATER-clear proposal.
-        order = np.lexsort((points[:, 1], points[:, 0], point_keys[:, 1], point_keys[:, 0]))
+        point_centres = (point_keys.astype(np.float64) + 0.5) * pitch
+        distance_squared = np.sum((points - point_centres) ** 2, axis=1)
+        # Select the real proposal nearest each occupied cell centre, with XY
+        # ties deterministic.  Per-window quadrature counts this representative
+        # rather than the synthetic centre: a boundary cell contributes area
+        # only when it has a known safe proposal inside that circular window.
+        order = np.lexsort((
+            points[:, 1],
+            points[:, 0],
+            distance_squared,
+            point_keys[:, 1],
+            point_keys[:, 0],
+        ))
         ordered_keys = point_keys[order]
         first = np.ones(len(order), dtype=bool)
         first[1:] = np.any(ordered_keys[1:] != ordered_keys[:-1], axis=1)
@@ -810,6 +818,39 @@ def _vacant_candidate_mask(
     if not len(blockers):
         return np.ones(len(candidates), dtype=bool)
     distance = _nearest_distance(candidates, blockers)
+    return distance >= max(spacing - tolerance, 0.0)
+
+
+def _fixed_fade_survival_mask(
+    fixed_fade_xy: np.ndarray,
+    reserved_density_xy: np.ndarray,
+    *,
+    spacing_m: float,
+    distance_tolerance_m: float = 1.0e-12,
+) -> np.ndarray:
+    """Let release-gated density capacity preempt advisory fade rows.
+
+    A scarcity-aware density lower-coverage witness is selected first against
+    immutable WATER.  A fade row may survive only when it leaves that witness
+    usable at the final WATER spacing.  This avoids allowing an advisory fade
+    point to make non-empty, release-gated vacant support unattainable.
+    """
+
+    fade = np.asarray(fixed_fade_xy, np.float64)
+    reserved = np.asarray(reserved_density_xy, np.float64)
+    if fade.ndim != 2 or fade.shape[1] != 2:
+        raise ValueError("fixed fade points must have shape (N, 2)")
+    if reserved.ndim != 2 or reserved.shape[1] != 2:
+        raise ValueError("reserved density points must have shape (N, 2)")
+    spacing = float(spacing_m)
+    tolerance = float(distance_tolerance_m)
+    if not np.isfinite(spacing) or spacing <= 0.0:
+        raise ValueError("fixed fade spacing must be positive and finite")
+    if not np.isfinite(tolerance) or tolerance < 0.0:
+        raise ValueError("fixed fade tolerance must be finite and non-negative")
+    if not len(fade) or not len(reserved):
+        return np.ones(len(fade), dtype=bool)
+    distance = _nearest_distance(fade, reserved)
     return distance >= max(spacing - tolerance, 0.0)
 
 
@@ -2054,7 +2095,7 @@ def build_fine_water_geometry(
     )
     raw_support_sample_count = _circle_point_counts(
         audit_centres,
-        raw_fillable_cells.cell_centres_xy,
+        raw_fillable_cells.representative_xy,
         radius_m=density_settings.audit_radius_m,
     )
     raw_support_area = np.minimum(
@@ -2064,7 +2105,7 @@ def build_fine_water_geometry(
     )
     vacant_support_sample_count = _circle_point_counts(
         audit_centres,
-        vacant_support_cells.cell_centres_xy,
+        vacant_support_cells.representative_xy,
         radius_m=density_settings.audit_radius_m,
     )
     vacant_support_area = np.minimum(
@@ -2154,28 +2195,45 @@ def build_fine_water_geometry(
     fixed_fade_priority = proposal_priority[fixed_fade_mask]
     fixed_fade_kind = proposal_kind[fixed_fade_mask]
     fixed_fade_water_distance = water_distance[fixed_fade_mask]
-    refill_existing = (
-        np.concatenate((water_xy, fixed_fade_xy), axis=0)
-        if len(fixed_fade_xy)
-        else water_xy
-    )
+    fixed_fade_input_xy = fixed_fade_xy.copy()
+    fixed_fade_input_count = len(fixed_fade_xy)
 
-    # Build one globally spacing-valid reservoir against the *actual* fixed
-    # solver state: surviving immutable WATER plus fixed fade additions.  The
-    # complete packing is a necessary per-window lower-coverage check, not a
-    # certificate that the whole packing satisfies overlapping upper bounds.
-    # Only the final solver subset can certify both interval sides together.
-    capacity_blue = confidence.variable_radius_blue_noise(
+    # Build a scarcity-aware lower-coverage witness against surviving
+    # immutable WATER first.  An arbitrary maximal blue-noise packing is not a
+    # feasibility proof: a row just outside a circular audit boundary can
+    # otherwise block the sole in-boundary row.  This uses the same
+    # overlapping-window solver as the final selection, with unchanged raw
+    # demand and explicit integer lower counts.  Release-gated density support
+    # then has priority over advisory fade, whose conflicting rows are culled
+    # below.  This witness is necessary lower coverage, not an upper-interval
+    # certificate; only the final joint subset certifies both interval sides.
+    disk_area = math.pi * density_settings.audit_radius_m**2
+    capacity_addition_lower = np.ceil(
+        density_settings.minimum_ratio
+        * measured_targets.raw_desired_addition_count
+    ).astype(np.int64)
+    capacity_addition_lower[~required_mask] = 0
+    capacity_water_lower = (
+        measured_targets.existing_water_count + capacity_addition_lower
+    )
+    capacity_target_water_count = (
+        measured_targets.existing_water_count.astype(np.float64)
+        + measured_targets.raw_desired_addition_count
+    )
+    capacity_refill = refinement.refill_circular_density_dips(
+        audit_centres,
+        water_xy,
         reservoir_xy[vacant_reservoir_indices],
-        water_spacing,
-        existing_points=refill_existing,
-        existing_radius=water_spacing,
-        priority=reservoir_priority[vacant_reservoir_indices],
+        radius_m=density_settings.audit_radius_m,
+        target_density_per_m2=capacity_target_water_count / disk_area,
+        water_spacing_m=water_spacing,
+        minimum_ratio=density_settings.minimum_ratio,
+        minimum_observed_count=capacity_water_lower,
+        active_centre_mask=required_mask,
         seed=seed ^ 0xCA9AC17,
-        rebuild_interval=512,
     )
     spacing_capacity_reservoir_indices = vacant_reservoir_indices[
-        capacity_blue.selected_indices
+        capacity_refill.selected_candidate_indices
     ]
     spacing_capacity_candidate_xy = reservoir_xy[
         spacing_capacity_reservoir_indices
@@ -2183,6 +2241,23 @@ def build_fine_water_geometry(
     # Fixed fade rows are blockers, not members of this density-candidate
     # reservoir. They are outside all registered density windows by definition.
     spacing_capacity_xy = spacing_capacity_candidate_xy
+    fixed_fade_keep = _fixed_fade_survival_mask(
+        fixed_fade_xy,
+        spacing_capacity_xy,
+        spacing_m=water_spacing,
+    )
+    preempted_fixed_fade_xy = fixed_fade_xy[~fixed_fade_keep].copy()
+    fixed_fade_xyz = fixed_fade_xyz[fixed_fade_keep]
+    fixed_fade_xy = fixed_fade_xy[fixed_fade_keep]
+    fixed_fade_label = fixed_fade_label[fixed_fade_keep]
+    fixed_fade_priority = fixed_fade_priority[fixed_fade_keep]
+    fixed_fade_kind = fixed_fade_kind[fixed_fade_keep]
+    fixed_fade_water_distance = fixed_fade_water_distance[fixed_fade_keep]
+    refill_existing = (
+        np.concatenate((water_xy, fixed_fade_xy), axis=0)
+        if len(fixed_fade_xy)
+        else water_xy
+    )
     spacing_capacity_count = _circle_point_counts(
         audit_centres,
         spacing_capacity_xy,
@@ -2200,7 +2275,6 @@ def build_fine_water_geometry(
     target_combined_count = (
         measured_targets.terrain_count.astype(np.float64) + target_water_count
     )
-    disk_area = math.pi * density_settings.audit_radius_m**2
     target_water_density_per_m2 = target_water_count / disk_area
     target_combined_density_per_m2 = target_combined_count / disk_area
     water_lower_count = addition_contract.water_lower_count
@@ -2221,7 +2295,8 @@ def build_fine_water_geometry(
         measured_targets.terrain_count + water_upper_count
     ).astype(np.int64)
     capacity_violation = required_mask & (
-        addition_contract.addition_lower_count > spacing_capacity_count
+        (addition_contract.addition_lower_count > spacing_capacity_count)
+        | (capacity_refill.remaining_deficit_count > 0)
     )
     if np.any(capacity_violation):
         failed = np.flatnonzero(capacity_violation)
@@ -2239,6 +2314,9 @@ def build_fine_water_geometry(
                 "vacant_support_area_m2": float(
                     vacant_support_area[int(row)]
                 ),
+                "vacant_support_representative_count_in_window": int(
+                    vacant_support_sample_count[int(row)]
+                ),
             }
             for row in failed[:24]
         ]
@@ -2247,8 +2325,8 @@ def build_fine_water_geometry(
             {
                 "status": "failed",
                 "reason": (
-                    "globally spacing-valid reservoir cannot cover a required "
-                    "per-window lower addition count"
+                    "scarcity-aware deterministic spacing witness did not "
+                    "cover a required per-window lower addition count"
                 ),
                 "failed_window_count": int(len(failed)),
                 "required_window_count": int(np.count_nonzero(required_mask)),
@@ -2257,11 +2335,15 @@ def build_fine_water_geometry(
                 "vacant_support_cell_count": int(len(vacant_support_cells.cell_keys)),
                 "spacing_reservoir_selection_count": int(len(spacing_capacity_xy)),
                 "fixed_fade_blocker_count": int(len(fixed_fade_xy)),
+                "fixed_fade_input_count": int(fixed_fade_input_count),
+                "fixed_fade_preempted_count": int(
+                    len(preempted_fixed_fade_xy)
+                ),
                 "failed_window_preview": preview,
             },
         )
         raise RuntimeError(
-            "necessary 1.8 mm spacing-reservoir lower coverage failed "
+            "scarcity-aware 1.8 mm lower-coverage witness failed "
             f"in {len(failed)} windows; compact diagnostic="
             f"{destination / 'density-capacity-failure.json'}"
         )
@@ -2563,7 +2645,11 @@ def build_fine_water_geometry(
         "selected_count": int(len(joint_selected)),
         "provisional_primary_candidate_count": int(len(cleared_primary_xy)),
         "provisional_primary_selected_count": int(len(provisional_primary)),
-        "fixed_fade_count": int(np.count_nonzero(fixed_fade_mask)),
+        "fixed_fade_count": int(len(fixed_fade_xy)),
+        "fixed_fade_input_count": int(fixed_fade_input_count),
+        "fixed_fade_preempted_by_density_capacity_count": int(
+            len(preempted_fixed_fade_xy)
+        ),
         "repair_candidate_count": int(len(repair_xy)),
         "joint_repack_performed": True,
         "audit_centres": int(len(audit_centres)),
@@ -2677,8 +2763,13 @@ def build_fine_water_geometry(
         vacant_safe_reservoir_xy=(
             reservoir_xy[all_vacant_reservoir_indices].astype(np.float64)
         ),
+        vacant_density_reservoir_xy=(
+            reservoir_xy[vacant_reservoir_indices].astype(np.float64)
+        ),
         support_pitch_m=np.asarray(raw_fillable_cells.pitch_m, dtype=np.float64),
         spacing_capacity_xy=spacing_capacity_xy.astype(np.float64),
+        fixed_fade_input_xy=fixed_fade_input_xy.astype(np.float64),
+        preempted_fixed_fade_xy=preempted_fixed_fade_xy.astype(np.float64),
     )
     candidate_fp = _fingerprint(
         candidate_path,
@@ -2843,6 +2934,7 @@ def build_fine_water_geometry(
             "support_sample_cell_area_m2": (
                 raw_fillable_cells.cell_area_m2
             ),
+            "support_area_window_membership_uses_real_representatives": True,
             "footprint_full_disk_sample_count": (
                 footprint_support.full_disk_sample_count
             ),
@@ -2869,6 +2961,12 @@ def build_fine_water_geometry(
             "vacant_safe_reservoir_archive_key": "vacant_safe_reservoir_xy",
             "vacant_safe_reservoir_count": int(
                 len(all_vacant_reservoir_indices)
+            ),
+            "vacant_density_reservoir_archive_key": (
+                "vacant_density_reservoir_xy"
+            ),
+            "vacant_density_reservoir_count": int(
+                len(vacant_reservoir_indices)
             ),
             "support_pitch_archive_key": "support_pitch_m",
             "immutable_water_spacing_m": water_spacing,
@@ -2906,9 +3004,30 @@ def build_fine_water_geometry(
             "spacing_capacity_fixed_fade_blocker_count": int(
                 len(fixed_fade_xy)
             ),
+            "spacing_capacity_fixed_fade_input_count": int(
+                fixed_fade_input_count
+            ),
+            "spacing_capacity_fixed_fade_preempted_count": int(
+                len(preempted_fixed_fade_xy)
+            ),
+            "spacing_capacity_fixed_fade_input_archive_key": (
+                "fixed_fade_input_xy"
+            ),
+            "spacing_capacity_preempted_fixed_fade_archive_key": (
+                "preempted_fixed_fade_xy"
+            ),
             "spacing_capacity_seed": int(seed ^ 0xCA9AC17),
+            "spacing_capacity_selection_method": (
+                "scarcity-aware-overlapping-window-lower-coverage-v1"
+            ),
+            "spacing_capacity_remaining_deficit_count": (
+                capacity_refill.remaining_deficit_count.tolist()
+            ),
             "spacing_capacity_archive_key": "spacing_capacity_xy",
-            "spacing_capacity_uses_complete_safe_reservoir_and_fixed_fade": True,
+            "spacing_capacity_uses_complete_safe_reservoir": True,
+            "spacing_capacity_kept_fixed_fade_is_compatible": True,
+            "spacing_capacity_built_against_surviving_water_before_fixed_fade": True,
+            "spacing_capacity_preempts_advisory_fixed_fade": True,
             "spacing_capacity_is_spacing_feasible_reservoir_not_interval_certificate": True,
             "spacing_capacity_candidate_rows_in_joint_pool": (
                 capacity_candidate_rows_in_joint_pool
