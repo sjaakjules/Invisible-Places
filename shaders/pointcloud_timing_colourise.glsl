@@ -135,15 +135,71 @@ vec4 ResolveTimingColouriseEffect(uint effectIndex, uint pointIndex) {
         clamp(lut.a, 0.0, 1.0) * safeEdgeMask);
 }
 
+const uint kTimingColouriseBlendNormal = 0u;
+const uint kTimingColouriseBlendMultiply = 1u;
+const uint kTimingColouriseBlendScreen = 2u;
+const uint kTimingColouriseBlendAdd = 3u;
+const uint kTimingColouriseBlendDivide = 4u;
+const uint kTimingColouriseBlendVividLight = 5u;
+// Keep in lockstep with kTimingColouriseBlendDivisorFloor in
+// PointCloudPreviewState.hpp.
+const float kTimingColouriseBlendDivisorFloor = 1.0e-3;
+
+// One colourise step is blended = base * scale + offset for every supported
+// mode, because each mode is linear in the base colour once the wash colour
+// is known (Vivid Light branches on the wash, never the base). Mirrors
+// ComposeTimingColouriseBlendStep in PointCloudPreviewState.hpp; the two
+// must stay identical.
+void FoldTimingColouriseBlendStep(
+    uint blendMode,
+    vec3 wash,
+    float amount,
+    inout vec3 scale,
+    inout vec3 offsetColour) {
+    vec3 branchScale = vec3(0.0);
+    vec3 branchOffset = wash;
+    if (blendMode == kTimingColouriseBlendMultiply) {
+        branchScale = wash;
+        branchOffset = vec3(0.0);
+    } else if (blendMode == kTimingColouriseBlendScreen) {
+        branchScale = vec3(1.0) - wash;
+        branchOffset = wash;
+    } else if (blendMode == kTimingColouriseBlendAdd) {
+        branchScale = vec3(1.0);
+        branchOffset = wash;
+    } else if (blendMode == kTimingColouriseBlendDivide) {
+        branchScale = vec3(1.0) /
+            max(wash, vec3(kTimingColouriseBlendDivisorFloor));
+        branchOffset = vec3(0.0);
+    } else if (blendMode == kTimingColouriseBlendVividLight) {
+        const vec3 burnScale = vec3(1.0) /
+            max(2.0 * wash, vec3(kTimingColouriseBlendDivisorFloor));
+        const vec3 dodgeScale = vec3(1.0) /
+            max(2.0 * (vec3(1.0) - wash),
+                vec3(kTimingColouriseBlendDivisorFloor));
+        const bvec3 burns = lessThan(wash, vec3(0.5));
+        branchScale = mix(dodgeScale, burnScale, vec3(burns));
+        branchOffset = mix(
+            vec3(0.0),
+            vec3(1.0) - burnScale,
+            vec3(burns));
+    }
+    const vec3 stepScale = vec3(1.0 - amount) + amount * branchScale;
+    const vec3 stepOffset = amount * branchOffset;
+    scale *= stepScale;
+    offsetColour = offsetColour * stepScale + stepOffset;
+}
+
 void ResolveTimingColouriseTransform(
     uint pointIndex,
     out vec4 transform,
-    out float emissionAdd) {
-    // Compose the per-effect mix chain into one affine transform so the
-    // interstage payload is a single vec4 + float instead of eight vec4s:
-    // finalColour = baseColour * transform.a + transform.rgb.
-    vec3 blended = vec3(0.0);
-    float retained = 1.0;
+    out vec4 scale) {
+    // Fold the per-effect blend chain into one per-channel affine transform
+    // so the interstage payload is two vec4s instead of eight:
+    // finalColour = baseColour * scale.rgb + transform.rgb, with the
+    // accumulated emission in transform.a.
+    vec3 offsetColour = vec3(0.0);
+    vec3 retained = vec3(1.0);
     float emission = 0.0;
     const uint effectCount = min(
         styleData.timingColouriseControl.x,
@@ -159,19 +215,24 @@ void ResolveTimingColouriseTransform(
                 // attenuation into the affine transform preserves stack
                 // order with neighbouring colourise effects.
                 const float retainedLight = clamp(1.0 + effect.x, 0.0, 1.0);
-                blended *= retainedLight;
+                offsetColour *= retainedLight;
                 retained *= retainedLight;
             } else {
                 emission += effect.x;
             }
             continue;
         }
-        const float alpha = clamp(effect.a, 0.0, 1.0);
-        blended = mix(blended, clamp(effect.rgb, 0.0, 1.0), alpha);
-        retained *= 1.0 - alpha;
+        const uint blendMode = uint(
+            styleData.timingColouriseRanges[effectIndex].z + 0.5);
+        FoldTimingColouriseBlendStep(
+            blendMode,
+            clamp(effect.rgb, 0.0, 1.0),
+            clamp(effect.a, 0.0, 1.0),
+            retained,
+            offsetColour);
     }
-    transform = vec4(blended, retained);
-    emissionAdd = emission;
+    transform = vec4(offsetColour, emission);
+    scale = vec4(retained, 0.0);
 }
 
 #endif
@@ -179,12 +240,12 @@ void ResolveTimingColouriseTransform(
 #ifdef POINTCLOUD_TIMING_COLOURISE_FRAGMENT
 
 vec3 ApplyTimingColouriseStack(vec3 baseColor) {
-    return baseColor * inTimingColouriseTransform.a +
+    return baseColor * inTimingColouriseScale.rgb +
         inTimingColouriseTransform.rgb;
 }
 
 float ResolveTimingColouriseEmissionAdd() {
-    return max(0.0, inTimingColouriseEmissionAdd);
+    return max(0.0, inTimingColouriseTransform.a);
 }
 
 #endif

@@ -4798,6 +4798,9 @@ ResolveTimingColouriseStack(
         if (selected.emitColourise) {
             auto colouriseResolved = resolved;
             colouriseResolved.output = TimingColouriseOutput::Colourise;
+            colouriseResolved.blendMode = static_cast<
+                invisible_places::renderer::pointcloud::
+                    TimingColouriseBlendMode>(effect.blendMode);
             colouriseResolved.rgbaLut =
                 invisible_places::timing::
                     EvaluateTimingColourisePaletteLut(
@@ -6531,6 +6534,9 @@ void HashTimingColouriseStack(
         HashFloat(seed, effect.edgeFadeLowerFraction);
         HashFloat(seed, effect.edgeFadeUpperFraction);
         HashFloat(seed, effect.emissiveLevel);
+        HashCombine(
+            seed,
+            static_cast<std::uint64_t>(effect.blendMode));
         for (const auto& sample : effect.rgbaLut) {
             for (const float value : sample) {
                 HashFloat(seed, value);

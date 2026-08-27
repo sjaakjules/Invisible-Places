@@ -14125,7 +14125,12 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         styleGpu.timingColouriseRanges[packedEffectIndex] = glm::vec4{
             std::isfinite(effect.lowerBound) ? effect.lowerBound : 0.0F,
             std::isfinite(effect.upperBound) ? effect.upperBound : 0.0F,
-            0.0F,
+            // z carries the colourise blend mode for the per-channel fold
+            // in the shader; emissive slots blend nothing.
+            effect.output ==
+                    renderer::pointcloud::TimingColouriseOutput::Colourise
+                ? static_cast<float>(effect.blendMode)
+                : 0.0F,
             effect.output ==
                     renderer::pointcloud::TimingColouriseOutput::Emissive
                 ? (std::isfinite(effect.emissiveLevel)

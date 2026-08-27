@@ -1032,10 +1032,15 @@ glm::vec3 ApplyTimingColourise(
             mask->normalizedValue);
         const float amount = Clamp01(lut.a) * mask->edgeMask;
         if (amount > 1.0e-5F) {
-            baseColor = glm::mix(
-                baseColor,
-                glm::clamp(glm::vec3{lut}, glm::vec3{0.0F}, glm::vec3{1.0F}),
-                amount);
+            // Same per-channel blend step the GPU folds; sequential form
+            // because the base colour is in hand here.
+            const auto blended = invisible_places::renderer::pointcloud::
+                ApplyTimingColouriseBlendStep(
+                    effect.blendMode,
+                    {baseColor.x, baseColor.y, baseColor.z},
+                    {Clamp01(lut.x), Clamp01(lut.y), Clamp01(lut.z)},
+                    amount);
+            baseColor = {blended[0], blended[1], blended[2]};
         }
     }
     return baseColor;

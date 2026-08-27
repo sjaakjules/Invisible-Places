@@ -18,7 +18,7 @@ layout(location = 9) out float outSurfaceAngleMask;
 layout(location = 10) out vec3 outAovNormal;
 layout(location = 12) out vec4 outWaterColourTransform;
 layout(location = 13) flat out vec4 outTimingColouriseTransform;
-layout(location = 14) flat out float outTimingColouriseEmissionAdd;
+layout(location = 14) flat out vec4 outTimingColouriseScale;
 #endif
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
@@ -1193,7 +1193,7 @@ void main() {
     ResolveTimingColouriseTransform(
         pointIndex,
         outTimingColouriseTransform,
-        outTimingColouriseEmissionAdd);
+        outTimingColouriseScale);
     if (styleData.timingColouriseControl.x != 0u) {
         vec3 waterFromZero;
         vec3 waterFromOne;

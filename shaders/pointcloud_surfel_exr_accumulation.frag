@@ -15,7 +15,7 @@ layout(location = 9) in float inSurfaceAngleMask;
 layout(location = 10) in vec3 inAovNormal;
 layout(location = 12) in vec4 inWaterColourTransform;
 layout(location = 13) flat in vec4 inTimingColouriseTransform;
-layout(location = 14) flat in float inTimingColouriseEmissionAdd;
+layout(location = 14) flat in vec4 inTimingColouriseScale;
 
 layout(location = 0) out vec4 outAccumulation;
 layout(location = 1) out float outRevealage;
