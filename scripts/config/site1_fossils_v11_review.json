@@ -1,0 +1,475 @@
+{
+  "version": 1,
+  "id": "site1_fossils_v11_review",
+  "provenance": {
+    "source_screenshots": [
+      "/Users/juju/Documents/Screenshots/Screenshot 2026-08-26 at 9.46.37 pm.png",
+      "/Users/juju/Documents/Screenshots/Screenshot 2026-08-26 at 9.49.01 pm.png",
+      "/Users/juju/Documents/Screenshots/Screenshot 2026-08-26 at 9.47.03 pm.png",
+      "/Users/juju/Documents/Screenshots/Screenshot 2026-08-26 at 9.45.44 pm.png",
+      "/Users/juju/Documents/Screenshots/Screenshot 2026-08-26 at 9.48.46 pm.png",
+      "/Users/juju/Documents/Screenshots/Screenshot 2026-08-26 at 10.31.20 pm.png"
+    ],
+    "registration_method": "Native-resolution plan-view occupancy registration against the current 25 mm SAND/ROCK/WATER support, refined by affine ECC and cross-image SIFT constraints. Image 6 is a perspective cross-reference only.",
+    "coordinate_convention": "Native screenshot pixels use top-left origin. For plan images, world_xy = offset_xy + matrix_2x2 * [u, v]. Review bboxes are [xmin, xmax, ymin, ymax] in metres.",
+    "coordinate_precision_m": 0.001,
+    "evidence_vs_action_note": "Screenshot marks and hand-drawn lines provide approximate locations, outlines, density discontinuities, and visible object identity only. They are not WATER/SAND/ROCK classifiers and no bbox or stroke is a direct fill, clipping, or deletion mask. Actions, layer assignment, ScanID=10, confidence requirements, density tapering, and reversible removal come from the written request and must be validated against measured 3D support.",
+    "supersedes_review_config": "scripts/config/site1_fossils_v10_review.json"
+  },
+  "registration": {
+    "image_1": {
+      "path": "/Users/juju/Documents/Screenshots/Screenshot 2026-08-26 at 9.46.37 pm.png",
+      "dimensions_px": [1366, 1766],
+      "view": "plan",
+      "matrix_2x2": [
+        [0.018719003641, 0.000003384625],
+        [0.000032443429, -0.018732821487]
+      ],
+      "offset_xy": [758.836002289, 835.805328451],
+      "uncertainty_m": [0.02, 0.04],
+      "diagnostic": "Direct WATER-mask affine registration; ECC correlation 0.9906."
+    },
+    "image_2": {
+      "path": "/Users/juju/Documents/Screenshots/Screenshot 2026-08-26 at 9.49.01 pm.png",
+      "dimensions_px": [2816, 1782],
+      "view": "plan_detail",
+      "matrix_2x2": [
+        [0.003608117457, -0.000494697108],
+        [-0.000491114399, -0.003611754230]
+      ],
+      "offset_xy": [769.074717335, 814.204299476],
+      "uncertainty_m": [0.04, 0.07],
+      "diagnostic": "Cross-image graph/SIFT-regularized affine; direct WATER-mask ECC approximately 0.9916."
+    },
+    "image_3": {
+      "path": "/Users/juju/Documents/Screenshots/Screenshot 2026-08-26 at 9.47.03 pm.png",
+      "dimensions_px": [2898, 1878],
+      "view": "plan_detail",
+      "matrix_2x2": [
+        [0.002535527567, -0.000001015350],
+        [0.000001798932, -0.002537698384]
+      ],
+      "offset_xy": [768.339073776, 823.544936690],
+      "uncertainty_m": [0.02, 0.04],
+      "diagnostic": "Strong axis-aligned terrain-occupancy match; approximate intersection-over-union 0.93."
+    },
+    "image_4": {
+      "path": "/Users/juju/Documents/Screenshots/Screenshot 2026-08-26 at 9.45.44 pm.png",
+      "dimensions_px": [3040, 1928],
+      "view": "plan_detail",
+      "matrix_2x2": [
+        [0.002547013252, -0.000240293568],
+        [-0.000237671287, -0.002549459564]
+      ],
+      "offset_xy": [766.578761090, 820.729111251],
+      "uncertainty_m": [0.03, 0.05],
+      "diagnostic": "Registered through image 3 with 2,832 SIFT inliers and 0.48 px median residual."
+    },
+    "image_5": {
+      "path": "/Users/juju/Documents/Screenshots/Screenshot 2026-08-26 at 9.48.46 pm.png",
+      "dimensions_px": [3538, 2028],
+      "view": "plan_detail",
+      "matrix_2x2": [
+        [0.002968398171, -0.000406901666],
+        [-0.000403954097, -0.002971390049]
+      ],
+      "offset_xy": [769.174541081, 817.999711512],
+      "uncertainty_m": [0.04, 0.07],
+      "diagnostic": "Cross-image graph/SIFT-regularized affine; direct and graph solutions differ by approximately 0.05 m."
+    },
+    "image_6": {
+      "path": "/Users/juju/Documents/Screenshots/Screenshot 2026-08-26 at 10.31.20 pm.png",
+      "dimensions_px": [3180, 1752],
+      "view": "perspective",
+      "matrix_2x2": null,
+      "offset_xy": null,
+      "uncertainty_m": null,
+      "diagnostic": "No defensible plan affine without the CloudCompare camera pose. World references below are cross-identifications with image 1 and must be resolved by connected 3D component analysis."
+    }
+  },
+  "marked_locations": {
+    "image_1": [
+      {
+        "id": "image_1_mark_1",
+        "normalized_xy": [0.505, 0.359],
+        "world": [771.751, 823.951],
+        "review_bbox": [771.251, 772.251, 823.451, 824.451],
+        "screenshot_evidence": "Yellow-zone interstitial-density location.",
+        "written_action": "Continue locally supported WATER points to terrain interfaces and add confidently reconstructed SAND/ROCK interstitial points where the measured contour supports them."
+      },
+      {
+        "id": "image_1_mark_2",
+        "normalized_xy": [0.509, 0.775],
+        "world": [771.856, 810.189],
+        "review_bbox": [768.61, 774.85, 808.03, 811.83],
+        "screenshot_evidence": "Three southern missing areas inside the cyan outline.",
+        "written_action": "Detect and fill only the actual supported gaps; retain measured terrain islands."
+      },
+      {
+        "id": "image_1_mark_3",
+        "normalized_xy": [0.857, 0.591],
+        "world": [780.753, 816.292],
+        "review_bbox": [780.20, 781.30, 815.74, 816.84],
+        "screenshot_evidence": "Naturally sparse eastern terrain near the proposed taper side.",
+        "written_action": "Make WATER density progressively sparser outward and match nearby measured SAND density."
+      },
+      {
+        "id": "image_1_mark_4",
+        "normalized_xy": [0.676, 0.79],
+        "world": [776.126, 809.700],
+        "review_bbox": [775.63, 776.63, 809.20, 810.20],
+        "screenshot_evidence": "Dense SAND/WATER interface.",
+        "written_action": "Maintain continuous local density at the interface before applying the outward taper."
+      },
+      {
+        "id": "image_1_mark_5",
+        "normalized_xy": [0.154, 0.482],
+        "world": [762.777, 819.867],
+        "review_bbox": [762.43, 763.13, 819.52, 820.22],
+        "screenshot_evidence": "Plan-view bag candidate.",
+        "written_action": "Remove the confirmed bag component from 1 mm and 5 mm ROCK outputs and archive every removed point."
+      },
+      {
+        "id": "image_1_mark_6",
+        "normalized_xy": [0.107, 0.466],
+        "world": [761.575, 820.394],
+        "review_bbox": [761.13, 762.02, 819.94, 820.84],
+        "screenshot_evidence": "Plan-view seated-person candidate.",
+        "written_action": "Remove the confirmed person component from 1 mm and 5 mm ROCK outputs and archive every removed point."
+      },
+      {
+        "id": "image_1_mark_7",
+        "normalized_xy": [0.103, 0.436],
+        "world": [761.472, 821.386],
+        "review_bbox": [761.02, 761.92, 820.94, 821.84],
+        "screenshot_evidence": "Plan-view bag candidate.",
+        "written_action": "Remove the confirmed bag component from 1 mm and 5 mm ROCK outputs and archive every removed point."
+      },
+      {
+        "id": "image_1_mark_8",
+        "normalized_xy": [0.105, 0.18],
+        "world": [761.522, 829.855],
+        "review_bbox": [760.72, 762.32, 829.15, 830.56],
+        "screenshot_evidence": "Plan-view group containing two seated-person candidates.",
+        "written_action": "Split and remove only the two confirmed person components from 1 mm and 5 mm ROCK outputs; archive every removed point."
+      }
+    ],
+    "image_2": [
+      {
+        "id": "image_2_mark_1",
+        "normalized_xy": [0.496, 0.613],
+        "world": [773.574, 809.573],
+        "review_bbox": [773.32, 773.82, 809.32, 809.82],
+        "screenshot_evidence": "Missing point region.",
+        "written_action": "Patch only where local WATER or terrain support establishes a valid continuation."
+      },
+      {
+        "id": "image_2_mark_2",
+        "normalized_xy": [0.448, 0.571],
+        "world": [773.123, 809.910],
+        "review_bbox": [772.87, 773.37, 809.66, 810.16],
+        "screenshot_evidence": "Missing point region.",
+        "written_action": "Patch only where local WATER or terrain support establishes a valid continuation."
+      },
+      {
+        "id": "image_2_mark_3",
+        "normalized_xy": [0.277, 0.569],
+        "world": [771.388, 810.159],
+        "review_bbox": [771.14, 771.64, 809.91, 810.41],
+        "screenshot_evidence": "Missing point region.",
+        "written_action": "Patch only where local WATER or terrain support establishes a valid continuation."
+      },
+      {
+        "id": "image_2_mark_4",
+        "normalized_xy": [0.087, 0.445],
+        "world": [769.566, 811.220],
+        "review_bbox": [769.32, 769.82, 810.97, 811.47],
+        "screenshot_evidence": "Missing point region.",
+        "written_action": "Patch only where local WATER or terrain support establishes a valid continuation."
+      },
+      {
+        "id": "image_2_mark_5",
+        "normalized_xy": [0.79, 0.632],
+        "world": [776.544, 809.044],
+        "review_bbox": [776.09, 776.99, 808.59, 809.49],
+        "screenshot_evidence": "Low-density interface requiring interstitial points.",
+        "written_action": "Blend WATER density continuously into measured SAND/ROCK support without a tiled edge."
+      }
+    ],
+    "image_3": [
+      {
+        "id": "image_3_mark_1",
+        "normalized_xy": [0.639, 0.496],
+        "world": [773.034, 821.184],
+        "review_bbox": [772.63, 773.43, 820.78, 821.58],
+        "screenshot_evidence": "Density dip at the WATER/SAND edge.",
+        "written_action": "Continue pointwise density to the SAND edge with no gap or abrupt dip."
+      },
+      {
+        "id": "image_3_mark_2",
+        "normalized_xy": [0.428, 0.631],
+        "world": [771.483, 820.540],
+        "review_bbox": [771.10, 771.85, 820.15, 820.90],
+        "screenshot_evidence": "Low-density crack with possible floating noise.",
+        "written_action": "Add ScanID=10 terrain points only when independent surface predictions agree and all noise vetoes pass; otherwise leave unchanged."
+      },
+      {
+        "id": "image_3_mark_3",
+        "normalized_xy": [0.447, 0.096],
+        "world": [771.623, 823.090],
+        "review_bbox": [771.02, 772.23, 822.49, 823.69],
+        "review_circle_radius_m": 0.60,
+        "screenshot_evidence": "Circular lower-density scanner-footprint candidate.",
+        "written_action": "Detect its measured boundary rather than assuming a fixed diameter; add accepted terrain points with ScanID=10."
+      }
+    ],
+    "image_4": [
+      {
+        "id": "image_4_mark_1",
+        "normalized_xy": [0.674, 0.445],
+        "world": [771.591, 818.055],
+        "review_bbox": [771.19, 771.99, 817.65, 818.46],
+        "screenshot_evidence": "Low-density WATER/SAND interface.",
+        "written_action": "Add pointwise interstitial support so the density transition is continuous."
+      },
+      {
+        "id": "image_4_mark_2",
+        "normalized_xy": [0.235, 0.39],
+        "world": [768.218, 818.642],
+        "review_bbox": [767.82, 768.62, 818.24, 819.04],
+        "screenshot_evidence": "Potential lower-density SAND region.",
+        "written_action": "Add ScanID=10 SAND points only where confidence-gated reconstruction is supported."
+      }
+    ],
+    "image_5": [
+      {
+        "id": "image_5_mark_1",
+        "normalized_xy": [0.711, 0.224],
+        "world": [776.457, 815.634],
+        "review_bbox": [775.86, 777.06, 815.03, 816.23],
+        "screenshot_evidence": "Measured SAND density decreases from left to right.",
+        "written_action": "Match the WATER candidate radius/density field to the same smooth falloff."
+      },
+      {
+        "id": "image_5_mark_2",
+        "normalized_xy": [0.563, 0.531],
+        "world": [774.649, 813.995],
+        "review_bbox": [774.05, 775.25, 813.40, 814.60],
+        "screenshot_evidence": "Large WATER patch approaching the drawn eastern density boundary.",
+        "written_action": "Apply a continuous outward density taper while preserving local interface density."
+      }
+    ],
+    "image_6": [
+      {
+        "id": "image_6_mark_1",
+        "normalized_xy": [0.128, 0.596],
+        "pixel_xy": [407.04, 1044.192],
+        "world": [761.472, 821.386],
+        "world_candidates": [[761.472, 821.386], [762.777, 819.867]],
+        "review_bbox": [761.00, 763.20, 819.40, 821.90],
+        "cross_reference_confidence": "low",
+        "screenshot_evidence": "Perspective-view bag candidate; exact pairing with the two plan-view bags is ambiguous.",
+        "written_action": "Resolve by 3D connected component and intensity/geometry evidence before reversible removal."
+      },
+      {
+        "id": "image_6_mark_2",
+        "normalized_xy": [0.178, 0.519],
+        "pixel_xy": [566.04, 909.288],
+        "world": [761.575, 820.394],
+        "review_bbox": [761.13, 762.02, 819.94, 820.84],
+        "cross_reference_confidence": "high",
+        "screenshot_evidence": "Perspective-view legs/person corresponding to image-1 mark 6.",
+        "written_action": "Resolve the complete 3D person component before reversible removal."
+      },
+      {
+        "id": "image_6_mark_3",
+        "normalized_xy": [0.242, 0.523],
+        "pixel_xy": [769.56, 916.296],
+        "world": [762.777, 819.867],
+        "world_candidates": [[762.777, 819.867], [761.472, 821.386]],
+        "review_bbox": [761.00, 763.20, 819.40, 821.90],
+        "cross_reference_confidence": "low",
+        "screenshot_evidence": "Perspective-view bag candidate; exact pairing with the two plan-view bags is ambiguous.",
+        "written_action": "Resolve by 3D connected component and intensity/geometry evidence before reversible removal."
+      },
+      {
+        "id": "image_6_mark_4",
+        "normalized_xy": [0.796, 0.651],
+        "pixel_xy": [2531.28, 1140.552],
+        "world": [761.522, 829.855],
+        "review_bbox": [760.72, 762.32, 829.15, 830.56],
+        "cross_reference_confidence": "medium_group",
+        "screenshot_evidence": "First perspective-view person in the image-1 mark-8 group.",
+        "written_action": "Split the shared plan-view group into distinct 3D components before reversible removal."
+      },
+      {
+        "id": "image_6_mark_5",
+        "normalized_xy": [0.865, 0.633],
+        "pixel_xy": [2750.70, 1109.016],
+        "world": [761.522, 829.855],
+        "review_bbox": [760.72, 762.32, 829.15, 830.56],
+        "cross_reference_confidence": "medium_group",
+        "screenshot_evidence": "Second perspective-view person in the image-1 mark-8 group.",
+        "written_action": "Split the shared plan-view group into distinct 3D components before reversible removal."
+      }
+    ]
+  },
+  "plan_annotations": {
+    "yellow_review_polygon": {
+      "role": "Broad review zone only; never use as a blanket terrain or WATER fill mask.",
+      "polygon": [
+        [779.109, 832.506],
+        [774.879, 833.679],
+        [770.929, 831.836],
+        [769.376, 830.148],
+        [768.759, 824.189],
+        [766.120, 821.843],
+        [765.578, 820.643],
+        [765.747, 817.328],
+        [766.758, 814.726],
+        [767.788, 813.473],
+        [769.529, 813.344],
+        [771.419, 813.947],
+        [776.098, 817.608],
+        [776.416, 819.089],
+        [775.386, 822.852],
+        [775.872, 825.888],
+        [776.546, 827.987],
+        [779.503, 831.177],
+        [779.615, 831.870]
+      ]
+    },
+    "cyan_southern_gap": {
+      "role": "Review the enclosed lower gaps. The freehand stroke self-loops, so use the bbox to locate candidates and measured support to derive actual fill components.",
+      "review_bbox": [768.61, 774.85, 808.03, 811.83],
+      "raw_stroke_polygon": [
+        [768.780, 811.470],
+        [768.612, 810.627],
+        [769.024, 809.728],
+        [772.749, 808.030],
+        [774.172, 808.032],
+        [774.808, 808.371],
+        [774.846, 809.158],
+        [773.966, 810.130],
+        [774.827, 809.794],
+        [773.629, 810.692],
+        [772.356, 810.783],
+        [769.454, 811.827]
+      ]
+    },
+    "red_density_taper_guide": {
+      "role": "Approximate soft transition guide. It is neither a clipping boundary nor a prescribed fixed-width taper.",
+      "polyline": [
+        [777.556, 828.457],
+        [777.182, 826.658],
+        [776.864, 825.534],
+        [776.996, 824.222],
+        [777.277, 822.912],
+        [777.651, 821.788],
+        [778.213, 820.853],
+        [778.457, 818.980],
+        [778.682, 816.358],
+        [778.832, 813.361],
+        [778.739, 810.363],
+        [779.020, 809.427]
+      ]
+    }
+  },
+  "obstruction_review": {
+    "source_layers": ["Site1-ROCK-1mm", "Site1-ROCK-5mm"],
+    "southern_union_bbox": [761.00, 763.20, 819.40, 821.90],
+    "northern_people_group_bbox": [760.72, 762.32, 829.15, 830.56],
+    "perspective_cross_reference": {
+      "image_6_mark_2_to_image_1_mark_6": "high-confidence identity cross-reference",
+      "image_6_marks_1_and_3_to_image_1_marks_5_and_7": "two-bag group correspondence; one-to-one order unresolved",
+      "image_6_marks_4_and_5_to_image_1_mark_8": "two-person group correspondence; individual world centroids unresolved"
+    },
+    "selection_rule": "Bboxes locate candidate components only. Confirm complete people/bag components using connected 3D geometry plus RGB/intensity evidence; do not delete every point in an envelope.",
+    "reversibility": {
+      "immutable_sources": true,
+      "write_cleaned_candidates_separately": true,
+      "archive_removed_points_with_all_original_properties": true,
+      "record_source_path_source_hash_original_point_index_and_reason": true,
+      "require_round_trip_restore_check": true
+    }
+  },
+  "algorithm_policy": {
+    "density_continuity": {
+      "support_layers": ["SAND", "ROCK", "existing WATER"],
+      "estimate_target_from_measured_local_spacing": true,
+      "local_density_neighbours": 12,
+      "minimum_interpolation_bandwidth_m": 0.025,
+      "sampling": "deterministic variable-radius blue noise against both measured and already-selected points",
+      "existing_and_selected_clearance_uses_larger_local_radius": true,
+      "no_grid_or_cell_quota": true,
+      "interface_rule": "Match the local measured SAND/ROCK spacing at the shoreline before any outward taper; cull individual candidates within the local exclusion radius rather than whole squares.",
+      "fine_reference_spacing_m": 0.002,
+      "coarse_reference_spacing_m": 0.005
+    },
+    "right_edge_taper": {
+      "guide": "plan_annotations.red_density_taper_guide.polyline",
+      "derive_direction_and_width_from_nearby_measured_sand_density": true,
+      "interpolation": "bounded C1 cubic smoothstep over signed outward distance",
+      "preserve_interface_density_before_taper": true,
+      "monotone_outward_nonincrease": true,
+      "no_hard_clip_at_guide": true
+    },
+    "terrain_infill": {
+      "target_layers": ["SAND", "ROCK"],
+      "new_scan_id": 10,
+      "assign_layer_from_measured_local_composition_and_geometry": true,
+      "interpolate_donor_properties_then_recompute_geometry_fields": true,
+      "never_relabel_density_support_as_water_without_geometry_evidence": true
+    },
+    "scanner_and_crack_confidence": {
+      "independent_surface_predictions": [
+        "robust local tangent or MLS surface",
+        "screened-Poisson or topology-aware local surface",
+        "harmonic or boundary-constrained continuation"
+      ],
+      "minimum_donor_sectors": 6,
+      "strong_donor_sectors": 7,
+      "maximum_surface_prediction_spread_m": 0.003,
+      "strong_surface_prediction_spread_m": 0.002,
+      "minimum_normal_coherence": 0.80,
+      "strong_normal_coherence": 0.90,
+      "maximum_vertical_thickness_m": 0.012,
+      "strong_vertical_thickness_m": 0.006,
+      "maximum_vertical_multimodality_score": 0.35,
+      "strong_vertical_multimodality_score": 0.15,
+      "maximum_fine_residual_energy_ratio": 2.0,
+      "residual_energy_is_veto_only": true,
+      "minimum_accepted_tier_scanner_footprint": "supported",
+      "minimum_accepted_tier_crack_or_crevasse": "strong",
+      "reject_if_any_hard_veto_fails": true,
+      "leave_unresolved_geometry_unchanged": true,
+      "record_per_candidate_metrics_tier_and_reason_mask": true
+    },
+    "obstruction_removal": {
+      "target_layers": ["ROCK-1mm", "ROCK-5mm"],
+      "component_not_bbox_selection": true,
+      "require_plan_and_perspective_or_equivalent_3d_confirmation": true,
+      "retain_neighbouring_ground_surface": true,
+      "apply_identical_component_identity_across_resolutions": true,
+      "reversible_manifest_required": true
+    }
+  },
+  "acceptance": {
+    "minimum_dense_spacing_m": 0.002,
+    "minimum_coarse_spacing_m": 0.005,
+    "maximum_median_spacing_ratio_jump_across_interface": 1.25,
+    "maximum_p90_spacing_ratio_jump_across_interface": 1.50,
+    "maximum_surface_reproduction_error_m": 0.00025,
+    "no_square_density_boundaries": true,
+    "right_edge_density_must_not_increase_outward": true,
+    "terrain_additions_must_have_scan_id": 10,
+    "terrain_additions_require_recorded_confidence": true,
+    "scanner_footprint_minimum_tier": "supported",
+    "crack_or_crevasse_minimum_tier": "strong",
+    "no_blanket_fill_of_yellow_or_cyan_annotation": true,
+    "no_bbox_based_obstruction_deletion": true,
+    "all_removed_points_must_be_round_trip_restorable": true,
+    "strict_v9_exclusions_retained": true,
+    "canonical_clouds_must_not_change_before_install": true
+  }
+}
