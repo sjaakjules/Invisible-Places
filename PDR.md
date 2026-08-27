@@ -704,20 +704,36 @@ discard work. Save shall overwrite a saved original from its variant and
 retire the variant; deleting a saved original beside a variant shall ask
 whether the variant goes too. The palette shall additionally offer, without
 moving any colour marker: a Loop toggle that mirrors the sampled output so
-the left colour sits at the centre and the ends match; and a keyable Palette
-Skew (centre plus per-side spreads on a 4^skew power curve) that
-redistributes how the bounds span samples the palette, edited from a
-dedicated histogram row that also previews the final sampled palette. Bounds
-edge fades shall be independent per edge, each keyable and reaching a whole
-span in either direction, with linked-by-default histogram handles that
-double-click to separate and relink. Keyed palette-stop properties shall
-join the shared value graph as one auto-ranged curve per track with the full
-curve-style set; keyed stop colours shall interpolate in an authored sRGB,
-linear-light, or OkLab space and tint their curve with the interpolated
-colour. Colourise and Emissive settings shall follow the selected scalar
-field through a per-field visual memory unless the user opts a feature into
-one global set. Project schema 85 introduces the per-edge fades; the
-remaining state serializes additively with omitted defaults.
+the left colour sits at the centre and the ends match; and a Palette Skew
+warp edited in a band attached to the histogram bottom, where evenly spaced
+palette-coordinate notches bunch and spread over the sampled palette strip
+(whose opacity follows the colourise amount). The warp is a monotone curve
+through draggable nodes: each node skews left/right and spreads or pinches
+up/down its surrounding area, snapping onto neutral spread and its unskewed
+home; double-click adds a node anchoring the coordinate that lands there,
+or removes one. The centre node's coordinates stay keyable as Skew Centre
+and Skew Spread. Bounds edge fades shall be independent per edge, each
+keyable and reaching a whole span in either direction; they stay linked
+through one recoloured "Ends Fade" control until a fade handle is
+double-clicked apart, splitting into per-edge tinted columns. Every
+geometric bounds coordinate shall remain text-editable in any Bounds Keying
+mode, writing through the keyed pair. Keyed palette-stop properties shall
+join the shared value graph as one auto-ranged curve per track with the
+full curve-style set (Linear and Hold are honoured stored styles, keys are
+authoritative at their exact instant, and new keys default to Monotone
+Spline); keyed stop colours shall interpolate in an authored sRGB,
+linear-light, or OkLab space and tint their curve. Emissive output shall
+support a falloff profile over the bounds: level-multiplier nodes joined by
+a Monotone Spline, each node keyable over time, shaped by the falloff's own
+skew warp, and previewed as a mid-grey response strip atop the histogram.
+Value-graph time markers shall hang below the axis, select every key at
+their time (or a pre-selected subset), and drags shall snap onto other
+keys' times unless a dragged key would stack on its own setting, with a
+mouse shake toggling snapping. Colourise and Emissive settings shall follow
+the selected scalar field through a per-field visual memory unless the user
+opts a feature into one global set. Project schema 85 introduces the
+per-edge fades; the remaining state serializes additively with omitted
+defaults.
 
 ### 5.8 Procedural Motion
 #### FR-MOTION-1

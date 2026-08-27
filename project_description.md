@@ -592,18 +592,34 @@ the animation overview.
   field, bounds, fade, and smooth key tracks.
 - Palette sampling adds marker-free transforms: a Loop toggle mirrors the
   output so the palette's left colour sits at the centre and the ends match,
-  and a keyable Palette Skew (a centre dot plus per-side triangle pairs on a
-  plum histogram row, with the final sampled palette previewed in place)
-  redistributes how the bounds span reads the palette. Preset and saved
-  palettes both fork private `_edited` variants on first edit; originals stay
-  view-only while their variant exists, and delete asks which of the pair to
-  remove. Bounds edge fades are independent per edge, keyable, reach a whole
-  span in either direction, and stay linked until a fade handle is
-  double-clicked apart. Keyed palette-stop properties draw as auto-ranged
-  curves on the shared value graph with every curve style, keyed colours
-  blend in a chosen sRGB, linear-light, or OkLab space while tinting their
-  curve, and each scalar field remembers its own Colourise/Emissive settings
-  unless the feature opts into one global set.
+  and a Palette Skew warp band attached to the histogram bottom, where
+  evenly spaced palette notches bunch and spread over the sampled palette
+  strip (its opacity follows the colourise amount). Warp nodes drag
+  left/right to skew and up/down to spread or pinch their surroundings,
+  snap onto neutral and their unskewed home, and double-click to add or
+  remove; the centre node stays keyable as Skew Centre and Skew Spread.
+  Preset and saved palettes both fork private `_edited` variants on first
+  edit; originals stay view-only while their variant exists, and delete
+  asks which of the pair to remove. Bounds edge fades are independent per
+  edge, keyable, reach a whole span in either direction, and stay linked as
+  one green "Ends Fade" control until a fade handle is double-clicked
+  apart, recolouring each edge. Every geometric bounds coordinate stays
+  text-editable in any Bounds Keying mode by writing through the keyed
+  pair. Keyed palette-stop properties draw as auto-ranged curves on the
+  shared value graph with every curve style (new keys default to Monotone
+  Spline; Linear and Hold are honoured), keyed colours blend in a chosen
+  sRGB, linear-light, or OkLab space while tinting their curve, and each
+  scalar field remembers its own Colourise/Emissive settings unless the
+  feature opts into one global set.
+- Emissive output gains a falloff profile over the bounds: level-multiplier
+  nodes joined by a Monotone Spline, edited on their own curve above the
+  emissive timeline, keyable per node, warped by the falloff's own skew
+  band, and previewed as a mid-grey response strip atop the histogram -
+  brighter where emission adds, darker where negative levels dim.
+- Timeline markers hang below the value graphs' axis, click-select every
+  key at their time (or a pre-selected subset), and drags snap onto other
+  keys' times unless that would stack keys of one setting; shaking the
+  mouse mid-drag toggles snapping.
 - Emissive effects have no palette UI. They apply a non-negative, smoothly
   keyable emissive level through a scalar-field bounds/fade mask; bounds and
   fade use the same keyable histogram controls as Colourise effects.
