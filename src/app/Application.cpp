@@ -99839,6 +99839,46 @@ float TimingColouriseHistogramHandleValue(
     }
 }
 
+// Writes a desired geometric bounds state through the selected Bounds
+// Keying mode: each of the mode's two coordinates that changed is written
+// via SetTimingColouriseBoundsParameterAt, so armed tracks auto-key and
+// unarmed ones edit the base. This is how the histogram handles and the
+// cross-mode text editors both express "move the interval like this"
+// regardless of which coordinates actually carry the keys.
+bool ApplyTimingColouriseBoundsDesiredState(
+    std::vector<invisible_places::timing::TimingScalarBoundsStore>* stores,
+    invisible_places::timing::TimingColouriseEffect* effect,
+    float position,
+    const invisible_places::timing::TimingColouriseBounds& current,
+    const invisible_places::timing::TimingColouriseBounds& desired,
+    bool cyclicTiming) {
+    const auto parameters = invisible_places::timing::
+        TimingColouriseBoundsParametersForMode(
+            effect->boundsKeyMode);
+    bool changed = false;
+    for (const auto parameter : parameters) {
+        const float currentValue = invisible_places::timing::
+            TimingColouriseBoundsParameterValue(
+                current,
+                parameter);
+        const float desiredValue = invisible_places::timing::
+            TimingColouriseBoundsParameterValue(
+                desired,
+                parameter);
+        if (std::abs(currentValue - desiredValue) >
+            std::numeric_limits<float>::epsilon()) {
+            changed |= SetTimingColouriseBoundsParameterAt(
+                stores,
+                effect,
+                parameter,
+                position,
+                desiredValue,
+                cyclicTiming);
+        }
+    }
+    return changed;
+}
+
 bool ApplyTimingColouriseHistogramBounds(
     std::vector<invisible_places::timing::TimingScalarBoundsStore>* stores,
     invisible_places::timing::TimingColouriseEffect* effect,
@@ -100017,31 +100057,13 @@ bool ApplyTimingColouriseHistogramBounds(
             return false;
     }
 
-    const auto parameters = invisible_places::timing::
-        TimingColouriseBoundsParametersForMode(
-            effect->boundsKeyMode);
-    bool changed = false;
-    for (const auto parameter : parameters) {
-        const float currentValue = invisible_places::timing::
-            TimingColouriseBoundsParameterValue(
-                bounds,
-                parameter);
-        const float desiredValue = invisible_places::timing::
-            TimingColouriseBoundsParameterValue(
-                desired,
-                parameter);
-        if (std::abs(currentValue - desiredValue) >
-            std::numeric_limits<float>::epsilon()) {
-            changed |= SetTimingColouriseBoundsParameterAt(
-                stores,
-                effect,
-                parameter,
-                position,
-                desiredValue,
-                cyclicTiming);
-        }
-    }
-    return changed;
+    return ApplyTimingColouriseBoundsDesiredState(
+        stores,
+        effect,
+        position,
+        bounds,
+        desired,
+        cyclicTiming);
 }
 
 void DrawTimingColouriseHistogram(
@@ -100846,11 +100868,25 @@ void DrawTimingColouriseBoundsParameterEditor(
         invisible_places::timing::TimingColouriseBoundsParameterValue(
             evaluatedBounds,
             parameter);
-    const bool editable =
+    const bool allowed =
         TimingColouriseBoundsParameterEditableAt(
             effect,
             parameter,
             position);
+    const bool geometric =
+        parameter == invisible_places::timing::
+                         TimingColouriseBoundsParameter::Lower ||
+        parameter == invisible_places::timing::
+                         TimingColouriseBoundsParameter::Upper ||
+        parameter == invisible_places::timing::
+                         TimingColouriseBoundsParameter::Centre ||
+        parameter == invisible_places::timing::
+                         TimingColouriseBoundsParameter::Spread;
+    // A geometric coordinate outside the Bounds Keying pair stays view-tinted
+    // but remains editable: its edit is expressed through the mode's own two
+    // coordinates, keying them when they are armed.
+    const bool crossEdit = !allowed && geometric;
+    const bool editable = allowed || crossEdit;
     const bool keyed =
         TimingColouriseBoundsParameterHasKeys(
             *effect,
@@ -100934,6 +100970,19 @@ void DrawTimingColouriseBoundsParameterEditor(
         ImGui::PushStyleColor(
             ImGuiCol_Text,
             kWaterKeyedSettingColour);
+    } else if (crossEdit) {
+        // Slightly dimmed: this value is derived from the mode pair, but
+        // typing here still steers the interval.
+        const ImVec4 text = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+        const ImVec4 muted =
+            ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
+        ImGui::PushStyleColor(
+            ImGuiCol_Text,
+            ImVec4{
+                std::lerp(text.x, muted.x, 0.55F),
+                std::lerp(text.y, muted.y, 0.55F),
+                std::lerp(text.z, muted.z, 0.55F),
+                text.w});
     }
     ImGui::BeginDisabled(!editable);
     // InputScalar calls MarkItemEdited after InputText reapplies its
@@ -100961,12 +101010,54 @@ void DrawTimingColouriseBoundsParameterEditor(
         valueEditMatches && valueEdit.has_value()
             ? valueEdit->draft
             : *draft);
-    if (keyed) {
+    if (keyed || crossEdit) {
         ImGui::PopStyleColor();
     }
     ImGui::PopStyleColor(3);
     ImGui::PopStyleVar(2);
-    if (changed && editable && submittedDraft.has_value() &&
+    if (changed && crossEdit && submittedDraft.has_value()) {
+        // Express the edit through the Bounds Keying pair: Lower/Upper move
+        // that endpoint alone, Centre translates at constant spacing, and
+        // Spacing resizes about the centre. The mode's own coordinates then
+        // absorb the change, auto-keying wherever they are armed.
+        using invisible_places::timing::TimingColouriseBoundsParameter;
+        const float value = submittedDraft.value();
+        auto desired = evaluatedBounds;
+        const float centre =
+            std::midpoint(evaluatedBounds.lower, evaluatedBounds.upper);
+        switch (parameter) {
+            case TimingColouriseBoundsParameter::Lower:
+                desired.lower = std::min(value, evaluatedBounds.upper);
+                break;
+            case TimingColouriseBoundsParameter::Upper:
+                desired.upper = std::max(value, evaluatedBounds.lower);
+                break;
+            case TimingColouriseBoundsParameter::Centre: {
+                const float shift = value - centre;
+                desired.lower += shift;
+                desired.upper += shift;
+                break;
+            }
+            case TimingColouriseBoundsParameter::Spread: {
+                const float halfSpan = std::max(0.0F, value) * 0.5F;
+                desired.lower = centre - halfSpan;
+                desired.upper = centre + halfSpan;
+                break;
+            }
+            default:
+                break;
+        }
+        if (ApplyTimingColouriseBoundsDesiredState(
+                &runtimeState->water.timingScalarBoundsStores,
+                effect,
+                position,
+                evaluatedBounds,
+                desired,
+                CurrentAnimationTimingIsCyclic(*runtimeState))) {
+            runtimeState->previewRenderStateSignatureValid = false;
+        }
+    } else if (
+        changed && editable && submittedDraft.has_value() &&
         SetTimingColouriseBoundsParameterAt(
             &runtimeState->water.timingScalarBoundsStores,
             effect,
@@ -101007,7 +101098,9 @@ void DrawTimingColouriseBoundsParameterEditor(
                 : "Fade is view-only in this Bounds Keying mode.");
     } else {
         DrawTimingControlTooltip(
-            editable
+            crossEdit
+                ? "This value is derived from the selected Bounds Keying pair, but editing it still steers the interval: Lower/Upper move that endpoint alone, Centre translates at constant spacing, and Spacing resizes about the centre. The mode's own coordinates absorb the change and auto-key where armed."
+            : editable
                 ? keyed
                       ? "This setting is armed. Editing at a new animation position automatically adds a key using its Curve style."
                   : !effect->boundsKeys.empty()
