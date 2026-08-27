@@ -596,25 +596,195 @@ class PlyAndSubsequenceTests(unittest.TestCase):
             root = Path(directory)
             base = records(2, start=10.0, scan_id=2.0)
             additions = records(4, start=20.0)
+            additions[2:]["x"] += 0.05
+            additions[2:]["y"] += 0.05
             fine_records = np.concatenate((base, additions))
             fine = write_ply(root / "fine.ply", fine_records)
             # The active 5 mm subset contains additions from label 1 only;
-            # label 2 must not silently disappear from the release audit.
+            # label 2 is also too far from every coarse record to have a
+            # valid geometric proxy and must not silently disappear.
             coarse = write_ply(
                 root / "coarse.ply",
                 fine_records[[0, 2, 3]].copy(),
             )
             with self.assertRaisesRegex(
                 RuntimeError,
-                "omits fine scalar component labels: \\[2\\]",
+                "omits exact fine component labels \\[2\\] without complete spatial proxy coverage",
             ):
-                V12.scalar_enrichment.verify_coarse_exact_subset_component_scalar_coverage(
+                V12.coarse_scalar_audit.verify_coarse_exact_subset_component_scalar_coverage(
                     fine,
                     coarse,
                     fine_base_points=len(base),
                     fine_component_labels=np.asarray([1, 1, 2, 2], np.int32),
                     chunk_records=2,
                 )
+
+    def test_coarse_scalar_audit_accepts_strict_base_record_proxies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = records(1, start=0.0, scan_id=2.0)
+            exact = records(1, start=1.0)
+            proxied = records(2, start=0.0)
+            proxied[0]["x"] = base[0]["x"] + 0.003
+            proxied[0]["y"] = base[0]["y"]
+            proxied[0]["z"] = base[0]["z"]
+            proxied[1]["x"] = base[0]["x"] + 0.004
+            proxied[1]["y"] = base[0]["y"]
+            proxied[1]["z"] = base[0]["z"]
+            fine_records = np.concatenate((base, exact, proxied))
+            fine = write_ply(root / "fine.ply", fine_records)
+            coarse = write_ply(
+                root / "coarse.ply", fine_records[[0, 1]].copy()
+            )
+
+            audit = (
+                V12.coarse_scalar_audit.verify_coarse_exact_subset_component_scalar_coverage(
+                    fine,
+                    coarse,
+                    fine_base_points=len(base),
+                    fine_component_labels=np.asarray([1, 2, 2], np.int32),
+                    chunk_records=1,
+                )
+            )
+
+            self.assertEqual(
+                audit["method"],
+                "exact-addition-or-strict-3d-coarse-proxy-scalar-audit-v2",
+            )
+            implementation_path = (
+                V12.SCRIPT_DIR / "site1_v12_coarse_scalar_audit.py"
+            ).resolve()
+            self.assertEqual(
+                audit["implementation"],
+                {
+                    "path": str(implementation_path),
+                    "sha256": V12.sha256_path(implementation_path),
+                },
+            )
+            self.assertEqual(audit["exact_component_labels"], [1])
+            self.assertEqual(audit["proxy_component_labels"], [2])
+            self.assertEqual(audit["proxy_fine_row_count"], 2)
+            self.assertEqual(audit["unique_proxy_record_count"], 1)
+            self.assertLess(audit["maximum_proxy_distance_m"], 0.005)
+            self.assertTrue(
+                audit["every_omitted_component_fine_row_has_strict_proxy"]
+            )
+
+    def test_coarse_scalar_audit_rejects_proxy_at_5mm_boundary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = records(1, start=0.0, scan_id=2.0)
+            exact = records(1, start=1.0)
+            boundary = records(1, start=0.0)
+            boundary[0]["x"] = base[0]["x"] + np.nextafter(
+                np.float32(0.005), np.float32(np.inf)
+            )
+            boundary[0]["y"] = base[0]["y"]
+            boundary[0]["z"] = base[0]["z"]
+            fine_records = np.concatenate((base, exact, boundary))
+            fine = write_ply(root / "fine.ply", fine_records)
+            coarse = write_ply(
+                root / "coarse.ply", fine_records[[0, 1]].copy()
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "strictly <0.005m"):
+                V12.coarse_scalar_audit.verify_coarse_exact_subset_component_scalar_coverage(
+                    fine,
+                    coarse,
+                    fine_base_points=len(base),
+                    fine_component_labels=np.asarray([1, 2], np.int32),
+                    chunk_records=1,
+                )
+
+    def test_coarse_scalar_audit_rejects_bad_proxy_scalar(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = records(1, start=0.0, scan_id=2.0)
+            base[0]["scalar_A_R_Roughness_Combined"] = 2.0
+            exact = records(1, start=1.0)
+            proxied = records(1, start=0.003)
+            proxied[0]["y"] = base[0]["y"]
+            proxied[0]["z"] = base[0]["z"]
+            fine_records = np.concatenate((base, exact, proxied))
+            fine = write_ply(root / "fine.ply", fine_records)
+            coarse = write_ply(
+                root / "coarse.ply", fine_records[[0, 1]].copy()
+            )
+
+            with self.assertRaisesRegex(
+                RuntimeError, "insufficient finite per-component scalar coverage"
+            ):
+                V12.coarse_scalar_audit.verify_coarse_exact_subset_component_scalar_coverage(
+                    fine,
+                    coarse,
+                    fine_base_points=len(base),
+                    fine_component_labels=np.asarray([1, 2], np.int32),
+                    chunk_records=1,
+                )
+
+    def test_coarse_proxy_selection_is_chunk_and_tie_invariant(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = records(2, start=0.0, scan_id=2.0)
+            base[0]["x"] = -0.003
+            base[1]["x"] = 0.003
+            base[0]["y"] = base[1]["y"] = 815.0
+            base[0]["z"] = base[1]["z"] = 2.0
+            base[0]["scalar_A_R_Roughness_Combined"] = 0.2
+            base[1]["scalar_A_R_Roughness_Combined"] = 0.7
+            exact = records(1, start=1.0)
+            tied = records(1, start=0.0)
+            tied[0]["y"] = 815.0
+            tied[0]["z"] = 2.0
+            fine_records = np.concatenate((base, exact, tied))
+            fine = write_ply(root / "fine.ply", fine_records)
+            coarse = write_ply(
+                root / "coarse.ply", fine_records[[0, 1, 2]].copy()
+            )
+
+            audits = [
+                V12.coarse_scalar_audit.verify_coarse_exact_subset_component_scalar_coverage(
+                    fine,
+                    coarse,
+                    fine_base_points=len(base),
+                    fine_component_labels=np.asarray([1, 2], np.int32),
+                    chunk_records=chunk,
+                )
+                for chunk in (1, 2, 3)
+            ]
+            with mock.patch.dict(
+                sys.modules, {"scipy": None, "scipy.spatial": None}
+            ):
+                fallback_audit = (
+                    V12.coarse_scalar_audit.verify_coarse_exact_subset_component_scalar_coverage(
+                        fine,
+                        coarse,
+                        fine_base_points=len(base),
+                        fine_component_labels=np.asarray([1, 2], np.int32),
+                        chunk_records=2,
+                    )
+                )
+
+            self.assertEqual(
+                {value["proxy_assignment_sha256"] for value in audits},
+                {audits[0]["proxy_assignment_sha256"]},
+            )
+            self.assertEqual(
+                fallback_audit["proxy_assignment_sha256"],
+                audits[0]["proxy_assignment_sha256"],
+            )
+            self.assertEqual(
+                {value["component_representation"][1]["maximum_proxy_distance_m"] for value in audits},
+                {audits[0]["component_representation"][1]["maximum_proxy_distance_m"]},
+            )
+            # Both base rows are exactly 3 mm away.  The smallest coarse
+            # index is the deterministic proxy, so its scalar value is used.
+            proxy_component = audits[0]["coverage"]["components"][1]
+            roughness = proxy_component["fields"][
+                "scalar_A_R_Roughness_Combined"
+            ]
+            self.assertAlmostEqual(roughness["minimum"], 0.2)
+            self.assertAlmostEqual(roughness["maximum"], 0.2)
 
 
 class CleanMeshReportTests(unittest.TestCase):
@@ -1168,6 +1338,22 @@ class ReleaseLifecycleTests(unittest.TestCase):
             field["fraction"] = field["finite"] / field["total"]
             write_json(manifest_path, document)
             with self.assertRaisesRegex(RuntimeError, "not 100% finite"):
+                V12.verify(fixture.args)
+
+    def test_release_manifest_cannot_forge_coarse_audit_implementation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Fixture(directory)
+            build_fixture(fixture)
+            manifest_path = fixture.run / "release" / "manifest.json"
+            document = json.loads(manifest_path.read_text())
+            document["upstream_provenance"][
+                "coarse_component_field_scalar_coverage"
+            ]["implementation"]["sha256"] = "0" * 64
+            write_json(manifest_path, document)
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "direct coarse scalar audit implementation fingerprint differs",
+            ):
                 V12.verify(fixture.args)
 
 

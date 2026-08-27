@@ -51,6 +51,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import site1_v11_water_scalar_enrichment as scalar_enrichment  # noqa: E402
+import site1_v12_coarse_scalar_audit as coarse_scalar_audit  # noqa: E402
 import site1_v12_interface_audit as interface_audit  # noqa: E402
 
 ROOT = SCRIPT_DIR.parent
@@ -2233,7 +2234,7 @@ def _build_locked(
             "unable to load geometry labels for coarse scalar verification"
         ) from error
     coarse_scalar_coverage = dict(
-        scalar_enrichment.verify_coarse_exact_subset_component_scalar_coverage(
+        coarse_scalar_audit.verify_coarse_exact_subset_component_scalar_coverage(
             files["WATER-2mm candidate"],
             files["WATER-5mm candidate"],
             fine_base_points=int(
@@ -2650,9 +2651,20 @@ def _validate_direct_scalar_audits(
     )
 
     _require(isinstance(coarse, Mapping), "direct coarse scalar audit is missing")
+    implementation = coarse.get("implementation")
+    implementation_path = (
+        SCRIPT_DIR / "site1_v12_coarse_scalar_audit.py"
+    ).resolve()
+    _require(
+        isinstance(implementation, Mapping)
+        and set(implementation) == {"path", "sha256"}
+        and implementation.get("path") == str(implementation_path)
+        and implementation.get("sha256") == sha256_path(implementation_path),
+        "direct coarse scalar audit implementation fingerprint differs",
+    )
     _require(
         coarse.get("method")
-        == "exact-full-record-fine-suffix-membership-scalar-audit-v1"
+        == "exact-addition-or-strict-3d-coarse-proxy-scalar-audit-v2"
         and coarse.get("fine_candidate_sha256") == candidate_fine.get("sha256")
         and coarse.get("coarse_candidate_sha256") == candidate_coarse.get("sha256")
         and coarse.get("geometry_archive_sha256") == geometry_archive.get("sha256")
@@ -2663,6 +2675,8 @@ def _validate_direct_scalar_audits(
         and coarse.get("component_label_sha256") == label_sha
         and coarse.get("geometry_fields") == required_fields
         and coarse.get("full_record_membership_exact") is True
+        and coarse.get("proxy_records_are_exact_coarse_records") is True
+        and coarse.get("every_omitted_component_fine_row_has_strict_proxy") is True
         and coarse.get("every_fine_component_represented") is True
         and coarse.get("all_required_fields_accepted") is True,
         "direct coarse scalar audit contract differs",
@@ -2680,6 +2694,159 @@ def _validate_direct_scalar_audits(
         and isinstance(coarse.get("fine_component_labels"), list)
         and coarse.get("fine_component_labels"),
         "direct coarse scalar component representation differs",
+    )
+    fine_labels = coarse["fine_component_labels"]
+    exact_labels = coarse.get("exact_component_labels")
+    proxy_labels = coarse.get("proxy_component_labels")
+    _require(
+        isinstance(exact_labels, list)
+        and isinstance(proxy_labels, list)
+        and exact_labels == sorted(exact_labels)
+        and proxy_labels == sorted(proxy_labels)
+        and not (set(exact_labels) & set(proxy_labels))
+        and sorted(exact_labels + proxy_labels) == fine_labels,
+        "direct coarse exact/proxy component partition differs",
+    )
+    exact_count = _integer(
+        coarse.get("exact_component_count"),
+        "direct coarse exact component count",
+    )
+    proxy_count = _integer(
+        coarse.get("proxy_component_count"),
+        "direct coarse proxy component count",
+    )
+    _require(
+        exact_count == len(exact_labels)
+        and proxy_count == len(proxy_labels)
+        and exact_count + proxy_count == len(fine_labels),
+        "direct coarse exact/proxy component counts differ",
+    )
+    proxy_fine_rows = _integer(
+        coarse.get("proxy_fine_row_count"),
+        "direct coarse proxy fine-row count",
+    )
+    unique_proxy_rows = _integer(
+        coarse.get("unique_proxy_record_count"),
+        "direct coarse unique proxy-row count",
+    )
+    proxy_limit = _finite_number(
+        coarse.get("proxy_distance_limit_m"),
+        "direct coarse proxy distance limit",
+    )
+    _require(
+        proxy_limit == MINIMUM_COARSE_SPACING_M
+        and coarse.get("proxy_distance_contract")
+        == "strictly-less-than-full-3d"
+        and coarse.get("deterministic_nearest_proxy_tie_break")
+        == "minimum-exact-squared-distance-then-smallest-coarse-index"
+        and coarse.get("proxy_fine_index_space")
+        == "zero-based-fine-addition-suffix-local",
+        "direct coarse spatial-proxy contract differs",
+    )
+    assignment_sha = coarse.get("proxy_assignment_sha256")
+    _require(
+        isinstance(assignment_sha, str) and len(assignment_sha) == 64,
+        "direct coarse proxy-assignment hash is invalid",
+    )
+    maximum_proxy_distance = coarse.get("maximum_proxy_distance_m")
+    if proxy_labels:
+        maximum_proxy_distance = _finite_number(
+            maximum_proxy_distance,
+            "direct coarse maximum proxy distance",
+        )
+        _require(
+            proxy_fine_rows > 0
+            and unique_proxy_rows > 0
+            and 0.0 <= maximum_proxy_distance < proxy_limit,
+            "direct coarse proxy coverage is incomplete",
+        )
+    else:
+        _require(
+            proxy_fine_rows == 0
+            and unique_proxy_rows == 0
+            and maximum_proxy_distance is None,
+            "direct coarse empty proxy coverage differs",
+        )
+    representation = coarse.get("component_representation")
+    _require(
+        isinstance(representation, list)
+        and len(representation) == len(fine_labels),
+        "direct coarse component representation rows differ",
+    )
+    seen_representation: set[int] = set()
+    represented_proxy_fine_rows = 0
+    represented_unique_proxy_rows = 0
+    for row in representation:
+        _require(
+            isinstance(row, Mapping)
+            and set(row)
+            == {
+                "component_label",
+                "fine_rows",
+                "representation",
+                "exact_coarse_addition_rows",
+                "proxy_fine_rows",
+                "unique_proxy_coarse_rows",
+                "maximum_proxy_distance_m",
+            },
+            "direct coarse component representation row differs",
+        )
+        label_value = _integer(
+            row.get("component_label"),
+            "direct coarse represented component label",
+        )
+        fine_rows = _integer(
+            row.get("fine_rows"),
+            "direct coarse represented fine rows",
+        )
+        exact_rows = _integer(
+            row.get("exact_coarse_addition_rows"),
+            "direct coarse represented exact rows",
+        )
+        local_proxy_fine = _integer(
+            row.get("proxy_fine_rows"),
+            "direct coarse represented proxy fine rows",
+        )
+        local_unique_proxy = _integer(
+            row.get("unique_proxy_coarse_rows"),
+            "direct coarse represented unique proxy rows",
+        )
+        _require(
+            label_value in fine_labels
+            and label_value not in seen_representation
+            and fine_rows > 0,
+            "direct coarse represented component identity differs",
+        )
+        seen_representation.add(label_value)
+        if label_value in exact_labels:
+            _require(
+                row.get("representation") == "exact-fine-addition-records"
+                and exact_rows > 0
+                and local_proxy_fine == 0
+                and local_unique_proxy == 0
+                and row.get("maximum_proxy_distance_m") is None,
+                "direct coarse exact component representation differs",
+            )
+        else:
+            local_maximum = _finite_number(
+                row.get("maximum_proxy_distance_m"),
+                "direct coarse represented maximum proxy distance",
+            )
+            _require(
+                row.get("representation") == "strict-full-3d-coarse-proxies"
+                and exact_rows == 0
+                and local_proxy_fine == fine_rows
+                and local_unique_proxy > 0
+                and 0.0 <= local_maximum < proxy_limit,
+                "direct coarse proxy component representation differs",
+            )
+            represented_proxy_fine_rows += local_proxy_fine
+            represented_unique_proxy_rows += local_unique_proxy
+    _require(
+        sorted(seen_representation) == fine_labels
+        and represented_proxy_fine_rows == proxy_fine_rows
+        and represented_unique_proxy_rows == unique_proxy_rows,
+        "direct coarse component representation aggregate differs",
     )
     _validate_component_field_coverage(
         coarse.get("coverage"),
@@ -3349,7 +3516,7 @@ def _verify_release_files(paths: ReleasePaths, manifest: Mapping) -> dict:
         "active fine component scalar audit differs from release provenance",
     )
     direct_coarse_audit = (
-        scalar_enrichment.verify_coarse_exact_subset_component_scalar_coverage(
+        coarse_scalar_audit.verify_coarse_exact_subset_component_scalar_coverage(
             fine_location,
             coarse_location,
             fine_base_points=int(stored_fine_audit["base_points"]),
@@ -3359,6 +3526,7 @@ def _verify_release_files(paths: ReleasePaths, manifest: Mapping) -> dict:
     )
     coarse_comparison_keys = (
         "method",
+        "implementation",
         "fine_candidate_points",
         "coarse_candidate_points",
         "fine_base_points",
@@ -3366,10 +3534,25 @@ def _verify_release_files(paths: ReleasePaths, manifest: Mapping) -> dict:
         "matched_coarse_addition_count",
         "fine_component_labels",
         "coarse_component_labels",
+        "exact_component_labels",
+        "proxy_component_labels",
+        "exact_component_count",
+        "proxy_component_count",
+        "proxy_fine_row_count",
+        "unique_proxy_record_count",
+        "maximum_proxy_distance_m",
+        "proxy_distance_limit_m",
+        "proxy_distance_contract",
+        "deterministic_nearest_proxy_tie_break",
+        "proxy_fine_index_space",
+        "proxy_assignment_sha256",
+        "component_representation",
         "component_label_sha256",
         "geometry_fields",
         "coverage",
         "full_record_membership_exact",
+        "proxy_records_are_exact_coarse_records",
+        "every_omitted_component_fine_row_has_strict_proxy",
         "every_fine_component_represented",
         "all_required_fields_accepted",
     )
