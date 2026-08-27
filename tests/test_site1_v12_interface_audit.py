@@ -683,6 +683,66 @@ class Fixture:
 
 
 class InterfaceAuditTests(unittest.TestCase):
+    def test_remote_good_overlap_terrain_is_recounted_independently(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Fixture(directory)
+            remote_reference = (0.8, 0.0)
+
+            config = json.loads(fixture.config.read_text())
+            reference = next(
+                row
+                for row in config["marked_locations"]
+                if row["id"] == "good_overlap_reference"
+            )
+            reference["world"] = list(remote_reference)
+            fixture.config.write_text(json.dumps(config))
+
+            addition_xyz = np.column_stack(tuple(
+                fixture.addition_records[name] for name in ("x", "y", "z")
+            ))
+            base_xyz = np.column_stack(tuple(
+                fixture.base_records[name] for name in ("x", "y", "z")
+            ))
+            fixture.base_records = write_ply(
+                fixture.base,
+                np.concatenate((
+                    base_xyz,
+                    np.asarray([(0.8, 0.0, 0.0)] * 6, np.float64),
+                )),
+            )
+            fixture._set_addition_records(addition_xyz)
+
+            terrain = [
+                (x, y, -0.01)
+                for x in (0.06, 0.07, 0.08)
+                for y in (-0.02, 0.0, 0.02)
+            ]
+            terrain.append((0.16, 0.0, -0.01))
+            terrain.extend(
+                (remote_reference[0] + dx, remote_reference[1] + dy, -0.01)
+                for dx in (-0.02, 0.0, 0.02)
+                for dy in (-0.02, 0.0, 0.02)
+            )
+            write_ply(fixture.sand, terrain)
+            fixture.write_fine_manifest()
+
+            result = AUDIT.build_interface_audit(
+                **fixture.kwargs(),
+                output_path=fixture.output,
+                chunk_records=4,
+                edge_sample_limit=20,
+            )
+            self.assertEqual(result["status"], "passed")
+            document = json.loads(fixture.output.read_text())
+            gate = document["metrics"][
+                "density_continuity_lower_and_upper_gate"
+            ]
+            self.assertTrue(
+                gate[
+                    "reference_water_and_terrain_counts_independently_recounted"
+                ]
+            )
+
     def test_radius_membership_is_chunked_and_includes_boundary(self):
         centres = np.asarray([[0.0, 0.0], [10.0, 0.0]], np.float64)
         points = np.asarray(

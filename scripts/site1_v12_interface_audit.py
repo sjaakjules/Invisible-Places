@@ -775,12 +775,19 @@ class _BottomK:
 
 def _stream_terrain_counts(
     terrain_paths: Sequence[Path],
-    specs: Sequence[water_pipeline.CircleSpec],
+    collection_specs: Sequence[water_pipeline.CircleSpec],
     centres: np.ndarray,
     *,
     chunk_records: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    expanded = _expanded_specs(specs, max(SUPPORT_RADIUS_M, EDGE_CENSOR_M))
+    # The moving audit also contains local-reference and good-overlap centres
+    # outside the hand-marked review circles.  The caller supplies those
+    # collection footprints as well as the review specs; expanding that union
+    # keeps the streamed prefilter conservative without silently dropping a
+    # remote reference neighbourhood.
+    expanded = _expanded_specs(
+        collection_specs, max(SUPPORT_RADIUS_M, EDGE_CENSOR_M)
+    )
     bounds = _bbox(expanded)
     inner_counts = np.zeros(len(centres), np.int64)
     outer_counts = np.zeros(len(centres), np.int64)
@@ -2838,6 +2845,10 @@ def build_interface_audit(
         ),
         *_expanded_specs((good_overlap,), density_settings.audit_radius_m),
     )
+    terrain_count_collection_specs = (
+        *specs,
+        *density_collection_specs,
+    )
     expanded = (
         # Production gathers immutable blockers from each configured region
         # expanded by 16 cm. Match that support exactly for density recounts.
@@ -2901,7 +2912,7 @@ def build_interface_audit(
     final_outer_all = _tree_counts(final_tree, audit_centres, SUPPORT_RADIUS_M)
     terrain_inner_all, terrain_outer_all = _stream_terrain_counts(
         (sand, rock),
-        specs,
+        terrain_count_collection_specs,
         audit_centres,
         chunk_records=chunk_records,
     )
