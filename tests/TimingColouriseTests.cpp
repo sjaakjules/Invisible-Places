@@ -2355,6 +2355,8 @@ TEST_CASE(
     effect.palettePhaseOffset = 0.25F;
     effect.paletteLooped = true;
     effect.paletteSkewCentre = 0.3F;
+    effect.blendMode =
+        invisible_places::timing::TimingColouriseBlendMode::Multiply;
     REQUIRE(invisible_places::timing::
                 AddOrUpdateTimingColouriseEffectParameterKey(
                     &effect,
@@ -2375,6 +2377,8 @@ TEST_CASE(
         effect.palettePhaseOffset = -0.4F;
         effect.paletteLooped = false;
         effect.paletteSkewCentre = 0.8F;
+        effect.blendMode =
+            invisible_places::timing::TimingColouriseBlendMode::Screen;
         effect.effectParameterKeys.clear();
 
         invisible_places::timing::ApplyTimingColouriseFieldSelection(
@@ -2387,6 +2391,9 @@ TEST_CASE(
         CHECK(effect.palettePhaseOffset == Approx(0.25F));
         CHECK(effect.paletteLooped);
         CHECK(effect.paletteSkewCentre == Approx(0.3F));
+        CHECK(effect.blendMode ==
+              invisible_places::timing::TimingColouriseBlendMode::
+                  Multiply);
         REQUIRE(effect.effectParameterKeys.size() == 1U);
         CHECK(effect.effectParameterKeys.front().value ==
               Approx(0.6F));
@@ -2401,6 +2408,8 @@ TEST_CASE(
         CHECK(effect.palettePhaseOffset == Approx(-0.4F));
         CHECK_FALSE(effect.paletteLooped);
         CHECK(effect.paletteSkewCentre == Approx(0.8F));
+        CHECK(effect.blendMode ==
+              invisible_places::timing::TimingColouriseBlendMode::Screen);
         CHECK(effect.effectParameterKeys.empty());
     }
 

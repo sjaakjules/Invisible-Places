@@ -4820,6 +4820,51 @@ ParseTimingColouriseColourSpace(const json& spaceJson) {
     return TimingColouriseColourSpace::Srgb;
 }
 
+std::string TimingColouriseBlendModeName(
+    invisible_places::timing::TimingColouriseBlendMode mode) {
+    using invisible_places::timing::TimingColouriseBlendMode;
+    switch (mode) {
+        case TimingColouriseBlendMode::Normal:
+            return "normal";
+        case TimingColouriseBlendMode::Multiply:
+            return "multiply";
+        case TimingColouriseBlendMode::Screen:
+            return "screen";
+        case TimingColouriseBlendMode::Add:
+            return "add";
+        case TimingColouriseBlendMode::Divide:
+            return "divide";
+        case TimingColouriseBlendMode::VividLight:
+            return "vivid_light";
+    }
+    return "normal";
+}
+
+invisible_places::timing::TimingColouriseBlendMode
+ParseTimingColouriseBlendMode(const json& modeJson) {
+    using invisible_places::timing::TimingColouriseBlendMode;
+    if (!modeJson.is_string()) {
+        return TimingColouriseBlendMode::Normal;
+    }
+    const auto name = modeJson.get<std::string>();
+    if (name == "multiply") {
+        return TimingColouriseBlendMode::Multiply;
+    }
+    if (name == "screen") {
+        return TimingColouriseBlendMode::Screen;
+    }
+    if (name == "add") {
+        return TimingColouriseBlendMode::Add;
+    }
+    if (name == "divide") {
+        return TimingColouriseBlendMode::Divide;
+    }
+    if (name == "vivid_light") {
+        return TimingColouriseBlendMode::VividLight;
+    }
+    return TimingColouriseBlendMode::Normal;
+}
+
 std::string TimingColouriseAmountOverrideModeName(
     invisible_places::timing::TimingColouriseAmountOverrideMode mode) {
     using invisible_places::timing::TimingColouriseAmountOverrideMode;
@@ -5617,6 +5662,12 @@ json SerializeTimingColouriseEffect(
             if (memory.paletteLooped) {
                 memoryJson["palette_looped"] = true;
             }
+            if (memory.blendMode !=
+                invisible_places::timing::TimingColouriseBlendMode::
+                    Normal) {
+                memoryJson["blend_mode"] =
+                    TimingColouriseBlendModeName(memory.blendMode);
+            }
             if (memory.colourKeyInterpolationSpace !=
                 invisible_places::timing::TimingColouriseColourSpace::
                     Srgb) {
@@ -5668,6 +5719,13 @@ json SerializeTimingColouriseEffect(
     // byte-identical; older readers drop the key harmlessly.
     if (sanitized.paletteLooped) {
         effectJson["palette_looped"] = true;
+    }
+    // The colourise blend mode is written only away from the Normal default
+    // so untouched documents stay byte-identical.
+    if (sanitized.blendMode !=
+        invisible_places::timing::TimingColouriseBlendMode::Normal) {
+        effectJson["blend_mode"] =
+            TimingColouriseBlendModeName(sanitized.blendMode);
     }
     // The keyed-colour blend space is written only away from the sRGB
     // default so untouched documents stay byte-identical.
@@ -5874,6 +5932,10 @@ ParseTimingColouriseEffect(
     }
     effect.paletteLooped =
         effectJson.value("palette_looped", false);
+    if (effectJson.contains("blend_mode")) {
+        effect.blendMode =
+            ParseTimingColouriseBlendMode(effectJson.at("blend_mode"));
+    }
     if (effectJson.contains("colour_key_interpolation")) {
         effect.colourKeyInterpolationSpace =
             ParseTimingColouriseColourSpace(
@@ -6104,6 +6166,10 @@ ParseTimingColouriseEffect(
             }
             memory.paletteLooped =
                 memoryJson.value("palette_looped", false);
+            if (memoryJson.contains("blend_mode")) {
+                memory.blendMode = ParseTimingColouriseBlendMode(
+                    memoryJson.at("blend_mode"));
+            }
             if (memoryJson.contains("colour_key_interpolation")) {
                 memory.colourKeyInterpolationSpace =
                     ParseTimingColouriseColourSpace(

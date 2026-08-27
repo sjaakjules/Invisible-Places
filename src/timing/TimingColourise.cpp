@@ -5728,6 +5728,7 @@ void StashTimingColouriseFieldVisuals(TimingColouriseEffect* effect) {
     entry->colouriseAmountOverrideMode =
         effect->colouriseAmountOverrideMode;
     entry->colouriseAmountOverride = effect->colouriseAmountOverride;
+    entry->blendMode = effect->blendMode;
     entry->palettePhaseOffset = effect->palettePhaseOffset;
     entry->paletteSkewCentre = effect->paletteSkewCentre;
     entry->paletteSkewSpread = effect->paletteSkewSpread;
@@ -5777,6 +5778,7 @@ void ApplyTimingColouriseFieldSelection(
                 visualEntry->colouriseAmountOverrideMode;
             effect->colouriseAmountOverride =
                 visualEntry->colouriseAmountOverride;
+            effect->blendMode = visualEntry->blendMode;
             effect->palettePhaseOffset =
                 visualEntry->palettePhaseOffset;
             effect->paletteSkewCentre = visualEntry->paletteSkewCentre;

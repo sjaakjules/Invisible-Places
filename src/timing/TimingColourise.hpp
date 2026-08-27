@@ -91,6 +91,23 @@ enum class TimingColouriseAmountOverrideMode : std::uint8_t {
     Scale,
 };
 
+// How a colourise Visual Feature lays its palette colour into the point
+// colour beneath it (earlier stack slots, or the base cloud colour). Slot
+// order stays the compositing order; the mode only changes the per-point
+// maths, mirroring the After Effects layer modes the exhibition sequences
+// were graded with. Every mode here is linear in the base colour once the
+// wash colour is known, so the renderer folds any stack into one
+// per-channel scale/offset pair. Values match the renderer/GLSL constants.
+enum class TimingColouriseBlendMode : std::uint8_t {
+    // mix(base, wash, amount): the historical behaviour and AE's Normal.
+    Normal = 0,
+    Multiply = 1,
+    Screen = 2,
+    Add = 3,
+    Divide = 4,
+    VividLight = 5,
+};
+
 // Legacy discriminator retained only for parsing documents written before
 // Visual Features carried independent colourise/emissive aspects. Runtime
 // effects no longer store a kind; they enable either or both aspects.
@@ -381,6 +398,7 @@ struct TimingColouriseFieldVisualMemory {
     TimingColouriseAmountOverrideMode colouriseAmountOverrideMode =
         TimingColouriseAmountOverrideMode::Maximum;
     float colouriseAmountOverride = 1.0F;
+    TimingColouriseBlendMode blendMode = TimingColouriseBlendMode::Normal;
     float palettePhaseOffset = 0.0F;
     float paletteSkewCentre = 0.5F;
     float paletteSkewSpread = 0.0F;
@@ -456,6 +474,9 @@ struct TimingColouriseEffect {
     // Applied after palette/key evaluation. This changes colour mixing only,
     // never point opacity or the authored per-stop amounts.
     float colouriseAmountOverride = 1.0F;
+    // Authored, non-animated compositing mode for the colourise aspect.
+    // Emissive output ignores it.
+    TimingColouriseBlendMode blendMode = TimingColouriseBlendMode::Normal;
     // Mirrors the sampled palette so the leftmost authored colour sits at the
     // output centre and the rightmost colour reaches both ends. Like Palette
     // Phase this changes only how the palette is sampled: the authored stops

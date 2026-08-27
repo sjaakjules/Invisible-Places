@@ -4492,6 +4492,78 @@ TEST_CASE("Loop Palette round-trips and stays omitted when disabled",
   CHECK(stateJson["timing_effects"][1]["palette_looped"] == true);
 }
 
+TEST_CASE("Colourise blend modes round-trip and stay omitted at Normal",
+          "[project][serialization][timing][colourise][blend]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::timing::TimingColouriseBlendMode;
+  using invisible_places::timing::TimingColouriseEffect;
+  using invisible_places::timing::TimingColouriseFieldVisualMemory;
+  using invisible_places::timing::TimingTakeSceneState;
+
+  ProjectDocument document;
+  document.projectName = "blend-modes";
+  TimingTakeSceneState state;
+  const std::array<TimingColouriseBlendMode, 6> modes = {
+      TimingColouriseBlendMode::Normal,
+      TimingColouriseBlendMode::Multiply,
+      TimingColouriseBlendMode::Screen,
+      TimingColouriseBlendMode::Add,
+      TimingColouriseBlendMode::Divide,
+      TimingColouriseBlendMode::VividLight,
+  };
+  for (std::size_t index = 0; index < modes.size(); ++index) {
+    TimingColouriseEffect effect;
+    effect.id = "effect-" + std::to_string(index);
+    effect.blendMode = modes[index];
+    state.colouriseEffects.push_back(std::move(effect));
+  }
+  TimingColouriseFieldVisualMemory memory;
+  memory.selector.scalarFieldName = "Curvature";
+  memory.blendMode = TimingColouriseBlendMode::Divide;
+  state.colouriseEffects.front().fieldVisualMemory = {memory};
+  document.timingTakeStates = {state};
+
+  TemporaryProjectFile file{"invisible_places_blend_modes.json"};
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(document, file.path, &errorMessage));
+  const auto loaded = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loaded.has_value());
+  const auto& effects = loaded->timingTakeStates.at(0).colouriseEffects;
+  REQUIRE(effects.size() == modes.size());
+  for (std::size_t index = 0; index < modes.size(); ++index) {
+    CHECK(effects[index].blendMode == modes[index]);
+  }
+  REQUIRE(effects.front().fieldVisualMemory.size() == 1U);
+  CHECK(effects.front().fieldVisualMemory.front().blendMode ==
+        TimingColouriseBlendMode::Divide);
+
+  // Normal is the omitted default; unknown names fall back to it rather
+  // than failing the load.
+  std::ifstream savedInput{file.path};
+  REQUIRE(savedInput.is_open());
+  auto savedJson = nlohmann::json::parse(savedInput);
+  savedInput.close();
+  auto& stateJson = savedJson["timing_take_states"][0];
+  CHECK_FALSE(stateJson["timing_effects"][0].contains("blend_mode"));
+  CHECK(stateJson["timing_effects"][1]["blend_mode"] == "multiply");
+  CHECK(stateJson["timing_effects"][4]["blend_mode"] == "divide");
+  CHECK(stateJson["timing_effects"][5]["blend_mode"] == "vivid_light");
+  stateJson["timing_effects"][1]["blend_mode"] = "hard_mix";
+  {
+    std::ofstream rewrite{file.path};
+    REQUIRE(rewrite.is_open());
+    rewrite << savedJson.dump(2);
+  }
+  const auto reloaded = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(reloaded.has_value());
+  CHECK(reloaded->timingTakeStates.at(0).colouriseEffects.at(1).blendMode ==
+        TimingColouriseBlendMode::Normal);
+}
+
 TEST_CASE("Palette skew warp state round-trips and legacy sides fold",
           "[project][serialization][timing][colourise][skew]") {
   using invisible_places::serialization::LoadProjectDocument;
