@@ -92502,8 +92502,9 @@ TimingScalarTrackInterpolationAt(
     if (previous != nullptr) {
         return previous->interpolation;
     }
+    // Empty tracks arm with the Monotone Spline default new keys use.
     return first != nullptr ? first->interpolation
-                            : WaterScenarioInterpolation::Smooth;
+                            : WaterScenarioInterpolation::SmoothVelocity;
 }
 
 invisible_places::timing::TimingColourisePalette
@@ -97749,6 +97750,40 @@ void DrawTimingColourisePaletteEditor(
     } else if (!isDraggingPaletteStop()) {
         timings.colourisePaletteDrag.reset();
     }
+    const auto findParameterKeyAt =
+        [&](std::string_view stopId,
+            TimingColourisePaletteStopParameter parameter,
+            float keyPosition)
+            -> TimingColourisePaletteStopParameterKey* {
+        const auto found = std::find_if(
+            effect->paletteStopParameterKeys.begin(),
+            effect->paletteStopParameterKeys.end(),
+            [&](const auto& key) {
+                return key.stopId == stopId &&
+                       key.parameter == parameter &&
+                       std::abs(key.position - keyPosition) <=
+                           invisible_places::timing::
+                               kTimingColouriseKeyTolerance;
+            });
+        return found ==
+                       effect->paletteStopParameterKeys.end()
+                   ? nullptr
+                   : &*found;
+    };
+    const auto interpolationForAt =
+        [&](std::string_view stopId,
+            TimingColourisePaletteStopParameter parameter,
+            float keyPosition) {
+        const auto* key =
+            findParameterKeyAt(
+                stopId,
+                parameter,
+                keyPosition);
+        return key != nullptr
+                   ? key->interpolation
+                   : WaterScenarioInterpolation::SmoothVelocity;
+    };
+
     const auto paletteBeforePreview = workingPalette;
     const bool wasDraggingPaletteStop =
         isDraggingPaletteStop();
@@ -98128,7 +98163,11 @@ void DrawTimingColourisePaletteEditor(
                                 Position,
                             previewKeyPosition,
                             stop.position,
-                            WaterScenarioInterpolation::Smooth);
+                            interpolationForAt(
+                                stop.id,
+                                TimingColourisePaletteStopParameter::
+                                    Position,
+                                previewKeyPosition));
                 }
                 if (!amountChanged) {
                     continue;
@@ -98151,7 +98190,11 @@ void DrawTimingColourisePaletteEditor(
                                 ColouriseAmount,
                             previewKeyPosition,
                             stop.colouriseAmount,
-                            WaterScenarioInterpolation::Smooth);
+                            interpolationForAt(
+                                stop.id,
+                                TimingColourisePaletteStopParameter::
+                                    ColouriseAmount,
+                                previewKeyPosition));
                     continue;
                 }
                 const auto baseIndex = stopIndexById(
@@ -98200,39 +98243,6 @@ void DrawTimingColourisePaletteEditor(
         ImGui::OpenPopup("Colour Stop");
     }
 
-    const auto findParameterKeyAt =
-        [&](std::string_view stopId,
-            TimingColourisePaletteStopParameter parameter,
-            float keyPosition)
-            -> TimingColourisePaletteStopParameterKey* {
-        const auto found = std::find_if(
-            effect->paletteStopParameterKeys.begin(),
-            effect->paletteStopParameterKeys.end(),
-            [&](const auto& key) {
-                return key.stopId == stopId &&
-                       key.parameter == parameter &&
-                       std::abs(key.position - keyPosition) <=
-                           invisible_places::timing::
-                               kTimingColouriseKeyTolerance;
-            });
-        return found ==
-                       effect->paletteStopParameterKeys.end()
-                   ? nullptr
-                   : &*found;
-    };
-    const auto interpolationForAt =
-        [&](std::string_view stopId,
-            TimingColourisePaletteStopParameter parameter,
-            float keyPosition) {
-        const auto* key =
-            findParameterKeyAt(
-                stopId,
-                parameter,
-                keyPosition);
-        return key != nullptr
-                   ? key->interpolation
-                   : WaterScenarioInterpolation::Smooth;
-    };
 
     float pickerPosition = position;
     const bool pickerMatches =
@@ -98482,7 +98492,11 @@ void DrawTimingColourisePaletteEditor(
                                         ColouriseAmount,
                                     pickerPosition,
                                     editedStop.colouriseAmount,
-                                    WaterScenarioInterpolation::Smooth);
+                                    interpolationForAt(
+                                        originalStop.id,
+                                        TimingColourisePaletteStopParameter::
+                                            ColouriseAmount,
+                                        pickerPosition));
                         } else if (const auto baseIndex =
                                        stopIndexById(
                                            effect->basePalette,

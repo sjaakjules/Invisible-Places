@@ -1104,12 +1104,16 @@ std::size_t MergeLegacyTimingEffectAspects(
     std::array<float, 3> baseColour,
     std::span<const TimingColouriseLayerSample> samples);
 
+// New keys default to Monotone Spline (SmoothVelocity), the same default the
+// Water setting tracks adopted: continuous speed through continuing keys
+// without overshoot. Callers preserving an existing key's style still pass it
+// explicitly, and parsed keys keep whatever the document stored.
 void AddOrUpdateTimingColourisePaletteKey(
     TimingColouriseEffect* effect,
     float position,
     TimingColourisePalette palette,
     invisible_places::water::WaterScenarioInterpolation interpolation =
-        invisible_places::water::WaterScenarioInterpolation::Smooth);
+        invisible_places::water::WaterScenarioInterpolation::SmoothVelocity);
 [[nodiscard]] bool AddOrUpdateTimingColourisePaletteStopScalarKey(
     TimingColouriseEffect* effect,
     std::string_view stopId,
@@ -1117,34 +1121,34 @@ void AddOrUpdateTimingColourisePaletteKey(
     float position,
     float value,
     invisible_places::water::WaterScenarioInterpolation interpolation =
-        invisible_places::water::WaterScenarioInterpolation::Smooth);
+        invisible_places::water::WaterScenarioInterpolation::SmoothVelocity);
 [[nodiscard]] bool AddOrUpdateTimingColourisePaletteStopColourKey(
     TimingColouriseEffect* effect,
     std::string_view stopId,
     float position,
     std::array<float, 3> colour,
     invisible_places::water::WaterScenarioInterpolation interpolation =
-        invisible_places::water::WaterScenarioInterpolation::Smooth);
+        invisible_places::water::WaterScenarioInterpolation::SmoothVelocity);
 void AddOrUpdateTimingColouriseBoundsKey(
     TimingColouriseEffect* effect,
     float position,
     TimingColouriseBounds bounds,
     invisible_places::water::WaterScenarioInterpolation interpolation =
-        invisible_places::water::WaterScenarioInterpolation::Smooth);
+        invisible_places::water::WaterScenarioInterpolation::SmoothVelocity);
 [[nodiscard]] bool AddOrUpdateTimingColouriseBoundsParameterKey(
     TimingColouriseEffect* effect,
     TimingColouriseBoundsParameter parameter,
     float position,
     float value,
     invisible_places::water::WaterScenarioInterpolation interpolation =
-        invisible_places::water::WaterScenarioInterpolation::Smooth);
+        invisible_places::water::WaterScenarioInterpolation::SmoothVelocity);
 [[nodiscard]] bool AddOrUpdateTimingColouriseEffectParameterKey(
     TimingColouriseEffect* effect,
     TimingColouriseEffectParameter parameter,
     float position,
     float value,
     invisible_places::water::WaterScenarioInterpolation interpolation =
-        invisible_places::water::WaterScenarioInterpolation::Smooth);
+        invisible_places::water::WaterScenarioInterpolation::SmoothVelocity);
 [[nodiscard]] bool MoveTimingColourisePaletteKey(
     TimingColouriseEffect* effect,
     float sourcePosition,

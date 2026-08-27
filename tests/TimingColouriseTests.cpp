@@ -2424,6 +2424,38 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Timing Colourise new keys default to Monotone Spline",
+    "[timing][colourise][keys][default-interpolation]") {
+    TimingColouriseEffect effect;
+    effect.basePalette = Solid({0.5F, 0.5F, 0.5F}, 1.0F);
+    REQUIRE(invisible_places::timing::
+                AddOrUpdateTimingColouriseEffectParameterKey(
+                    &effect,
+                    TimingColouriseEffectParameter::AmountOverride,
+                    0.25F,
+                    0.5F));
+    REQUIRE(invisible_places::timing::
+                AddOrUpdateTimingColouriseBoundsParameterKey(
+                    &effect,
+                    TimingColouriseBoundsParameter::Lower,
+                    0.25F,
+                    0.1F));
+    REQUIRE(invisible_places::timing::
+                AddOrUpdateTimingColourisePaletteStopScalarKey(
+                    &effect,
+                    effect.basePalette.stops.front().id,
+                    TimingColourisePaletteStopParameter::Position,
+                    0.25F,
+                    0.4F));
+    CHECK(effect.effectParameterKeys.front().interpolation ==
+          WaterScenarioInterpolation::SmoothVelocity);
+    CHECK(effect.boundsParameterKeys.front().interpolation ==
+          WaterScenarioInterpolation::SmoothVelocity);
+    CHECK(effect.paletteStopParameterKeys.front().interpolation ==
+          WaterScenarioInterpolation::SmoothVelocity);
+}
+
+TEST_CASE(
     "Timing Colourise stop tracks honour spline curve styles",
     "[timing][colourise][palette][keys][spline]") {
     TimingColouriseEffect effect;
