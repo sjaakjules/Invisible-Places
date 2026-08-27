@@ -4492,13 +4492,14 @@ TEST_CASE("Loop Palette round-trips and stays omitted when disabled",
   CHECK(stateJson["timing_effects"][1]["palette_looped"] == true);
 }
 
-TEST_CASE("Palette skew base values and keys round-trip",
+TEST_CASE("Palette skew warp state round-trips and legacy sides fold",
           "[project][serialization][timing][colourise][skew]") {
   using invisible_places::serialization::LoadProjectDocument;
   using invisible_places::serialization::ProjectDocument;
   using invisible_places::serialization::SaveProjectDocument;
   using invisible_places::timing::TimingColouriseEffect;
   using invisible_places::timing::TimingColouriseEffectParameter;
+  using invisible_places::timing::TimingColourisePaletteSkewNode;
   using invisible_places::timing::TimingTakeSceneState;
 
   ProjectDocument document;
@@ -4511,8 +4512,15 @@ TEST_CASE("Palette skew base values and keys round-trip",
   skewed.id = "effect-2";
   skewed.name = "Skewed";
   skewed.paletteSkewCentre = 0.25F;
-  skewed.paletteSkewLower = -0.5F;
-  skewed.paletteSkewUpper = 0.75F;
+  skewed.paletteSkewSpread = -0.5F;
+  skewed.emissiveSkewCentre = 0.7F;
+  skewed.emissiveSkewSpread = 0.2F;
+  skewed.paletteSkewNodes.push_back(TimingColourisePaletteSkewNode{
+      .id = "skew-node-1",
+      .palettePosition = 0.8F,
+      .fieldPosition = 0.9F,
+      .spread = 0.4F,
+  });
   skewed.effectParameterKeys.push_back({
       .parameter = TimingColouriseEffectParameter::PaletteSkewCentre,
       .position = 0.4F,
@@ -4531,11 +4539,19 @@ TEST_CASE("Palette skew base values and keys round-trip",
   const auto& effects = loaded->timingTakeStates[0].colouriseEffects;
   REQUIRE(effects.size() == 2U);
   CHECK(effects[0].paletteSkewCentre == Catch::Approx(0.5F));
-  CHECK(effects[0].paletteSkewLower == Catch::Approx(0.0F));
-  CHECK(effects[0].paletteSkewUpper == Catch::Approx(0.0F));
+  CHECK(effects[0].paletteSkewSpread == Catch::Approx(0.0F));
+  CHECK(effects[0].paletteSkewNodes.empty());
   CHECK(effects[1].paletteSkewCentre == Catch::Approx(0.25F));
-  CHECK(effects[1].paletteSkewLower == Catch::Approx(-0.5F));
-  CHECK(effects[1].paletteSkewUpper == Catch::Approx(0.75F));
+  CHECK(effects[1].paletteSkewSpread == Catch::Approx(-0.5F));
+  CHECK(effects[1].emissiveSkewCentre == Catch::Approx(0.7F));
+  CHECK(effects[1].emissiveSkewSpread == Catch::Approx(0.2F));
+  REQUIRE(effects[1].paletteSkewNodes.size() == 1U);
+  CHECK(effects[1].paletteSkewNodes[0].id == "skew-node-1");
+  CHECK(effects[1].paletteSkewNodes[0].palettePosition ==
+        Catch::Approx(0.8F));
+  CHECK(effects[1].paletteSkewNodes[0].fieldPosition ==
+        Catch::Approx(0.9F));
+  CHECK(effects[1].paletteSkewNodes[0].spread == Catch::Approx(0.4F));
   REQUIRE(effects[1].effectParameterKeys.size() == 1U);
   CHECK(effects[1].effectParameterKeys[0].parameter ==
         TimingColouriseEffectParameter::PaletteSkewCentre);
@@ -4544,16 +4560,48 @@ TEST_CASE("Palette skew base values and keys round-trip",
   // Identity skew stays out of the document entirely.
   std::ifstream savedInput{file.path};
   REQUIRE(savedInput.is_open());
-  const auto savedJson = nlohmann::json::parse(savedInput);
+  auto savedJson = nlohmann::json::parse(savedInput);
   savedInput.close();
   const auto& stateJson = savedJson["timing_take_states"][0];
   CHECK_FALSE(stateJson["timing_effects"][0].contains("palette_skew_centre"));
-  CHECK_FALSE(stateJson["timing_effects"][0].contains("palette_skew_lower"));
-  CHECK_FALSE(stateJson["timing_effects"][0].contains("palette_skew_upper"));
+  CHECK_FALSE(stateJson["timing_effects"][0].contains("palette_skew_spread"));
+  CHECK_FALSE(stateJson["timing_effects"][0].contains("palette_skew_nodes"));
   CHECK(stateJson["timing_effects"][1]["palette_skew_centre"] ==
         Catch::Approx(0.25));
+  CHECK(stateJson["timing_effects"][1]["palette_skew_spread"] ==
+        Catch::Approx(-0.5));
   CHECK(stateJson["timing_effects"][1]["effect_parameter_keys"][0]
                  ["parameter"] == "palette_skew_centre");
+
+  // A document from the short-lived per-side model folds its sides into
+  // the centre node's spread and retags any per-side keys.
+  auto& legacyEffect = savedJson["timing_take_states"][0]
+                                ["timing_effects"][1];
+  legacyEffect.erase("palette_skew_spread");
+  legacyEffect.erase("palette_skew_nodes");
+  legacyEffect["palette_skew_lower"] = 0.6F;
+  legacyEffect["palette_skew_upper"] = 0.2F;
+  legacyEffect["effect_parameter_keys"] = nlohmann::json::array({
+      {{"parameter", "palette_skew_lower"},
+       {"position", 0.3F},
+       {"value", 0.5F},
+       {"interpolation", "linear"}},
+  });
+  {
+    std::ofstream legacyOutput{file.path};
+    REQUIRE(legacyOutput.is_open());
+    legacyOutput << savedJson.dump(2);
+  }
+  const auto legacyLoaded = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(legacyLoaded.has_value());
+  const auto& migrated =
+      legacyLoaded->timingTakeStates[0].colouriseEffects.at(1);
+  CHECK(migrated.paletteSkewSpread == Catch::Approx(0.4F));
+  REQUIRE(migrated.effectParameterKeys.size() == 1U);
+  CHECK(migrated.effectParameterKeys[0].parameter ==
+        TimingColouriseEffectParameter::PaletteSkewSpread);
+  CHECK(migrated.effectParameterKeys[0].value == Catch::Approx(0.5F));
 }
 
 TEST_CASE("Field-scoped visual settings round-trip",

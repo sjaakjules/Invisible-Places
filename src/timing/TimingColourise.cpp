@@ -349,6 +349,9 @@ bool IsValidEffectParameter(
         case TimingColouriseEffectParameter::PaletteSkewCentre:
         case TimingColouriseEffectParameter::PaletteSkewLower:
         case TimingColouriseEffectParameter::PaletteSkewUpper:
+        case TimingColouriseEffectParameter::PaletteSkewSpread:
+        case TimingColouriseEffectParameter::EmissiveSkewCentre:
+        case TimingColouriseEffectParameter::EmissiveSkewSpread:
             return true;
     }
     return false;
@@ -506,10 +509,17 @@ float EffectParameterBaseValue(
             return effect.emissiveLevel;
         case TimingColouriseEffectParameter::PaletteSkewCentre:
             return effect.paletteSkewCentre;
+        case TimingColouriseEffectParameter::PaletteSkewSpread:
+            return effect.paletteSkewSpread;
+        case TimingColouriseEffectParameter::EmissiveSkewCentre:
+            return effect.emissiveSkewCentre;
+        case TimingColouriseEffectParameter::EmissiveSkewSpread:
+            return effect.emissiveSkewSpread;
+        // Legacy per-side skews; sanitize retags their keys onto Spread,
+        // so nothing evaluates them.
         case TimingColouriseEffectParameter::PaletteSkewLower:
-            return effect.paletteSkewLower;
         case TimingColouriseEffectParameter::PaletteSkewUpper:
-            return effect.paletteSkewUpper;
+            return 0.0F;
     }
     return 0.0F;
 }
@@ -525,9 +535,12 @@ float SanitizeEffectParameterValue(
         case TimingColouriseEffectParameter::EmissiveLevel:
             return FiniteOr(value, 1.0F);
         case TimingColouriseEffectParameter::PaletteSkewCentre:
+        case TimingColouriseEffectParameter::EmissiveSkewCentre:
             return std::clamp(FiniteOr(value, 0.5F), 0.0F, 1.0F);
         case TimingColouriseEffectParameter::PaletteSkewLower:
         case TimingColouriseEffectParameter::PaletteSkewUpper:
+        case TimingColouriseEffectParameter::PaletteSkewSpread:
+        case TimingColouriseEffectParameter::EmissiveSkewSpread:
             return ClampPaletteSkew(value);
     }
     return 0.0F;
@@ -3252,11 +3265,17 @@ bool TimingEffectParameterIsSupported(
         case TimingColouriseEffectParameter::PalettePhase:
         case TimingColouriseEffectParameter::AmountOverride:
         case TimingColouriseEffectParameter::PaletteSkewCentre:
-        case TimingColouriseEffectParameter::PaletteSkewLower:
-        case TimingColouriseEffectParameter::PaletteSkewUpper:
+        case TimingColouriseEffectParameter::PaletteSkewSpread:
             return colouriseEnabled;
         case TimingColouriseEffectParameter::EmissiveLevel:
+        case TimingColouriseEffectParameter::EmissiveSkewCentre:
+        case TimingColouriseEffectParameter::EmissiveSkewSpread:
             return emissiveEnabled;
+        // Legacy per-side skews exist only between parsing and sanitize,
+        // which retags their keys onto Spread.
+        case TimingColouriseEffectParameter::PaletteSkewLower:
+        case TimingColouriseEffectParameter::PaletteSkewUpper:
+            return false;
     }
     return false;
 }
@@ -3443,8 +3462,57 @@ TimingColouriseEffect SanitizeTimingColouriseEffect(
         FiniteOr(effect.palettePhaseOffset, 0.0F);
     effect.paletteSkewCentre =
         std::clamp(FiniteOr(effect.paletteSkewCentre, 0.5F), 0.0F, 1.0F);
-    effect.paletteSkewLower = ClampPaletteSkew(effect.paletteSkewLower);
-    effect.paletteSkewUpper = ClampPaletteSkew(effect.paletteSkewUpper);
+    effect.paletteSkewSpread = ClampPaletteSkew(effect.paletteSkewSpread);
+    effect.emissiveSkewCentre =
+        std::clamp(FiniteOr(effect.emissiveSkewCentre, 0.5F), 0.0F, 1.0F);
+    effect.emissiveSkewSpread =
+        ClampPaletteSkew(effect.emissiveSkewSpread);
+    const auto sanitizeSkewNodes =
+        [](std::vector<TimingColourisePaletteSkewNode>* nodes) {
+            std::vector<TimingColourisePaletteSkewNode> kept;
+            kept.reserve(nodes->size());
+            for (auto& node : *nodes) {
+                if (node.id.empty() ||
+                    std::any_of(
+                        kept.begin(),
+                        kept.end(),
+                        [&](const TimingColourisePaletteSkewNode&
+                                existing) {
+                            return existing.id == node.id;
+                        })) {
+                    continue;
+                }
+                node.palettePosition = std::clamp(
+                    FiniteOr(node.palettePosition, 0.5F),
+                    0.02F,
+                    0.98F);
+                node.fieldPosition = Clamp01(node.fieldPosition);
+                node.spread = ClampPaletteSkew(node.spread);
+                kept.push_back(std::move(node));
+            }
+            std::stable_sort(
+                kept.begin(),
+                kept.end(),
+                [](const TimingColourisePaletteSkewNode& left,
+                   const TimingColourisePaletteSkewNode& right) {
+                    return left.palettePosition < right.palettePosition;
+                });
+            *nodes = std::move(kept);
+        };
+    sanitizeSkewNodes(&effect.paletteSkewNodes);
+    sanitizeSkewNodes(&effect.emissiveSkewNodes);
+    // Legacy per-side skew keys become centre-spread keys: the node warp
+    // has no per-side lanes, and the retag preserves each key's timing and
+    // approximate intent.
+    for (auto& key : effect.effectParameterKeys) {
+        if (key.parameter ==
+                TimingColouriseEffectParameter::PaletteSkewLower ||
+            key.parameter ==
+                TimingColouriseEffectParameter::PaletteSkewUpper) {
+            key.parameter =
+                TimingColouriseEffectParameter::PaletteSkewSpread;
+        }
+    }
     effect.emissiveLevel =
         FiniteOr(effect.emissiveLevel, 1.0F);
     std::erase_if(
@@ -3640,10 +3708,16 @@ TimingColouriseEffect SanitizeTimingColouriseEffect(
             FiniteOr(memory.paletteSkewCentre, 0.5F),
             0.0F,
             1.0F);
-        memory.paletteSkewLower =
-            ClampPaletteSkew(memory.paletteSkewLower);
-        memory.paletteSkewUpper =
-            ClampPaletteSkew(memory.paletteSkewUpper);
+        memory.paletteSkewSpread =
+            ClampPaletteSkew(memory.paletteSkewSpread);
+        memory.emissiveSkewCentre = std::clamp(
+            FiniteOr(memory.emissiveSkewCentre, 0.5F),
+            0.0F,
+            1.0F);
+        memory.emissiveSkewSpread =
+            ClampPaletteSkew(memory.emissiveSkewSpread);
+        sanitizeSkewNodes(&memory.paletteSkewNodes);
+        sanitizeSkewNodes(&memory.emissiveSkewNodes);
         memory.emissiveLevel = FiniteOr(memory.emissiveLevel, 1.0F);
         std::erase_if(
             memory.effectParameterKeys,
@@ -5496,8 +5570,11 @@ void StashTimingColouriseFieldVisuals(TimingColouriseEffect* effect) {
     entry->colouriseAmountOverride = effect->colouriseAmountOverride;
     entry->palettePhaseOffset = effect->palettePhaseOffset;
     entry->paletteSkewCentre = effect->paletteSkewCentre;
-    entry->paletteSkewLower = effect->paletteSkewLower;
-    entry->paletteSkewUpper = effect->paletteSkewUpper;
+    entry->paletteSkewSpread = effect->paletteSkewSpread;
+    entry->paletteSkewNodes = effect->paletteSkewNodes;
+    entry->emissiveSkewCentre = effect->emissiveSkewCentre;
+    entry->emissiveSkewSpread = effect->emissiveSkewSpread;
+    entry->emissiveSkewNodes = effect->emissiveSkewNodes;
     entry->emissiveLevel = effect->emissiveLevel;
     entry->effectParameterKeys = effect->effectParameterKeys;
     entry->paletteKeys = effect->paletteKeys;
@@ -5541,8 +5618,13 @@ void ApplyTimingColouriseFieldSelection(
             effect->palettePhaseOffset =
                 visualEntry->palettePhaseOffset;
             effect->paletteSkewCentre = visualEntry->paletteSkewCentre;
-            effect->paletteSkewLower = visualEntry->paletteSkewLower;
-            effect->paletteSkewUpper = visualEntry->paletteSkewUpper;
+            effect->paletteSkewSpread = visualEntry->paletteSkewSpread;
+            effect->paletteSkewNodes = visualEntry->paletteSkewNodes;
+            effect->emissiveSkewCentre =
+                visualEntry->emissiveSkewCentre;
+            effect->emissiveSkewSpread =
+                visualEntry->emissiveSkewSpread;
+            effect->emissiveSkewNodes = visualEntry->emissiveSkewNodes;
             effect->emissiveLevel = visualEntry->emissiveLevel;
             effect->effectParameterKeys =
                 visualEntry->effectParameterKeys;
@@ -5914,62 +5996,236 @@ TimingColouriseLut ApplyTimingColourisePalettePhase(
     return shifted;
 }
 
-float TimingColourisePaletteSkewCoordinate(
-    float centre,
-    float lowerSkew,
-    float upperSkew,
-    float boundsFraction) {
-    constexpr float kDegenerateHalf = 1.0e-6F;
-    const float t = Clamp01(boundsFraction);
-    const float c = std::clamp(FiniteOr(centre, 0.5F), 0.0F, 1.0F);
-    // 4^skew keeps skew 0 exactly linear and gives each side a symmetric
-    // 1/4x..4x exponent range. An exponent above one holds the coordinate
-    // near the palette midpoint longer, stretching the centre colours.
-    if (t <= c) {
-        if (c <= kDegenerateHalf) {
-            return 0.5F;
+namespace {
+
+// The forward warp curve: knots in palette (or falloff-curve) space, their
+// bounds-fraction targets, and monotone-limited Hermite tangents scaled by
+// each node's 4^spread density factor.
+struct TimingColouriseWarpCurve {
+    std::vector<float> palette;
+    std::vector<float> field;
+    std::vector<float> tangent;
+};
+
+TimingColouriseWarpCurve BuildTimingColouriseWarpCurve(
+    std::span<const TimingColouriseWarpPoint> points) {
+    TimingColouriseWarpCurve curve;
+    const std::size_t knotCount = points.size() + 2U;
+    curve.palette.reserve(knotCount);
+    curve.field.reserve(knotCount);
+    curve.tangent.assign(knotCount, 0.0F);
+    curve.palette.push_back(0.0F);
+    curve.field.push_back(0.0F);
+    std::vector<float> spreads;
+    spreads.assign(knotCount, 0.0F);
+    for (std::size_t index = 0U; index < points.size(); ++index) {
+        curve.palette.push_back(points[index].palettePosition);
+        curve.field.push_back(points[index].fieldPosition);
+        spreads[index + 1U] = points[index].spread;
+    }
+    curve.palette.push_back(1.0F);
+    curve.field.push_back(1.0F);
+
+    const std::size_t segmentCount = knotCount - 1U;
+    std::vector<float> secant(segmentCount, 1.0F);
+    for (std::size_t index = 0U; index < segmentCount; ++index) {
+        const float paletteSpan = std::max(
+            curve.palette[index + 1U] - curve.palette[index],
+            1.0e-4F);
+        secant[index] = std::max(
+            curve.field[index + 1U] - curve.field[index],
+            0.0F) / paletteSpan;
+    }
+    for (std::size_t index = 0U; index < knotCount; ++index) {
+        const float left = index > 0U ? secant[index - 1U] : secant[0];
+        const float right =
+            index + 1U < knotCount ? secant[index] : secant.back();
+        float tangent = index == 0U
+            ? right
+            : index + 1U == knotCount
+                ? left
+                : 0.5F * (left + right);
+        // Local pinch/spread: 4^spread keeps 0 exactly neutral and gives a
+        // symmetric quarter-to-four-times density range.
+        tangent *= std::pow(4.0F, ClampPaletteSkew(spreads[index]));
+        // Fritsch-Carlson limiting keeps the warp monotone whatever the
+        // spread asked for.
+        const float limit = 3.0F * std::min(left, right);
+        curve.tangent[index] = std::clamp(tangent, 0.0F, limit);
+    }
+    return curve;
+}
+
+float EvaluateTimingColouriseWarpCurve(
+    const TimingColouriseWarpCurve& curve,
+    float palettePosition) {
+    const float p = Clamp01(palettePosition);
+    std::size_t segment = 0U;
+    while (segment + 2U < curve.palette.size() &&
+           p > curve.palette[segment + 1U]) {
+        ++segment;
+    }
+    const float p0 = curve.palette[segment];
+    const float p1 = curve.palette[segment + 1U];
+    const float span = std::max(p1 - p0, 1.0e-6F);
+    const float t = Clamp01((p - p0) / span);
+    const float t2 = t * t;
+    const float t3 = t2 * t;
+    const float x0 = curve.field[segment];
+    const float x1 = curve.field[segment + 1U];
+    const float m0 = curve.tangent[segment];
+    const float m1 = curve.tangent[segment + 1U];
+    const float value =
+        (2.0F * t3 - 3.0F * t2 + 1.0F) * x0 +
+        (t3 - 2.0F * t2 + t) * span * m0 +
+        (-2.0F * t3 + 3.0F * t2) * x1 +
+        (t3 - t2) * span * m1;
+    // Monotone limiting keeps the segment inside its endpoints; the clamp
+    // only absorbs floating-point residue.
+    return std::clamp(value, std::min(x0, x1), std::max(x0, x1));
+}
+
+}  // namespace
+
+std::vector<TimingColouriseWarpPoint> BuildTimingColouriseWarpPoints(
+    float centreFieldPosition,
+    float centreSpread,
+    std::span<const TimingColourisePaletteSkewNode> extraNodes) {
+    std::vector<TimingColouriseWarpPoint> points;
+    points.reserve(extraNodes.size() + 1U);
+    points.push_back(TimingColouriseWarpPoint{
+        .palettePosition = 0.5F,
+        .fieldPosition =
+            std::clamp(FiniteOr(centreFieldPosition, 0.5F), 0.0F, 1.0F),
+        .spread = ClampPaletteSkew(centreSpread),
+    });
+    for (const auto& node : extraNodes) {
+        points.push_back(TimingColouriseWarpPoint{
+            .palettePosition = std::clamp(
+                FiniteOr(node.palettePosition, 0.5F),
+                0.02F,
+                0.98F),
+            .fieldPosition = Clamp01(node.fieldPosition),
+            .spread = ClampPaletteSkew(node.spread),
+        });
+    }
+    std::stable_sort(
+        points.begin(),
+        points.end(),
+        [](const TimingColouriseWarpPoint& left,
+           const TimingColouriseWarpPoint& right) {
+            return left.palettePosition < right.palettePosition;
+        });
+    // Coincident anchors keep their first (centre-first) representative,
+    // and the bounds targets are clamped strictly increasing so the map
+    // can always be inverted.
+    constexpr float kMargin = 1.0e-3F;
+    std::vector<TimingColouriseWarpPoint> sanitized;
+    sanitized.reserve(points.size());
+    for (auto& point : points) {
+        if (!sanitized.empty() &&
+            point.palettePosition - sanitized.back().palettePosition <=
+                2.0F * kMargin) {
+            continue;
         }
-        const float towardEnd = (c - t) / c;
-        const float gamma =
-            std::pow(4.0F, std::clamp(FiniteOr(lowerSkew, 0.0F), -1.0F, 1.0F));
-        return 0.5F - 0.5F * std::pow(towardEnd, gamma);
+        sanitized.push_back(point);
     }
-    if (1.0F - c <= kDegenerateHalf) {
-        return 0.5F;
+    float previousField = 0.0F;
+    for (std::size_t index = 0U; index < sanitized.size(); ++index) {
+        const float remaining =
+            static_cast<float>(sanitized.size() - index);
+        sanitized[index].fieldPosition = std::clamp(
+            sanitized[index].fieldPosition,
+            previousField + kMargin,
+            1.0F - kMargin * remaining);
+        previousField = sanitized[index].fieldPosition;
     }
-    const float towardEnd = (t - c) / (1.0F - c);
-    const float gamma =
-        std::pow(4.0F, std::clamp(FiniteOr(upperSkew, 0.0F), -1.0F, 1.0F));
-    return 0.5F + 0.5F * std::pow(towardEnd, gamma);
+    return sanitized;
+}
+
+float EvaluateTimingColouriseWarpFieldPosition(
+    std::span<const TimingColouriseWarpPoint> points,
+    float palettePosition) {
+    return EvaluateTimingColouriseWarpCurve(
+        BuildTimingColouriseWarpCurve(points),
+        palettePosition);
+}
+
+float EvaluateTimingColouriseWarpPaletteCoordinate(
+    std::span<const TimingColouriseWarpPoint> points,
+    float fieldFraction) {
+    const float target = Clamp01(fieldFraction);
+    const auto curve = BuildTimingColouriseWarpCurve(points);
+    float low = 0.0F;
+    float high = 1.0F;
+    for (int iteration = 0; iteration < 28; ++iteration) {
+        const float middle = std::midpoint(low, high);
+        if (EvaluateTimingColouriseWarpCurve(curve, middle) < target) {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    return std::midpoint(low, high);
+}
+
+bool TimingColouriseWarpIsIdentity(
+    std::span<const TimingColouriseWarpPoint> points) {
+    constexpr float kEpsilon = 1.0e-5F;
+    return std::all_of(
+        points.begin(),
+        points.end(),
+        [](const TimingColouriseWarpPoint& point) {
+            return std::abs(
+                       point.fieldPosition - point.palettePosition) <=
+                       kEpsilon &&
+                   std::abs(point.spread) <= kEpsilon;
+        });
+}
+
+std::string AllocateTimingColourisePaletteSkewNodeId(
+    std::span<const TimingColourisePaletteSkewNode> nodes) {
+    for (std::size_t candidate = 1U;; ++candidate) {
+        std::string id = "skew-node-" + std::to_string(candidate);
+        if (std::none_of(
+                nodes.begin(),
+                nodes.end(),
+                [&](const TimingColourisePaletteSkewNode& node) {
+                    return node.id == id;
+                })) {
+            return id;
+        }
+    }
 }
 
 TimingColouriseLut ApplyTimingColourisePaletteSkew(
     const TimingColouriseLut& lut,
-    float centre,
-    float lowerSkew,
-    float upperSkew) {
-    const bool identity =
-        std::abs(FiniteOr(centre, 0.5F) - 0.5F) <=
-            std::numeric_limits<float>::epsilon() &&
-        std::abs(FiniteOr(lowerSkew, 0.0F)) <=
-            std::numeric_limits<float>::epsilon() &&
-        std::abs(FiniteOr(upperSkew, 0.0F)) <=
-            std::numeric_limits<float>::epsilon();
-    if (identity) {
+    std::span<const TimingColouriseWarpPoint> warp) {
+    if (TimingColouriseWarpIsIdentity(warp)) {
         return lut;
     }
+    const auto curve = BuildTimingColouriseWarpCurve(warp);
     TimingColouriseLut skewed{};
     for (std::size_t index = 0U; index < skewed.size(); ++index) {
         const float destination =
             static_cast<float>(index) /
             static_cast<float>(skewed.size() - 1U);
+        // Invert the forward warp per sample: which palette coordinate
+        // lands on this bounds fraction.
+        float low = 0.0F;
+        float high = 1.0F;
+        for (int iteration = 0; iteration < 28; ++iteration) {
+            const float middle = std::midpoint(low, high);
+            if (EvaluateTimingColouriseWarpCurve(curve, middle) <
+                destination) {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
         const auto sample = SampleTimingColouriseLut(
             lut,
-            TimingColourisePaletteSkewCoordinate(
-                centre,
-                lowerSkew,
-                upperSkew,
-                destination));
+            std::midpoint(low, high));
         skewed[index] = {
             sample.colour[0],
             sample.colour[1],
@@ -5978,32 +6234,6 @@ TimingColouriseLut ApplyTimingColourisePaletteSkew(
         };
     }
     return skewed;
-}
-
-float TimingColourisePaletteSkewFromSideFraction(
-    float sideFraction,
-    float paletteQuantile) {
-    // Solve towardEnd^gamma == paletteQuantile for gamma, then invert
-    // gamma == 4^skew. Fractions at the degenerate ends have no unique
-    // solution and resolve to the nearest representable skew.
-    const float quantile = std::clamp(
-        FiniteOr(paletteQuantile, 0.5F),
-        1.0e-4F,
-        1.0F - 1.0e-4F);
-    const float fraction = FiniteOr(sideFraction, quantile);
-    // A marker dragged to the centre needs gamma -> 0 (skew -1, ends
-    // stretched); dragged to the side's end it needs gamma -> infinity
-    // (skew +1, centre stretched) - independent of which quantile it marks.
-    if (fraction <= 1.0e-4F) {
-        return -1.0F;
-    }
-    if (fraction >= 1.0F - 1.0e-4F) {
-        return 1.0F;
-    }
-    const float gamma =
-        std::log(quantile) / std::log(fraction);
-    return ClampPaletteSkew(
-        std::log(gamma) / std::log(4.0F));
 }
 
 TimingColouriseLut ApplyTimingColourisePaletteLoop(
@@ -6290,10 +6520,12 @@ TimingColouriseLut EvaluateTimingColourisePaletteLut(
         TimingColouriseEffectParameter::AmountOverride);
     const float skewCentre = evaluatedParameter(
         TimingColouriseEffectParameter::PaletteSkewCentre);
-    const float skewLower = evaluatedParameter(
-        TimingColouriseEffectParameter::PaletteSkewLower);
-    const float skewUpper = evaluatedParameter(
-        TimingColouriseEffectParameter::PaletteSkewUpper);
+    const float skewSpread = evaluatedParameter(
+        TimingColouriseEffectParameter::PaletteSkewSpread);
+    const auto warp = BuildTimingColouriseWarpPoints(
+        skewCentre,
+        skewSpread,
+        sanitized.paletteSkewNodes);
     const auto finalize = [&](TimingColouriseLut lut) {
         // Loop first so the phase rotation cycles a seamless, end-matched
         // palette instead of dragging the mirror seam through the output.
@@ -6305,9 +6537,7 @@ TimingColouriseLut EvaluateTimingColourisePaletteLut(
         return ApplyTimingColouriseAmountOverride(
             ApplyTimingColourisePaletteSkew(
                 ApplyTimingColourisePalettePhase(lut, phaseOffset),
-                skewCentre,
-                skewLower,
-                skewUpper),
+                warp),
             sanitized.colouriseAmountOverrideMode,
             amountOverride);
     };

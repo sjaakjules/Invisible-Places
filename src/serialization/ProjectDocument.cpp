@@ -4886,6 +4886,12 @@ std::string TimingColouriseEffectParameterName(
             return "palette_skew_lower";
         case TimingColouriseEffectParameter::PaletteSkewUpper:
             return "palette_skew_upper";
+        case TimingColouriseEffectParameter::PaletteSkewSpread:
+            return "palette_skew_spread";
+        case TimingColouriseEffectParameter::EmissiveSkewCentre:
+            return "emissive_skew_centre";
+        case TimingColouriseEffectParameter::EmissiveSkewSpread:
+            return "emissive_skew_spread";
     }
     return "palette_phase";
 }
@@ -4914,6 +4920,15 @@ ParseTimingColouriseEffectParameter(const json& parameterJson) {
     }
     if (name == "palette_skew_upper") {
         return TimingColouriseEffectParameter::PaletteSkewUpper;
+    }
+    if (name == "palette_skew_spread") {
+        return TimingColouriseEffectParameter::PaletteSkewSpread;
+    }
+    if (name == "emissive_skew_centre") {
+        return TimingColouriseEffectParameter::EmissiveSkewCentre;
+    }
+    if (name == "emissive_skew_spread") {
+        return TimingColouriseEffectParameter::EmissiveSkewSpread;
     }
     return std::nullopt;
 }
@@ -5089,6 +5104,47 @@ ParseTimingColouriseBoundsKeys(const json& keysJson) {
         keys.push_back(std::move(key));
     }
     return keys;
+}
+
+json SerializeTimingColourisePaletteSkewNodes(
+    const std::vector<invisible_places::timing::
+                          TimingColourisePaletteSkewNode>& nodes) {
+    json nodesJson = json::array();
+    for (const auto& node : nodes) {
+        nodesJson.push_back({
+            {"id", node.id},
+            {"palette_position", node.palettePosition},
+            {"field_position", node.fieldPosition},
+            {"spread", node.spread},
+        });
+    }
+    return nodesJson;
+}
+
+std::vector<invisible_places::timing::TimingColourisePaletteSkewNode>
+ParseTimingColourisePaletteSkewNodes(const json& nodesJson) {
+    std::vector<invisible_places::timing::TimingColourisePaletteSkewNode>
+        nodes;
+    if (!nodesJson.is_array()) {
+        return nodes;
+    }
+    for (const auto& nodeJson : nodesJson) {
+        if (!nodeJson.is_object()) {
+            continue;
+        }
+        invisible_places::timing::TimingColourisePaletteSkewNode node;
+        node.id = nodeJson.value("id", std::string{});
+        if (node.id.empty()) {
+            continue;
+        }
+        node.palettePosition =
+            nodeJson.value("palette_position", node.palettePosition);
+        node.fieldPosition =
+            nodeJson.value("field_position", node.fieldPosition);
+        node.spread = nodeJson.value("spread", node.spread);
+        nodes.push_back(std::move(node));
+    }
+    return nodes;
 }
 
 json SerializeTimingColourisePaletteKeys(
@@ -5455,13 +5511,27 @@ json SerializeTimingColouriseEffect(
                 memoryJson["palette_skew_centre"] =
                     memory.paletteSkewCentre;
             }
-            if (memory.paletteSkewLower != 0.0F) {
-                memoryJson["palette_skew_lower"] =
-                    memory.paletteSkewLower;
+            if (memory.paletteSkewSpread != 0.0F) {
+                memoryJson["palette_skew_spread"] =
+                    memory.paletteSkewSpread;
             }
-            if (memory.paletteSkewUpper != 0.0F) {
-                memoryJson["palette_skew_upper"] =
-                    memory.paletteSkewUpper;
+            if (!memory.paletteSkewNodes.empty()) {
+                memoryJson["palette_skew_nodes"] =
+                    SerializeTimingColourisePaletteSkewNodes(
+                        memory.paletteSkewNodes);
+            }
+            if (memory.emissiveSkewCentre != 0.5F) {
+                memoryJson["emissive_skew_centre"] =
+                    memory.emissiveSkewCentre;
+            }
+            if (memory.emissiveSkewSpread != 0.0F) {
+                memoryJson["emissive_skew_spread"] =
+                    memory.emissiveSkewSpread;
+            }
+            if (!memory.emissiveSkewNodes.empty()) {
+                memoryJson["emissive_skew_nodes"] =
+                    SerializeTimingColourisePaletteSkewNodes(
+                        memory.emissiveSkewNodes);
             }
             visualMemoryJson.push_back(std::move(memoryJson));
         }
@@ -5486,11 +5556,26 @@ json SerializeTimingColouriseEffect(
     if (sanitized.paletteSkewCentre != 0.5F) {
         effectJson["palette_skew_centre"] = sanitized.paletteSkewCentre;
     }
-    if (sanitized.paletteSkewLower != 0.0F) {
-        effectJson["palette_skew_lower"] = sanitized.paletteSkewLower;
+    if (sanitized.paletteSkewSpread != 0.0F) {
+        effectJson["palette_skew_spread"] = sanitized.paletteSkewSpread;
     }
-    if (sanitized.paletteSkewUpper != 0.0F) {
-        effectJson["palette_skew_upper"] = sanitized.paletteSkewUpper;
+    if (!sanitized.paletteSkewNodes.empty()) {
+        effectJson["palette_skew_nodes"] =
+            SerializeTimingColourisePaletteSkewNodes(
+                sanitized.paletteSkewNodes);
+    }
+    if (sanitized.emissiveSkewCentre != 0.5F) {
+        effectJson["emissive_skew_centre"] =
+            sanitized.emissiveSkewCentre;
+    }
+    if (sanitized.emissiveSkewSpread != 0.0F) {
+        effectJson["emissive_skew_spread"] =
+            sanitized.emissiveSkewSpread;
+    }
+    if (!sanitized.emissiveSkewNodes.empty()) {
+        effectJson["emissive_skew_nodes"] =
+            SerializeTimingColourisePaletteSkewNodes(
+                sanitized.emissiveSkewNodes);
     }
     return effectJson;
 }
@@ -5660,12 +5745,34 @@ ParseTimingColouriseEffect(
     effect.paletteSkewCentre = effectJson.value(
         "palette_skew_centre",
         effect.paletteSkewCentre);
-    effect.paletteSkewLower = effectJson.value(
-        "palette_skew_lower",
-        effect.paletteSkewLower);
-    effect.paletteSkewUpper = effectJson.value(
-        "palette_skew_upper",
-        effect.paletteSkewUpper);
+    if (effectJson.contains("palette_skew_spread")) {
+        effect.paletteSkewSpread = effectJson.value(
+            "palette_skew_spread",
+            effect.paletteSkewSpread);
+    } else {
+        // Fold the short-lived per-side skews into the centre node's
+        // spread; keyed variants are retagged by sanitize.
+        effect.paletteSkewSpread =
+            (effectJson.value("palette_skew_lower", 0.0F) +
+             effectJson.value("palette_skew_upper", 0.0F)) *
+            0.5F;
+    }
+    if (effectJson.contains("palette_skew_nodes")) {
+        effect.paletteSkewNodes =
+            ParseTimingColourisePaletteSkewNodes(
+                effectJson.at("palette_skew_nodes"));
+    }
+    effect.emissiveSkewCentre = effectJson.value(
+        "emissive_skew_centre",
+        effect.emissiveSkewCentre);
+    effect.emissiveSkewSpread = effectJson.value(
+        "emissive_skew_spread",
+        effect.emissiveSkewSpread);
+    if (effectJson.contains("emissive_skew_nodes")) {
+        effect.emissiveSkewNodes =
+            ParseTimingColourisePaletteSkewNodes(
+                effectJson.at("emissive_skew_nodes"));
+    }
     effect.palettePhaseOffset = effectJson.value(
         "palette_phase_offset",
         effect.palettePhaseOffset);
@@ -5861,12 +5968,32 @@ ParseTimingColouriseEffect(
             memory.paletteSkewCentre = memoryJson.value(
                 "palette_skew_centre",
                 memory.paletteSkewCentre);
-            memory.paletteSkewLower = memoryJson.value(
-                "palette_skew_lower",
-                memory.paletteSkewLower);
-            memory.paletteSkewUpper = memoryJson.value(
-                "palette_skew_upper",
-                memory.paletteSkewUpper);
+            if (memoryJson.contains("palette_skew_spread")) {
+                memory.paletteSkewSpread = memoryJson.value(
+                    "palette_skew_spread",
+                    memory.paletteSkewSpread);
+            } else {
+                memory.paletteSkewSpread =
+                    (memoryJson.value("palette_skew_lower", 0.0F) +
+                     memoryJson.value("palette_skew_upper", 0.0F)) *
+                    0.5F;
+            }
+            if (memoryJson.contains("palette_skew_nodes")) {
+                memory.paletteSkewNodes =
+                    ParseTimingColourisePaletteSkewNodes(
+                        memoryJson.at("palette_skew_nodes"));
+            }
+            memory.emissiveSkewCentre = memoryJson.value(
+                "emissive_skew_centre",
+                memory.emissiveSkewCentre);
+            memory.emissiveSkewSpread = memoryJson.value(
+                "emissive_skew_spread",
+                memory.emissiveSkewSpread);
+            if (memoryJson.contains("emissive_skew_nodes")) {
+                memory.emissiveSkewNodes =
+                    ParseTimingColourisePaletteSkewNodes(
+                        memoryJson.at("emissive_skew_nodes"));
+            }
             memory.emissiveLevel = memoryJson.value(
                 "emissive_level",
                 memory.emissiveLevel);

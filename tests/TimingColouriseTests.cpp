@@ -4004,80 +4004,111 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "Timing Colourise palette skew remaps sampling without moving stops",
+    "Timing Colourise warp nodes remap sampling without moving stops",
     "[timing][colourise][palette][skew]") {
-    using invisible_places::timing::TimingColourisePaletteSkewCoordinate;
+    using invisible_places::timing::BuildTimingColouriseWarpPoints;
+    using invisible_places::timing::EvaluateTimingColouriseWarpFieldPosition;
+    using invisible_places::timing::
+        EvaluateTimingColouriseWarpPaletteCoordinate;
+    using invisible_places::timing::TimingColourisePaletteSkewNode;
 
-    SECTION("identity parameters are the linear map") {
-        for (const float t : {0.0F, 0.2F, 0.5F, 0.83F, 1.0F}) {
+    SECTION("the neutral centre node is the identity") {
+        const auto warp = BuildTimingColouriseWarpPoints(0.5F, 0.0F, {});
+        CHECK(invisible_places::timing::TimingColouriseWarpIsIdentity(warp));
+        for (const float p : {0.0F, 0.2F, 0.5F, 0.83F, 1.0F}) {
             CHECK(
-                TimingColourisePaletteSkewCoordinate(0.5F, 0.0F, 0.0F, t) ==
-                Approx(t).margin(1.0e-6F));
+                EvaluateTimingColouriseWarpFieldPosition(warp, p) ==
+                Approx(p).margin(1.0e-4F));
         }
     }
 
-    SECTION("the centre always lands on the palette midpoint") {
-        for (const float centre : {0.0F, 0.25F, 0.5F, 0.9F, 1.0F}) {
+    SECTION("the centre node pins the palette midpoint where it sits") {
+        for (const float centre : {0.2F, 0.5F, 0.8F}) {
+            const auto warp =
+                BuildTimingColouriseWarpPoints(centre, 0.0F, {});
             CHECK(
-                TimingColourisePaletteSkewCoordinate(
+                EvaluateTimingColouriseWarpFieldPosition(warp, 0.5F) ==
+                Approx(centre).margin(2.0e-3F));
+            CHECK(
+                EvaluateTimingColouriseWarpPaletteCoordinate(
+                    warp,
+                    centre) == Approx(0.5F).margin(2.0e-3F));
+        }
+    }
+
+    SECTION("spread widens the area around the node, pinch narrows it") {
+        const auto measureCentreArea = [](float spread) {
+            const auto warp =
+                BuildTimingColouriseWarpPoints(0.5F, spread, {});
+            // Field area covered by the middle fifth of the palette.
+            return EvaluateTimingColouriseWarpFieldPosition(warp, 0.6F) -
+                   EvaluateTimingColouriseWarpFieldPosition(warp, 0.4F);
+        };
+        const float neutral = measureCentreArea(0.0F);
+        CHECK(measureCentreArea(1.0F) > neutral * 1.5F);
+        CHECK(measureCentreArea(-1.0F) < neutral * 0.6F);
+    }
+
+    SECTION("extra nodes pin their own palette coordinate") {
+        const TimingColourisePaletteSkewNode node{
+            .id = "skew-node-1",
+            .palettePosition = 0.25F,
+            .fieldPosition = 0.6F,
+            .spread = 0.0F,
+        };
+        const auto warp = BuildTimingColouriseWarpPoints(
+            0.75F,
+            0.0F,
+            std::span<const TimingColourisePaletteSkewNode>{&node, 1U});
+        CHECK(
+            EvaluateTimingColouriseWarpFieldPosition(warp, 0.25F) ==
+            Approx(0.6F).margin(2.0e-3F));
+        CHECK(
+            EvaluateTimingColouriseWarpFieldPosition(warp, 0.5F) ==
+            Approx(0.75F).margin(2.0e-3F));
+    }
+
+    SECTION("the map stays monotone for every node combination") {
+        const std::array<TimingColourisePaletteSkewNode, 2> nodes{
+            TimingColourisePaletteSkewNode{
+                .id = "a",
+                .palettePosition = 0.2F,
+                .fieldPosition = 0.75F,
+                .spread = 1.0F},
+            TimingColourisePaletteSkewNode{
+                .id = "b",
+                .palettePosition = 0.8F,
+                .fieldPosition = 0.85F,
+                .spread = -1.0F},
+        };
+        for (const float centre : {0.1F, 0.5F, 0.9F}) {
+            for (const float spread : {-1.0F, 0.0F, 1.0F}) {
+                const auto warp = BuildTimingColouriseWarpPoints(
                     centre,
-                    0.6F,
-                    -0.3F,
-                    centre) == Approx(0.5F).margin(1.0e-6F));
-        }
-        CHECK(
-            TimingColourisePaletteSkewCoordinate(0.25F, 0.0F, 0.0F, 0.0F) ==
-            Approx(0.0F).margin(1.0e-6F));
-        CHECK(
-            TimingColourisePaletteSkewCoordinate(0.25F, 0.0F, 0.0F, 1.0F) ==
-            Approx(1.0F).margin(1.0e-6F));
-    }
-
-    SECTION("positive skew stretches the centre-adjacent colours") {
-        // With upper skew +1 the exponent is 4, so most of the right half
-        // keeps sampling near the palette midpoint.
-        const float skewed =
-            TimingColourisePaletteSkewCoordinate(0.5F, 0.0F, 1.0F, 0.75F);
-        CHECK(skewed < 0.6F);
-        // With upper skew -1 the end colours claim the same fraction.
-        const float endStretched =
-            TimingColourisePaletteSkewCoordinate(0.5F, 0.0F, -1.0F, 0.75F);
-        CHECK(endStretched > 0.9F);
-    }
-
-    SECTION("the map is monotone for every parameter combination") {
-        for (const float centre : {0.15F, 0.5F, 0.85F}) {
-            for (const float lower : {-1.0F, 0.0F, 0.7F}) {
-                for (const float upper : {-0.6F, 0.0F, 1.0F}) {
-                    float previous = -1.0F;
-                    for (int step = 0; step <= 64; ++step) {
-                        const float t =
-                            static_cast<float>(step) / 64.0F;
-                        const float mapped =
-                            TimingColourisePaletteSkewCoordinate(
-                                centre,
-                                lower,
-                                upper,
-                                t);
-                        CHECK(mapped >= previous - 1.0e-6F);
-                        previous = mapped;
-                    }
+                    spread,
+                    nodes);
+                float previous = -1.0F;
+                for (int step = 0; step <= 64; ++step) {
+                    const float p =
+                        static_cast<float>(step) / 64.0F;
+                    const float mapped =
+                        EvaluateTimingColouriseWarpFieldPosition(
+                            warp,
+                            p);
+                    CHECK(mapped >= previous - 1.0e-5F);
+                    previous = mapped;
                 }
-            }
-        }
-    }
-
-    SECTION("triangle-handle solve inverts the quantile placement") {
-        for (const float skew : {-0.8F, -0.25F, 0.0F, 0.4F, 1.0F}) {
-            for (const float quantile : {0.25F, 0.75F}) {
-                const float gamma = std::pow(4.0F, skew);
-                const float fraction =
-                    std::pow(quantile, 1.0F / gamma);
-                CHECK(
-                    invisible_places::timing::
-                        TimingColourisePaletteSkewFromSideFraction(
-                            fraction,
-                            quantile) == Approx(skew).margin(2.0e-3F));
+                // The inverse agrees with the forward map.
+                for (const float p : {0.15F, 0.5F, 0.85F}) {
+                    const float t =
+                        EvaluateTimingColouriseWarpFieldPosition(
+                            warp,
+                            p);
+                    CHECK(
+                        EvaluateTimingColouriseWarpPaletteCoordinate(
+                            warp,
+                            t) == Approx(p).margin(2.0e-3F));
+                }
             }
         }
     }
@@ -4104,7 +4135,7 @@ TEST_CASE(
         // The palette midpoint (grey 0.5) now sits a quarter of the way in.
         const auto quarter =
             invisible_places::timing::SampleTimingColouriseLut(base, 0.25F);
-        CHECK(quarter.colour[0] == Approx(0.5F).margin(0.02F));
+        CHECK(quarter.colour[0] == Approx(0.5F).margin(0.03F));
 
         // A key on the skew-centre track overrides the base value.
         REQUIRE(invisible_places::timing::
@@ -4122,7 +4153,7 @@ TEST_CASE(
             invisible_places::timing::SampleTimingColouriseLut(
                 keyed,
                 0.75F);
-        CHECK(threeQuarter.colour[0] == Approx(0.5F).margin(0.02F));
+        CHECK(threeQuarter.colour[0] == Approx(0.5F).margin(0.03F));
 
         // Skew never rewrites the authored stops.
         const auto authored =
@@ -4132,6 +4163,30 @@ TEST_CASE(
         REQUIRE(authored.stops.size() == 2U);
         CHECK(authored.stops[0].position == Approx(0.0F));
         CHECK(authored.stops[1].position == Approx(1.0F));
+    }
+
+    SECTION("legacy per-side skew keys retag onto the spread track") {
+        TimingColouriseEffect effect;
+        effect.effectParameterKeys.push_back({
+            .parameter =
+                TimingColouriseEffectParameter::PaletteSkewLower,
+            .position = 0.3F,
+            .value = 0.6F,
+        });
+        effect.effectParameterKeys.push_back({
+            .parameter =
+                TimingColouriseEffectParameter::PaletteSkewUpper,
+            .position = 0.7F,
+            .value = -0.4F,
+        });
+        const auto sanitized =
+            invisible_places::timing::SanitizeTimingColouriseEffect(
+                effect);
+        REQUIRE(sanitized.effectParameterKeys.size() == 2U);
+        for (const auto& key : sanitized.effectParameterKeys) {
+            CHECK(key.parameter ==
+                  TimingColouriseEffectParameter::PaletteSkewSpread);
+        }
     }
 }
 

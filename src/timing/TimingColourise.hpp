@@ -105,12 +105,62 @@ enum class TimingColouriseEffectParameter : std::uint8_t {
     EmissiveLevel,
     // Palette Skew redistributes how the selected bounds span maps onto the
     // palette without changing any stop. Centre is the bounds fraction where
-    // the palette's midpoint lands; the per-side skews trade area between
-    // the centre-adjacent and end-adjacent colours of that side.
+    // the palette's midpoint lands and Spread is the centre node's local
+    // pinch/spread. The per-side Lower/Upper parameters are legacy: sanitize
+    // retags their keys onto Spread, so no live track carries them.
     PaletteSkewCentre,
     PaletteSkewLower,
     PaletteSkewUpper,
+    PaletteSkewSpread,
+    // The emissive falloff curve owns the same warp pair over the bounds
+    // span, independent of the palette's.
+    EmissiveSkewCentre,
+    EmissiveSkewSpread,
 };
+
+// One extra warp node beside the always-present centre node. The node pins
+// palette (or falloff-curve) coordinate `palettePosition` to the bounds
+// fraction `fieldPosition`; `spread` in [-1, 1] scales the mapping's local
+// density around it (positive spreads the surrounding area, negative
+// pinches it). Extra nodes are authored state; only the centre node's
+// coordinates are keyable.
+struct TimingColourisePaletteSkewNode {
+    std::string id;
+    float palettePosition = 0.5F;
+    float fieldPosition = 0.5F;
+    float spread = 0.0F;
+};
+
+// A sanitized control point of the forward warp: strictly increasing in
+// both coordinates between the implicit (0,0) and (1,1) endpoints.
+struct TimingColouriseWarpPoint {
+    float palettePosition = 0.5F;
+    float fieldPosition = 0.5F;
+    float spread = 0.0F;
+};
+
+// Builds the sorted, collision-clamped control points for one warp from the
+// centre node plus any extra nodes. The result always contains at least the
+// centre node.
+[[nodiscard]] std::vector<TimingColouriseWarpPoint>
+BuildTimingColouriseWarpPoints(
+    float centreFieldPosition,
+    float centreSpread,
+    std::span<const TimingColourisePaletteSkewNode> extraNodes);
+// Forward warp: the bounds fraction where one palette (or falloff)
+// coordinate lands. Monotone cubic Hermite through the control points with
+// 4^spread tangent scaling, re-limited so the map never reverses.
+[[nodiscard]] float EvaluateTimingColouriseWarpFieldPosition(
+    std::span<const TimingColouriseWarpPoint> points,
+    float palettePosition);
+// Inverse warp: the palette coordinate sampled at one bounds fraction.
+[[nodiscard]] float EvaluateTimingColouriseWarpPaletteCoordinate(
+    std::span<const TimingColouriseWarpPoint> points,
+    float fieldFraction);
+[[nodiscard]] bool TimingColouriseWarpIsIdentity(
+    std::span<const TimingColouriseWarpPoint> points);
+[[nodiscard]] std::string AllocateTimingColourisePaletteSkewNodeId(
+    std::span<const TimingColourisePaletteSkewNode> nodes);
 
 enum class TimingColourisePaletteStopParameter : std::uint8_t {
     Position = 0,
@@ -297,8 +347,11 @@ struct TimingColouriseFieldVisualMemory {
     float colouriseAmountOverride = 1.0F;
     float palettePhaseOffset = 0.0F;
     float paletteSkewCentre = 0.5F;
-    float paletteSkewLower = 0.0F;
-    float paletteSkewUpper = 0.0F;
+    float paletteSkewSpread = 0.0F;
+    std::vector<TimingColourisePaletteSkewNode> paletteSkewNodes;
+    float emissiveSkewCentre = 0.5F;
+    float emissiveSkewSpread = 0.0F;
+    std::vector<TimingColourisePaletteSkewNode> emissiveSkewNodes;
     float emissiveLevel = 1.0F;
     std::vector<TimingColouriseEffectParameterKey> effectParameterKeys;
     std::vector<TimingColourisePaletteKey> paletteKeys;
@@ -371,14 +424,19 @@ struct TimingColouriseEffect {
     // and every stop key keep their positions. The mirrored output is
     // seamless, so phase animation cycles without a visible join.
     bool paletteLooped = false;
-    // Base values for the Palette Skew controls; keys on the matching
+    // Base values for the Palette Skew centre node; keys on the matching
     // TimingColouriseEffectParameter tracks override them. Skew is a pure
-    // sampling remap of the bounds span: 0.5/0/0 is the identity, the centre
-    // moves the palette midpoint, and each side's skew in [-1, 1] stretches
-    // the centre-adjacent colours (positive) or the end colours (negative).
+    // sampling remap of the bounds span: centre 0.5 with spread 0 and no
+    // extra nodes is the identity. Moving the centre skews where the
+    // palette midpoint lands; its spread pinches or spreads the area
+    // around it. Extra nodes below pin further palette coordinates.
     float paletteSkewCentre = 0.5F;
-    float paletteSkewLower = 0.0F;
-    float paletteSkewUpper = 0.0F;
+    float paletteSkewSpread = 0.0F;
+    std::vector<TimingColourisePaletteSkewNode> paletteSkewNodes;
+    // The emissive falloff curve's own warp over the same bounds span.
+    float emissiveSkewCentre = 0.5F;
+    float emissiveSkewSpread = 0.0F;
+    std::vector<TimingColourisePaletteSkewNode> emissiveSkewNodes;
     // Base cyclic offset in palette turns. Palette Phase keys below store a
     // signed delta from the preceding phase key (or this base for the first
     // key), constrained to one turn in either direction. Evaluation
@@ -1039,31 +1097,12 @@ std::size_t MergeLegacyTimingEffectAspects(
 // an end-matched cyclic palette.
 [[nodiscard]] TimingColouriseLut ApplyTimingColourisePaletteLoop(
     const TimingColouriseLut& lut);
-// Palette Skew: maps a normalized bounds fraction onto the palette
-// coordinate it samples. Monotone and continuous, with t == centre always
-// landing on the palette midpoint. Each side follows a power curve whose
-// exponent is 4^skew, so skew 0 is linear, positive skew stretches the
-// centre-adjacent colours of that side and negative skew stretches its end
-// colours. A centre of 0 or 1 collapses that side to a single instant.
-[[nodiscard]] float TimingColourisePaletteSkewCoordinate(
-    float centre,
-    float lowerSkew,
-    float upperSkew,
-    float boundsFraction);
-// Resamples a LUT through the skew map. Identity parameters return the
-// input LUT unchanged.
+// Resamples a LUT through the inverse warp so LUT index t (a bounds
+// fraction) shows the palette coordinate the warp maps there. An identity
+// warp returns the input LUT unchanged.
 [[nodiscard]] TimingColouriseLut ApplyTimingColourisePaletteSkew(
     const TimingColouriseLut& lut,
-    float centre,
-    float lowerSkew,
-    float upperSkew);
-// Solves the side skew that places the palette coordinate `paletteQuantile`
-// of one side (0..1 measured from the centre toward that side's end) at the
-// side fraction `sideFraction` of the bounds half. Used by the histogram's
-// skew triangles; the result is clamped to the authored [-1, 1] range.
-[[nodiscard]] float TimingColourisePaletteSkewFromSideFraction(
-    float sideFraction,
-    float paletteQuantile);
+    std::span<const TimingColouriseWarpPoint> warp);
 [[nodiscard]] float EvaluateTimingColouriseEffectParameter(
     const TimingColouriseEffect& effect,
     TimingColouriseEffectParameter parameter,
