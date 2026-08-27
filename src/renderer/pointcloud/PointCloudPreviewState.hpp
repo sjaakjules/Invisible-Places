@@ -5,6 +5,7 @@
 
 #include <glm/mat4x4.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -40,6 +41,106 @@ enum class TimingColouriseOutput : std::uint32_t {
     Emissive = 1U,
 };
 
+// Compositing mode for a colourise effect against the colour beneath it
+// (earlier slots, or the base cloud colour). Values match
+// timing::TimingColouriseBlendMode and the constants in
+// shaders/pointcloud_timing_colourise.glsl.
+enum class TimingColouriseBlendMode : std::uint32_t {
+    Normal = 0U,
+    Multiply = 1U,
+    Screen = 2U,
+    Add = 3U,
+    Divide = 4U,
+    VividLight = 5U,
+};
+
+// Divisors in the Divide and Vivid Light modes are floored here so the fold
+// stays finite; the hard clip this produces at extreme wash values matches
+// the After Effects float-space look once the output clamps.
+inline constexpr float kTimingColouriseBlendDivisorFloor = 1.0e-3F;
+
+// One colourise step is blended = base * scale + offset for every supported
+// mode, because each mode is linear in the base colour once the wash colour
+// is known (Vivid Light branches on the wash, never the base). That keeps a
+// whole stack foldable into one per-channel scale/offset pair across the
+// vertex->fragment interface. Mirrored by FoldTimingColouriseBlendStep in
+// shaders/pointcloud_timing_colourise.glsl; the two must stay identical.
+inline void ComposeTimingColouriseBlendStep(
+    TimingColouriseBlendMode mode,
+    const std::array<float, 3>& wash,
+    float amount,
+    std::array<float, 3>* scale,
+    std::array<float, 3>* offset) {
+    for (std::size_t channel = 0U; channel < 3U; ++channel) {
+        const float washValue = wash[channel];
+        float branchScale = 0.0F;
+        float branchOffset = washValue;
+        switch (mode) {
+            case TimingColouriseBlendMode::Normal:
+                break;
+            case TimingColouriseBlendMode::Multiply:
+                branchScale = washValue;
+                branchOffset = 0.0F;
+                break;
+            case TimingColouriseBlendMode::Screen:
+                branchScale = 1.0F - washValue;
+                branchOffset = washValue;
+                break;
+            case TimingColouriseBlendMode::Add:
+                branchScale = 1.0F;
+                branchOffset = washValue;
+                break;
+            case TimingColouriseBlendMode::Divide:
+                branchScale = 1.0F /
+                              std::max(
+                                  washValue,
+                                  kTimingColouriseBlendDivisorFloor);
+                branchOffset = 0.0F;
+                break;
+            case TimingColouriseBlendMode::VividLight:
+                if (washValue < 0.5F) {
+                    branchScale =
+                        1.0F /
+                        std::max(
+                            2.0F * washValue,
+                            kTimingColouriseBlendDivisorFloor);
+                    branchOffset = 1.0F - branchScale;
+                } else {
+                    branchScale =
+                        1.0F /
+                        std::max(
+                            2.0F * (1.0F - washValue),
+                            kTimingColouriseBlendDivisorFloor);
+                    branchOffset = 0.0F;
+                }
+                break;
+        }
+        const float stepScale =
+            (1.0F - amount) + amount * branchScale;
+        const float stepOffset = amount * branchOffset;
+        (*scale)[channel] *= stepScale;
+        (*offset)[channel] =
+            (*offset)[channel] * stepScale + stepOffset;
+    }
+}
+
+// Sequential form of the same step for callers that hold the base colour
+// (the offline renderer and tests).
+inline std::array<float, 3> ApplyTimingColouriseBlendStep(
+    TimingColouriseBlendMode mode,
+    const std::array<float, 3>& base,
+    const std::array<float, 3>& wash,
+    float amount) {
+    std::array<float, 3> scale{1.0F, 1.0F, 1.0F};
+    std::array<float, 3> offset{0.0F, 0.0F, 0.0F};
+    ComposeTimingColouriseBlendStep(mode, wash, amount, &scale, &offset);
+    return {
+        base[0] * scale[0] + offset[0],
+        base[1] * scale[1] + offset[1],
+        base[2] * scale[2] + offset[2],
+    };
+}
+
 struct ResolvedTimingColouriseEffect {
     bool enabled = false;
     TimingColouriseSource source = TimingColouriseSource::ScalarField;
@@ -56,6 +157,9 @@ struct ResolvedTimingColouriseEffect {
     // values add emission; negative values darken point colour, with -1 fully
     // dark at full mask. Colourise effects ignore this value.
     float emissiveLevel = 0.0F;
+    // Compositing mode against the colour beneath this slot. Emissive
+    // output ignores it.
+    TimingColouriseBlendMode blendMode = TimingColouriseBlendMode::Normal;
     // RGB is the tint and A is colourise amount. Alpha never changes point
     // opacity.
     std::array<std::array<float, 4>, kTimingColouriseLutSamples> rgbaLut{};

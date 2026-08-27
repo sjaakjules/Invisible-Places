@@ -1,3 +1,4 @@
+#include "renderer/pointcloud/PointCloudPreviewState.hpp"
 #include "serialization/ProjectDocument.hpp"
 #include "serialization/ProjectDocumentJson.hpp"
 #include "timing/TimingColourise.hpp"
@@ -7936,4 +7937,207 @@ TEST_CASE(
     CHECK(
         authoredLoaded->selectedTimingTakeId ==
         invisible_places::timing::kAuthoredTimingTakeId);
+}
+
+TEST_CASE(
+    "Colourise blend steps anchor to their compositing identities",
+    "[timing][colourise][blend]") {
+    using invisible_places::renderer::pointcloud::
+        ApplyTimingColouriseBlendStep;
+    using invisible_places::renderer::pointcloud::TimingColouriseBlendMode;
+
+    const std::array<float, 3> base{0.3F, 0.6F, 0.9F};
+    const std::array<float, 3> wash{0.8F, 0.5F, 0.2F};
+    constexpr std::array<TimingColouriseBlendMode, 6> kModes = {
+        TimingColouriseBlendMode::Normal,
+        TimingColouriseBlendMode::Multiply,
+        TimingColouriseBlendMode::Screen,
+        TimingColouriseBlendMode::Add,
+        TimingColouriseBlendMode::Divide,
+        TimingColouriseBlendMode::VividLight,
+    };
+
+    SECTION("zero amount leaves the base untouched in every mode") {
+        for (const auto mode : kModes) {
+            const auto result =
+                ApplyTimingColouriseBlendStep(mode, base, wash, 0.0F);
+            for (std::size_t channel = 0; channel < 3; ++channel) {
+                CHECK(result[channel] == Approx(base[channel]));
+            }
+        }
+    }
+
+    SECTION("Normal at full amount replaces with the wash") {
+        const auto result = ApplyTimingColouriseBlendStep(
+            TimingColouriseBlendMode::Normal,
+            base,
+            wash,
+            1.0F);
+        for (std::size_t channel = 0; channel < 3; ++channel) {
+            CHECK(result[channel] == Approx(wash[channel]));
+        }
+        // Half amount is the historical mix.
+        const auto half = ApplyTimingColouriseBlendStep(
+            TimingColouriseBlendMode::Normal,
+            base,
+            wash,
+            0.5F);
+        for (std::size_t channel = 0; channel < 3; ++channel) {
+            CHECK(
+                half[channel] ==
+                Approx(0.5F * base[channel] + 0.5F * wash[channel]));
+        }
+    }
+
+    SECTION("Multiply lays the wash into a white base and keeps black") {
+        const auto overWhite = ApplyTimingColouriseBlendStep(
+            TimingColouriseBlendMode::Multiply,
+            {1.0F, 1.0F, 1.0F},
+            wash,
+            1.0F);
+        const auto overBlack = ApplyTimingColouriseBlendStep(
+            TimingColouriseBlendMode::Multiply,
+            {0.0F, 0.0F, 0.0F},
+            wash,
+            1.0F);
+        for (std::size_t channel = 0; channel < 3; ++channel) {
+            CHECK(overWhite[channel] == Approx(wash[channel]));
+            CHECK(overBlack[channel] == Approx(0.0F));
+        }
+    }
+
+    SECTION("Screen lays the wash into a black base and keeps white") {
+        const auto overBlack = ApplyTimingColouriseBlendStep(
+            TimingColouriseBlendMode::Screen,
+            {0.0F, 0.0F, 0.0F},
+            wash,
+            1.0F);
+        const auto overWhite = ApplyTimingColouriseBlendStep(
+            TimingColouriseBlendMode::Screen,
+            {1.0F, 1.0F, 1.0F},
+            wash,
+            1.0F);
+        for (std::size_t channel = 0; channel < 3; ++channel) {
+            CHECK(overBlack[channel] == Approx(wash[channel]));
+            CHECK(overWhite[channel] == Approx(1.0F));
+        }
+    }
+
+    SECTION("Add sums and Divide brightens by the wash reciprocal") {
+        const auto added = ApplyTimingColouriseBlendStep(
+            TimingColouriseBlendMode::Add,
+            base,
+            wash,
+            1.0F);
+        const auto identity = ApplyTimingColouriseBlendStep(
+            TimingColouriseBlendMode::Divide,
+            base,
+            {1.0F, 1.0F, 1.0F},
+            1.0F);
+        const auto doubled = ApplyTimingColouriseBlendStep(
+            TimingColouriseBlendMode::Divide,
+            base,
+            {0.5F, 0.5F, 0.5F},
+            1.0F);
+        for (std::size_t channel = 0; channel < 3; ++channel) {
+            CHECK(
+                added[channel] ==
+                Approx(base[channel] + wash[channel]));
+            CHECK(identity[channel] == Approx(base[channel]));
+            CHECK(doubled[channel] == Approx(2.0F * base[channel]));
+        }
+    }
+
+    SECTION("Vivid Light is the identity at a mid wash and clips hard") {
+        const auto identity = ApplyTimingColouriseBlendStep(
+            TimingColouriseBlendMode::VividLight,
+            base,
+            {0.5F, 0.5F, 0.5F},
+            1.0F);
+        for (std::size_t channel = 0; channel < 3; ++channel) {
+            CHECK(identity[channel] == Approx(base[channel]));
+        }
+        // A black wash burns everything below pure white far negative
+        // (clipping black downstream); a white wash dodges far positive.
+        const auto burned = ApplyTimingColouriseBlendStep(
+            TimingColouriseBlendMode::VividLight,
+            base,
+            {0.0F, 0.0F, 0.0F},
+            1.0F);
+        const auto dodged = ApplyTimingColouriseBlendStep(
+            TimingColouriseBlendMode::VividLight,
+            base,
+            {1.0F, 1.0F, 1.0F},
+            1.0F);
+        for (std::size_t channel = 0; channel < 3; ++channel) {
+            CHECK(burned[channel] < 0.0F);
+            CHECK(dodged[channel] > 1.0F);
+        }
+    }
+}
+
+TEST_CASE(
+    "Folded colourise blend stacks match sequential application",
+    "[timing][colourise][blend][fold]") {
+    using invisible_places::renderer::pointcloud::
+        ApplyTimingColouriseBlendStep;
+    using invisible_places::renderer::pointcloud::
+        ComposeTimingColouriseBlendStep;
+    using invisible_places::renderer::pointcloud::TimingColouriseBlendMode;
+
+    // Deterministic congruential values stand in for arbitrary authored
+    // stacks; the fold must reproduce sequential blending for any order of
+    // modes, washes, and amounts because the GPU only ever sees the fold.
+    std::uint32_t lcgState = 12345U;
+    const auto nextUnit = [&lcgState]() {
+        lcgState = lcgState * 1664525U + 1013904223U;
+        return static_cast<float>((lcgState >> 8U) & 0xFFFFU) / 65535.0F;
+    };
+    constexpr std::array<TimingColouriseBlendMode, 6> kModes = {
+        TimingColouriseBlendMode::Normal,
+        TimingColouriseBlendMode::Multiply,
+        TimingColouriseBlendMode::Screen,
+        TimingColouriseBlendMode::Add,
+        TimingColouriseBlendMode::Divide,
+        TimingColouriseBlendMode::VividLight,
+    };
+
+    for (int trial = 0; trial < 64; ++trial) {
+        const std::array<float, 3> base{
+            nextUnit(),
+            nextUnit(),
+            nextUnit()};
+        std::array<float, 3> sequential = base;
+        std::array<float, 3> scale{1.0F, 1.0F, 1.0F};
+        std::array<float, 3> offset{0.0F, 0.0F, 0.0F};
+        for (int step = 0; step < 5; ++step) {
+            const auto mode = kModes
+                [static_cast<std::size_t>(
+                     nextUnit() * 5.99F) %
+                 kModes.size()];
+            const std::array<float, 3> wash{
+                nextUnit(),
+                nextUnit(),
+                nextUnit()};
+            const float amount = nextUnit();
+            sequential = ApplyTimingColouriseBlendStep(
+                mode,
+                sequential,
+                wash,
+                amount);
+            ComposeTimingColouriseBlendStep(
+                mode,
+                wash,
+                amount,
+                &scale,
+                &offset);
+        }
+        for (std::size_t channel = 0; channel < 3; ++channel) {
+            const float folded =
+                base[channel] * scale[channel] + offset[channel];
+            CHECK(
+                folded ==
+                Approx(sequential[channel]).margin(1.0e-3));
+        }
+    }
 }
