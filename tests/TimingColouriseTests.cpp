@@ -2591,6 +2591,123 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Timing Colourise emissive falloff shapes the level across the bounds",
+    "[timing][colourise][emissive][falloff]") {
+    using invisible_places::timing::TimingColouriseEmissiveFalloffNode;
+    using invisible_places::timing::
+        TimingColouriseEmissiveFalloffParameter;
+
+    TimingColouriseEffect effect;
+    effect.colouriseEnabled = false;
+    effect.emissiveEnabled = true;
+    effect.field.scalarFieldName = "Heat";
+    effect.emissiveLevel = 2.0F;
+
+    SECTION("no nodes is the flat historical response") {
+        const auto profile = invisible_places::timing::
+            EvaluateTimingEmissiveFalloffProfile(effect, 0.0F);
+        for (const float value : profile) {
+            CHECK(value == Approx(2.0F));
+        }
+    }
+
+    SECTION("a single node still yields a straight line") {
+        effect.emissiveFalloffNodes.push_back(
+            TimingColouriseEmissiveFalloffNode{
+                .id = "falloff-node-1",
+                .position = 0.5F,
+                .level = 0.5F,
+            });
+        const auto profile = invisible_places::timing::
+            EvaluateTimingEmissiveFalloffProfile(effect, 0.0F);
+        for (const float value : profile) {
+            CHECK(value == Approx(1.0F));
+        }
+    }
+
+    SECTION("two nodes fall off across the span and hold past the ends") {
+        effect.emissiveFalloffNodes = {
+            {.id = "left", .position = 0.25F, .level = 1.0F},
+            {.id = "right", .position = 0.75F, .level = 0.0F},
+        };
+        const auto profile = invisible_places::timing::
+            EvaluateTimingEmissiveFalloffProfile(effect, 0.0F);
+        CHECK(profile.front() == Approx(2.0F));
+        CHECK(profile[16] == Approx(2.0F).margin(0.05F));
+        CHECK(profile[32] == Approx(1.0F).margin(0.05F));
+        CHECK(profile[48] == Approx(0.0F).margin(0.01F));
+        CHECK(profile.back() == Approx(0.0F).margin(0.01F));
+        // Monotone between the nodes.
+        for (std::size_t index = 17U; index <= 48U; ++index) {
+            CHECK(profile[index] <= profile[index - 1U] + 1.0e-4F);
+        }
+    }
+
+    SECTION("node coordinates key over animation time") {
+        effect.emissiveFalloffNodes = {
+            {.id = "mobile", .position = 0.2F, .level = 1.0F},
+        };
+        REQUIRE(invisible_places::timing::
+                    AddOrUpdateTimingColouriseEmissiveFalloffKey(
+                        &effect,
+                        "mobile",
+                        TimingColouriseEmissiveFalloffParameter::Level,
+                        0.0F,
+                        1.0F,
+                        WaterScenarioInterpolation::Linear));
+        REQUIRE(invisible_places::timing::
+                    AddOrUpdateTimingColouriseEmissiveFalloffKey(
+                        &effect,
+                        "mobile",
+                        TimingColouriseEmissiveFalloffParameter::Level,
+                        1.0F,
+                        0.0F,
+                        WaterScenarioInterpolation::Linear));
+        const auto nodesAtStart = invisible_places::timing::
+            EvaluateTimingColouriseEmissiveFalloffNodes(effect, 0.0F);
+        REQUIRE(nodesAtStart.size() == 1U);
+        CHECK(nodesAtStart.front().level == Approx(1.0F));
+        const auto nodesAtMiddle = invisible_places::timing::
+            EvaluateTimingColouriseEmissiveFalloffNodes(effect, 0.5F);
+        CHECK(nodesAtMiddle.front().level == Approx(0.5F));
+        const auto profile = invisible_places::timing::
+            EvaluateTimingEmissiveFalloffProfile(effect, 0.5F);
+        CHECK(profile[32] == Approx(1.0F));
+
+        // Keys for unknown nodes are refused; removal works by track.
+        CHECK_FALSE(invisible_places::timing::
+                        AddOrUpdateTimingColouriseEmissiveFalloffKey(
+                            &effect,
+                            "missing",
+                            TimingColouriseEmissiveFalloffParameter::
+                                Level,
+                            0.5F,
+                            1.0F));
+        CHECK(invisible_places::timing::
+                  RemoveTimingColouriseEmissiveFalloffKeysAtPosition(
+                      &effect,
+                      "mobile",
+                      TimingColouriseEmissiveFalloffParameter::Level,
+                      1.0F) == 1U);
+        CHECK(effect.emissiveFalloffKeys.size() == 1U);
+    }
+
+    SECTION("the emissive skew warp shifts where the falloff lands") {
+        effect.emissiveFalloffNodes = {
+            {.id = "left", .position = 0.25F, .level = 1.0F},
+            {.id = "right", .position = 0.75F, .level = 0.0F},
+        };
+        // Push the curve midpoint (falloff coordinate 0.5) to bounds
+        // fraction 0.75: the high-level half now covers three quarters.
+        effect.emissiveSkewCentre = 0.75F;
+        const auto profile = invisible_places::timing::
+            EvaluateTimingEmissiveFalloffProfile(effect, 0.0F);
+        CHECK(profile[48] == Approx(1.0F).margin(0.08F));
+        CHECK(profile.back() == Approx(0.0F).margin(0.01F));
+    }
+}
+
+TEST_CASE(
     "Timing Colourise saved palettes keep private edited variants",
     "[timing][colourise][palette][local-edit][saved]") {
     using invisible_places::timing::TimingColourisePaletteSourceKind;

@@ -4604,6 +4604,94 @@ TEST_CASE("Palette skew warp state round-trips and legacy sides fold",
   CHECK(migrated.effectParameterKeys[0].value == Catch::Approx(0.5F));
 }
 
+TEST_CASE("Emissive falloff nodes and keys round-trip",
+          "[project][serialization][timing][colourise][emissive][falloff]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::timing::TimingColouriseEffect;
+  using invisible_places::timing::TimingColouriseEmissiveFalloffKey;
+  using invisible_places::timing::TimingColouriseEmissiveFalloffNode;
+  using invisible_places::timing::TimingColouriseEmissiveFalloffParameter;
+  using invisible_places::timing::TimingTakeSceneState;
+  using invisible_places::water::WaterScenarioInterpolation;
+
+  ProjectDocument document;
+  document.projectName = "emissive-falloff";
+  TimingTakeSceneState state;
+  TimingColouriseEffect flat;
+  flat.id = "effect-1";
+  flat.name = "Flat";
+  TimingColouriseEffect shaped;
+  shaped.id = "effect-2";
+  shaped.name = "Shaped";
+  shaped.colouriseEnabled = false;
+  shaped.emissiveEnabled = true;
+  shaped.field.scalarFieldName = "Heat";
+  shaped.emissiveFalloffNodes = {
+      TimingColouriseEmissiveFalloffNode{
+          .id = "falloff-node-1",
+          .position = 0.3F,
+          .level = 0.9F},
+      TimingColouriseEmissiveFalloffNode{
+          .id = "falloff-node-2",
+          .position = 0.8F,
+          .level = 0.1F},
+  };
+  shaped.emissiveFalloffKeys = {
+      TimingColouriseEmissiveFalloffKey{
+          .nodeId = "falloff-node-1",
+          .parameter = TimingColouriseEmissiveFalloffParameter::Position,
+          .position = 0.4F,
+          .value = 0.6F,
+      },
+      TimingColouriseEmissiveFalloffKey{
+          .nodeId = "falloff-node-2",
+          .parameter = TimingColouriseEmissiveFalloffParameter::Level,
+          .position = 0.7F,
+          .value = 0.5F,
+          .interpolation = WaterScenarioInterpolation::Linear,
+      },
+  };
+  state.colouriseEffects = {flat, shaped};
+  document.timingTakeStates = {state};
+
+  TemporaryProjectFile file{"invisible_places_emissive_falloff.json"};
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(document, file.path, &errorMessage));
+  const auto loaded = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loaded.has_value());
+  const auto& effects = loaded->timingTakeStates.at(0).colouriseEffects;
+  REQUIRE(effects.size() == 2U);
+  CHECK(effects[0].emissiveFalloffNodes.empty());
+  CHECK(effects[0].emissiveFalloffKeys.empty());
+  REQUIRE(effects[1].emissiveFalloffNodes.size() == 2U);
+  CHECK(effects[1].emissiveFalloffNodes[0].id == "falloff-node-1");
+  CHECK(effects[1].emissiveFalloffNodes[0].position ==
+        Catch::Approx(0.3F));
+  CHECK(effects[1].emissiveFalloffNodes[1].level == Catch::Approx(0.1F));
+  REQUIRE(effects[1].emissiveFalloffKeys.size() == 2U);
+  CHECK(effects[1].emissiveFalloffKeys[0].nodeId == "falloff-node-1");
+  CHECK(effects[1].emissiveFalloffKeys[0].parameter ==
+        TimingColouriseEmissiveFalloffParameter::Position);
+  CHECK(effects[1].emissiveFalloffKeys[0].value == Catch::Approx(0.6F));
+  CHECK(effects[1].emissiveFalloffKeys[1].interpolation ==
+        WaterScenarioInterpolation::Linear);
+
+  // Empty falloff stays out of the document.
+  std::ifstream savedInput{file.path};
+  REQUIRE(savedInput.is_open());
+  const auto savedJson = nlohmann::json::parse(savedInput);
+  savedInput.close();
+  const auto& effectsJson =
+      savedJson["timing_take_states"][0]["timing_effects"];
+  CHECK_FALSE(effectsJson[0].contains("emissive_falloff_nodes"));
+  CHECK_FALSE(effectsJson[0].contains("emissive_falloff_keys"));
+  CHECK(effectsJson[1]["emissive_falloff_keys"][0]["parameter"] ==
+        "position");
+}
+
 TEST_CASE("Field-scoped visual settings round-trip",
           "[project][serialization][timing][colourise][field-memory]") {
   using invisible_places::serialization::LoadProjectDocument;

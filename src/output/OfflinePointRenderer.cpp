@@ -1006,9 +1006,14 @@ glm::vec3 ApplyTimingColourise(
         if (effect.output ==
             invisible_places::renderer::pointcloud::
                 TimingColouriseOutput::Emissive) {
-            const float level = std::isfinite(effect.emissiveLevel)
-                                    ? effect.emissiveLevel
-                                    : 0.0F;
+            // The slot's LUT channel r carries the falloff-shaped signed
+            // level per bounds fraction, mirroring the GPU path.
+            const float lutLevel = SampleTimingColouriseLut(
+                                       effect,
+                                       mask->normalizedValue)
+                                       .x;
+            const float level =
+                std::isfinite(lutLevel) ? lutLevel : 0.0F;
             if (level < 0.0F) {
                 baseColor *= std::clamp(
                     1.0F + level * mask->edgeMask,
@@ -1057,9 +1062,11 @@ float ResolveTimingColouriseEmissionAdd(
         if (!mask.has_value()) {
             continue;
         }
-        const float level = std::isfinite(effect.emissiveLevel)
-                                ? effect.emissiveLevel
-                                : 0.0F;
+        const float lutLevel = SampleTimingColouriseLut(
+                                   effect,
+                                   mask->normalizedValue)
+                                   .x;
+        const float level = std::isfinite(lutLevel) ? lutLevel : 0.0F;
         if (level > 0.0F) {
             emissionAdd += level * mask->edgeMask;
         }

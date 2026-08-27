@@ -4794,6 +4794,24 @@ ResolveTimingColouriseStack(
                     effect,
                     normalizedPosition,
                     cyclic);
+            // The falloff profile rides the slot's otherwise-unused LUT:
+            // channel r carries the signed level per bounds fraction, so
+            // emission can vary across the interval on every render path.
+            const auto emissiveProfile = invisible_places::timing::
+                EvaluateTimingEmissiveFalloffProfile(
+                    effect,
+                    normalizedPosition,
+                    cyclic);
+            for (std::size_t sampleIndex = 0U;
+                 sampleIndex < emissiveResolved.rgbaLut.size();
+                 ++sampleIndex) {
+                emissiveResolved.rgbaLut[sampleIndex] = {
+                    emissiveProfile[sampleIndex],
+                    0.0F,
+                    0.0F,
+                    0.0F,
+                };
+            }
             result.effects[result.effectCount++] = emissiveResolved;
         }
     }

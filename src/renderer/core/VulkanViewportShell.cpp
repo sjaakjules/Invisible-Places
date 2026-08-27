@@ -14179,6 +14179,31 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
                         1.0F),
                 };
             }
+        } else if (
+            effect.output ==
+            renderer::pointcloud::TimingColouriseOutput::Emissive) {
+            // Emissive slots carry their falloff-shaped signed level in
+            // LUT channel r, unclamped to [0, 1] because emission may
+            // exceed one and darkening is negative.
+            for (std::size_t sampleIndex = 0;
+                 sampleIndex <
+                 renderer::pointcloud::kTimingColouriseLutSamples;
+                 ++sampleIndex) {
+                const float level = effect.rgbaLut[sampleIndex][0];
+                const std::size_t packedIndex =
+                    packedEffectIndex *
+                        renderer::pointcloud::kTimingColouriseLutSamples +
+                    sampleIndex;
+                styleGpu.timingColouriseLut[packedIndex] = glm::vec4{
+                    std::clamp(
+                        std::isfinite(level) ? level : 0.0F,
+                        -64.0F,
+                        64.0F),
+                    0.0F,
+                    0.0F,
+                    0.0F,
+                };
+            }
         }
         ++packedTimingColouriseCount;
     }

@@ -3520,6 +3520,93 @@ TimingColouriseEffect SanitizeTimingColouriseEffect(
                 TimingColouriseEffectParameter::PaletteSkewSpread;
         }
     }
+    const auto sanitizeFalloff =
+        [](std::vector<TimingColouriseEmissiveFalloffNode>* nodes,
+           std::vector<TimingColouriseEmissiveFalloffKey>* keys) {
+            std::vector<TimingColouriseEmissiveFalloffNode> keptNodes;
+            keptNodes.reserve(nodes->size());
+            for (auto& node : *nodes) {
+                if (node.id.empty() ||
+                    std::any_of(
+                        keptNodes.begin(),
+                        keptNodes.end(),
+                        [&](const TimingColouriseEmissiveFalloffNode&
+                                existing) {
+                            return existing.id == node.id;
+                        })) {
+                    continue;
+                }
+                node.position = Clamp01(node.position);
+                node.level = Clamp01(node.level);
+                keptNodes.push_back(std::move(node));
+            }
+            std::stable_sort(
+                keptNodes.begin(),
+                keptNodes.end(),
+                [](const TimingColouriseEmissiveFalloffNode& left,
+                   const TimingColouriseEmissiveFalloffNode& right) {
+                    return left.position < right.position;
+                });
+            *nodes = std::move(keptNodes);
+            std::erase_if(
+                *keys,
+                [&](const TimingColouriseEmissiveFalloffKey& key) {
+                    return key.nodeId.empty() ||
+                           (key.parameter !=
+                                TimingColouriseEmissiveFalloffParameter::
+                                    Position &&
+                            key.parameter !=
+                                TimingColouriseEmissiveFalloffParameter::
+                                    Level) ||
+                           std::none_of(
+                               nodes->begin(),
+                               nodes->end(),
+                               [&](const auto& node) {
+                                   return node.id == key.nodeId;
+                               });
+                });
+            for (auto& key : *keys) {
+                key.position = Clamp01(key.position);
+                key.value = Clamp01(key.value);
+                if (!IsValidInterpolation(key.interpolation)) {
+                    key.interpolation = invisible_places::water::
+                        WaterScenarioInterpolation::Smooth;
+                }
+            }
+            std::stable_sort(
+                keys->begin(),
+                keys->end(),
+                [](const TimingColouriseEmissiveFalloffKey& left,
+                   const TimingColouriseEmissiveFalloffKey& right) {
+                    if (left.nodeId != right.nodeId) {
+                        return left.nodeId < right.nodeId;
+                    }
+                    if (left.parameter != right.parameter) {
+                        return static_cast<std::uint8_t>(
+                                   left.parameter) <
+                               static_cast<std::uint8_t>(
+                                   right.parameter);
+                    }
+                    return left.position < right.position;
+                });
+            std::vector<TimingColouriseEmissiveFalloffKey> unique;
+            unique.reserve(keys->size());
+            for (auto& key : *keys) {
+                if (!unique.empty() &&
+                    unique.back().nodeId == key.nodeId &&
+                    unique.back().parameter == key.parameter &&
+                    std::abs(unique.back().position - key.position) <=
+                        kTimingColouriseKeyTolerance) {
+                    unique.back() = std::move(key);
+                } else {
+                    unique.push_back(std::move(key));
+                }
+            }
+            *keys = std::move(unique);
+        };
+    sanitizeFalloff(
+        &effect.emissiveFalloffNodes,
+        &effect.emissiveFalloffKeys);
     effect.emissiveLevel =
         FiniteOr(effect.emissiveLevel, 1.0F);
     std::erase_if(
@@ -3725,6 +3812,9 @@ TimingColouriseEffect SanitizeTimingColouriseEffect(
             ClampPaletteSkew(memory.emissiveSkewSpread);
         sanitizeSkewNodes(&memory.paletteSkewNodes);
         sanitizeSkewNodes(&memory.emissiveSkewNodes);
+        sanitizeFalloff(
+            &memory.emissiveFalloffNodes,
+            &memory.emissiveFalloffKeys);
         memory.emissiveLevel = FiniteOr(memory.emissiveLevel, 1.0F);
         std::erase_if(
             memory.effectParameterKeys,
@@ -4150,6 +4240,12 @@ bool TimingColouriseEffectSettingsKeysHaveNoLaneCollisions(
             effect.boundsParameterKeys,
             [](const auto& left, const auto& right) {
                 return left.parameter == right.parameter;
+            }) ||
+        !TimingColouriseKeysHaveNoLaneCollisions(
+            effect.emissiveFalloffKeys,
+            [](const auto& left, const auto& right) {
+                return left.nodeId == right.nodeId &&
+                       left.parameter == right.parameter;
             })) {
         return false;
     }
@@ -4218,6 +4314,12 @@ bool TimingColouriseEffectSettingsKeysHaveNoCyclicLaneCollisions(
             effect.boundsParameterKeys,
             [](const auto& left, const auto& right) {
                 return left.parameter == right.parameter;
+            }) ||
+        !TimingColouriseKeysHaveNoCyclicLaneCollisions(
+            effect.emissiveFalloffKeys,
+            [](const auto& left, const auto& right) {
+                return left.nodeId == right.nodeId &&
+                       left.parameter == right.parameter;
             })) {
         return false;
     }
@@ -4453,6 +4555,9 @@ std::vector<float> TimingColouriseEffectSettingsKeyPositions(
     AppendTimingColouriseSettingsKeyPositions(
         &positions,
         effect.boundsKeys);
+    AppendTimingColouriseSettingsKeyPositions(
+        &positions,
+        effect.emissiveFalloffKeys);
     for (const auto& memory : effect.fieldBoundsMemory) {
         // The live vectors above are authoritative for the selected field.
         // Its remembered entry is only the snapshot from the last switch and
@@ -4495,6 +4600,9 @@ TimingColouriseEffectSettingsKeySpan(
         &span,
         effect.boundsParameterKeys);
     ExtendTimingColouriseSettingsKeySpan(&span, effect.boundsKeys);
+    ExtendTimingColouriseSettingsKeySpan(
+        &span,
+        effect.emissiveFalloffKeys);
     for (const auto& memory : effect.fieldBoundsMemory) {
         if (IsCurrentTimingColouriseFieldMemory(effect, memory)) {
             continue;
@@ -4587,7 +4695,8 @@ bool TransformTimingColouriseEffectSettingsKeys(
         !mapKeys(&candidate.paletteKeys) ||
         !mapKeys(&candidate.paletteStopParameterKeys) ||
         !mapKeys(&candidate.boundsParameterKeys) ||
-        !mapKeys(&candidate.boundsKeys)) {
+        !mapKeys(&candidate.boundsKeys) ||
+        !mapKeys(&candidate.emissiveFalloffKeys)) {
         return false;
     }
     for (auto& memory : candidate.fieldBoundsMemory) {
@@ -4789,7 +4898,8 @@ bool TransformTimingColouriseEffectSettingsKeysCyclic(
         !mapKeys(&candidate.paletteKeys) ||
         !mapKeys(&candidate.paletteStopParameterKeys) ||
         !mapKeys(&candidate.boundsParameterKeys) ||
-        !mapKeys(&candidate.boundsKeys)) {
+        !mapKeys(&candidate.boundsKeys) ||
+        !mapKeys(&candidate.emissiveFalloffKeys)) {
         return false;
     }
     for (auto& memory : candidate.fieldBoundsMemory) {
@@ -5058,6 +5168,7 @@ bool RetimeTimingTakeSceneStateNormalizedPositions(
         retimeKeys(&effect.paletteStopParameterKeys);
         retimeKeys(&effect.boundsParameterKeys);
         retimeKeys(&effect.boundsKeys);
+        retimeKeys(&effect.emissiveFalloffKeys);
         for (auto& memory : effect.fieldBoundsMemory) {
             retimeKeys(&memory.boundsParameterKeys);
             retimeKeys(&memory.boundsKeys);
@@ -5483,6 +5594,13 @@ void MergeTimingTakeSceneStateKeepingFirst(
             &destinationEffect->boundsKeys,
             sourceEffect.boundsKeys,
             [](const auto&, const auto&) { return true; });
+        MergeTimingKeysKeepingFirst(
+            &destinationEffect->emissiveFalloffKeys,
+            sourceEffect.emissiveFalloffKeys,
+            [](const auto& left, const auto& right) {
+                return left.nodeId == right.nodeId &&
+                       left.parameter == right.parameter;
+            });
         for (const auto& sourceMemory : sourceEffect.fieldBoundsMemory) {
             auto destinationMemory = std::find_if(
                 destinationEffect->fieldBoundsMemory.begin(),
@@ -5582,6 +5700,8 @@ void StashTimingColouriseFieldVisuals(TimingColouriseEffect* effect) {
     entry->emissiveSkewCentre = effect->emissiveSkewCentre;
     entry->emissiveSkewSpread = effect->emissiveSkewSpread;
     entry->emissiveSkewNodes = effect->emissiveSkewNodes;
+    entry->emissiveFalloffNodes = effect->emissiveFalloffNodes;
+    entry->emissiveFalloffKeys = effect->emissiveFalloffKeys;
     entry->emissiveLevel = effect->emissiveLevel;
     entry->effectParameterKeys = effect->effectParameterKeys;
     entry->paletteKeys = effect->paletteKeys;
@@ -5632,6 +5752,10 @@ void ApplyTimingColouriseFieldSelection(
             effect->emissiveSkewSpread =
                 visualEntry->emissiveSkewSpread;
             effect->emissiveSkewNodes = visualEntry->emissiveSkewNodes;
+            effect->emissiveFalloffNodes =
+                visualEntry->emissiveFalloffNodes;
+            effect->emissiveFalloffKeys =
+                visualEntry->emissiveFalloffKeys;
             effect->emissiveLevel = visualEntry->emissiveLevel;
             effect->effectParameterKeys =
                 visualEntry->effectParameterKeys;
@@ -6365,6 +6489,16 @@ TimingColouriseEffect PrepareTimingColouriseEffectForEvaluation(
                    std::tie(right.stopId, right.parameter);
         });
     ExpandTimingKeysForCyclicEvaluation(
+        &prepared.emissiveFalloffKeys,
+        [](const auto& left, const auto& right) {
+            return left.nodeId == right.nodeId &&
+                   left.parameter == right.parameter;
+        },
+        [](const auto& left, const auto& right) {
+            return std::tie(left.nodeId, left.parameter) <
+                   std::tie(right.nodeId, right.parameter);
+        });
+    ExpandTimingKeysForCyclicEvaluation(
         &prepared.boundsParameterKeys,
         [](const auto& left, const auto& right) {
             return left.parameter == right.parameter;
@@ -6410,6 +6544,62 @@ TimingColourisePalette EvaluatePreparedTimingColourisePalette(
                                   .value_or(stop.colouriseAmount);
     }
     return SanitizeTimingColourisePalette(std::move(palette));
+}
+
+std::vector<TimingColouriseEvaluatedFalloffNode>
+EvaluatePreparedEmissiveFalloffNodes(
+    const TimingColouriseEffect& prepared,
+    float normalizedPosition) {
+    std::vector<TimingColouriseEvaluatedFalloffNode> nodes;
+    nodes.reserve(prepared.emissiveFalloffNodes.size());
+    for (const auto& node : prepared.emissiveFalloffNodes) {
+        const auto trackValue =
+            [&](TimingColouriseEmissiveFalloffParameter parameter,
+                float fallback) {
+                const auto matches =
+                    [&](const TimingColouriseEmissiveFalloffKey& key) {
+                        return key.nodeId == node.id &&
+                               key.parameter == parameter;
+                    };
+                const auto begin = std::find_if(
+                    prepared.emissiveFalloffKeys.begin(),
+                    prepared.emissiveFalloffKeys.end(),
+                    matches);
+                auto end = begin;
+                while (end != prepared.emissiveFalloffKeys.end() &&
+                       matches(*end)) {
+                    ++end;
+                }
+                if (begin == end) {
+                    return fallback;
+                }
+                return Clamp01(
+                    EvaluateScalarKeyTrack(
+                        begin,
+                        end,
+                        normalizedPosition,
+                        [](const TimingColouriseEmissiveFalloffKey&
+                               key) { return key.value; })
+                        .value_or(fallback));
+            };
+        nodes.push_back(TimingColouriseEvaluatedFalloffNode{
+            .id = node.id,
+            .position = trackValue(
+                TimingColouriseEmissiveFalloffParameter::Position,
+                node.position),
+            .level = trackValue(
+                TimingColouriseEmissiveFalloffParameter::Level,
+                node.level),
+        });
+    }
+    std::stable_sort(
+        nodes.begin(),
+        nodes.end(),
+        [](const TimingColouriseEvaluatedFalloffNode& left,
+           const TimingColouriseEvaluatedFalloffNode& right) {
+            return left.position < right.position;
+        });
+    return nodes;
 }
 
 }  // namespace
@@ -6481,6 +6671,190 @@ float EvaluateTimingEmissiveLevel(
         TimingColouriseEffectParameter::EmissiveLevel,
         normalizedPosition,
         cyclic);
+}
+
+std::vector<TimingColouriseEvaluatedFalloffNode>
+EvaluateTimingColouriseEmissiveFalloffNodes(
+    const TimingColouriseEffect& effect,
+    float normalizedPosition,
+    bool cyclic) {
+    const auto prepared = PrepareTimingColouriseEffectForEvaluation(
+        effect,
+        cyclic);
+    normalizedPosition = cyclic
+        ? WrapTimingColouriseLoopPosition(normalizedPosition)
+        : Clamp01(normalizedPosition);
+    return EvaluatePreparedEmissiveFalloffNodes(
+        prepared,
+        normalizedPosition);
+}
+
+float EvaluateTimingColouriseEmissiveFalloffMultiplier(
+    std::span<const TimingColouriseEvaluatedFalloffNode> nodes,
+    float boundsFraction) {
+    if (nodes.empty()) {
+        // The flat historical response: emission applies evenly.
+        return 1.0F;
+    }
+    struct CurveKey {
+        float position = 0.0F;
+        float value = 1.0F;
+        invisible_places::water::WaterScenarioInterpolation
+            interpolation = invisible_places::water::
+                WaterScenarioInterpolation::SmoothVelocity;
+    };
+    std::vector<CurveKey> curve;
+    curve.reserve(nodes.size());
+    for (const auto& node : nodes) {
+        curve.push_back(CurveKey{
+            .position = Clamp01(node.position),
+            .value = Clamp01(node.level),
+        });
+    }
+    // The profile is a Monotone Spline through the nodes, held flat past
+    // the outermost ones (the shared evaluator's endpoint rule).
+    return Clamp01(
+        EvaluateScalarKeyTrack(
+            curve.begin(),
+            curve.end(),
+            Clamp01(boundsFraction),
+            [](const CurveKey& key) { return key.value; })
+            .value_or(1.0F));
+}
+
+std::array<float, kTimingColouriseLutSampleCount>
+EvaluateTimingEmissiveFalloffProfile(
+    const TimingColouriseEffect& effect,
+    float normalizedPosition,
+    bool cyclic) {
+    const auto prepared = PrepareTimingColouriseEffectForEvaluation(
+        effect,
+        cyclic);
+    normalizedPosition = cyclic
+        ? WrapTimingColouriseLoopPosition(normalizedPosition)
+        : Clamp01(normalizedPosition);
+    const auto parameterValue =
+        [&](TimingColouriseEffectParameter parameter) {
+            return EvaluateEffectParameterTrack(
+                       prepared.effectParameterKeys,
+                       parameter,
+                       normalizedPosition,
+                       prepared.palettePhaseOffset,
+                       cyclic)
+                .value_or(
+                    EffectParameterBaseValue(prepared, parameter));
+        };
+    const float level = parameterValue(
+        TimingColouriseEffectParameter::EmissiveLevel);
+    std::array<float, kTimingColouriseLutSampleCount> profile{};
+    const auto nodes = EvaluatePreparedEmissiveFalloffNodes(
+        prepared,
+        normalizedPosition);
+    const auto warp = BuildTimingColouriseWarpPoints(
+        parameterValue(
+            TimingColouriseEffectParameter::EmissiveSkewCentre),
+        parameterValue(
+            TimingColouriseEffectParameter::EmissiveSkewSpread),
+        prepared.emissiveSkewNodes);
+    const bool identityWarp = TimingColouriseWarpIsIdentity(warp);
+    if (nodes.empty()) {
+        profile.fill(level);
+        return profile;
+    }
+    for (std::size_t index = 0U; index < profile.size(); ++index) {
+        const float fraction =
+            static_cast<float>(index) /
+            static_cast<float>(profile.size() - 1U);
+        const float curvePosition = identityWarp
+            ? fraction
+            : EvaluateTimingColouriseWarpPaletteCoordinate(
+                  warp,
+                  fraction);
+        profile[index] =
+            level * EvaluateTimingColouriseEmissiveFalloffMultiplier(
+                        nodes,
+                        curvePosition);
+    }
+    return profile;
+}
+
+std::string AllocateTimingColouriseEmissiveFalloffNodeId(
+    std::span<const TimingColouriseEmissiveFalloffNode> nodes) {
+    for (std::size_t candidate = 1U;; ++candidate) {
+        std::string id = "falloff-node-" + std::to_string(candidate);
+        if (std::none_of(
+                nodes.begin(),
+                nodes.end(),
+                [&](const TimingColouriseEmissiveFalloffNode& node) {
+                    return node.id == id;
+                })) {
+            return id;
+        }
+    }
+}
+
+bool AddOrUpdateTimingColouriseEmissiveFalloffKey(
+    TimingColouriseEffect* effect,
+    std::string_view nodeId,
+    TimingColouriseEmissiveFalloffParameter parameter,
+    float position,
+    float value,
+    invisible_places::water::WaterScenarioInterpolation interpolation) {
+    if (effect == nullptr || nodeId.empty() ||
+        !std::isfinite(position) || !std::isfinite(value) ||
+        std::none_of(
+            effect->emissiveFalloffNodes.begin(),
+            effect->emissiveFalloffNodes.end(),
+            [&](const TimingColouriseEmissiveFalloffNode& node) {
+                return node.id == nodeId;
+            })) {
+        return false;
+    }
+    TimingColouriseEmissiveFalloffKey key{
+        .nodeId = std::string{nodeId},
+        .parameter = parameter,
+        .position = Clamp01(position),
+        .value = Clamp01(value),
+        .interpolation = IsValidInterpolation(interpolation)
+                             ? interpolation
+                             : invisible_places::water::
+                                   WaterScenarioInterpolation::
+                                       SmoothVelocity,
+    };
+    const auto existing = std::find_if(
+        effect->emissiveFalloffKeys.begin(),
+        effect->emissiveFalloffKeys.end(),
+        [&](const TimingColouriseEmissiveFalloffKey& candidate) {
+            return candidate.nodeId == key.nodeId &&
+                   candidate.parameter == key.parameter &&
+                   std::abs(candidate.position - key.position) <=
+                       kTimingColouriseKeyTolerance;
+        });
+    if (existing == effect->emissiveFalloffKeys.end()) {
+        effect->emissiveFalloffKeys.push_back(std::move(key));
+    } else {
+        *existing = std::move(key);
+    }
+    *effect = SanitizeTimingColouriseEffect(std::move(*effect));
+    return true;
+}
+
+std::size_t RemoveTimingColouriseEmissiveFalloffKeysAtPosition(
+    TimingColouriseEffect* effect,
+    std::string_view nodeId,
+    TimingColouriseEmissiveFalloffParameter parameter,
+    float position) {
+    if (effect == nullptr || !std::isfinite(position)) {
+        return 0U;
+    }
+    return std::erase_if(
+        effect->emissiveFalloffKeys,
+        [&](const TimingColouriseEmissiveFalloffKey& key) {
+            return key.nodeId == nodeId &&
+                   key.parameter == parameter &&
+                   std::abs(key.position - position) <=
+                       kTimingColouriseKeyTolerance;
+        });
 }
 
 TimingColourisePalette EvaluateTimingColourisePalette(

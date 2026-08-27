@@ -131,6 +131,42 @@ struct TimingColourisePaletteSkewNode {
     float spread = 0.0F;
 };
 
+// The emissive falloff curve: a monotone-spline profile over the bounds
+// span that scales the keyable Emissive Level per field value, so emission
+// can fall off across the interval instead of applying evenly. Each node
+// pins a level multiplier at a bounds fraction; no nodes means the flat
+// historical response. Node coordinates are keyable over animation time
+// through TimingColouriseEmissiveFalloffKey tracks.
+enum class TimingColouriseEmissiveFalloffParameter : std::uint8_t {
+    Position = 0,
+    Level,
+};
+
+struct TimingColouriseEmissiveFalloffNode {
+    std::string id;
+    // Bounds fraction (before the emissive skew warp) and level multiplier.
+    float position = 0.5F;
+    float level = 1.0F;
+};
+
+struct TimingColouriseEmissiveFalloffKey {
+    std::string nodeId;
+    TimingColouriseEmissiveFalloffParameter parameter =
+        TimingColouriseEmissiveFalloffParameter::Level;
+    // Normalized animation position, not the node's curve position.
+    float position = 0.0F;
+    float value = 0.0F;
+    invisible_places::water::WaterScenarioInterpolation interpolation =
+        invisible_places::water::WaterScenarioInterpolation::Smooth;
+};
+
+// One node with its coordinates evaluated at an animation position.
+struct TimingColouriseEvaluatedFalloffNode {
+    std::string id;
+    float position = 0.5F;
+    float level = 1.0F;
+};
+
 // A sanitized control point of the forward warp: strictly increasing in
 // both coordinates between the implicit (0,0) and (1,1) endpoints.
 struct TimingColouriseWarpPoint {
@@ -353,6 +389,8 @@ struct TimingColouriseFieldVisualMemory {
     float emissiveSkewSpread = 0.0F;
     std::vector<TimingColourisePaletteSkewNode> emissiveSkewNodes;
     float emissiveLevel = 1.0F;
+    std::vector<TimingColouriseEmissiveFalloffNode> emissiveFalloffNodes;
+    std::vector<TimingColouriseEmissiveFalloffKey> emissiveFalloffKeys;
     std::vector<TimingColouriseEffectParameterKey> effectParameterKeys;
     std::vector<TimingColourisePaletteKey> paletteKeys;
     std::vector<TimingColourisePaletteStopParameterKey>
@@ -449,6 +487,10 @@ struct TimingColouriseEffect {
     // opacity. The Max/Scale mode itself remains an authored, non-animated
     // choice.
     float emissiveLevel = 1.0F;
+    // Emissive falloff profile: nodes over the bounds span and their
+    // per-node animation tracks. Empty means the flat historical response.
+    std::vector<TimingColouriseEmissiveFalloffNode> emissiveFalloffNodes;
+    std::vector<TimingColouriseEmissiveFalloffKey> emissiveFalloffKeys;
     std::vector<TimingColouriseEffectParameterKey> effectParameterKeys;
     // Legacy whole-palette snapshots remain active only in LegacySnapshots
     // mode. New authoring writes the independent tracks below.
@@ -1118,6 +1160,44 @@ std::size_t MergeLegacyTimingEffectAspects(
     const TimingColouriseEffect& effect,
     float normalizedPosition,
     bool cyclic = false);
+// The falloff nodes with their coordinates evaluated at one animation
+// position, sorted by evaluated curve position.
+[[nodiscard]] std::vector<TimingColouriseEvaluatedFalloffNode>
+EvaluateTimingColouriseEmissiveFalloffNodes(
+    const TimingColouriseEffect& effect,
+    float normalizedPosition,
+    bool cyclic = false);
+// The falloff multiplier at one bounds fraction: a Monotone Spline through
+// the evaluated nodes, held flat past the outermost ones. No nodes is the
+// flat historical response of 1.
+[[nodiscard]] float EvaluateTimingColouriseEmissiveFalloffMultiplier(
+    std::span<const TimingColouriseEvaluatedFalloffNode> nodes,
+    float boundsFraction);
+// The 64-sample signed emissive profile across the bounds span at one
+// animation position: the keyed Emissive Level times the falloff
+// multiplier, sampled through the emissive skew warp. This is what the
+// renderer consumes for emissive slots.
+[[nodiscard]] std::array<float, kTimingColouriseLutSampleCount>
+EvaluateTimingEmissiveFalloffProfile(
+    const TimingColouriseEffect& effect,
+    float normalizedPosition,
+    bool cyclic = false);
+[[nodiscard]] std::string AllocateTimingColouriseEmissiveFalloffNodeId(
+    std::span<const TimingColouriseEmissiveFalloffNode> nodes);
+[[nodiscard]] bool AddOrUpdateTimingColouriseEmissiveFalloffKey(
+    TimingColouriseEffect* effect,
+    std::string_view nodeId,
+    TimingColouriseEmissiveFalloffParameter parameter,
+    float position,
+    float value,
+    invisible_places::water::WaterScenarioInterpolation interpolation =
+        invisible_places::water::WaterScenarioInterpolation::SmoothVelocity);
+[[nodiscard]] std::size_t
+RemoveTimingColouriseEmissiveFalloffKeysAtPosition(
+    TimingColouriseEffect* effect,
+    std::string_view nodeId,
+    TimingColouriseEmissiveFalloffParameter parameter,
+    float position);
 [[nodiscard]] TimingColourisePalette EvaluateTimingColourisePalette(
     const TimingColouriseEffect& effect,
     float normalizedPosition,

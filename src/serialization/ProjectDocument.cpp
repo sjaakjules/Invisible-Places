@@ -5106,6 +5106,123 @@ ParseTimingColouriseBoundsKeys(const json& keysJson) {
     return keys;
 }
 
+std::string TimingColouriseEmissiveFalloffParameterName(
+    invisible_places::timing::TimingColouriseEmissiveFalloffParameter
+        parameter) {
+    using invisible_places::timing::
+        TimingColouriseEmissiveFalloffParameter;
+    switch (parameter) {
+        case TimingColouriseEmissiveFalloffParameter::Position:
+            return "position";
+        case TimingColouriseEmissiveFalloffParameter::Level:
+            return "level";
+    }
+    return "level";
+}
+
+std::optional<
+    invisible_places::timing::TimingColouriseEmissiveFalloffParameter>
+ParseTimingColouriseEmissiveFalloffParameter(const json& parameterJson) {
+    using invisible_places::timing::
+        TimingColouriseEmissiveFalloffParameter;
+    if (!parameterJson.is_string()) {
+        return std::nullopt;
+    }
+    const auto name = parameterJson.get<std::string>();
+    if (name == "position") {
+        return TimingColouriseEmissiveFalloffParameter::Position;
+    }
+    if (name == "level") {
+        return TimingColouriseEmissiveFalloffParameter::Level;
+    }
+    return std::nullopt;
+}
+
+json SerializeTimingColouriseEmissiveFalloff(
+    const std::vector<invisible_places::timing::
+                          TimingColouriseEmissiveFalloffNode>& nodes) {
+    json nodesJson = json::array();
+    for (const auto& node : nodes) {
+        nodesJson.push_back({
+            {"id", node.id},
+            {"position", node.position},
+            {"level", node.level},
+        });
+    }
+    return nodesJson;
+}
+
+std::vector<invisible_places::timing::TimingColouriseEmissiveFalloffNode>
+ParseTimingColouriseEmissiveFalloff(const json& nodesJson) {
+    std::vector<invisible_places::timing::TimingColouriseEmissiveFalloffNode>
+        nodes;
+    if (!nodesJson.is_array()) {
+        return nodes;
+    }
+    for (const auto& nodeJson : nodesJson) {
+        if (!nodeJson.is_object()) {
+            continue;
+        }
+        invisible_places::timing::TimingColouriseEmissiveFalloffNode node;
+        node.id = nodeJson.value("id", std::string{});
+        if (node.id.empty()) {
+            continue;
+        }
+        node.position = nodeJson.value("position", node.position);
+        node.level = nodeJson.value("level", node.level);
+        nodes.push_back(std::move(node));
+    }
+    return nodes;
+}
+
+json SerializeTimingColouriseEmissiveFalloffKeys(
+    const std::vector<invisible_places::timing::
+                          TimingColouriseEmissiveFalloffKey>& keys) {
+    json keysJson = json::array();
+    for (const auto& key : keys) {
+        keysJson.push_back({
+            {"node_id", key.nodeId},
+            {"parameter",
+             TimingColouriseEmissiveFalloffParameterName(key.parameter)},
+            {"position", key.position},
+            {"value", key.value},
+            {"interpolation",
+             WaterScenarioInterpolationName(key.interpolation)},
+        });
+    }
+    return keysJson;
+}
+
+std::vector<invisible_places::timing::TimingColouriseEmissiveFalloffKey>
+ParseTimingColouriseEmissiveFalloffKeys(const json& keysJson) {
+    std::vector<invisible_places::timing::TimingColouriseEmissiveFalloffKey>
+        keys;
+    if (!keysJson.is_array()) {
+        return keys;
+    }
+    for (const auto& keyJson : keysJson) {
+        const auto parameter =
+            keyJson.contains("parameter")
+                ? ParseTimingColouriseEmissiveFalloffParameter(
+                      keyJson.at("parameter"))
+                : std::nullopt;
+        if (!parameter.has_value()) {
+            continue;
+        }
+        invisible_places::timing::TimingColouriseEmissiveFalloffKey key;
+        key.nodeId = keyJson.value("node_id", std::string{});
+        key.parameter = parameter.value();
+        key.position = keyJson.value("position", key.position);
+        key.value = keyJson.value("value", key.value);
+        if (keyJson.contains("interpolation")) {
+            key.interpolation = ParseWaterScenarioInterpolation(
+                keyJson.at("interpolation"));
+        }
+        keys.push_back(std::move(key));
+    }
+    return keys;
+}
+
 json SerializeTimingColourisePaletteSkewNodes(
     const std::vector<invisible_places::timing::
                           TimingColourisePaletteSkewNode>& nodes) {
@@ -5533,6 +5650,16 @@ json SerializeTimingColouriseEffect(
                     SerializeTimingColourisePaletteSkewNodes(
                         memory.emissiveSkewNodes);
             }
+            if (!memory.emissiveFalloffNodes.empty()) {
+                memoryJson["emissive_falloff_nodes"] =
+                    SerializeTimingColouriseEmissiveFalloff(
+                        memory.emissiveFalloffNodes);
+            }
+            if (!memory.emissiveFalloffKeys.empty()) {
+                memoryJson["emissive_falloff_keys"] =
+                    SerializeTimingColouriseEmissiveFalloffKeys(
+                        memory.emissiveFalloffKeys);
+            }
             visualMemoryJson.push_back(std::move(memoryJson));
         }
         effectJson["field_visual_memory"] = std::move(visualMemoryJson);
@@ -5576,6 +5703,16 @@ json SerializeTimingColouriseEffect(
         effectJson["emissive_skew_nodes"] =
             SerializeTimingColourisePaletteSkewNodes(
                 sanitized.emissiveSkewNodes);
+    }
+    if (!sanitized.emissiveFalloffNodes.empty()) {
+        effectJson["emissive_falloff_nodes"] =
+            SerializeTimingColouriseEmissiveFalloff(
+                sanitized.emissiveFalloffNodes);
+    }
+    if (!sanitized.emissiveFalloffKeys.empty()) {
+        effectJson["emissive_falloff_keys"] =
+            SerializeTimingColouriseEmissiveFalloffKeys(
+                sanitized.emissiveFalloffKeys);
     }
     return effectJson;
 }
@@ -5772,6 +5909,16 @@ ParseTimingColouriseEffect(
         effect.emissiveSkewNodes =
             ParseTimingColourisePaletteSkewNodes(
                 effectJson.at("emissive_skew_nodes"));
+    }
+    if (effectJson.contains("emissive_falloff_nodes")) {
+        effect.emissiveFalloffNodes =
+            ParseTimingColouriseEmissiveFalloff(
+                effectJson.at("emissive_falloff_nodes"));
+    }
+    if (effectJson.contains("emissive_falloff_keys")) {
+        effect.emissiveFalloffKeys =
+            ParseTimingColouriseEmissiveFalloffKeys(
+                effectJson.at("emissive_falloff_keys"));
     }
     effect.palettePhaseOffset = effectJson.value(
         "palette_phase_offset",
@@ -5993,6 +6140,16 @@ ParseTimingColouriseEffect(
                 memory.emissiveSkewNodes =
                     ParseTimingColourisePaletteSkewNodes(
                         memoryJson.at("emissive_skew_nodes"));
+            }
+            if (memoryJson.contains("emissive_falloff_nodes")) {
+                memory.emissiveFalloffNodes =
+                    ParseTimingColouriseEmissiveFalloff(
+                        memoryJson.at("emissive_falloff_nodes"));
+            }
+            if (memoryJson.contains("emissive_falloff_keys")) {
+                memory.emissiveFalloffKeys =
+                    ParseTimingColouriseEmissiveFalloffKeys(
+                        memoryJson.at("emissive_falloff_keys"));
             }
             memory.emissiveLevel = memoryJson.value(
                 "emissive_level",

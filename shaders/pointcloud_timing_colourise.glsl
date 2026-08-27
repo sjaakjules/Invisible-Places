@@ -89,9 +89,25 @@ vec4 ResolveTimingColouriseEffect(uint effectIndex, uint pointIndex) {
     if (source.w == kTimingColouriseEmissiveOutput) {
         // A single resolved vec4 carries both effect kinds. Negative alpha
         // is an emissive sentinel consumed by
-        // ResolveTimingColouriseTransform; x stores the signed masked level.
+        // ResolveTimingColouriseTransform; x stores the signed masked
+        // level, sampled from the slot's falloff profile in LUT channel r
+        // so emission can vary across the bounds span.
+        const float emissiveScaled =
+            normalized * float(kTimingColouriseLutSamples - 1u);
+        const uint emissiveLower = min(
+            uint(floor(emissiveScaled)),
+            kTimingColouriseLutSamples - 1u);
+        const uint emissiveUpper = min(
+            emissiveLower + 1u,
+            kTimingColouriseLutSamples - 1u);
+        const uint emissiveOffset =
+            effectIndex * kTimingColouriseLutSamples;
+        const float emissiveLevel = mix(
+            styleData.timingColouriseLut[emissiveOffset + emissiveLower].r,
+            styleData.timingColouriseLut[emissiveOffset + emissiveUpper].r,
+            emissiveScaled - float(emissiveLower));
         return vec4(
-            range.w * safeEdgeMask,
+            emissiveLevel * safeEdgeMask,
             0.0,
             0.0,
             -1.0);

@@ -737,6 +737,9 @@ TEST_CASE(
             effect.edgeFadeLowerFraction = edgeFadeFraction;
             effect.edgeFadeUpperFraction = edgeFadeFraction;
             effect.emissiveLevel = level;
+            // Emissive slots carry their falloff-shaped level in LUT
+            // channel r; a flat profile reproduces the plain level.
+            effect.rgbaLut.fill({level, 0.0F, 0.0F, 0.0F});
         };
         // Exercise the complete shared capacity by placing the first visible
         // emissive effect in the eighth slot.
@@ -909,6 +912,8 @@ TEST_CASE(
             emissive.edgeFadeLowerFraction = 0.25F;
             emissive.edgeFadeUpperFraction = 0.25F;
             emissive.emissiveLevel = topmost ? emissiveLevel : 0.0F;
+            emissive.rgbaLut.fill(
+                {topmost ? emissiveLevel : 0.0F, 0.0F, 0.0F, 0.0F});
         }
 
         const invisible_places::output::OfflinePointLayer layer{
