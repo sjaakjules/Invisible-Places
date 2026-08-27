@@ -27,6 +27,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import subprocess
 import sys
@@ -1121,7 +1122,26 @@ def _transaction(
     target_status: str,
 ) -> dict:
     transaction_dir = _new_transaction_dir(paths, action)
-    items, methods = _prepare_items(paths, manifest, transaction_dir, action)
+    try:
+        items, methods = _prepare_items(paths, manifest, transaction_dir, action)
+    except BaseException:
+        # Canonical mutation begins only after the durable journal is written.
+        # A preparation failure therefore leaves private clone material that is
+        # safe to retire, and must not become an unjournaled recovery blocker.
+        journal_path = transaction_dir / "journal.json"
+        if transaction_dir.exists() and not journal_path.exists():
+            transaction_root = _strict_directory(
+                paths.transactions, "transaction root"
+            )
+            _require(
+                transaction_dir.parent == transaction_root
+                and transaction_dir.name.startswith(f"{action}-")
+                and not transaction_dir.is_symlink(),
+                f"unsafe unjournaled transaction directory: {transaction_dir}",
+            )
+            shutil.rmtree(transaction_dir)
+            _fsync_directory(transaction_root)
+        raise
     journal_path = transaction_dir / "journal.json"
     journal = {
         "schema_version": JOURNAL_SCHEMA_VERSION,

@@ -330,6 +330,36 @@ class ReleaseTransactionTests(unittest.TestCase):
             journal = TERRAIN._load_json(journals[0], "journal")[1]
             self.assertEqual(journal["state"], "rolled-back")
 
+    def test_failed_preparation_leaves_no_unjournaled_recovery_blocker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Fixture(directory)
+            fixture.build()
+            transactions = fixture.run / "release" / "transactions"
+            real_clone = TERRAIN._clone_or_copy
+            calls = 0
+
+            def fail_second_clone(source, destination):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("injected preparation failure")
+                return real_clone(source, destination)
+
+            with (
+                mock.patch.object(TERRAIN, "refuse_running_app"),
+                mock.patch.object(
+                    TERRAIN, "_clone_or_copy", side_effect=fail_second_clone
+                ),
+                self.assertRaisesRegex(OSError, "preparation failure"),
+            ):
+                TERRAIN.install(fixture.args)
+
+            self.assertTrue(transactions.is_dir())
+            self.assertEqual(list(transactions.iterdir()), [])
+            result = TERRAIN.verify(fixture.args)
+            self.assertTrue(result["verified"])
+            self.assertEqual(result["status"], "built")
+
     def test_verify_recovers_an_incomplete_archived_first_layer(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = Fixture(directory)
