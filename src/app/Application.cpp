@@ -785,6 +785,9 @@ enum class TimingColouriseKeyTrack {
     Palette,
     Bounds,
     EffectParameter,
+    // Per-node emissive falloff tracks; the handle's stopId field carries
+    // the falloff node id for this track kind.
+    EmissiveFalloff,
 };
 
 // Fade toggle colours: linked fades keep the familiar green, while the
@@ -853,6 +856,9 @@ struct TimingColouriseLocalKeyPositionEditState {
     std::optional<
         invisible_places::timing::TimingColourisePaletteStopParameter>
         stopParameter;
+    std::optional<
+        invisible_places::timing::TimingColouriseEmissiveFalloffParameter>
+        falloffParameter;
     float sourcePosition = 0.0F;
     float draftPosition = 0.0F;
     bool requestKeyboardFocus = false;
@@ -885,6 +891,9 @@ struct TimingColouriseKeyHandle {
     std::optional<
         invisible_places::timing::TimingColourisePaletteStopParameter>
         stopParameter;
+    std::optional<
+        invisible_places::timing::TimingColouriseEmissiveFalloffParameter>
+        falloffParameter;
     float position = 0.0F;
 };
 
@@ -896,6 +905,7 @@ bool TimingColouriseKeyHandlesMatch(
            left.effectParameter == right.effectParameter &&
            left.stopId == right.stopId &&
            left.stopParameter == right.stopParameter &&
+           left.falloffParameter == right.falloffParameter &&
            std::abs(left.position - right.position) <=
                invisible_places::timing::kTimingColouriseKeyTolerance;
 }
@@ -2048,6 +2058,8 @@ struct TimingsPanelState {
     TimingColouriseHistogramHandle activeHistogramHandle =
         TimingColouriseHistogramHandle::None;
     std::optional<TimingColouriseSkewNodeDragState> skewNodeDrag;
+    std::optional<TimingColouriseSkewNodeDragState> emissiveFalloffDrag;
+    std::string selectedEmissiveFalloffNodeId;
     float histogramHandleGrabOffset = 0.0F;
     // Distribution Spread is a UI-only editing lens. Keying, persistence,
     // preview, and export continue to use raw scalar values.
@@ -93158,6 +93170,9 @@ struct TimingColouriseKeyLaneSeries {
     std::optional<
         invisible_places::timing::TimingColourisePaletteStopParameter>
         stopParameter;
+    std::optional<
+        invisible_places::timing::TimingColouriseEmissiveFalloffParameter>
+        falloffParameter;
     // Owned storage for dynamically built lanes; `positions` points at it
     // when used. Both owned fields need a fix-up pass after the containing
     // vector stops growing, because growth relocates them.
@@ -93180,6 +93195,7 @@ TimingColouriseKeyHandle TimingColouriseKeyHandleForLane(
         .effectParameter = lane.effectParameter,
         .stopId = lane.stopId,
         .stopParameter = lane.stopParameter,
+        .falloffParameter = lane.falloffParameter,
         .position = position,
     };
 }
@@ -93263,6 +93279,18 @@ void AddCoincidentTimingColouriseKeyHandles(
                 });
         }
     }
+    for (const auto& key : effect.emissiveFalloffKeys) {
+        if (matchesAnchorPosition(key.position)) {
+            AddUniqueTimingColouriseKeyHandle(
+                handles,
+                TimingColouriseKeyHandle{
+                    .track = TimingColouriseKeyTrack::EmissiveFalloff,
+                    .stopId = key.nodeId,
+                    .falloffParameter = key.parameter,
+                    .position = key.position,
+                });
+        }
+    }
 }
 
 std::optional<std::pair<
@@ -93271,6 +93299,23 @@ std::optional<std::pair<
 TimingColouriseExactScalarKey(
     const invisible_places::timing::TimingColouriseEffect& effect,
     const TimingColouriseKeyHandle& handle) {
+    if (handle.track == TimingColouriseKeyTrack::EmissiveFalloff &&
+        handle.falloffParameter.has_value()) {
+        const auto found = std::find_if(
+            effect.emissiveFalloffKeys.begin(),
+            effect.emissiveFalloffKeys.end(),
+            [&](const auto& key) {
+                return key.nodeId == handle.stopId &&
+                       key.parameter == handle.falloffParameter.value() &&
+                       std::abs(key.position - handle.position) <=
+                           invisible_places::timing::
+                               kTimingColouriseKeyTolerance;
+            });
+        if (found != effect.emissiveFalloffKeys.end()) {
+            return std::pair{found->value, found->interpolation};
+        }
+        return std::nullopt;
+    }
     if (handle.track == TimingColouriseKeyTrack::Palette &&
         handle.stopParameter.has_value()) {
         // Colour keys have no single scalar; their lane is time-only.
@@ -93477,7 +93522,16 @@ bool DeleteSelectedTimingColouriseKeys(
     }
     std::size_t removed = 0U;
     for (const auto& handle : selection->keys) {
-        if (handle.track == TimingColouriseKeyTrack::Palette &&
+        if (handle.track == TimingColouriseKeyTrack::EmissiveFalloff &&
+            handle.falloffParameter.has_value()) {
+            removed += invisible_places::timing::
+                RemoveTimingColouriseEmissiveFalloffKeysAtPosition(
+                    effect,
+                    handle.stopId,
+                    handle.falloffParameter.value(),
+                    handle.position);
+        } else if (
+            handle.track == TimingColouriseKeyTrack::Palette &&
             handle.stopParameter.has_value()) {
             removed += invisible_places::timing::
                 RemoveTimingColourisePaletteStopParameterKeysAtPosition(
@@ -93690,6 +93744,10 @@ void DrawTimingKeyLaneGroup(
                 // lane stays a compact marker rail.
                 return true;
             }
+            if (lane.track == TimingColouriseKeyTrack::EmissiveFalloff &&
+                lane.falloffParameter.has_value()) {
+                return true;
+            }
             return lane.track ==
                        TimingColouriseKeyTrack::EffectParameter &&
                    lane.effectParameter.has_value();
@@ -93853,7 +93911,8 @@ void DrawTimingKeyLaneGroup(
                    state.boundsParameter == lane.boundsParameter &&
                    state.effectParameter == lane.effectParameter &&
                    state.stopId == lane.stopId &&
-                   state.stopParameter == lane.stopParameter;
+                   state.stopParameter == lane.stopParameter &&
+                   state.falloffParameter == lane.falloffParameter;
         };
     const auto findMatchingSeries =
         [&](const auto& state)
@@ -93873,6 +93932,31 @@ void DrawTimingKeyLaneGroup(
         [&](const TimingColouriseKeyLaneSeries& lane,
             float sourcePosition,
             float destinationPosition) {
+            if (lane.track == TimingColouriseKeyTrack::EmissiveFalloff &&
+                lane.falloffParameter.has_value()) {
+                const auto found = std::find_if(
+                    effect->emissiveFalloffKeys.begin(),
+                    effect->emissiveFalloffKeys.end(),
+                    [&](const auto& key) {
+                        return key.nodeId == lane.stopId &&
+                               key.parameter ==
+                                   lane.falloffParameter.value() &&
+                               std::abs(
+                                   key.position - sourcePosition) <=
+                                   invisible_places::timing::
+                                       kTimingColouriseKeyTolerance;
+                    });
+                if (found == effect->emissiveFalloffKeys.end()) {
+                    return false;
+                }
+                found->position = std::clamp(
+                    destinationPosition,
+                    0.0F,
+                    1.0F);
+                *effect = invisible_places::timing::
+                    SanitizeTimingColouriseEffect(std::move(*effect));
+                return true;
+            }
             if (lane.track == TimingColouriseKeyTrack::Palette &&
                 lane.stopParameter.has_value()) {
                 // Move one stop track's key alone; the cluster branch
@@ -93952,6 +94036,22 @@ void DrawTimingKeyLaneGroup(
                 invisible_places::timing::
                     kTimingColouriseKeyTolerance) {
                 return false;
+            }
+            if (lane.track == TimingColouriseKeyTrack::EmissiveFalloff &&
+                lane.falloffParameter.has_value()) {
+                return std::any_of(
+                    effect->emissiveFalloffKeys.begin(),
+                    effect->emissiveFalloffKeys.end(),
+                    [&](const auto& key) {
+                        return key.nodeId == lane.stopId &&
+                               key.parameter ==
+                                   lane.falloffParameter.value() &&
+                               std::abs(
+                                   key.position -
+                                   destinationPosition) <=
+                                   invisible_places::timing::
+                                       kTimingColouriseKeyTolerance;
+                    });
             }
             if (lane.track == TimingColouriseKeyTrack::Palette &&
                 lane.stopParameter.has_value()) {
@@ -94070,6 +94170,30 @@ void DrawTimingKeyLaneGroup(
                     return std::nullopt;
                 }
                 return value2;
+            } else if (
+                lane.track ==
+                    TimingColouriseKeyTrack::EmissiveFalloff &&
+                lane.falloffParameter.has_value()) {
+                const auto nodes = invisible_places::timing::
+                    EvaluateTimingColouriseEmissiveFalloffNodes(
+                        *effect,
+                        position,
+                        cyclicTiming);
+                const auto node = std::find_if(
+                    nodes.begin(),
+                    nodes.end(),
+                    [&](const auto& candidate) {
+                        return candidate.id == lane.stopId;
+                    });
+                if (node == nodes.end()) {
+                    return std::nullopt;
+                }
+                value = lane.falloffParameter.value() ==
+                                invisible_places::timing::
+                                    TimingColouriseEmissiveFalloffParameter::
+                                        Position
+                            ? node->position
+                            : node->level;
             } else if (
                 lane.track ==
                     TimingColouriseKeyTrack::EffectParameter &&
@@ -94556,6 +94680,7 @@ void DrawTimingKeyLaneGroup(
                     .effectParameter = handle.effectParameter,
                     .stopId = handle.stopId,
                     .stopParameter = handle.stopParameter,
+                    .falloffParameter = handle.falloffParameter,
                     .sourcePosition = handle.position,
                     .draftPosition = handle.position,
                     .requestKeyboardFocus = true,
@@ -94828,6 +94953,15 @@ void DrawTimingKeyLaneGroup(
                 .position = key.position,
             });
         }
+        for (const auto& key :
+             drag.originalEffect.emissiveFalloffKeys) {
+            existingHandles.push_back({
+                .track = TimingColouriseKeyTrack::EmissiveFalloff,
+                .stopId = key.nodeId,
+                .falloffParameter = key.parameter,
+                .position = key.position,
+            });
+        }
         bool collision = false;
         for (const auto& selected : drag.handles) {
             auto destination = selected;
@@ -94847,6 +94981,8 @@ void DrawTimingKeyLaneGroup(
                            existing.stopId == destination.stopId &&
                            existing.stopParameter ==
                                destination.stopParameter &&
+                           existing.falloffParameter ==
+                               destination.falloffParameter &&
                            keysCoincide(
                                existing.position,
                                destination.position);
@@ -94870,6 +95006,17 @@ void DrawTimingKeyLaneGroup(
                            target,
                        const TimingColouriseKeyHandle& handle) {
                         if (handle.track ==
+                                TimingColouriseKeyTrack::
+                                    EmissiveFalloff &&
+                            handle.falloffParameter.has_value()) {
+                            (void)invisible_places::timing::
+                                RemoveTimingColouriseEmissiveFalloffKeysAtPosition(
+                                    target,
+                                    handle.stopId,
+                                    handle.falloffParameter.value(),
+                                    handle.position);
+                        } else if (
+                            handle.track ==
                                 TimingColouriseKeyTrack::Palette &&
                             handle.stopParameter.has_value()) {
                             (void)invisible_places::timing::
@@ -95028,6 +95175,21 @@ void DrawTimingKeyLaneGroup(
             for (auto& key : updated.paletteStopParameterKeys) {
                 key.position = movedStopKeyPosition(key);
             }
+            for (auto& key : updated.emissiveFalloffKeys) {
+                for (const auto& selected : drag.handles) {
+                    if (selected.track ==
+                            TimingColouriseKeyTrack::EmissiveFalloff &&
+                        selected.falloffParameter == key.parameter &&
+                        selected.stopId == key.nodeId &&
+                        std::abs(selected.position - key.position) <=
+                            invisible_places::timing::
+                                kTimingColouriseKeyTolerance) {
+                        key.position =
+                            movedKeyPosition(selected.position);
+                        break;
+                    }
+                }
+            }
             for (auto& key : updated.boundsParameterKeys) {
                 key.position = movedPosition(
                     TimingColouriseKeyTrack::Bounds,
@@ -95151,6 +95313,31 @@ void DrawTimingKeyLaneGroup(
                                   (mouse.y - drag.mouseStartY) *
                                       valueDrag.unitsPerPixel
                             : value;
+                    }
+                } else if (
+                    valueDrag.handle.track ==
+                        TimingColouriseKeyTrack::EmissiveFalloff &&
+                    valueDrag.handle.falloffParameter.has_value()) {
+                    value = std::clamp(value, 0.0F, 1.0F);
+                    const auto found = std::find_if(
+                        updated.emissiveFalloffKeys.begin(),
+                        updated.emissiveFalloffKeys.end(),
+                        [&](const auto& key) {
+                            return key.nodeId ==
+                                       valueDrag.handle.stopId &&
+                                   key.parameter ==
+                                       valueDrag.handle
+                                           .falloffParameter.value() &&
+                                   std::abs(
+                                       key.position -
+                                       movedKeyPosition(
+                                           valueDrag.handle
+                                               .position)) <=
+                                       invisible_places::timing::
+                                           kTimingColouriseKeyTolerance;
+                        });
+                    if (found != updated.emissiveFalloffKeys.end()) {
+                        found->value = value;
                     }
                 } else if (
                     valueDrag.handle.track ==
@@ -96752,6 +96939,379 @@ bool DrawTimingColouriseEffectParameterEditor(
     return changed;
 }
 
+// The emissive falloff editor: level multiplier (y) over the bounds span
+// (x, before the emissive skew warp). Nodes drag in both axes, auto-keying
+// any armed per-node track at the current animation position; double-click
+// empty space adds a node and double-clicking a node removes it.
+void DrawTimingEmissiveFalloffCurveEditor(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::timing::TimingColouriseEffect* effect) {
+    using invisible_places::timing::TimingColouriseEmissiveFalloffNode;
+    using invisible_places::timing::
+        TimingColouriseEmissiveFalloffParameter;
+    auto& timings = runtimeState->timingsPanel;
+    const float position = CurrentAuthoredTrackPosition(*runtimeState);
+    const bool cyclicTiming =
+        CurrentAnimationTimingIsCyclic(*runtimeState);
+    ImGui::TextDisabled("Emissive falloff over bounds");
+    DrawTimingControlTooltip(
+        "Scale the emissive level across the selected bounds: node height "
+        "is a 0 to 1 multiplier joined by a Monotone Spline and held flat "
+        "past the outermost nodes. Drag nodes to shape the profile - "
+        "armed node tracks auto-key at the current animation position. "
+        "Double-click empty space to add a node, a node to remove it. No "
+        "nodes means emission applies evenly.");
+    const ImVec2 size{
+        std::max(160.0F, ImGui::GetContentRegionAvail().x),
+        72.0F};
+    ImGui::InvisibleButton(
+        "##TimingEmissiveFalloffCurve",
+        size,
+        ImGuiButtonFlags_MouseButtonLeft);
+    const auto minimum = ImGui::GetItemRectMin();
+    const auto maximum = ImGui::GetItemRectMax();
+    const float width = std::max(1.0F, maximum.x - minimum.x);
+    const float height = std::max(1.0F, maximum.y - minimum.y);
+    auto* drawList = ImGui::GetWindowDrawList();
+    drawList->AddRectFilled(
+        minimum,
+        maximum,
+        ImGui::GetColorU32(ImGuiCol_FrameBg),
+        2.0F);
+    drawList->AddRect(
+        minimum,
+        maximum,
+        ImGui::GetColorU32(ImGuiCol_Border),
+        2.0F);
+    const auto xForFraction = [&](float fraction) {
+        return minimum.x + width * std::clamp(fraction, 0.0F, 1.0F);
+    };
+    const auto yForLevel = [&](float level) {
+        return maximum.y -
+               height * std::clamp(level, 0.0F, 1.0F);
+    };
+    const ImU32 curveColour = IM_COL32(244, 155, 78, 255);
+    const auto nodes = invisible_places::timing::
+        EvaluateTimingColouriseEmissiveFalloffNodes(
+            *effect,
+            position,
+            cyclicTiming);
+    constexpr int kCurveSamples = 64;
+    for (int sample = 1; sample <= kCurveSamples; ++sample) {
+        const float previousFraction =
+            static_cast<float>(sample - 1) /
+            static_cast<float>(kCurveSamples);
+        const float fraction =
+            static_cast<float>(sample) /
+            static_cast<float>(kCurveSamples);
+        drawList->AddLine(
+            ImVec2{
+                xForFraction(previousFraction),
+                yForLevel(invisible_places::timing::
+                              EvaluateTimingColouriseEmissiveFalloffMultiplier(
+                                  nodes,
+                                  previousFraction))},
+            ImVec2{
+                xForFraction(fraction),
+                yForLevel(invisible_places::timing::
+                              EvaluateTimingColouriseEmissiveFalloffMultiplier(
+                                  nodes,
+                                  fraction))},
+            nodes.empty()
+                ? (curveColour & 0x00FFFFFFU) | 0x66000000U
+                : curveColour,
+            1.6F);
+    }
+    if (nodes.empty()) {
+        const char* hint = "Even emission. Double-click to add a node.";
+        drawList->AddText(
+            ImVec2{
+                minimum.x +
+                    (width - ImGui::CalcTextSize(hint).x) * 0.5F,
+                std::midpoint(minimum.y, maximum.y)},
+            ImGui::GetColorU32(ImGuiCol_TextDisabled),
+            hint);
+    }
+    const auto nodeHasKeys = [&](std::string_view nodeId) {
+        return std::any_of(
+            effect->emissiveFalloffKeys.begin(),
+            effect->emissiveFalloffKeys.end(),
+            [&](const auto& key) { return key.nodeId == nodeId; });
+    };
+    const auto mouse = ImGui::GetIO().MousePos;
+    std::optional<std::size_t> hoveredNode;
+    float nearestDistance = 9.0F;
+    for (std::size_t index = 0U; index < nodes.size(); ++index) {
+        const float distance = std::hypot(
+            mouse.x - xForFraction(nodes[index].position),
+            mouse.y - yForLevel(nodes[index].level));
+        if (ImGui::IsItemHovered() && distance <= nearestDistance) {
+            nearestDistance = distance;
+            hoveredNode = index;
+        }
+    }
+    for (std::size_t index = 0U; index < nodes.size(); ++index) {
+        const ImVec2 point{
+            xForFraction(nodes[index].position),
+            yForLevel(nodes[index].level)};
+        const bool selected =
+            timings.selectedEmissiveFalloffNodeId == nodes[index].id;
+        drawList->AddCircleFilled(point, 4.0F, curveColour);
+        drawList->AddCircle(
+            point,
+            selected ? 6.0F : 5.0F,
+            selected
+                ? ImGui::GetColorU32(ImGuiCol_SliderGrabActive)
+            : nodeHasKeys(nodes[index].id)
+                ? ImGui::GetColorU32(kWaterKeyedSettingColour)
+                : ImGui::GetColorU32(ImGuiCol_Border),
+            0,
+            selected ? 2.0F : 1.0F);
+    }
+
+    auto& drag = timings.emissiveFalloffDrag;
+    if (drag.has_value() && drag->effectId != effect->id) {
+        drag.reset();
+    }
+    const float clickFraction = std::clamp(
+        (mouse.x - minimum.x) / width,
+        0.0F,
+        1.0F);
+    const float clickLevel = std::clamp(
+        (maximum.y - mouse.y) / height,
+        0.0F,
+        1.0F);
+    if (hoveredNode.has_value() &&
+        ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        const std::string removedId = nodes[hoveredNode.value()].id;
+        std::erase_if(
+            effect->emissiveFalloffNodes,
+            [&](const auto& node) { return node.id == removedId; });
+        std::erase_if(
+            effect->emissiveFalloffKeys,
+            [&](const auto& key) { return key.nodeId == removedId; });
+        if (timings.selectedEmissiveFalloffNodeId == removedId) {
+            timings.selectedEmissiveFalloffNodeId.clear();
+        }
+        drag.reset();
+        runtimeState->previewRenderStateSignatureValid = false;
+    } else if (
+        ImGui::IsItemHovered() && !hoveredNode.has_value() &&
+        ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        StopAnimationPlayback(runtimeState);
+        TimingColouriseEmissiveFalloffNode node{
+            .id = invisible_places::timing::
+                AllocateTimingColouriseEmissiveFalloffNodeId(
+                    effect->emissiveFalloffNodes),
+            .position = clickFraction,
+            .level = clickLevel,
+        };
+        timings.selectedEmissiveFalloffNodeId = node.id;
+        effect->emissiveFalloffNodes.push_back(std::move(node));
+        *effect = invisible_places::timing::
+            SanitizeTimingColouriseEffect(std::move(*effect));
+        runtimeState->previewRenderStateSignatureValid = false;
+    } else if (
+        hoveredNode.has_value() &&
+        ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        StopAnimationPlayback(runtimeState);
+        timings.selectedEmissiveFalloffNodeId =
+            nodes[hoveredNode.value()].id;
+        drag = TimingColouriseSkewNodeDragState{
+            .effectId = effect->id,
+            .emissiveAspect = true,
+            .nodeId = nodes[hoveredNode.value()].id,
+        };
+    }
+    if (drag.has_value() && drag->effectId == effect->id &&
+        ImGui::IsItemActive() &&
+        ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        const auto node = std::find_if(
+            effect->emissiveFalloffNodes.begin(),
+            effect->emissiveFalloffNodes.end(),
+            [&](const auto& candidate) {
+                return candidate.id == drag->nodeId;
+            });
+        if (node != effect->emissiveFalloffNodes.end()) {
+            const auto writeParameter =
+                [&](TimingColouriseEmissiveFalloffParameter parameter,
+                    float value,
+                    float* base) {
+                    const bool armed = std::any_of(
+                        effect->emissiveFalloffKeys.begin(),
+                        effect->emissiveFalloffKeys.end(),
+                        [&](const auto& key) {
+                            return key.nodeId == drag->nodeId &&
+                                   key.parameter == parameter;
+                        });
+                    if (armed) {
+                        const auto interpolation =
+                            TimingScalarTrackInterpolationAt(
+                                effect->emissiveFalloffKeys,
+                                [&](const auto& key) {
+                                    return key.nodeId ==
+                                               drag->nodeId &&
+                                           key.parameter == parameter;
+                                },
+                                position);
+                        (void)invisible_places::timing::
+                            AddOrUpdateTimingColouriseEmissiveFalloffKey(
+                                effect,
+                                drag->nodeId,
+                                parameter,
+                                position,
+                                value,
+                                interpolation);
+                    } else {
+                        *base = value;
+                    }
+                };
+            writeParameter(
+                TimingColouriseEmissiveFalloffParameter::Position,
+                clickFraction,
+                &node->position);
+            // The add above may sanitize and relocate; re-find for level.
+            const auto levelNode = std::find_if(
+                effect->emissiveFalloffNodes.begin(),
+                effect->emissiveFalloffNodes.end(),
+                [&](const auto& candidate) {
+                    return candidate.id == drag->nodeId;
+                });
+            if (levelNode != effect->emissiveFalloffNodes.end()) {
+                writeParameter(
+                    TimingColouriseEmissiveFalloffParameter::Level,
+                    clickLevel,
+                    &levelNode->level);
+            }
+            runtimeState->previewRenderStateSignatureValid = false;
+        }
+    }
+    if (drag.has_value() && drag->effectId == effect->id &&
+        !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        drag.reset();
+    }
+
+    // Keying row for the selected node: arm both coordinates, navigate
+    // this node's keys, or delete them at the current position.
+    const auto selectedNode = std::find_if(
+        effect->emissiveFalloffNodes.begin(),
+        effect->emissiveFalloffNodes.end(),
+        [&](const auto& candidate) {
+            return candidate.id ==
+                   timings.selectedEmissiveFalloffNodeId;
+        });
+    if (selectedNode != effect->emissiveFalloffNodes.end()) {
+        const std::string nodeId = selectedNode->id;
+        ImGui::TextDisabled("Node keys");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("+##KeyFalloffNode")) {
+            const auto evaluated = invisible_places::timing::
+                EvaluateTimingColouriseEmissiveFalloffNodes(
+                    *effect,
+                    position,
+                    cyclicTiming);
+            const auto current = std::find_if(
+                evaluated.begin(),
+                evaluated.end(),
+                [&](const auto& candidate) {
+                    return candidate.id == nodeId;
+                });
+            if (current != evaluated.end()) {
+                (void)invisible_places::timing::
+                    AddOrUpdateTimingColouriseEmissiveFalloffKey(
+                        effect,
+                        nodeId,
+                        TimingColouriseEmissiveFalloffParameter::
+                            Position,
+                        position,
+                        current->position);
+                (void)invisible_places::timing::
+                    AddOrUpdateTimingColouriseEmissiveFalloffKey(
+                        effect,
+                        nodeId,
+                        TimingColouriseEmissiveFalloffParameter::Level,
+                        position,
+                        current->level);
+                runtimeState->previewRenderStateSignatureValid = false;
+            }
+        }
+        DrawTimingControlTooltip(
+            "Key this node's curve position and level at the current animation position, arming both tracks for autokey.");
+        std::vector<float> nodeKeyPositions;
+        for (const auto& key : effect->emissiveFalloffKeys) {
+            if (key.nodeId == nodeId) {
+                nodeKeyPositions.push_back(key.position);
+            }
+        }
+        std::sort(nodeKeyPositions.begin(), nodeKeyPositions.end());
+        const auto previous = [&]() -> std::optional<float> {
+            std::optional<float> result;
+            for (const float candidate : nodeKeyPositions) {
+                if (candidate <
+                    position - invisible_places::timing::
+                                   kTimingColouriseKeyTolerance) {
+                    result = candidate;
+                }
+            }
+            return result;
+        }();
+        const auto next = [&]() -> std::optional<float> {
+            for (const float candidate : nodeKeyPositions) {
+                if (candidate >
+                    position + invisible_places::timing::
+                                   kTimingColouriseKeyTolerance) {
+                    return candidate;
+                }
+            }
+            return std::nullopt;
+        }();
+        ImGui::SameLine(0.0F, 2.0F);
+        ImGui::BeginDisabled(!previous.has_value());
+        if (ImGui::SmallButton("<##FalloffPrev")) {
+            ScrubFeatureTimelineToAuthoredPosition(
+                runtimeState,
+                previous.value());
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine(0.0F, 2.0F);
+        ImGui::BeginDisabled(!next.has_value());
+        if (ImGui::SmallButton(">##FalloffNext")) {
+            ScrubFeatureTimelineToAuthoredPosition(
+                runtimeState,
+                next.value());
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine(0.0F, 2.0F);
+        const bool onKey = std::any_of(
+            nodeKeyPositions.begin(),
+            nodeKeyPositions.end(),
+            [&](const float candidate) {
+                return std::abs(candidate - position) <=
+                       invisible_places::timing::
+                           kTimingColouriseKeyTolerance;
+            });
+        ImGui::BeginDisabled(!onKey);
+        if (ImGui::SmallButton("X##FalloffDelete")) {
+            (void)invisible_places::timing::
+                RemoveTimingColouriseEmissiveFalloffKeysAtPosition(
+                    effect,
+                    nodeId,
+                    TimingColouriseEmissiveFalloffParameter::Position,
+                    position);
+            (void)invisible_places::timing::
+                RemoveTimingColouriseEmissiveFalloffKeysAtPosition(
+                    effect,
+                    nodeId,
+                    TimingColouriseEmissiveFalloffParameter::Level,
+                    position);
+            runtimeState->previewRenderStateSignatureValid = false;
+        }
+        ImGui::EndDisabled();
+        DrawTimingControlTooltip(
+            "Delete this node's keys at the current animation position.");
+    }
+}
+
 void DrawTimingEmissiveLevelEditor(
     PreviewRuntimeState* runtimeState,
     invisible_places::timing::TimingColouriseEffect* effect) {
@@ -96759,29 +97319,122 @@ void DrawTimingEmissiveLevelEditor(
         return;
     }
     using invisible_places::timing::TimingColouriseEffectParameter;
+    using invisible_places::timing::
+        TimingColouriseEmissiveFalloffParameter;
     (void)DrawTimingColouriseEffectParameterEditor(
         runtimeState,
         effect,
         TimingColouriseEffectParameter::EmissiveLevel);
+    DrawTimingEmissiveFalloffCurveEditor(runtimeState, effect);
     const auto keyPositions = invisible_places::timing::
         TimingColouriseEffectParameterKeyPositions(
             *effect,
             TimingColouriseEffectParameter::EmissiveLevel);
-    const TimingColouriseKeyLaneSeries lane{
-        .label = "Emissive Level",
-        .track = TimingColouriseKeyTrack::EffectParameter,
-        .effectParameter = TimingColouriseEffectParameter::EmissiveLevel,
-        .positions = std::span<const float>{keyPositions},
-        .colour = IM_COL32(244, 155, 78, 255),
+    const auto emissiveSkewCentreKeys = invisible_places::timing::
+        TimingColouriseEffectParameterKeyPositions(
+            *effect,
+            TimingColouriseEffectParameter::EmissiveSkewCentre);
+    const auto emissiveSkewSpreadKeys = invisible_places::timing::
+        TimingColouriseEffectParameterKeyPositions(
+            *effect,
+            TimingColouriseEffectParameter::EmissiveSkewSpread);
+    std::vector<TimingColouriseKeyLaneSeries> lanes{
+        TimingColouriseKeyLaneSeries{
+            .label = "Emissive Level",
+            .track = TimingColouriseKeyTrack::EffectParameter,
+            .effectParameter =
+                TimingColouriseEffectParameter::EmissiveLevel,
+            .positions = std::span<const float>{keyPositions},
+            .colour = IM_COL32(244, 155, 78, 255),
+        },
     };
+    if (!emissiveSkewCentreKeys.empty()) {
+        lanes.push_back(TimingColouriseKeyLaneSeries{
+            .label = "Falloff Skew Centre",
+            .track = TimingColouriseKeyTrack::EffectParameter,
+            .effectParameter =
+                TimingColouriseEffectParameter::EmissiveSkewCentre,
+            .positions =
+                std::span<const float>{emissiveSkewCentreKeys},
+            .colour = IM_COL32(186, 132, 232, 255),
+        });
+    }
+    if (!emissiveSkewSpreadKeys.empty()) {
+        lanes.push_back(TimingColouriseKeyLaneSeries{
+            .label = "Falloff Skew Spread",
+            .track = TimingColouriseKeyTrack::EffectParameter,
+            .effectParameter =
+                TimingColouriseEffectParameter::EmissiveSkewSpread,
+            .positions =
+                std::span<const float>{emissiveSkewSpreadKeys},
+            .colour = IM_COL32(150, 142, 240, 255),
+        });
+    }
+    // Keyed falloff-node coordinates join the same graph, one auto-ranged
+    // lane per (node, coordinate) track.
+    const auto nodeOrdinal =
+        [&](std::string_view nodeId) -> std::optional<std::size_t> {
+        for (std::size_t index = 0U;
+             index < effect->emissiveFalloffNodes.size();
+             ++index) {
+            if (effect->emissiveFalloffNodes[index].id == nodeId) {
+                return index;
+            }
+        }
+        return std::nullopt;
+    };
+    for (const auto& key : effect->emissiveFalloffKeys) {
+        auto lane = std::find_if(
+            lanes.begin(),
+            lanes.end(),
+            [&](const auto& candidate) {
+                return candidate.track ==
+                           TimingColouriseKeyTrack::EmissiveFalloff &&
+                       candidate.falloffParameter == key.parameter &&
+                       candidate.stopId == key.nodeId;
+            });
+        if (lane == lanes.end()) {
+            const auto ordinal = nodeOrdinal(key.nodeId);
+            lanes.push_back(TimingColouriseKeyLaneSeries{
+                .ownedLabel =
+                    "Falloff " +
+                    (ordinal.has_value()
+                         ? std::to_string(ordinal.value() + 1U)
+                         : std::string{"?"}) +
+                    (key.parameter ==
+                             TimingColouriseEmissiveFalloffParameter::
+                                 Position
+                         ? " Position"
+                         : " Level"),
+                .track = TimingColouriseKeyTrack::EmissiveFalloff,
+                .stopId = key.nodeId,
+                .falloffParameter = key.parameter,
+                .colour = key.parameter ==
+                                  TimingColouriseEmissiveFalloffParameter::
+                                      Position
+                              ? IM_COL32(226, 186, 116, 255)
+                              : IM_COL32(250, 208, 120, 255),
+            });
+            lane = std::prev(lanes.end());
+        }
+        lane->ownedPositions.push_back(key.position);
+    }
+    for (auto& lane : lanes) {
+        if (!lane.ownedLabel.empty()) {
+            lane.label = lane.ownedLabel.c_str();
+        }
+        if (!lane.ownedPositions.empty()) {
+            lane.positions = std::span<const float>{lane.ownedPositions};
+        }
+    }
     ImGui::TextDisabled("Value over animation position");
     DrawTimingControlTooltip(
-        "Curve height shows the evaluated setting value. Left-drag a key dot to change its time and value, or its lower marker to retime only. Left-drag empty space to window-select; right-drag scrubs.");
+        "Curve height shows the evaluated setting value, each lane scaled to its own range. Keyed falloff nodes join as Falloff N Position/Level lanes. Left-drag a key dot to change its time and value, or its lower marker to retime only. Left-drag empty space to window-select; right-drag scrubs.");
     DrawTimingKeyLaneGroup(
         "##TimingEmissiveLevelKeyLane",
         runtimeState,
         effect,
-        std::span<const TimingColouriseKeyLaneSeries>{&lane, 1U});
+        lanes);
 }
 
 void DrawTimingColourisePaletteEditor(
@@ -99980,22 +100633,30 @@ void DrawTimingColouriseHistogram(
     // (pinch).
     constexpr float kHistogramPlotHeight = 64.0F;
     constexpr float kPaletteStripHeight = 18.0F;
+    constexpr float kEmissiveStripHeight = 14.0F;
     constexpr float kWarpNotchHeight = 10.0F;
     const bool paletteBandVisible = effect->colouriseEnabled;
+    // The emissive falloff owns a mirrored band attached to the top: its
+    // grey response strip over the warp comb, with the falloff's own warp
+    // nodes hanging down into the plot.
+    const bool emissiveBandVisible = effect->emissiveEnabled;
     const float paletteBandHeight = paletteBandVisible
         ? kPaletteStripHeight + kWarpNotchHeight
         : 0.0F;
+    const float emissiveBandHeight = emissiveBandVisible
+        ? kEmissiveStripHeight + kWarpNotchHeight
+        : 0.0F;
     const ImVec2 size{
         std::max(160.0F, ImGui::GetContentRegionAvail().x),
-        kHistogramPlotHeight + paletteBandHeight};
+        kHistogramPlotHeight + paletteBandHeight + emissiveBandHeight};
     ImGui::InvisibleButton(
         "##TimingColouriseHistogram",
         size,
         ImGuiButtonFlags_MouseButtonLeft);
     const auto minimum = ImGui::GetItemRectMin();
     const auto maximum = ImGui::GetItemRectMax();
-    const float plotTop = minimum.y;
-    const float plotBottom = minimum.y + kHistogramPlotHeight;
+    const float plotTop = minimum.y + emissiveBandHeight;
+    const float plotBottom = plotTop + kHistogramPlotHeight;
     auto* drawList = ImGui::GetWindowDrawList();
     const auto& histogramData = histogram->data;
     const auto& histogramDisplayBins =
@@ -100156,9 +100817,9 @@ void DrawTimingColouriseHistogram(
             colour,
             2.0F);
         drawList->AddTriangleFilled(
-            ImVec2{x - 5.0F, minimum.y},
-            ImVec2{x + 5.0F, minimum.y},
-            ImVec2{x, minimum.y + 7.0F},
+            ImVec2{x - 5.0F, plotTop},
+            ImVec2{x + 5.0F, plotTop},
+            ImVec2{x, plotTop + 7.0F},
             colour);
         return x;
     };
@@ -100258,6 +100919,7 @@ void DrawTimingColouriseHistogram(
     // down pinches it, and double-clicking the band adds a node.
     struct TimingColouriseWarpNodeVisual {
         std::string nodeId;
+        bool emissive = false;
         float palettePosition = 0.5F;
         float x = 0.0F;
         float y = 0.0F;
@@ -100429,6 +101091,179 @@ void DrawTimingColouriseHistogram(
         }
     }
 
+    // Emissive falloff band: the mirrored top counterpart. Its strip shows
+    // the profile applied to a mid-grey - brighter where emission adds,
+    // darker where negative levels dim - and its own warp nodes hang from
+    // the comb down into the plot.
+    const ImU32 emissiveWarpColour = IM_COL32(232, 186, 96, 255);
+    const float emissiveStripBottom =
+        minimum.y + kEmissiveStripHeight;
+    const float emissiveNeutralY =
+        std::midpoint(emissiveStripBottom, plotTop);
+    const float emissiveSpreadFarY =
+        plotTop + kHistogramPlotHeight * 0.25F;
+    const float emissiveSpreadNearY = minimum.y + 2.0F;
+    const auto emissiveSpreadToY = [&](float spread) {
+        spread = std::clamp(spread, -1.0F, 1.0F);
+        return spread >= 0.0F
+            ? std::lerp(emissiveNeutralY, emissiveSpreadFarY, spread)
+            : std::lerp(emissiveNeutralY, emissiveSpreadNearY, -spread);
+    };
+    const auto emissiveYToSpread = [&](float y) {
+        if (y >= emissiveNeutralY) {
+            return std::clamp(
+                (y - emissiveNeutralY) /
+                    std::max(1.0F, emissiveSpreadFarY - emissiveNeutralY),
+                0.0F,
+                1.0F);
+        }
+        return -std::clamp(
+            (emissiveNeutralY - y) /
+                std::max(1.0F, emissiveNeutralY - emissiveSpreadNearY),
+            0.0F,
+            1.0F);
+    };
+    std::vector<invisible_places::timing::TimingColouriseWarpPoint>
+        emissiveWarpPoints;
+    if (emissiveBandVisible &&
+        rawSpanForBand > std::numeric_limits<float>::epsilon()) {
+        using invisible_places::timing::TimingColouriseEffectParameter;
+        const float emissiveCentre = invisible_places::timing::
+            EvaluateTimingColouriseEffectParameter(
+                *effect,
+                TimingColouriseEffectParameter::EmissiveSkewCentre,
+                position,
+                cyclicTiming);
+        const float emissiveSpread = invisible_places::timing::
+            EvaluateTimingColouriseEffectParameter(
+                *effect,
+                TimingColouriseEffectParameter::EmissiveSkewSpread,
+                position,
+                cyclicTiming);
+        emissiveWarpPoints =
+            invisible_places::timing::BuildTimingColouriseWarpPoints(
+                emissiveCentre,
+                emissiveSpread,
+                effect->emissiveSkewNodes);
+        const auto profile = invisible_places::timing::
+            EvaluateTimingEmissiveFalloffProfile(
+                *effect,
+                position,
+                cyclicTiming);
+        const float stripLeft = std::min(lowerX, upperX);
+        const float stripRight = std::max(lowerX, upperX);
+        constexpr int kStripSegments = 48;
+        if (stripRight - stripLeft > 2.0F) {
+            const auto responseColour = [&](float fraction) {
+                const float level = profile[std::min<std::size_t>(
+                    static_cast<std::size_t>(
+                        std::clamp(fraction, 0.0F, 1.0F) *
+                        static_cast<float>(profile.size() - 1U)),
+                    profile.size() - 1U)];
+                // Mid-grey response: additive emission brightens toward
+                // white (saturating at +1), negative levels darken the
+                // retained light exactly as the renderer does.
+                const float shade = level >= 0.0F
+                    ? 0.5F + 0.5F * std::clamp(level, 0.0F, 1.0F)
+                    : 0.5F * std::clamp(1.0F + level, 0.0F, 1.0F);
+                return ImGui::ColorConvertFloat4ToU32(
+                    ImVec4{shade, shade, shade, 1.0F});
+            };
+            for (int segment = 0; segment < kStripSegments; ++segment) {
+                const float startFraction =
+                    static_cast<float>(segment) /
+                    static_cast<float>(kStripSegments);
+                const float endFraction =
+                    static_cast<float>(segment + 1) /
+                    static_cast<float>(kStripSegments);
+                const ImU32 startColour = responseColour(startFraction);
+                const ImU32 endColour = responseColour(endFraction);
+                drawList->AddRectFilledMultiColor(
+                    ImVec2{
+                        std::lerp(stripLeft, stripRight, startFraction),
+                        minimum.y},
+                    ImVec2{
+                        std::lerp(stripLeft, stripRight, endFraction),
+                        emissiveStripBottom},
+                    startColour,
+                    endColour,
+                    endColour,
+                    startColour);
+            }
+            drawList->AddRect(
+                ImVec2{stripLeft, minimum.y},
+                ImVec2{stripRight, emissiveStripBottom},
+                ImGui::GetColorU32(ImGuiCol_Border));
+        }
+        constexpr int kWarpNotchCount = 33;
+        const auto xForBoundsFraction = [&](float fraction) {
+            return xForRaw(
+                evaluated.lower +
+                rawSpanForBand * std::clamp(fraction, 0.0F, 1.0F));
+        };
+        for (int notch = 0; notch < kWarpNotchCount; ++notch) {
+            const float curvePosition =
+                static_cast<float>(notch) /
+                static_cast<float>(kWarpNotchCount - 1);
+            const float x = xForBoundsFraction(
+                invisible_places::timing::
+                    EvaluateTimingColouriseWarpFieldPosition(
+                        emissiveWarpPoints,
+                        curvePosition));
+            drawList->AddLine(
+                ImVec2{x, emissiveStripBottom},
+                ImVec2{x, plotTop},
+                (emissiveWarpColour & 0x00FFFFFFU) | 0x66000000U,
+                1.0F);
+        }
+        const auto pushEmissiveNodeVisual =
+            [&](const std::string& nodeId,
+                float curvePosition,
+                float fieldPosition,
+                float spread) {
+                warpNodeVisuals.push_back(TimingColouriseWarpNodeVisual{
+                    .nodeId = nodeId,
+                    .emissive = true,
+                    .palettePosition = curvePosition,
+                    .x = xForBoundsFraction(fieldPosition),
+                    .y = emissiveSpreadToY(spread),
+                });
+            };
+        pushEmissiveNodeVisual(
+            std::string{},
+            0.5F,
+            std::clamp(emissiveCentre, 0.0F, 1.0F),
+            emissiveSpread);
+        for (const auto& node : effect->emissiveSkewNodes) {
+            pushEmissiveNodeVisual(
+                node.id,
+                node.palettePosition,
+                node.fieldPosition,
+                node.spread);
+        }
+        for (const auto& visual : warpNodeVisuals) {
+            if (!visual.emissive) {
+                continue;
+            }
+            drawList->AddLine(
+                ImVec2{visual.x, std::min(visual.y, emissiveStripBottom)},
+                ImVec2{visual.x, std::max(visual.y, plotTop)},
+                emissiveWarpColour,
+                2.0F);
+            const bool centreNode = visual.nodeId.empty();
+            drawList->AddCircleFilled(
+                ImVec2{visual.x, visual.y},
+                centreNode ? 4.5F : 3.8F,
+                emissiveWarpColour);
+            drawList->AddCircle(
+                ImVec2{visual.x, visual.y},
+                centreNode ? 6.0F : 5.2F,
+                ImGui::GetColorU32(ImGuiCol_Border),
+                0,
+                1.0F);
+        }
+    }
+
     const std::string helpMarkText =
         std::string{
             "Bounds histogram\n"
@@ -100437,7 +101272,10 @@ void DrawTimingColouriseHistogram(
             "The sideways T handles set each edge's signed Fade: inward is positive, outward is negative, up to a whole span either way.\n"
             "Fades move together while linked; double-click a fade handle to separate them, and double-click again to relink using that handle's value.\n"} +
         (paletteBandVisible
-             ? "The bottom band is Palette Skew: notches mark evenly spaced palette coordinates at their warped homes over the sampled palette strip, whose opacity follows the colourise amount. Drag a node left/right to skew around it, up to spread the area near it, down to pinch. Nodes snap onto neutral spread and their unskewed home. Double-click empty band to add a node, a node to remove it (the centre node resets instead).\n"
+             ? "The bottom band is Palette Skew: notches mark evenly spaced palette coordinates at their warped homes over the sampled palette strip, whose opacity follows the colourise amount. Drag a node left/right to skew around it, away from the strip to spread the area near it, toward it to pinch. Nodes snap onto neutral spread and their unskewed home. Double-click empty band to add a node, a node to remove it (the centre node resets instead).\n"
+             : std::string{}) +
+        (emissiveBandVisible
+             ? "The top band is the emissive falloff's own skew, with a mid-grey strip showing the applied emission - brighter where it adds, darker where negative levels dim. Same node interactions as the palette band.\n"
              : std::string{}) +
         (axis.UsesDistributionSpread()
              ? "Distribution Spread uses the cached high-resolution distribution for graph spacing and drag sensitivity; the vertical density shape stays in raw-value space and authored values remain raw."
@@ -100535,36 +101373,63 @@ void DrawTimingColouriseHistogram(
         skewNodeDrag->effectId != effect->id) {
         skewNodeDrag.reset();
     }
-    const bool warpBandActive =
-        paletteBandVisible &&
+    const bool spanUsable =
         rawSpanForBand > std::numeric_limits<float>::epsilon();
-    const bool mouseInWarpBand =
-        ImGui::IsItemHovered() && !watermarkHovered &&
-        mouse.y >= plotBottom - 2.0F &&
+    const bool mouseInPaletteBand =
+        paletteBandVisible && spanUsable && ImGui::IsItemHovered() &&
+        !watermarkHovered && mouse.y >= plotBottom - 2.0F &&
         mouse.x >= std::min(lowerX, upperX) &&
         mouse.x <= std::max(lowerX, upperX);
-    if (warpBandActive && hoveredWarpNode.has_value() &&
+    const bool mouseInEmissiveBand =
+        emissiveBandVisible && spanUsable && ImGui::IsItemHovered() &&
+        !watermarkHovered && mouse.y <= plotTop + 2.0F &&
+        mouse.x >= std::min(lowerX, upperX) &&
+        mouse.x <= std::max(lowerX, upperX);
+    const auto aspectCentreParameter = [](bool emissiveAspect) {
+        return emissiveAspect
+            ? invisible_places::timing::TimingColouriseEffectParameter::
+                  EmissiveSkewCentre
+            : invisible_places::timing::TimingColouriseEffectParameter::
+                  PaletteSkewCentre;
+    };
+    const auto aspectSpreadParameter = [](bool emissiveAspect) {
+        return emissiveAspect
+            ? invisible_places::timing::TimingColouriseEffectParameter::
+                  EmissiveSkewSpread
+            : invisible_places::timing::TimingColouriseEffectParameter::
+                  PaletteSkewSpread;
+    };
+    const auto aspectNodes = [&](bool emissiveAspect)
+        -> std::vector<
+            invisible_places::timing::TimingColourisePaletteSkewNode>* {
+        return emissiveAspect ? &effect->emissiveSkewNodes
+                              : &effect->paletteSkewNodes;
+    };
+    const auto aspectWarpPoints = [&](bool emissiveAspect)
+        -> const std::vector<
+            invisible_places::timing::TimingColouriseWarpPoint>& {
+        return emissiveAspect ? emissiveWarpPoints : paletteWarpPoints;
+    };
+    if (spanUsable && hoveredWarpNode.has_value() &&
         ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
         const auto visual = warpNodeVisuals[hoveredWarpNode.value()];
         if (visual.nodeId.empty()) {
             // The centre node cannot be removed; reset it instead.
             (void)SetTimingColouriseEffectParameterAt(
                 effect,
-                invisible_places::timing::
-                    TimingColouriseEffectParameter::PaletteSkewCentre,
+                aspectCentreParameter(visual.emissive),
                 position,
                 0.5F);
             (void)SetTimingColouriseEffectParameterAt(
                 effect,
-                invisible_places::timing::
-                    TimingColouriseEffectParameter::PaletteSkewSpread,
+                aspectSpreadParameter(visual.emissive),
                 position,
                 0.0F);
             runtimeState->statusMessage =
                 "Reset the centre warp node.";
         } else {
             std::erase_if(
-                effect->paletteSkewNodes,
+                *aspectNodes(visual.emissive),
                 [&](const auto& node) {
                     return node.id == visual.nodeId;
                 });
@@ -100573,80 +101438,84 @@ void DrawTimingColouriseHistogram(
         skewNodeDrag.reset();
         runtimeState->previewRenderStateSignatureValid = false;
     } else if (
-        warpBandActive && !hoveredWarpNode.has_value() &&
-        mouseInWarpBand &&
+        !hoveredWarpNode.has_value() &&
+        (mouseInPaletteBand || mouseInEmissiveBand) &&
         ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-        // Add a node that anchors whichever palette coordinate currently
+        // Add a node that anchors whichever curve coordinate currently
         // lands here, so the mapping does not jump on creation.
+        const bool emissiveAspect = mouseInEmissiveBand;
+        auto* nodesForAspect = aspectNodes(emissiveAspect);
         const float fraction = std::clamp(
             (mouseValue - evaluated.lower) / rawSpanForBand,
             0.0F,
             1.0F);
-        const float palettePosition = invisible_places::timing::
+        const float curvePosition = invisible_places::timing::
             EvaluateTimingColouriseWarpPaletteCoordinate(
-                paletteWarpPoints,
+                aspectWarpPoints(emissiveAspect),
                 fraction);
         bool nearExistingAnchor =
-            std::abs(palettePosition - 0.5F) <= 0.04F;
-        for (const auto& node : effect->paletteSkewNodes) {
+            std::abs(curvePosition - 0.5F) <= 0.04F;
+        for (const auto& node : *nodesForAspect) {
             nearExistingAnchor =
                 nearExistingAnchor ||
-                std::abs(palettePosition - node.palettePosition) <=
+                std::abs(curvePosition - node.palettePosition) <=
                     0.04F;
         }
         if (!nearExistingAnchor) {
-            effect->paletteSkewNodes.push_back(
+            nodesForAspect->push_back(
                 invisible_places::timing::TimingColourisePaletteSkewNode{
                     .id = invisible_places::timing::
                         AllocateTimingColourisePaletteSkewNodeId(
-                            effect->paletteSkewNodes),
+                            *nodesForAspect),
                     .palettePosition =
-                        std::clamp(palettePosition, 0.02F, 0.98F),
+                        std::clamp(curvePosition, 0.02F, 0.98F),
                     .fieldPosition = fraction,
                     .spread = 0.0F,
                 });
             std::stable_sort(
-                effect->paletteSkewNodes.begin(),
-                effect->paletteSkewNodes.end(),
+                nodesForAspect->begin(),
+                nodesForAspect->end(),
                 [](const auto& left, const auto& right) {
                     return left.palettePosition < right.palettePosition;
                 });
             runtimeState->statusMessage =
                 "Added a warp node. Drag it to skew, spread, or pinch "
-                "around its palette coordinate.";
+                "around its curve coordinate.";
             runtimeState->previewRenderStateSignatureValid = false;
         }
     } else if (
-        warpBandActive && hoveredWarpNode.has_value() &&
+        spanUsable && hoveredWarpNode.has_value() &&
         ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         skewNodeDrag = TimingColouriseSkewNodeDragState{
             .effectId = effect->id,
-            .emissiveAspect = false,
+            .emissiveAspect =
+                warpNodeVisuals[hoveredWarpNode.value()].emissive,
             .nodeId = warpNodeVisuals[hoveredWarpNode.value()].nodeId,
         };
     }
     if (skewNodeDrag.has_value() &&
-        skewNodeDrag->effectId == effect->id && warpBandActive &&
+        skewNodeDrag->effectId == effect->id && spanUsable &&
         ImGui::IsItemActive() &&
         ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        const bool emissiveAspect = skewNodeDrag->emissiveAspect;
         float fraction = std::clamp(
             (mouseValue - evaluated.lower) / rawSpanForBand,
             0.0F,
             1.0F);
         const bool centreNode = skewNodeDrag->nodeId.empty();
+        auto* nodesForAspect = aspectNodes(emissiveAspect);
         auto* extraNode = centreNode
             ? nullptr
             : [&]() -> invisible_places::timing::
                            TimingColourisePaletteSkewNode* {
                   const auto found = std::find_if(
-                      effect->paletteSkewNodes.begin(),
-                      effect->paletteSkewNodes.end(),
+                      nodesForAspect->begin(),
+                      nodesForAspect->end(),
                       [&](const auto& node) {
                           return node.id == skewNodeDrag->nodeId;
                       });
-                  return found == effect->paletteSkewNodes.end()
-                      ? nullptr
-                      : &*found;
+                  return found == nodesForAspect->end() ? nullptr
+                                                        : &*found;
               }();
         if (centreNode || extraNode != nullptr) {
             const float anchorPalette =
@@ -100658,23 +101527,23 @@ void DrawTimingColouriseHistogram(
             if (std::abs(fraction - anchorPalette) <= snapFraction) {
                 fraction = anchorPalette;
             }
-            float spread = warpYToSpread(mouse.y);
-            if (std::abs(mouse.y - warpNeutralY) <= 5.0F) {
+            float spread = emissiveAspect
+                ? emissiveYToSpread(mouse.y)
+                : warpYToSpread(mouse.y);
+            const float neutralY =
+                emissiveAspect ? emissiveNeutralY : warpNeutralY;
+            if (std::abs(mouse.y - neutralY) <= 5.0F) {
                 spread = 0.0F;
             }
             if (centreNode) {
                 bool changed = SetTimingColouriseEffectParameterAt(
                     effect,
-                    invisible_places::timing::
-                        TimingColouriseEffectParameter::
-                            PaletteSkewCentre,
+                    aspectCentreParameter(emissiveAspect),
                     position,
                     fraction);
                 changed = SetTimingColouriseEffectParameterAt(
                               effect,
-                              invisible_places::timing::
-                                  TimingColouriseEffectParameter::
-                                      PaletteSkewSpread,
+                              aspectSpreadParameter(emissiveAspect),
                               position,
                               spread) ||
                           changed;
@@ -100683,7 +101552,7 @@ void DrawTimingColouriseHistogram(
                         false;
                 }
             } else {
-                // Keep the node between its palette-order neighbours so
+                // Keep the node between its curve-order neighbours so
                 // the warp stays invertible without hidden clamping.
                 float lowerLimit = 0.01F;
                 float upperLimit = 0.99F;
@@ -100698,7 +101567,8 @@ void DrawTimingColouriseHistogram(
                             std::min(upperLimit, otherField - 0.01F);
                     }
                 };
-                for (const auto& point : paletteWarpPoints) {
+                for (const auto& point :
+                     aspectWarpPoints(emissiveAspect)) {
                     if (std::abs(
                             point.palettePosition -
                             extraNode->palettePosition) > 1.0e-4F) {
