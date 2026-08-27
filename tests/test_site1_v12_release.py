@@ -446,7 +446,7 @@ class Fixture:
                     "minimum_ratio": 0.85,
                     "maximum_ratio": 1.25,
                     "post_build_lower_and_upper_bounds_passed": True,
-                    "water_only_center_count_is_acceptance_criterion": False,
+                    "water_only_center_count_is_acceptance_criterion": True,
                 },
             },
             "acceptance": {
@@ -454,7 +454,7 @@ class Fixture:
                     name: True for name in V12._INTERFACE_AUDIT_CHECKS
                 },
                 "passed": True,
-                "water_only_center_count_is_acceptance_criterion": False,
+                "water_only_center_count_is_acceptance_criterion": True,
             },
         }
         interface_document["manifest_lock"] = {
@@ -522,6 +522,25 @@ class Fixture:
             cleanmesh=self.cleanmesh,
             downsample=self.downsample_executable,
         )
+
+
+def compact_fixture_interface_audit_verifier(**kwargs):
+    """Bound verifier seam for release fixtures without a full audit raster."""
+
+    manifest = Path(kwargs["manifest_path"]).resolve()
+    return {
+        "verified": True,
+        "status": "passed",
+        "manifest": str(manifest),
+        "manifest_sha256": V12.sha256_path(manifest),
+    }
+
+
+def build_fixture(fixture: Fixture):
+    return V12.build(
+        fixture.args,
+        interface_audit_verifier=compact_fixture_interface_audit_verifier,
+    )
 
 
 class PlyAndSubsequenceTests(unittest.TestCase):
@@ -651,6 +670,38 @@ class CleanMeshReportTests(unittest.TestCase):
 
 
 class FingerprintCompletenessTests(unittest.TestCase):
+    def test_release_interface_audit_schema_matches_hardened_audit(self):
+        self.assertEqual(
+            V12._INTERFACE_AUDIT_IMPLEMENTATIONS,
+            (
+                "site1_v12_interface_audit.py",
+                "site1_v11_water_density.py",
+                "site1_v11_water_scalar_enrichment.py",
+                "site1_v12_water_pipeline.py",
+                "rebuild_site1_fossils_v10.py",
+                "rebuild_site1_fossils_v9.py",
+                "rebuild_site1_fossils_water.py",
+                "site1_v11_confidence.py",
+                "site1_v12_water_refinement.py",
+                "site1_v11_terrain.py",
+            ),
+        )
+        self.assertEqual(
+            V12._INTERFACE_AUDIT_CHECKS,
+            {
+                "append_contract",
+                "final_additions_are_exact_vacant_safe_reservoir_rows",
+                "final_addition_stored_coordinate_geometry_passed",
+                "terrain_edge_eligibility_is_candidate_independent",
+                "terrain_edge_meaningful_configured_support_continuity_passed",
+                "measured_density_lower_and_upper_bounds_passed",
+            },
+        )
+        self.assertTrue(all(
+            (V12.SCRIPT_DIR / name).is_file()
+            for name in V12._INTERFACE_AUDIT_IMPLEMENTATIONS
+        ))
+
     def test_empty_and_partial_fingerprints_never_compare_equal(self):
         self.assertFalse(V12._same_fingerprint({}, {}))
         self.assertFalse(
@@ -746,7 +797,7 @@ class UpstreamProvenanceTests(unittest.TestCase):
     def test_build_hash_locks_all_compact_upstream_stages(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = Fixture(directory)
-            V12.build(fixture.args)
+            build_fixture(fixture)
             manifest = json.loads(
                 (fixture.run / "release" / "manifest.json").read_text()
             )
@@ -755,6 +806,16 @@ class UpstreamProvenanceTests(unittest.TestCase):
             self.assertTrue(provenance["fine_first"])
             self.assertFalse(provenance["coarse_scalar_recalculation"])
             self.assertEqual(provenance["interface_audit"]["status"], "passed")
+            self.assertEqual(
+                provenance["interface_audit"]["independent_gate_recomputation"],
+                {
+                    "verified": True,
+                    "status": "passed",
+                    "manifest_sha256": V12.sha256_path(
+                        fixture.interface_audit_manifest
+                    ),
+                },
+            )
             self.assertEqual(
                 set(provenance["artifacts"]),
                 set(V12._PROVENANCE_SNAPSHOT_NAMES),
@@ -770,7 +831,7 @@ class UpstreamProvenanceTests(unittest.TestCase):
             fixture = Fixture(directory)
             fixture.interface_audit_manifest.unlink()
             with self.assertRaises(FileNotFoundError):
-                V12.build(fixture.args)
+                build_fixture(fixture)
 
         with tempfile.TemporaryDirectory() as directory:
             fixture = Fixture(directory)
@@ -781,7 +842,7 @@ class UpstreamProvenanceTests(unittest.TestCase):
             )
             write_json(fixture.interface_audit_manifest, document)
             with self.assertRaisesRegex(RuntimeError, "final_water hash drift"):
-                V12.build(fixture.args)
+                build_fixture(fixture)
 
         with tempfile.TemporaryDirectory() as directory:
             fixture = Fixture(directory)
@@ -795,7 +856,7 @@ class UpstreamProvenanceTests(unittest.TestCase):
             )
             write_json(fixture.interface_audit_manifest, document)
             with self.assertRaisesRegex(RuntimeError, "acceptance checks"):
-                V12.build(fixture.args)
+                build_fixture(fixture)
 
     def test_interface_audit_partial_fingerprint_is_rejected_even_when_relocked(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -807,7 +868,60 @@ class UpstreamProvenanceTests(unittest.TestCase):
             )
             write_json(fixture.interface_audit_manifest, document)
             with self.assertRaisesRegex(RuntimeError, "fingerprint key set differs"):
-                V12.build(fixture.args)
+                build_fixture(fixture)
+
+    def test_direct_build_recomputes_and_rejects_relocked_forged_audit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Fixture(directory)
+            document = json.loads(fixture.interface_audit_manifest.read_text())
+            # This extra passed evidence is deliberately outside the compact
+            # release subset.  Its self-lock can be recomputed coherently, but
+            # the hardened audit verifier must rebuild the evidence rather
+            # than accepting that lock as authenticity.
+            document["audit_parameters"] = {"edge_sample_limit": 17}
+            document["metrics"]["forged_relocked_gate"] = {
+                "passed": True,
+            }
+            document["manifest_lock"][
+                "sha256"
+            ] = V12._canonical_json_hash_without_key(document, "manifest_lock")
+            write_json(fixture.interface_audit_manifest, document)
+            self.assertEqual(
+                document["manifest_lock"]["sha256"],
+                V12._canonical_json_hash_without_key(document, "manifest_lock"),
+            )
+
+            recomputed = json.loads(json.dumps(document))
+            recomputed["metrics"].pop("forged_relocked_gate")
+            recomputed["manifest_lock"][
+                "sha256"
+            ] = V12._canonical_json_hash_without_key(
+                recomputed,
+                "manifest_lock",
+            )
+
+            def rebuild_without_forged_evidence(**kwargs):
+                write_json(Path(kwargs["output_path"]), recomputed)
+                return {"verified": True}
+
+            with mock.patch.object(
+                V12.interface_audit,
+                "verify_interface_audit",
+                wraps=V12.interface_audit.verify_interface_audit,
+            ) as verifier, mock.patch.object(
+                V12.interface_audit,
+                "build_interface_audit",
+                side_effect=rebuild_without_forged_evidence,
+            ) as rebuild:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "differs from independent gate recomputation",
+                ):
+                    # No fixture override: this is the direct/default release
+                    # path used by the CLI.
+                    V12.build(fixture.args)
+            verifier.assert_called_once()
+            rebuild.assert_called_once()
 
     def test_arbitrary_same_schema_candidates_are_rejected_even_with_new_report(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -826,7 +940,7 @@ class UpstreamProvenanceTests(unittest.TestCase):
                 RuntimeError,
                 "fine scalar candidate hash drift|changed existing WATER payload",
             ):
-                V12.build(fixture.args)
+                build_fixture(fixture)
 
     def test_geometry_source_and_downsample_policy_tampering_fail_closed(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -839,7 +953,7 @@ class UpstreamProvenanceTests(unittest.TestCase):
                 "geometry manifest source hash does not match supplied file|"
                 "geometry source WATER fingerprint is incomplete",
             ):
-                V12.build(fixture.args)
+                build_fixture(fixture)
 
         with tempfile.TemporaryDirectory() as directory:
             fixture = Fixture(directory)
@@ -847,7 +961,7 @@ class UpstreamProvenanceTests(unittest.TestCase):
             document["coarse_scalar_recalculation_performed"] = True
             write_json(fixture.downsample_manifest, document)
             with self.assertRaisesRegex(RuntimeError, "coarse scalar recalculation"):
-                V12.build(fixture.args)
+                build_fixture(fixture)
 
     def test_fine_component_scalar_attestation_is_mandatory(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -858,7 +972,7 @@ class UpstreamProvenanceTests(unittest.TestCase):
             )
             write_json(fixture.fine_manifest, document)
             with self.assertRaisesRegex(RuntimeError, "fine scalar invariant"):
-                V12.build(fixture.args)
+                build_fixture(fixture)
 
     def test_far_lobe_no_component_attestation_must_match_measurements(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -870,7 +984,7 @@ class UpstreamProvenanceTests(unittest.TestCase):
                 RuntimeError,
                 "measured no-component proof",
             ):
-                V12.build(fixture.args)
+                build_fixture(fixture)
 
 
 class ReleaseLifecycleTests(unittest.TestCase):
@@ -884,7 +998,7 @@ class ReleaseLifecycleTests(unittest.TestCase):
             candidate_fine_before = V12.file_fingerprint(fixture.fine)
             candidate_coarse_before = V12.file_fingerprint(fixture.coarse)
 
-            built = V12.build(fixture.args)
+            built = build_fixture(fixture)
             self.assertTrue(built["built"])
             manifest = json.loads(
                 (fixture.run / "release" / "manifest.json").read_text()
@@ -962,9 +1076,9 @@ class ReleaseLifecycleTests(unittest.TestCase):
     def test_build_refuses_overwrite_and_candidate_hardlink_alias(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = Fixture(directory)
-            V12.build(fixture.args)
+            build_fixture(fixture)
             with self.assertRaisesRegex(FileExistsError, "release directory"):
-                V12.build(fixture.args)
+                build_fixture(fixture)
 
         with tempfile.TemporaryDirectory() as directory:
             fixture = Fixture(directory)
@@ -972,12 +1086,12 @@ class ReleaseLifecycleTests(unittest.TestCase):
             os.link(fixture.canonical_fine, fixture.fine)
             write_report(fixture.report, fixture.fine, fixture.coarse)
             with self.assertRaisesRegex(RuntimeError, "hard-link aliases"):
-                V12.build(fixture.args)
+                build_fixture(fixture)
 
     def test_restore_refuses_to_overwrite_reoccupied_candidate_path(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = Fixture(directory)
-            V12.build(fixture.args)
+            build_fixture(fixture)
             with mock.patch.object(V12, "refuse_running_app"):
                 V12.install(fixture.args)
             canonical_before = V12.file_fingerprint(fixture.canonical_fine)
@@ -992,7 +1106,7 @@ class ReleaseLifecycleTests(unittest.TestCase):
     def test_failed_restore_preparation_leaves_no_unjournaled_clone_orphan(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = Fixture(directory)
-            V12.build(fixture.args)
+            build_fixture(fixture)
             with mock.patch.object(V12, "refuse_running_app"):
                 V12.install(fixture.args)
             transactions = fixture.run / "release" / "transactions"
@@ -1018,7 +1132,7 @@ class ReleaseLifecycleTests(unittest.TestCase):
     def test_manifest_candidate_path_tampering_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = Fixture(directory)
-            V12.build(fixture.args)
+            build_fixture(fixture)
             manifest_path = fixture.run / "release" / "manifest.json"
             manifest = json.loads(manifest_path.read_text())
             manifest["clouds"]["WATER-2mm"]["candidate_path"] = str(
@@ -1031,7 +1145,7 @@ class ReleaseLifecycleTests(unittest.TestCase):
     def test_release_manifest_missing_fingerprint_keys_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = Fixture(directory)
-            V12.build(fixture.args)
+            build_fixture(fixture)
             manifest_path = fixture.run / "release" / "manifest.json"
             manifest = json.loads(manifest_path.read_text())
             manifest["clouds"]["WATER-2mm"]["candidate"] = {}
@@ -1042,7 +1156,7 @@ class ReleaseLifecycleTests(unittest.TestCase):
     def test_release_manifest_cannot_forge_component_scalar_coverage(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = Fixture(directory)
-            V12.build(fixture.args)
+            build_fixture(fixture)
             manifest_path = fixture.run / "release" / "manifest.json"
             document = json.loads(manifest_path.read_text())
             coverage = document["upstream_provenance"][
@@ -1061,7 +1175,7 @@ class InterruptedTransactionRecoveryTests(unittest.TestCase):
     def test_startup_recovery_rolls_back_partial_install(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = Fixture(directory)
-            V12.build(fixture.args)
+            build_fixture(fixture)
             paths = V12._coerce_paths(fixture.args)
             manifest_path, manifest = V12._read_release(paths)
             transaction_dir = V12._new_transaction_dir(paths, "install")
@@ -1115,7 +1229,7 @@ class InterruptedTransactionRecoveryTests(unittest.TestCase):
     def test_ambiguous_recovery_content_is_never_overwritten(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = Fixture(directory)
-            V12.build(fixture.args)
+            build_fixture(fixture)
             paths = V12._coerce_paths(fixture.args)
             _, manifest = V12._read_release(paths)
             transaction_dir = V12._new_transaction_dir(paths, "install")

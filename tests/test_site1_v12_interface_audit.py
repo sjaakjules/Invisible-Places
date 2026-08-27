@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -186,27 +187,44 @@ class Fixture:
             )),
         )
 
-    def _write_archive(self, labels):
+    def _write_archive(self, labels, *, kinds=None):
+        candidate_xy = np.column_stack((
+            self.addition_records["x"], self.addition_records["y"]
+        )).astype(np.float64)
+        self.candidate_kind = (
+            np.asarray(kinds, np.uint8)
+            if kinds is not None
+            else np.ones(len(candidate_xy), np.uint8)
+        )
+        if self.candidate_kind.shape != (len(candidate_xy),):
+            raise ValueError("candidate kinds differ from additions")
+        self.vacant_safe_reservoir_xy = np.unique(
+            np.concatenate((self.capacity_xy, candidate_xy), axis=0),
+            axis=0,
+        )
         np.savez(
             self.archive,
             records=self.addition_records,
+            candidate_xy=candidate_xy,
             candidate_label=np.asarray(labels, np.int32),
+            candidate_kind=self.candidate_kind,
             raw_support_cell_keys=self.support.cell_keys,
             raw_support_representative_xy=self.support.representative_xy,
             vacant_support_cell_keys=self.support.cell_keys,
             vacant_support_representative_xy=self.support.representative_xy,
+            vacant_safe_reservoir_xy=self.vacant_safe_reservoir_xy,
             support_pitch_m=np.asarray(self.SUPPORT_PITCH, np.float64),
             spacing_capacity_xy=self.capacity_xy,
         )
 
-    def replace_additions(self, xyz, *, labels=None):
+    def replace_additions(self, xyz, *, labels=None, kinds=None):
         self._set_addition_records(xyz)
         active_labels = (
             np.asarray(labels, np.int32)
             if labels is not None
             else np.ones(len(self.addition_records), np.int32)
         )
-        self._write_archive(active_labels)
+        self._write_archive(active_labels, kinds=kinds)
         self.write_fine_manifest()
 
     @staticmethod
@@ -458,6 +476,10 @@ class Fixture:
             "raw_support_representative_archive_key": "raw_support_representative_xy",
             "vacant_support_archive_key": "vacant_support_cell_keys",
             "vacant_support_representative_archive_key": "vacant_support_representative_xy",
+            "vacant_safe_reservoir_archive_key": "vacant_safe_reservoir_xy",
+            "vacant_safe_reservoir_count": int(
+                len(self.vacant_safe_reservoir_xy)
+            ),
             "support_pitch_archive_key": "support_pitch_m",
             "immutable_water_spacing_m": self.WATER_SPACING,
             "immutable_water_blocker_count": int(len(base_xy)),
@@ -475,11 +497,27 @@ class Fixture:
             "reference_sample_count": reference_sample_count.tolist(),
             "spacing_feasible_capacity_count": capacity_count.tolist(),
             "spacing_capacity_selection_count": int(len(self.capacity_xy)),
+            "spacing_capacity_fixed_fade_blocker_count": int(
+                np.count_nonzero(
+                    (self.candidate_kind == 4)
+                    & (
+                        np.sum(
+                            np.column_stack((
+                                self.addition_records["x"],
+                                self.addition_records["y"],
+                            )).astype(np.float64) ** 2,
+                            axis=1,
+                        )
+                        > settings.audit_radius_m**2 + 1e-12
+                    )
+                )
+            ),
             "spacing_capacity_seed": 120827,
             "spacing_capacity_archive_key": "spacing_capacity_xy",
-            "spacing_capacity_uses_complete_safe_reservoir": True,
-            "spacing_capacity_is_constructive_witness_not_maximum": True,
-            "spacing_capacity_in_joint_candidate_pool": True,
+            "spacing_capacity_uses_complete_safe_reservoir_and_fixed_fade": True,
+            "spacing_capacity_is_spacing_feasible_reservoir_not_interval_certificate": True,
+            "spacing_capacity_candidate_rows_in_joint_pool": True,
+            "final_selected_additions_are_joint_interval_certificate": True,
             "raw_desired_addition_count": raw_desired_addition_count.tolist(),
             "target_addition_count": addition_contract.target_addition_count.tolist(),
             "addition_lower_count": addition_contract.addition_lower_count.tolist(),
@@ -592,6 +630,212 @@ class Fixture:
 
 
 class InterfaceAuditTests(unittest.TestCase):
+    def test_radius_membership_is_chunked_and_includes_boundary(self):
+        centres = np.asarray([[0.0, 0.0], [10.0, 0.0]], np.float64)
+        points = np.asarray(
+            [
+                [0.0, 0.0],
+                [0.08, 0.0],
+                [0.08 + 0.5e-12, 0.0],
+                [0.08 + 2.0e-12, 0.0],
+                [9.92, 0.0],
+                [5.0, 5.0],
+                *([20.0 + index, 20.0] for index in range(17)),
+            ],
+            np.float64,
+        )
+        batch_sizes = []
+
+        class TrackingSpatialIndex:
+            def query(self, query, *, k=1, workers=-1):
+                self.assert_query_contract(k, workers)
+                query = np.asarray(query, np.float64)
+                batch_sizes.append(len(query))
+                if len(query) > 3:
+                    raise AssertionError("radius membership queried an unbounded batch")
+                squared = np.sum(
+                    (query[:, None, :] - centres[None, :, :]) ** 2,
+                    axis=2,
+                )
+                selected = np.argmin(squared, axis=1)
+                return (
+                    np.sqrt(squared[np.arange(len(query)), selected]),
+                    selected,
+                )
+
+            def assert_query_contract(self, k, workers):
+                if k != 1 or workers != -1:
+                    raise AssertionError("unexpected nearest-centre query contract")
+
+        with mock.patch.object(
+            AUDIT,
+            "_spatial_index",
+            return_value=TrackingSpatialIndex(),
+        ) as spatial_index:
+            membership = AUDIT._points_within_any_centre(
+                points,
+                centres,
+                radius_m=0.08,
+                chunk_rows=3,
+            )
+        spatial_index.assert_called_once()
+        self.assertGreater(len(batch_sizes), 1)
+        self.assertLessEqual(max(batch_sizes), 3)
+        np.testing.assert_array_equal(
+            membership[:6],
+            [True, True, True, False, True, False],
+        )
+        self.assertFalse(np.any(membership[6:]))
+
+    def test_final_addition_pair_spacing_is_checked_on_stored_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Fixture(directory)
+            fixture.replace_additions([
+                (-0.049, 0.001, 0.0),
+                (-0.048, 0.001, 0.0),
+                (-0.009, 0.001, 0.0),
+                (0.011, 0.001, 0.0),
+                (0.031, 0.001, 0.0),
+                (0.051, 0.001, 0.0),
+            ])
+            with self.assertRaisesRegex(
+                RuntimeError, "final appended addition pair spacing"
+            ):
+                AUDIT.build_interface_audit(
+                    **fixture.kwargs(),
+                    output_path=fixture.output,
+                    chunk_records=2,
+                )
+
+    def test_final_addition_clearance_streams_all_surviving_base_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Fixture(directory)
+            fixture.base_records = write_ply(
+                fixture.base,
+                [(0.16, 0.0, 0.0)] * 6 + [(0.6009, 0.001, 0.0)],
+            )
+            fixture.replace_additions([
+                (-0.049, 0.001, 0.0),
+                (-0.029, 0.001, 0.0),
+                (-0.009, 0.001, 0.0),
+                (0.011, 0.001, 0.0),
+                (0.031, 0.001, 0.0),
+                (0.5999, 0.001, 0.0),
+            ])
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "final appended addition clearance to surviving immutable WATER",
+            ):
+                AUDIT.build_interface_audit(
+                    **fixture.kwargs(),
+                    output_path=fixture.output,
+                    chunk_records=2,
+                )
+
+    def test_final_addition_must_be_exact_archived_safe_reservoir_row(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Fixture(directory)
+            defaults = [
+                (-0.049, 0.001, 0.0),
+                (-0.029, 0.001, 0.0),
+                (-0.009, 0.001, 0.0),
+                (0.011, 0.001, 0.0),
+                (0.031, 0.001, 0.0),
+                (0.051, 0.001, 0.0),
+                (0.60, 0.10, 0.0),
+            ]
+            fixture.replace_additions(defaults)
+            with np.load(fixture.archive, allow_pickle=False) as loaded:
+                payload = {name: np.asarray(loaded[name]).copy() for name in loaded.files}
+            outside = np.asarray(payload["candidate_xy"][-1], np.float64)
+            safe = np.asarray(payload["vacant_safe_reservoir_xy"], np.float64)
+            safe = safe[~np.all(safe == outside[None, :], axis=1)]
+            payload["vacant_safe_reservoir_xy"] = safe
+            fixture.vacant_safe_reservoir_xy = safe
+            np.savez(fixture.archive, **payload)
+            fixture.write_fine_manifest()
+            with self.assertRaisesRegex(
+                RuntimeError, "final appended addition.*vacant safe support"
+            ):
+                AUDIT.build_interface_audit(
+                    **fixture.kwargs(),
+                    output_path=fixture.output,
+                    chunk_records=3,
+                )
+
+    def test_audit_rebuilds_addition_bounds_without_production_helper(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Fixture(directory)
+            geometry = json.loads(fixture.geometry_manifest.read_text())
+            config_document = json.loads(fixture.config.read_text())
+            specs = AUDIT.water_pipeline.load_circle_specs(fixture.config)
+            with mock.patch.object(
+                AUDIT.water_pipeline.refinement,
+                "attainable_addition_density_contract",
+                side_effect=AssertionError("production helper reused"),
+            ):
+                contract = AUDIT._declared_density_contract(
+                    geometry, config_document, specs, fixture.archive
+                )
+            raw = np.asarray(contract["raw_desired_addition_count"], np.float64)
+            np.testing.assert_array_equal(
+                contract["addition_lower_count"], np.ceil(0.85 * raw)
+            )
+            np.testing.assert_array_equal(
+                contract["addition_upper_count"], np.ceil(1.25 * raw)
+            )
+
+    def test_capacity_candidates_are_separate_from_fixed_fade_blockers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Fixture(directory)
+            fixture.replace_additions(
+                [
+                    (-0.049, 0.001, 0.0),
+                    (-0.029, 0.001, 0.0),
+                    (-0.009, 0.001, 0.0),
+                    (0.011, 0.001, 0.0),
+                    (0.031, 0.001, 0.0),
+                    (0.051, 0.001, 0.0),
+                    (0.30, 0.0, 0.0),
+                ],
+                kinds=[1, 1, 1, 1, 1, 1, 4],
+            )
+            with mock.patch.object(
+                AUDIT,
+                "_points_within_any_centre",
+                wraps=AUDIT._points_within_any_centre,
+            ) as radius_membership:
+                result = AUDIT.build_interface_audit(
+                    **fixture.kwargs(),
+                    output_path=fixture.output,
+                    chunk_records=3,
+                    edge_sample_limit=17,
+                )
+            radius_membership.assert_called_once()
+            self.assertTrue(result["verified"])
+            document = json.loads(fixture.output.read_text())
+            geometry = document["metrics"][
+                "final_addition_stored_coordinate_geometry"
+            ]
+            self.assertTrue(
+                geometry["surviving_base_clearance_streamed_without_materialization"]
+            )
+
+    def test_joint_pool_declaration_must_be_true(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Fixture(directory)
+            geometry = json.loads(fixture.geometry_manifest.read_text())
+            geometry["density_audit"][
+                "spacing_capacity_candidate_rows_in_joint_pool"
+            ] = False
+            with self.assertRaisesRegex(RuntimeError, "flag.*false"):
+                AUDIT._declared_density_contract(
+                    geometry,
+                    json.loads(fixture.config.read_text()),
+                    AUDIT.water_pipeline.load_circle_specs(fixture.config),
+                    fixture.archive,
+                )
+
     def test_source_rows_removed_by_reversible_cull_do_not_count_as_blockers(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "base.ply"
@@ -777,6 +1021,36 @@ class InterfaceAuditTests(unittest.TestCase):
             )
             self.assertEqual(result["status"], "failed")
             with self.assertRaisesRegex(RuntimeError, "did not pass"):
+                AUDIT.verify_interface_audit(
+                    manifest_path=fixture.output,
+                    **fixture.kwargs(),
+                )
+
+    def test_relocked_failed_audit_cannot_forge_passed_acceptance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Fixture(directory)
+            write_ply(fixture.sand, [(4.0, 4.0, 0.0)])
+            write_ply(fixture.rock, [(4.1, 4.0, 0.0)])
+            fixture.write_fine_manifest()
+            result = AUDIT.build_interface_audit(
+                **fixture.kwargs(),
+                output_path=fixture.output,
+                chunk_records=4,
+                edge_sample_limit=20,
+            )
+            self.assertEqual(result["status"], "failed")
+            document = json.loads(fixture.output.read_text())
+            document["status"] = "passed"
+            document["acceptance"]["passed"] = True
+            for name in document["acceptance"]["checks"]:
+                document["acceptance"]["checks"][name] = True
+            document["manifest_lock"]["sha256"] = (
+                AUDIT._canonical_document_hash(document)
+            )
+            fixture.output.write_text(json.dumps(document))
+            with self.assertRaisesRegex(
+                RuntimeError, "independent interface audit recomputation did not pass"
+            ):
                 AUDIT.verify_interface_audit(
                     manifest_path=fixture.output,
                     **fixture.kwargs(),

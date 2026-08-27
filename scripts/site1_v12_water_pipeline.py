@@ -639,6 +639,34 @@ def _nearest_distance(query: np.ndarray, support: np.ndarray) -> np.ndarray:
     return np.asarray(distance, np.float64)
 
 
+def _roundtrip_xy_to_record_dtype(
+    xy: np.ndarray, record_dtype: np.dtype
+) -> np.ndarray:
+    """Return XY exactly as it will exist in the output PLY payload.
+
+    Scene coordinates are near 800 m while the canonical PLY stores float32
+    coordinates.  Selecting on higher-precision proposals can therefore turn
+    an accepted 1.8 mm separation into a genuinely sub-1.8 mm stored distance.
+    All geometric gates operate on this round-tripped representation instead.
+    """
+
+    points = np.asarray(xy, np.float64)
+    if points.ndim != 2 or points.shape[1] != 2:
+        raise ValueError("XY points must have shape (N, 2)")
+    fields = record_dtype.fields or {}
+    if "x" not in fields or "y" not in fields:
+        raise ValueError("record dtype lacks x/y fields")
+    x_dtype = fields["x"][0]
+    y_dtype = fields["y"][0]
+    result = np.column_stack((
+        points[:, 0].astype(x_dtype).astype(np.float64),
+        points[:, 1].astype(y_dtype).astype(np.float64),
+    ))
+    if not np.all(np.isfinite(result)):
+        raise ValueError("stored-coordinate XY contains non-finite values")
+    return result
+
+
 def _load_surface(v9_run: str | Path, v10_config: str | Path):
     _, document = _load_json(v10_config)
     return v10.load_surface_reference(Path(v9_run).resolve(strict=True), dict(document))
@@ -1822,6 +1850,10 @@ def build_fine_water_geometry(
     proposals, proposal_label, proposal_priority, proposal_kind = (
         generate_review_proposals(proposal_specs, seed=seed)
     )
+    # Quantise before every footprint, support, sidedness, terrain-clearance,
+    # vacancy and spacing decision. Z/noise below is sampled again at these
+    # exact stored XY coordinates.
+    proposals = _roundtrip_xy_to_record_dtype(proposals, source_info.dtype)
     raw_proposal_count = len(proposals)
     inside = _surface_contains(surface, proposals)
     proposals = proposals[inside]
@@ -2001,16 +2033,18 @@ def build_fine_water_geometry(
         radius_m=density_settings.audit_radius_m,
         sample_pitch_m=support_sample_pitch,
     )
+    all_vacant_reservoir_mask = _vacant_candidate_mask(
+        reservoir_xy,
+        water_xy,
+        spacing_m=water_spacing,
+    )
+    all_vacant_reservoir_indices = np.flatnonzero(all_vacant_reservoir_mask)
     density_reservoir_indices = np.flatnonzero(reservoir_kind != 4)
     raw_fillable_cells = _unique_fillable_support_cells(
         reservoir_xy[density_reservoir_indices],
         pitch_m=support_sample_pitch,
     )
-    vacant_local_mask = _vacant_candidate_mask(
-        reservoir_xy[density_reservoir_indices],
-        water_xy,
-        spacing_m=water_spacing,
-    )
+    vacant_local_mask = all_vacant_reservoir_mask[density_reservoir_indices]
     vacant_reservoir_indices = density_reservoir_indices[vacant_local_mask]
     vacant_density_reservoir_mask = np.zeros(len(reservoir_xy), dtype=bool)
     vacant_density_reservoir_mask[vacant_reservoir_indices] = True
@@ -2039,29 +2073,8 @@ def build_fine_water_geometry(
         footprint_support.valid_footprint_area_m2,
     )
 
-    # Construct one canonical, globally feasible 1.8 mm completion against all
-    # immutable WATER.  This is a witness, not a mathematical maximum.  Its
-    # moving-window counts must be sufficient for every requested lower bound.
-    capacity_blue = confidence.variable_radius_blue_noise(
-        reservoir_xy[vacant_reservoir_indices],
-        water_spacing,
-        existing_points=water_xy,
-        existing_radius=water_spacing,
-        priority=reservoir_priority[vacant_reservoir_indices],
-        seed=seed ^ 0xCA9AC17,
-        rebuild_interval=512,
-    )
-    spacing_capacity_reservoir_indices = vacant_reservoir_indices[
-        capacity_blue.selected_indices
-    ]
-    spacing_capacity_xy = reservoir_xy[spacing_capacity_reservoir_indices]
-    spacing_capacity_count = _circle_point_counts(
-        audit_centres,
-        spacing_capacity_xy,
-        radius_m=density_settings.audit_radius_m,
-    )
     # Eligibility is a property of exact footprint and genuinely vacant safe
-    # support.  A zero-count capacity witness must remain active so that the
+    # support.  A zero-count capacity reservoir must remain active so that the
     # fail-closed capacity check below reports it instead of masking it.
     fillable_support_active = vacant_support_sample_count > 0
     reference_surface_active = footprint_support.active_mask
@@ -2146,6 +2159,35 @@ def build_fine_water_geometry(
         if len(fixed_fade_xy)
         else water_xy
     )
+
+    # Build one globally spacing-valid reservoir against the *actual* fixed
+    # solver state: surviving immutable WATER plus fixed fade additions.  The
+    # complete packing is a necessary per-window lower-coverage check, not a
+    # certificate that the whole packing satisfies overlapping upper bounds.
+    # Only the final solver subset can certify both interval sides together.
+    capacity_blue = confidence.variable_radius_blue_noise(
+        reservoir_xy[vacant_reservoir_indices],
+        water_spacing,
+        existing_points=refill_existing,
+        existing_radius=water_spacing,
+        priority=reservoir_priority[vacant_reservoir_indices],
+        seed=seed ^ 0xCA9AC17,
+        rebuild_interval=512,
+    )
+    spacing_capacity_reservoir_indices = vacant_reservoir_indices[
+        capacity_blue.selected_indices
+    ]
+    spacing_capacity_candidate_xy = reservoir_xy[
+        spacing_capacity_reservoir_indices
+    ]
+    # Fixed fade rows are blockers, not members of this density-candidate
+    # reservoir. They are outside all registered density windows by definition.
+    spacing_capacity_xy = spacing_capacity_candidate_xy
+    spacing_capacity_count = _circle_point_counts(
+        audit_centres,
+        spacing_capacity_xy,
+        radius_m=density_settings.audit_radius_m,
+    )
     addition_contract = refinement.attainable_addition_density_contract(
         measured_targets.existing_water_count,
         measured_targets.raw_desired_addition_count,
@@ -2204,18 +2246,22 @@ def build_fine_water_geometry(
             destination / "density-capacity-failure.json",
             {
                 "status": "failed",
-                "reason": "canonical constructive spacing witness is insufficient",
+                "reason": (
+                    "globally spacing-valid reservoir cannot cover a required "
+                    "per-window lower addition count"
+                ),
                 "failed_window_count": int(len(failed)),
                 "required_window_count": int(np.count_nonzero(required_mask)),
                 "water_spacing_m": water_spacing,
                 "raw_support_cell_count": int(len(raw_fillable_cells.cell_keys)),
                 "vacant_support_cell_count": int(len(vacant_support_cells.cell_keys)),
-                "canonical_capacity_selection_count": int(len(spacing_capacity_xy)),
+                "spacing_reservoir_selection_count": int(len(spacing_capacity_xy)),
+                "fixed_fade_blocker_count": int(len(fixed_fade_xy)),
                 "failed_window_preview": preview,
             },
         )
         raise RuntimeError(
-            "canonical constructive 1.8 mm spacing feasibility was not proven "
+            "necessary 1.8 mm spacing-reservoir lower coverage failed "
             f"in {len(failed)} windows; compact diagnostic="
             f"{destination / 'density-capacity-failure.json'}"
         )
@@ -2372,15 +2418,19 @@ def build_fine_water_geometry(
     ]
 
     # Repack the surviving primary and wider repair candidates together.  The
-    # complete canonical capacity witness is included explicitly, so the
-    # fail-closed feasibility proof cannot refer to rows absent from the solver.
+    # complete spacing reservoir is included explicitly, so the necessary
+    # lower-coverage check cannot refer to rows absent from the solver.
     # A provisional primary point is not privileged merely because it was seen
     # before complete clearance; the joint lower-bound solver may supersede it
     # with a candidate that covers more or scarcer deficient windows.
     joint_xyz, joint_xy, joint_label, joint_priority, joint_kind, joint_distance = (
         _deduplicate_candidate_pool(
             np.concatenate((cleared_primary_xyz, repair_xyz, capacity_xyz), axis=0),
-            np.concatenate((cleared_primary_xy, repair_xy, spacing_capacity_xy), axis=0),
+            np.concatenate((
+                cleared_primary_xy,
+                repair_xy,
+                spacing_capacity_candidate_xy,
+            ), axis=0),
             np.concatenate((cleared_primary_label, repair_label, capacity_label), axis=0),
             np.concatenate((cleared_primary_priority, repair_priority, capacity_priority), axis=0),
             np.concatenate((cleared_primary_kind, repair_kind, capacity_kind), axis=0),
@@ -2391,17 +2441,17 @@ def build_fine_water_geometry(
             ), axis=0),
         )
     )
-    capacity_row_view = np.ascontiguousarray(spacing_capacity_xy).view(
-        np.dtype((np.void, spacing_capacity_xy.dtype.itemsize * 2))
+    capacity_row_view = np.ascontiguousarray(spacing_capacity_candidate_xy).view(
+        np.dtype((np.void, spacing_capacity_candidate_xy.dtype.itemsize * 2))
     ).ravel()
     joint_row_view = np.ascontiguousarray(joint_xy).view(
         np.dtype((np.void, joint_xy.dtype.itemsize * 2))
     ).ravel()
-    capacity_witness_in_joint_pool = bool(
+    capacity_candidate_rows_in_joint_pool = bool(
         np.all(np.isin(capacity_row_view, joint_row_view, assume_unique=False))
     )
-    if not capacity_witness_in_joint_pool:
-        raise RuntimeError("canonical spacing witness is absent from the joint pool")
+    if not capacity_candidate_rows_in_joint_pool:
+        raise RuntimeError("spacing-reservoir candidates are absent from joint pool")
     joint_same_spec_count, joint_cross_spec_count = (
         _circle_spec_membership_counts(
             audit_centres,
@@ -2624,6 +2674,9 @@ def build_fine_water_geometry(
         vacant_support_representative_xy=(
             vacant_support_cells.representative_xy.astype(np.float64)
         ),
+        vacant_safe_reservoir_xy=(
+            reservoir_xy[all_vacant_reservoir_indices].astype(np.float64)
+        ),
         support_pitch_m=np.asarray(raw_fillable_cells.pitch_m, dtype=np.float64),
         spacing_capacity_xy=spacing_capacity_xy.astype(np.float64),
     )
@@ -2813,6 +2866,10 @@ def build_fine_water_geometry(
             "vacant_support_representative_archive_key": (
                 "vacant_support_representative_xy"
             ),
+            "vacant_safe_reservoir_archive_key": "vacant_safe_reservoir_xy",
+            "vacant_safe_reservoir_count": int(
+                len(all_vacant_reservoir_indices)
+            ),
             "support_pitch_archive_key": "support_pitch_m",
             "immutable_water_spacing_m": water_spacing,
             "immutable_water_blocker_count": int(len(water_xy)),
@@ -2846,13 +2903,17 @@ def build_fine_water_geometry(
                 spacing_capacity_count.tolist()
             ),
             "spacing_capacity_selection_count": int(len(spacing_capacity_xy)),
+            "spacing_capacity_fixed_fade_blocker_count": int(
+                len(fixed_fade_xy)
+            ),
             "spacing_capacity_seed": int(seed ^ 0xCA9AC17),
             "spacing_capacity_archive_key": "spacing_capacity_xy",
-            "spacing_capacity_uses_complete_safe_reservoir": True,
-            "spacing_capacity_is_constructive_witness_not_maximum": True,
-            "spacing_capacity_in_joint_candidate_pool": (
-                capacity_witness_in_joint_pool
+            "spacing_capacity_uses_complete_safe_reservoir_and_fixed_fade": True,
+            "spacing_capacity_is_spacing_feasible_reservoir_not_interval_certificate": True,
+            "spacing_capacity_candidate_rows_in_joint_pool": (
+                capacity_candidate_rows_in_joint_pool
             ),
+            "final_selected_additions_are_joint_interval_certificate": True,
             "raw_desired_addition_count": (
                 measured_targets.raw_desired_addition_count.tolist()
             ),

@@ -51,6 +51,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import site1_v11_water_scalar_enrichment as scalar_enrichment  # noqa: E402
+import site1_v12_interface_audit as interface_audit  # noqa: E402
 
 ROOT = SCRIPT_DIR.parent
 DEFAULT_DATA = ROOT / "Data" / "Scene1"
@@ -883,9 +884,17 @@ _INTERFACE_AUDIT_IMPLEMENTATIONS = (
     "site1_v11_water_density.py",
     "site1_v11_water_scalar_enrichment.py",
     "site1_v12_water_pipeline.py",
+    "rebuild_site1_fossils_v10.py",
+    "rebuild_site1_fossils_v9.py",
+    "rebuild_site1_fossils_water.py",
+    "site1_v11_confidence.py",
+    "site1_v12_water_refinement.py",
+    "site1_v11_terrain.py",
 )
 _INTERFACE_AUDIT_CHECKS = {
     "append_contract",
+    "final_additions_are_exact_vacant_safe_reservoir_rows",
+    "final_addition_stored_coordinate_geometry_passed",
     "terrain_edge_eligibility_is_candidate_independent",
     "terrain_edge_meaningful_configured_support_continuity_passed",
     "measured_density_lower_and_upper_bounds_passed",
@@ -1726,11 +1735,49 @@ def _verify_interface_audit_provenance(
     candidate_fine: Mapping,
     geometry: Mapping,
     fine: Mapping,
+    *,
+    recomputing_verifier: Callable[..., Mapping] | None = None,
 ) -> dict:
-    """Require the passed, self-locked post-build WATER/terrain audit."""
+    """Require a passed audit whose gates independently recompute.
+
+    The compact checks below bind the audit into release provenance, but its
+    unkeyed JSON self-lock is not an authenticity proof.  The default path
+    therefore invokes the audit module's full deterministic verifier first.
+    ``recomputing_verifier`` is a keyword-only seam for compact unit fixtures;
+    neither the CLI nor the default :func:`build` path supplies an override.
+    """
+
+    verifier = (
+        interface_audit.verify_interface_audit
+        if recomputing_verifier is None
+        else recomputing_verifier
+    )
+    independently_verified = verifier(
+        manifest_path=paths.interface_audit_manifest,
+        base_water_path=_canonical(paths, "WATER-2mm"),
+        final_water_path=paths.candidate_2mm,
+        fine_manifest_path=paths.fine_manifest,
+        geometry_manifest_path=paths.geometry_manifest,
+        geometry_archive_path=paths.geometry_archive,
+        sand_1mm_path=paths.data_dir / "Site1-SAND-1mm.ply",
+        rock_1mm_path=paths.data_dir / "Site1-ROCK-1mm.ply",
+        review_config_path=paths.review_config,
+    )
+    _require(
+        isinstance(independently_verified, Mapping)
+        and independently_verified.get("verified") is True
+        and independently_verified.get("status") == "passed",
+        "independent interface audit gate recomputation did not pass",
+    )
 
     manifest_source, document = _load_json(
         paths.interface_audit_manifest, "v12 interface audit manifest"
+    )
+    manifest_sha256 = sha256_path(manifest_source)
+    _require(
+        independently_verified.get("manifest") == str(manifest_source)
+        and independently_verified.get("manifest_sha256") == manifest_sha256,
+        "independent interface audit verification is not bound to this manifest",
     )
     _require(document.get("schema_version") == 1, "interface audit schema mismatch")
     _require(
@@ -1885,8 +1932,8 @@ def _verify_interface_audit_provenance(
     )
     _require(acceptance.get("passed") is True, "interface audit acceptance did not pass")
     _require(
-        acceptance.get("water_only_center_count_is_acceptance_criterion") is False,
-        "interface audit incorrectly gates terrain-occupied centres on WATER alone",
+        acceptance.get("water_only_center_count_is_acceptance_criterion") is True,
+        "interface audit does not directly gate required WATER support",
     )
     metrics = document.get("metrics")
     density_gate = (
@@ -1902,7 +1949,7 @@ def _verify_interface_audit_provenance(
         and math.isclose(float(density_gate.get("minimum_ratio", -1.0)), 0.85, rel_tol=0.0, abs_tol=1.0e-12)
         and math.isclose(float(density_gate.get("maximum_ratio", -1.0)), 1.25, rel_tol=0.0, abs_tol=1.0e-12)
         and density_gate.get("post_build_lower_and_upper_bounds_passed") is True
-        and density_gate.get("water_only_center_count_is_acceptance_criterion") is False,
+        and density_gate.get("water_only_center_count_is_acceptance_criterion") is True,
         "interface audit measured density gate contract differs",
     )
     _require(
@@ -1917,6 +1964,11 @@ def _verify_interface_audit_provenance(
         "candidate_only": True,
         "canonical_writes": False,
         "manifest_lock_sha256": lock_sha,
+        "independent_gate_recomputation": {
+            "verified": True,
+            "status": "passed",
+            "manifest_sha256": manifest_sha256,
+        },
         "terrain_resolution_m": 0.001,
         "input_fingerprints": input_audits,
         "implementation_fingerprints": implementation_audits,
@@ -1928,9 +1980,9 @@ def _verify_interface_audit_provenance(
             "minimum_ratio": 0.85,
             "maximum_ratio": 1.25,
             "post_build_lower_and_upper_bounds_passed": True,
-            "water_only_center_count_is_acceptance_criterion": False,
+            "water_only_center_count_is_acceptance_criterion": True,
         },
-        "water_only_center_count_is_acceptance_criterion": False,
+        "water_only_center_count_is_acceptance_criterion": True,
     }
 
 
@@ -2121,7 +2173,11 @@ def refuse_running_app() -> None:
         raise RuntimeError("refusing WATER publication: invisible_places is running")
 
 
-def _build_locked(paths: ReleasePaths) -> dict:
+def _build_locked(
+    paths: ReleasePaths,
+    *,
+    interface_audit_verifier: Callable[..., Mapping] | None = None,
+) -> dict:
     files = _validate_build_paths(paths)
     fine_info = inspect_ply(files["WATER-2mm candidate"])
     coarse_info = inspect_ply(files["WATER-5mm candidate"])
@@ -2160,6 +2216,7 @@ def _build_locked(paths: ReleasePaths) -> dict:
         candidate_fingerprints["WATER-2mm"],
         geometry,
         fine_provenance,
+        recomputing_verifier=interface_audit_verifier,
     )
     relation = verify_ordered_record_subsequence(
         files["WATER-2mm candidate"], files["WATER-5mm candidate"]
@@ -2359,6 +2416,7 @@ def _build_locked(paths: ReleasePaths) -> dict:
                 "fine_and_coarse_component_scalar_coverage_directly_verified": True,
                 "geometry_base_archive_config_implementation_bound": True,
                 "passed_interface_audit_hash_locked": True,
+                "passed_interface_audit_independently_recomputed": True,
                 "downsample_stage_binds_fine_coarse_report_executable": True,
                 "coarse_scalar_recalculation_forbidden": True,
                 "compact_provenance_snapshots_hash_locked": True,
@@ -2386,10 +2444,17 @@ def _build_locked(paths: ReleasePaths) -> dict:
     }
 
 
-def build(args) -> dict:
+def build(
+    args,
+    *,
+    interface_audit_verifier: Callable[..., Mapping] | None = None,
+) -> dict:
     paths = _coerce_paths(args)
     with release_lock(paths.run_dir):
-        return _build_locked(paths)
+        return _build_locked(
+            paths,
+            interface_audit_verifier=interface_audit_verifier,
+        )
 
 
 def _manifest_path(paths: ReleasePaths) -> Path:
@@ -2814,6 +2879,7 @@ def _validate_release_provenance(paths: ReleasePaths, manifest: Mapping) -> None
     audit_append = interface_audit.get("append_contract")
     audit_checks = interface_audit.get("acceptance_checks")
     audit_density = interface_audit.get("measured_density_gate")
+    audit_recomputation = interface_audit.get("independent_gate_recomputation")
     _require(
         interface_audit.get("operation")
         == "site1-v12-post-build-terrain-water-interface-audit"
@@ -2821,7 +2887,7 @@ def _validate_release_provenance(paths: ReleasePaths, manifest: Mapping) -> None
         and interface_audit.get("candidate_only") is True
         and interface_audit.get("canonical_writes") is False
         and interface_audit.get("terrain_resolution_m") == 0.001
-        and interface_audit.get("water_only_center_count_is_acceptance_criterion") is False,
+        and interface_audit.get("water_only_center_count_is_acceptance_criterion") is True,
         "interface-audit provenance contract is incomplete",
     )
     _require(
@@ -2831,6 +2897,16 @@ def _validate_release_provenance(paths: ReleasePaths, manifest: Mapping) -> None
     )
     _require(isinstance(audit_manifest, Mapping), "interface-audit manifest fingerprint is missing")
     _fingerprint_keys(audit_manifest, ply=False)
+    _require(
+        isinstance(audit_recomputation, Mapping)
+        and set(audit_recomputation)
+        == {"verified", "status", "manifest_sha256"}
+        and audit_recomputation.get("verified") is True
+        and audit_recomputation.get("status") == "passed"
+        and audit_recomputation.get("manifest_sha256")
+        == audit_manifest.get("sha256"),
+        "interface-audit independent recomputation provenance is invalid",
+    )
     _require(
         audit_manifest.get("path") == str(paths.interface_audit_manifest),
         "interface-audit manifest provenance path differs",
@@ -2904,7 +2980,7 @@ def _validate_release_provenance(paths: ReleasePaths, manifest: Mapping) -> None
         and audit_density.get("minimum_ratio") == 0.85
         and audit_density.get("maximum_ratio") == 1.25
         and audit_density.get("post_build_lower_and_upper_bounds_passed") is True
-        and audit_density.get("water_only_center_count_is_acceptance_criterion") is False,
+        and audit_density.get("water_only_center_count_is_acceptance_criterion") is True,
         "interface-audit measured density provenance differs",
     )
     _require(
@@ -3128,6 +3204,7 @@ def _read_release(paths: ReleasePaths) -> tuple[Path, dict]:
         "fine_and_coarse_component_scalar_coverage_directly_verified",
         "geometry_base_archive_config_implementation_bound",
         "passed_interface_audit_hash_locked",
+        "passed_interface_audit_independently_recomputed",
         "downsample_stage_binds_fine_coarse_report_executable",
         "coarse_scalar_recalculation_forbidden",
         "compact_provenance_snapshots_hash_locked",

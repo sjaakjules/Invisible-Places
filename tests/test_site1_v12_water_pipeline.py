@@ -262,6 +262,26 @@ class DensityConfigTests(unittest.TestCase):
             >= 0.0018 - 1.0e-12
         ))
 
+    def test_xy_is_quantized_before_spacing_at_scene_world_scale(self):
+        record_dtype = np.dtype([
+            ("x", "<f4"), ("y", "<f4"), ("z", "<f4")
+        ])
+        raw = np.asarray([
+            [780.0, 820.0],
+            [780.0 + 0.0018, 820.0],
+        ], np.float64)
+        self.assertGreaterEqual(
+            float(np.linalg.norm(raw[1] - raw[0])), 0.0018 - 1e-12
+        )
+        stored = V12._roundtrip_xy_to_record_dtype(raw, record_dtype)
+        stored_distance = float(np.linalg.norm(stored[1] - stored[0]))
+        self.assertLess(stored_distance, 0.0018)
+        self.assertAlmostEqual(stored_distance, 0.00177001953125)
+        keep = V12._vacant_candidate_mask(
+            stored[1:], stored[:1], spacing_m=0.0018
+        )
+        np.testing.assert_array_equal(keep, [False])
+
     def test_zero_capacity_does_not_deactivate_vacant_registered_support(self):
         audit = V12.DensityAuditCentres(
             centres_xy=np.asarray([[0.0, 0.0]]),

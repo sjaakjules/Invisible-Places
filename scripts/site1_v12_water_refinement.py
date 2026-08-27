@@ -997,10 +997,12 @@ class AttainableAdditionDensityContract:
     """Integer WATER bounds with immutable source rows accounted once.
 
     ``raw_desired_addition_count`` is a measured demand over genuinely vacant
-    support.  It is not a total WATER count.  The canonical globally spaced
-    completion supplies an independently countable feasible witness for each
-    moving window.  Adding the immutable source count *after* ratio application
-    prevents existing WATER from being discounted and then requested again.
+    support. It is not a total WATER count. The globally spaced reservoir is a
+    necessary per-window lower-coverage check, not proof that one subset can
+    satisfy every overlapping lower and upper interval. The final constrained
+    solver selection supplies that certificate. Adding the immutable source
+    count *after* ratio application prevents existing WATER from being
+    discounted and then requested again.
     """
 
     immutable_water_count: np.ndarray
@@ -1030,11 +1032,12 @@ def attainable_addition_density_contract(
     """Convert measured vacant-support demand into attainable count bounds.
 
     Ratios apply only to *new* additions.  Immutable WATER is added back once
-    to the target and both bounds.  A single globally feasible spacing witness
-    proves the lower count can be constructed; demand is never silently
-    reduced to fit a greedy sample.  Integer rounding can otherwise invert the
-    interval for a sub-point target, so the upper count is raised to the lower
-    count in that sole quantisation case.
+    to the target and both bounds. A single globally spacing-valid reservoir
+    provides a necessary lower-coverage condition; passing it is deliberately
+    not called a joint interval-feasibility proof. Demand is never silently
+    reduced to fit that greedy reservoir. Integer rounding can otherwise invert
+    the interval for a sub-point target, so the upper count is raised to the
+    lower count in that sole quantisation case.
     """
 
     immutable_raw = np.asarray(immutable_water_count, dtype=np.float64)

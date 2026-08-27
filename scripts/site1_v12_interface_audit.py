@@ -20,6 +20,7 @@ import math
 import os
 from pathlib import Path
 import sys
+import tempfile
 from typing import Mapping, Sequence
 
 import numpy as np
@@ -42,9 +43,31 @@ EDGE_CONTINUITY_M = 0.04
 EDGE_SEARCH_M = 0.12
 EDGE_CENSOR_M = 0.25
 EDGE_SAMPLE_LIMIT = 250_000
+SPATIAL_QUERY_CHUNK_ROWS = 250_000
 EDGE_UNRESOLVED_FRACTION_LIMIT = 0.10
 FADE_EXTREME_FRACTION_LIMIT = 0.10
 MEASURED_DENSITY_KINDS = frozenset(("interface", "hole", "dip"))
+
+
+def _implementation_paths() -> dict[str, Path]:
+    """Exact code files that execute the audit's geometry contract."""
+
+    modules = (
+        sys.modules[__name__],
+        density,
+        scalar_enrichment,
+        water_pipeline,
+        water_pipeline.v10,
+        water_pipeline.v10.v9,
+        water_pipeline.v10.v6,
+        water_pipeline.confidence,
+        water_pipeline.refinement,
+        scalar_enrichment.terrain,
+    )
+    return {
+        Path(module.__file__).name: Path(module.__file__).resolve()
+        for module in modules
+    }
 
 
 def _require(condition: bool, message: str) -> None:
@@ -178,10 +201,27 @@ def _append_contract(
     with np.load(geometry_archive_path, allow_pickle=False) as archive:
         _require("records" in archive.files, "geometry archive lacks records")
         _require("candidate_label" in archive.files, "geometry archive lacks candidate_label")
+        _require("candidate_xy" in archive.files, "geometry archive lacks candidate_xy")
+        _require("candidate_kind" in archive.files, "geometry archive lacks candidate_kind")
         records = np.asarray(archive["records"]).copy()
         labels = np.asarray(archive["candidate_label"], np.int32).copy()
+        candidate_xy = np.asarray(archive["candidate_xy"], np.float64).copy()
+        candidate_kind = np.asarray(archive["candidate_kind"], np.uint8).copy()
     _require(records.dtype == final.dtype, "geometry archive schema differs from final WATER")
     _require(len(records) == len(labels), "geometry archive label count differs from records")
+    _require(
+        candidate_xy.shape == (len(records), 2)
+        and candidate_kind.shape == (len(records),)
+        and np.all(np.isfinite(candidate_xy)),
+        "geometry archive candidate evidence differs from records",
+    )
+    archived_record_xy = np.column_stack((records["x"], records["y"])).astype(
+        np.float64
+    )
+    _require(
+        np.array_equal(candidate_xy, archived_record_xy),
+        "geometry archive candidate XY differs from stored records",
+    )
     prefix_proof = scalar_enrichment.verify_reversible_base_cull_prefix(
         base_water_path,
         final_water_path,
@@ -325,6 +365,54 @@ def _collect_water_xy(
     return np.concatenate(parts) if parts else np.empty((0, 2), np.float64)
 
 
+def _minimum_ply_prefix_clearance(
+    path: Path,
+    count: int,
+    query_xy: np.ndarray,
+    *,
+    chunk_records: int,
+) -> float:
+    """Stream a verified PLY prefix against one bounded query-point tree."""
+
+    info = density.inspect_fixed_stride_ply(path)
+    active_count = int(count)
+    _require(
+        0 <= active_count <= info.count,
+        "surviving WATER prefix count is outside the final cloud",
+    )
+    _require(active_count > 0, "surviving immutable WATER prefix is empty")
+    query = np.asarray(query_xy, np.float64)
+    _require(
+        query.ndim == 2 and query.shape[1] == 2 and len(query),
+        "final addition query set is invalid",
+    )
+    tree = _spatial_index(query)
+    minimum = math.inf
+    seen = 0
+    for begin, records in density.iter_ply_chunks(
+        path, info=info, chunk_size=chunk_records
+    ):
+        if begin >= active_count:
+            break
+        take = min(len(records), active_count - begin)
+        if take:
+            xy = np.column_stack((
+                records["x"][:take].astype(np.float64, copy=False),
+                records["y"][:take].astype(np.float64, copy=False),
+            ))
+            distance, _ = tree.query(xy, k=1, workers=-1)
+            minimum = min(
+                minimum,
+                float(np.min(np.asarray(distance, np.float64))),
+            )
+            seen += take
+    _require(
+        seen == active_count,
+        "surviving WATER prefix collection was incomplete",
+    )
+    return minimum
+
+
 def _declared_removed_source_indices(
     geometry_manifest: Mapping[str, object], *, source_count: int
 ) -> np.ndarray:
@@ -443,6 +531,158 @@ def _spatial_index(points: np.ndarray):
         )
         return _NumpySpatialIndex(support)
     return cKDTree(support)
+
+
+def _points_within_any_centre(
+    points_xy: np.ndarray,
+    centres_xy: np.ndarray,
+    *,
+    radius_m: float,
+    chunk_rows: int = SPATIAL_QUERY_CHUNK_ROWS,
+) -> np.ndarray:
+    """Return radius membership without a centres-by-points allocation.
+
+    The production builder defines membership from the nearest audit centre
+    using ``distance <= radius + 1e-12``.  Querying a tree of the much smaller
+    centre set in bounded point chunks reconstructs that exact rule while the
+    NumPy fallback remains memory bounded for small dependency-free fixtures.
+    """
+
+    points = np.asarray(points_xy, np.float64)
+    centres = np.asarray(centres_xy, np.float64)
+    _require(
+        points.ndim == 2
+        and points.shape[1] == 2
+        and np.all(np.isfinite(points)),
+        "radius-membership points are invalid",
+    )
+    _require(
+        centres.ndim == 2
+        and centres.shape[1] == 2
+        and np.all(np.isfinite(centres)),
+        "radius-membership centres are invalid",
+    )
+    _require(
+        math.isfinite(radius_m) and radius_m >= 0.0,
+        "radius-membership radius is invalid",
+    )
+    _require(
+        isinstance(chunk_rows, int)
+        and not isinstance(chunk_rows, bool)
+        and chunk_rows > 0,
+        "radius-membership chunk size is invalid",
+    )
+    membership = np.zeros(len(points), bool)
+    if not len(points) or not len(centres):
+        return membership
+    index = _spatial_index(centres)
+    distance_limit = float(radius_m) + 1.0e-12
+    for begin in range(0, len(points), chunk_rows):
+        end = min(begin + chunk_rows, len(points))
+        nearest, _ = index.query(points[begin:end], k=1, workers=-1)
+        membership[begin:end] = (
+            np.asarray(nearest, np.float64) <= distance_limit
+        )
+    return membership
+
+
+def _xy_row_view(points: np.ndarray) -> np.ndarray:
+    xy = np.ascontiguousarray(points, dtype=np.float64)
+    _require(xy.ndim == 2 and xy.shape[1] == 2, "XY evidence has invalid shape")
+    return xy.view(np.dtype((np.void, xy.dtype.itemsize * 2))).ravel()
+
+
+def _minimum_pair_distance(points: np.ndarray) -> float:
+    """Exact minimum stored-coordinate pair distance with bounded fallback."""
+
+    xy = np.asarray(points, np.float64)
+    if len(xy) < 2:
+        return math.inf
+    try:
+        from scipy.spatial import cKDTree
+    except ModuleNotFoundError:
+        _require(
+            len(xy) <= 10_000,
+            "SciPy cKDTree is required to verify production-size final "
+            "addition pair spacing",
+        )
+        minimum_squared = math.inf
+        bytes_per_query = max(16 * len(xy), 16)
+        chunk = max(1, (32 * 1024 * 1024) // bytes_per_query)
+        for begin in range(0, len(xy), chunk):
+            end = min(begin + chunk, len(xy))
+            delta = xy[begin:end, None, :] - xy[None, :, :]
+            squared = np.sum(delta * delta, axis=2)
+            rows = np.arange(end - begin)
+            squared[rows, begin + rows] = np.inf
+            minimum_squared = min(minimum_squared, float(np.min(squared)))
+        return float(math.sqrt(minimum_squared))
+    nearest, _ = cKDTree(xy).query(xy, k=2, workers=-1)
+    return float(np.min(nearest[:, 1]))
+
+
+def _independent_final_addition_geometry_gate(
+    additions_xy: np.ndarray,
+    vacant_safe_reservoir_xy: np.ndarray,
+    *,
+    spacing_m: float,
+    surviving_base_count: int,
+    surviving_base_minimum_clearance_m: float,
+) -> dict[str, object]:
+    """Prove actual appended rows are safe, spaced and reservoir-derived."""
+
+    additions = np.asarray(additions_xy, np.float64)
+    safe = np.asarray(vacant_safe_reservoir_xy, np.float64)
+    for label, points in (
+        ("final additions", additions),
+        ("vacant safe reservoir", safe),
+    ):
+        _require(
+            points.ndim == 2
+            and points.shape[1] == 2
+            and np.all(np.isfinite(points)),
+            f"{label} XY is invalid",
+        )
+    _require(len(additions) > 0, "final WATER has no appended additions")
+    _require(len(safe) > 0, "archived vacant safe reservoir is empty")
+    membership = np.isin(
+        _xy_row_view(additions),
+        _xy_row_view(safe),
+        assume_unique=False,
+    )
+    _require(
+        np.all(membership),
+        "final appended addition is absent from archived vacant safe support",
+    )
+    spacing = float(spacing_m)
+    _require(np.isfinite(spacing) and spacing > 0.0, "final spacing is invalid")
+    pair_minimum = _minimum_pair_distance(additions)
+    base_count = int(surviving_base_count)
+    base_minimum = float(surviving_base_minimum_clearance_m)
+    _require(base_count > 0, "surviving immutable WATER blocker set is empty")
+    _require(np.isfinite(base_minimum), "surviving WATER clearance is invalid")
+    _require(
+        pair_minimum >= spacing - 1.0e-12,
+        "final appended addition pair spacing is below the 1.8 mm contract",
+    )
+    _require(
+        base_minimum >= spacing - 1.0e-12,
+        "final appended addition clearance to surviving immutable WATER is "
+        "below the 1.8 mm contract",
+    )
+    return {
+        "addition_count": int(len(additions)),
+        "surviving_immutable_water_count": base_count,
+        "vacant_safe_reservoir_count": int(len(safe)),
+        "all_additions_exact_members_of_vacant_safe_reservoir": True,
+        "minimum_addition_pair_spacing_m": (
+            None if not np.isfinite(pair_minimum) else pair_minimum
+        ),
+        "minimum_surviving_immutable_water_clearance_m": base_minimum,
+        "required_spacing_m": spacing,
+        "surviving_base_clearance_streamed_without_materialization": True,
+        "stored_coordinate_spacing_and_clearance_passed": True,
+    }
 
 
 def _tree_counts(tree, centres: np.ndarray, radius_m: float) -> np.ndarray:
@@ -1573,7 +1813,7 @@ def _declared_density_contract(
 
     This deliberately does not trust a declared total-density target.  It
     re-counts raw and immutable-WATER-clear support cells, re-counts the one
-    archived globally spaced capacity witness, reconstructs WATER-only
+    archived globally spaced candidate reservoir, reconstructs WATER-only
     reference density, and then rebuilds the discrete addition interval.
     """
 
@@ -1592,7 +1832,9 @@ def _declared_density_contract(
         "vacant_support_area_m2", "raw_support_cell_count",
         "vacant_support_cell_count", "raw_support_archive_key",
         "raw_support_representative_archive_key", "vacant_support_archive_key",
-        "vacant_support_representative_archive_key", "support_pitch_archive_key",
+        "vacant_support_representative_archive_key",
+        "vacant_safe_reservoir_archive_key", "vacant_safe_reservoir_count",
+        "support_pitch_archive_key",
         "immutable_water_spacing_m", "immutable_water_blocker_count",
         "all_surviving_immutable_water_rows_block_placement",
         "reference_water_density_per_m2", "local_reference_centres_xy",
@@ -1603,10 +1845,13 @@ def _declared_density_contract(
         "good_overlap_reference_water_area_m2", "reference_kind",
         "reference_sample_count", "spacing_feasible_capacity_count",
         "spacing_capacity_selection_count", "spacing_capacity_seed",
+        "spacing_capacity_fixed_fade_blocker_count",
         "spacing_capacity_archive_key",
-        "spacing_capacity_uses_complete_safe_reservoir",
-        "spacing_capacity_is_constructive_witness_not_maximum",
-        "spacing_capacity_in_joint_candidate_pool", "raw_desired_addition_count",
+        "spacing_capacity_uses_complete_safe_reservoir_and_fixed_fade",
+        "spacing_capacity_is_spacing_feasible_reservoir_not_interval_certificate",
+        "spacing_capacity_candidate_rows_in_joint_pool",
+        "final_selected_additions_are_joint_interval_certificate",
+        "raw_desired_addition_count",
         "target_addition_count", "addition_lower_count", "addition_upper_count",
         "capacity_sufficient_mask", "addition_bounds_rounding",
         "immutable_source_water_count", "target_water_count",
@@ -1640,9 +1885,10 @@ def _declared_density_contract(
     )
     for name in (
         "all_surviving_immutable_water_rows_block_placement",
-        "spacing_capacity_uses_complete_safe_reservoir",
-        "spacing_capacity_is_constructive_witness_not_maximum",
-        "spacing_capacity_in_joint_candidate_pool",
+        "spacing_capacity_uses_complete_safe_reservoir_and_fixed_fade",
+        "spacing_capacity_is_spacing_feasible_reservoir_not_interval_certificate",
+        "spacing_capacity_candidate_rows_in_joint_pool",
+        "final_selected_additions_are_joint_interval_certificate",
         "lower_and_allowed_upper_bounds_enforced",
         "water_only_center_count_is_acceptance_criterion",
         "uses_overlapping_circular_windows",
@@ -1728,6 +1974,7 @@ def _declared_density_contract(
         "raw_support_representative_archive_key": "raw_support_representative_xy",
         "vacant_support_archive_key": "vacant_support_cell_keys",
         "vacant_support_representative_archive_key": "vacant_support_representative_xy",
+        "vacant_safe_reservoir_archive_key": "vacant_safe_reservoir_xy",
         "support_pitch_archive_key": "support_pitch_m",
         "spacing_capacity_archive_key": "spacing_capacity_xy",
     }
@@ -1740,13 +1987,23 @@ def _declared_density_contract(
     if declared_hash is not None:
         _require(declared_hash == _sha256(archive), "geometry density-evidence archive hash drift")
     with np.load(archive, allow_pickle=False) as loaded:
-        _require(set(expected_archive_keys.values()) <= set(loaded.files), "geometry archive lacks v3 density evidence")
+        _require(
+            set(expected_archive_keys.values())
+            | {"candidate_xy", "candidate_kind"}
+            <= set(loaded.files),
+            "geometry archive lacks v3 density evidence",
+        )
         raw_keys = np.asarray(loaded["raw_support_cell_keys"], np.int64).copy()
         raw_representatives = np.asarray(loaded["raw_support_representative_xy"], np.float64).copy()
         vacant_keys = np.asarray(loaded["vacant_support_cell_keys"], np.int64).copy()
         vacant_representatives = np.asarray(loaded["vacant_support_representative_xy"], np.float64).copy()
+        vacant_safe_reservoir_xy = np.asarray(
+            loaded["vacant_safe_reservoir_xy"], np.float64
+        ).copy()
         archived_pitch = float(np.asarray(loaded["support_pitch_m"]).reshape(()))
         capacity_xy = np.asarray(loaded["spacing_capacity_xy"], np.float64).copy()
+        candidate_xy = np.asarray(loaded["candidate_xy"], np.float64).copy()
+        candidate_kind = np.asarray(loaded["candidate_kind"], np.uint8).copy()
     _require(abs(archived_pitch - support_pitch) <= 1e-15, "geometry support pitch differs from manifest")
 
     def validate_cells(label: str, keys: np.ndarray, representatives: np.ndarray) -> None:
@@ -1757,6 +2014,18 @@ def _declared_density_contract(
 
     validate_cells("raw", raw_keys, raw_representatives)
     validate_cells("vacant", vacant_keys, vacant_representatives)
+    _require(
+        vacant_safe_reservoir_xy.ndim == 2
+        and vacant_safe_reservoir_xy.shape[1] == 2
+        and len(vacant_safe_reservoir_xy)
+        and np.all(np.isfinite(vacant_safe_reservoir_xy)),
+        "vacant safe reservoir archive is invalid",
+    )
+    _require(
+        int(value["vacant_safe_reservoir_count"])
+        == len(vacant_safe_reservoir_xy),
+        "vacant safe reservoir count differs from archive",
+    )
     raw_view = np.ascontiguousarray(raw_keys).view(np.dtype((np.void, raw_keys.dtype.itemsize * 2))).ravel()
     vacant_view = np.ascontiguousarray(vacant_keys).view(np.dtype((np.void, vacant_keys.dtype.itemsize * 2))).ravel()
     _require(np.all(np.isin(vacant_view, raw_view)), "vacant support is not a subset of raw support")
@@ -1776,32 +2045,54 @@ def _declared_density_contract(
     _require(np.all(vacant_support_count <= raw_support_count) and np.all(vacant_support_area <= raw_support_area + 1e-15), "vacant support exceeds raw support")
     _require(np.array_equal(vacant_support_active, independent_vacant_count > 0), "vacant-support active mask differs from recount")
 
-    _require(capacity_xy.ndim == 2 and capacity_xy.shape[1] == 2 and np.all(np.isfinite(capacity_xy)), "spacing-capacity witness is invalid")
+    _require(capacity_xy.ndim == 2 and capacity_xy.shape[1] == 2 and np.all(np.isfinite(capacity_xy)), "spacing-capacity reservoir is invalid")
     _require(int(value["spacing_capacity_selection_count"]) == len(capacity_xy), "spacing-capacity global count differs")
-    capacity_cell_keys = np.floor(capacity_xy / support_pitch).astype(np.int64)
-    capacity_view = np.ascontiguousarray(capacity_cell_keys).view(np.dtype((np.void, capacity_cell_keys.dtype.itemsize * 2))).ravel()
-    _require(np.all(np.isin(capacity_view, vacant_view)), "spacing-capacity witness leaves vacant support")
+    _require(
+        candidate_xy.ndim == 2
+        and candidate_xy.shape[1] == 2
+        and len(candidate_xy) == len(candidate_kind)
+        and np.all(np.isfinite(candidate_xy)),
+        "final candidate geometry evidence is invalid",
+    )
+    capacity_membership = np.isin(
+        _xy_row_view(capacity_xy),
+        _xy_row_view(vacant_safe_reservoir_xy),
+        assume_unique=False,
+    )
+    _require(
+        np.all(capacity_membership),
+        "spacing-capacity reservoir leaves archived vacant safe support",
+    )
     capacity_count = water_pipeline._circle_point_counts(centres, capacity_xy, radius_m=radius)
     declared_capacity_count = integer_array("spacing_feasible_capacity_count")
     _require(np.array_equal(capacity_count, declared_capacity_count), "spacing-capacity window counts differ from archived witness")
-    if len(capacity_xy) > 1:
-        try:
-            from scipy.spatial import cKDTree
-        except ModuleNotFoundError:
-            _require(
-                len(capacity_xy) <= 10_000,
-                "SciPy cKDTree is required to verify pair spacing for a "
-                "production-size capacity witness; the bounded NumPy fallback "
-                "is limited to 10,000 points",
-            )
-            delta = capacity_xy[:, None, :] - capacity_xy[None, :, :]
-            squared = np.sum(delta * delta, axis=2)
-            np.fill_diagonal(squared, np.inf)
-            minimum_capacity_spacing = float(np.sqrt(np.min(squared)))
-        else:
-            nearest, _ = cKDTree(capacity_xy).query(capacity_xy, k=2, workers=-1)
-            minimum_capacity_spacing = float(np.min(nearest[:, 1]))
-        _require(minimum_capacity_spacing >= spacing - 1e-12, "spacing-capacity witness violates pair spacing")
+    minimum_capacity_spacing = _minimum_pair_distance(capacity_xy)
+    _require(
+        minimum_capacity_spacing >= spacing - 1e-12,
+        "spacing-capacity reservoir violates pair spacing",
+    )
+    in_density_window = _points_within_any_centre(
+        candidate_xy,
+        centres,
+        radius_m=radius,
+    )
+    fixed_fade_xy = candidate_xy[(candidate_kind == 4) & ~in_density_window]
+    fixed_fade_count = value["spacing_capacity_fixed_fade_blocker_count"]
+    _require(
+        isinstance(fixed_fade_count, int)
+        and not isinstance(fixed_fade_count, bool)
+        and fixed_fade_count >= 0
+        and fixed_fade_count == len(fixed_fade_xy),
+        "spacing-capacity fixed-fade blocker count differs from archive",
+    )
+    if len(capacity_xy) and len(fixed_fade_xy):
+        fixed_fade_distance = _spatial_index(fixed_fade_xy).query(
+            capacity_xy, k=1, workers=-1
+        )[0]
+        _require(
+            np.all(np.asarray(fixed_fade_distance, np.float64) >= spacing - 1e-12),
+            "spacing-capacity reservoir violates fixed-fade blocker spacing",
+        )
 
     eligibility = water_pipeline.DensityAuditCentres(centres, tuple(spec_id), tuple(spec_kind), spec_label.astype(np.int32))
     expected_required = water_pipeline._density_required_mask(eligibility, footprint.active_mask, independent_vacant_count > 0)
@@ -1855,13 +2146,32 @@ def _declared_density_contract(
     immutable = integer_array("immutable_source_water_count")
     water_before = integer_array("water_before_count")
     _require(np.array_equal(immutable, water_before), "immutable WATER baseline differs from before count")
-    rebuilt = water_pipeline.refinement.attainable_addition_density_contract(immutable, raw_desired, capacity_count, minimum_ratio=minimum, maximum_ratio=maximum, active_centre_mask=required_mask)
+    # Rebuild the discrete bounds locally instead of calling the production
+    # target helper. This is deliberately duplicated audit arithmetic.
+    rebuilt_target_addition = raw_desired.copy()
+    rebuilt_target_addition[~required_mask] = 0.0
+    rebuilt_addition_lower = np.ceil(
+        minimum * rebuilt_target_addition
+    ).astype(np.int64)
+    rebuilt_addition_upper = np.ceil(
+        maximum * rebuilt_target_addition
+    ).astype(np.int64)
+    rebuilt_addition_upper = np.maximum(
+        rebuilt_addition_upper, rebuilt_addition_lower
+    )
+    rebuilt_addition_lower[~required_mask] = 0
+    rebuilt_addition_upper[~required_mask] = 0
+    rebuilt_water_lower = immutable + rebuilt_addition_lower
+    rebuilt_water_upper = immutable + rebuilt_addition_upper
+    rebuilt_capacity_coverage = (
+        (~required_mask) | (rebuilt_addition_lower <= capacity_count)
+    )
     integer_expected = {
-        "addition_lower_count": rebuilt.addition_lower_count,
-        "addition_upper_count": rebuilt.addition_upper_count,
-        "water_lower_count": rebuilt.water_lower_count,
-        "water_nominal_upper_count": rebuilt.water_upper_count,
-        "water_upper_count": rebuilt.water_upper_count,
+        "addition_lower_count": rebuilt_addition_lower,
+        "addition_upper_count": rebuilt_addition_upper,
+        "water_lower_count": rebuilt_water_lower,
+        "water_nominal_upper_count": rebuilt_water_upper,
+        "water_upper_count": rebuilt_water_upper,
     }
     arrays: dict[str, np.ndarray] = {
         "valid_footprint_sample_count": valid_footprint_count,
@@ -1882,11 +2192,15 @@ def _declared_density_contract(
         _require(np.array_equal(actual, expected), f"fine density {name} differs from rebuilt addition contract")
         arrays[name] = actual
     target_addition = float_array("target_addition_count")
-    _require(np.allclose(target_addition, rebuilt.target_addition_count, rtol=0.0, atol=1e-12), "addition target was capped or changed")
-    _require(np.array_equal(capacity_sufficient, rebuilt.capacity_sufficient_mask) and np.all(capacity_sufficient[required_mask]), "constructive capacity does not prove every active lower bound")
+    _require(np.allclose(target_addition, rebuilt_target_addition, rtol=0.0, atol=1e-12), "addition target was capped or changed")
+    _require(
+        np.array_equal(capacity_sufficient, rebuilt_capacity_coverage)
+        and np.all(capacity_sufficient[required_mask]),
+        "spacing reservoir does not cover every active lower bound",
+    )
     arrays["target_addition_count"] = target_addition
-    arrays["addition_lower_count"] = rebuilt.addition_lower_count
-    arrays["addition_upper_count"] = rebuilt.addition_upper_count
+    arrays["addition_lower_count"] = rebuilt_addition_lower
+    arrays["addition_upper_count"] = rebuilt_addition_upper
 
     terrain_count = integer_array("terrain_count")
     terrain_outer_count = integer_array("terrain_outer_count")
@@ -1901,7 +2215,7 @@ def _declared_density_contract(
     combined_lower = integer_array("combined_lower_count")
     combined_nominal_upper = integer_array("combined_nominal_upper_count")
     combined_upper = integer_array("combined_upper_count")
-    _require(np.array_equal(combined_lower, terrain_count + rebuilt.water_lower_count) and np.array_equal(combined_nominal_upper, terrain_count + rebuilt.water_upper_count) and np.array_equal(combined_upper, terrain_count + rebuilt.water_upper_count), "combined addition-bound arithmetic differs")
+    _require(np.array_equal(combined_lower, terrain_count + rebuilt_water_lower) and np.array_equal(combined_nominal_upper, terrain_count + rebuilt_water_upper) and np.array_equal(combined_upper, terrain_count + rebuilt_water_upper), "combined addition-bound arithmetic differs")
     arrays.update(target_water_count=target_water, target_combined_count=target_combined, target_water_density_per_m2=target_water_density, target_combined_density_per_m2=target_combined_density, terrain_count=terrain_count, terrain_outer_count=terrain_outer_count, combined_lower_count=combined_lower, combined_nominal_upper_count=combined_nominal_upper, combined_upper_count=combined_upper)
     for name in ("water_after_count", "combined_before_count", "combined_after_count", "repair_reservoir_count", "repair_reservoir_selected_count"):
         arrays[name] = integer_array(name)
@@ -1944,6 +2258,7 @@ def _declared_density_contract(
         "surface": surface,
         "raw_support_representative_xy": raw_representatives,
         "vacant_support_representative_xy": vacant_representatives,
+        "vacant_safe_reservoir_xy": vacant_safe_reservoir_xy,
         "spacing_capacity_xy": capacity_xy,
         "local_reference_centres_xy": local_centres,
         "good_overlap_reference_centres_xy": overlap_centres,
@@ -2022,7 +2337,7 @@ def _independent_density_gate(
         )
         _require(
             np.all(capacity_distance >= spacing - 1e-12),
-            "archived capacity witness violates immutable-WATER spacing",
+            "archived spacing-capacity reservoir violates immutable-WATER spacing",
         )
     for name, actual in (
         ("local_reference_water_count", local_reference_water_count),
@@ -2359,7 +2674,9 @@ def build_interface_audit(
         *_expanded_specs((good_overlap,), density_settings.audit_radius_m),
     )
     expanded = (
-        *_expanded_specs(specs, max(SUPPORT_RADIUS_M, EDGE_CENSOR_M)),
+        # Production gathers immutable blockers from each configured region
+        # expanded by 16 cm. Match that support exactly for density recounts.
+        *_expanded_specs(specs, SUPPORT_RADIUS_M),
         *density_collection_specs,
     )
     removed_source_indices = _declared_removed_source_indices(
@@ -2371,6 +2688,21 @@ def build_interface_audit(
         expanded,
         chunk_records=chunk_records,
         excluded_source_indices=removed_source_indices,
+    )
+    surviving_base_minimum_clearance = _minimum_ply_prefix_clearance(
+        final_water,
+        int(append["base_points"]),
+        additions_xy,
+        chunk_records=chunk_records,
+    )
+    final_addition_geometry = _independent_final_addition_geometry_gate(
+        additions_xy,
+        density_contract["vacant_safe_reservoir_xy"],
+        spacing_m=float(density_contract["immutable_water_spacing_m"]),
+        surviving_base_count=int(append["base_points"]),
+        surviving_base_minimum_clearance_m=(
+            surviving_base_minimum_clearance
+        ),
     )
     additions_local = additions_xy[_circle_union_mask(additions_xy, expanded)]
     final_xy = _collect_water_xy(
@@ -2479,6 +2811,18 @@ def build_interface_audit(
     fade = _fade_audit(specs, additions_tree, final_tree)
     checks = {
         "append_contract": True,
+        "final_additions_are_exact_vacant_safe_reservoir_rows": (
+            final_addition_geometry[
+                "all_additions_exact_members_of_vacant_safe_reservoir"
+            ]
+            is True
+        ),
+        "final_addition_stored_coordinate_geometry_passed": (
+            final_addition_geometry[
+                "stored_coordinate_spacing_and_clearance_passed"
+            ]
+            is True
+        ),
         "terrain_edge_eligibility_is_candidate_independent": (
             terrain["eligibility"]["final_water_used_for_eligibility"] is False
             and terrain["eligible_edge_points"] > 0
@@ -2500,12 +2844,8 @@ def build_interface_audit(
         "review_config": _fingerprint(config),
     }
     implementations = {
-        Path(__file__).name: _fingerprint(Path(__file__)),
-        Path(density.__file__).name: _fingerprint(Path(density.__file__)),
-        Path(scalar_enrichment.__file__).name: _fingerprint(
-            Path(scalar_enrichment.__file__)
-        ),
-        Path(water_pipeline.__file__).name: _fingerprint(Path(water_pipeline.__file__)),
+        name: _fingerprint(path)
+        for name, path in _implementation_paths().items()
     }
     document = {
         "schema_version": 1,
@@ -2514,6 +2854,9 @@ def build_interface_audit(
         "status": "passed" if passed else "failed",
         "candidate_only": True,
         "canonical_writes": False,
+        "audit_parameters": {
+            "edge_sample_limit": int(edge_sample_limit),
+        },
         "annotations_are_search_neighbourhoods_not_masks": True,
         "terrain_resolution": {
             "selected": "canonical-1mm-SAND-plus-ROCK",
@@ -2528,6 +2871,9 @@ def build_interface_audit(
             "regions": regions,
             "moving_circle_aggregate": moving,
             "terrain_edge_nearest_water": terrain,
+            "final_addition_stored_coordinate_geometry": (
+                final_addition_geometry
+            ),
             "density_continuity_lower_and_upper_gate": density_gate,
             "density_dip_maximum_ratios": {
                 "covered_by": "density_continuity_lower_and_upper_gate",
@@ -2597,12 +2943,7 @@ def verify_interface_audit(
         _require(isinstance(block, Mapping), f"interface audit input fingerprint is invalid: {name}")
         _assert_fingerprint(block, path, f"interface audit input {name}")
     implementations = document.get("implementations")
-    implementation_paths = {
-        Path(__file__).name: Path(__file__),
-        Path(density.__file__).name: Path(density.__file__),
-        Path(scalar_enrichment.__file__).name: Path(scalar_enrichment.__file__),
-        Path(water_pipeline.__file__).name: Path(water_pipeline.__file__),
-    }
+    implementation_paths = _implementation_paths()
     _require(isinstance(implementations, Mapping) and set(implementations) == set(implementation_paths), "interface audit implementation set differs")
     for name, path in implementation_paths.items():
         block = implementations[name]
@@ -2616,6 +2957,58 @@ def verify_interface_audit(
     _require(
         acceptance.get("water_only_center_count_is_acceptance_criterion") is True,
         "interface audit does not directly gate required WATER support",
+    )
+    audit_parameters = document.get("audit_parameters")
+    _require(
+        isinstance(audit_parameters, Mapping)
+        and set(audit_parameters) == {"edge_sample_limit"},
+        "interface audit execution parameters are incomplete",
+    )
+    edge_sample_limit = audit_parameters["edge_sample_limit"]
+    _require(
+        isinstance(edge_sample_limit, int)
+        and not isinstance(edge_sample_limit, bool)
+        and edge_sample_limit > 0,
+        "interface audit edge sample limit is invalid",
+    )
+
+    # The JSON lock detects accidental corruption but is not an authenticity
+    # primitive: anyone can edit and re-hash it. Re-run every gate from the
+    # pinned inputs and require the full deterministic evidence document to
+    # match (apart from creation time and its derived self-lock).
+    with tempfile.TemporaryDirectory(prefix="site1-v12-audit-verify-") as directory:
+        # macOS exposes /var as a /private/var alias; use the resolved root so
+        # the strict anti-alias input check sees the canonical path.
+        rebuilt_path = (
+            Path(directory).resolve() / "recomputed-interface-audit.json"
+        )
+        rebuilt_result = build_interface_audit(
+            base_water_path=base_water_path,
+            final_water_path=final_water_path,
+            fine_manifest_path=fine_manifest_path,
+            geometry_manifest_path=geometry_manifest_path,
+            geometry_archive_path=geometry_archive_path,
+            sand_1mm_path=sand_1mm_path,
+            rock_1mm_path=rock_1mm_path,
+            review_config_path=review_config_path,
+            output_path=rebuilt_path,
+            edge_sample_limit=edge_sample_limit,
+        )
+        _require(
+            rebuilt_result["verified"] is True,
+            "independent interface audit recomputation did not pass",
+        )
+        _, rebuilt = _load_json(rebuilt_path, "recomputed interface audit")
+
+    def stable_evidence(value: Mapping) -> dict:
+        result = dict(value)
+        result.pop("created", None)
+        result.pop("manifest_lock", None)
+        return result
+
+    _require(
+        stable_evidence(document) == stable_evidence(rebuilt),
+        "interface audit differs from independent gate recomputation",
     )
     return {
         "verified": True,
