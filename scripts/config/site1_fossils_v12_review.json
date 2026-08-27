@@ -1,0 +1,120 @@
+{
+  "version": 1,
+  "id": "site1_fossils_v12_water_review",
+  "provenance": {
+    "source_screenshots": [
+      "/Users/juju/Documents/Screenshots/Screenshot 2026-08-27 at 2.16.49 pm.png",
+      "/Users/juju/Documents/Screenshots/Screenshot 2026-08-27 at 2.14.42 pm.png"
+    ],
+    "registration_method": "Native-resolution SIFT registration to the current Site1 plan-view terrain and WATER support, cross-checked against the v11 registered detail views.",
+    "coordinate_convention": "Native screenshot pixels use a top-left origin. world_xy = offset_xy + matrix_2x2 * [u, v].",
+    "coordinate_precision_m": 0.001,
+    "evidence_vs_action_note": "The hand annotations identify review locations and visible density behaviour. They are not fill, clip, or deletion masks. Every change must be selected from measured 3D geometry and pass the configured terrain-support and density checks.",
+    "supersedes_review_config": "scripts/config/site1_fossils_v11_review.json"
+  },
+  "registration": {
+    "image_1": {
+      "path": "/Users/juju/Documents/Screenshots/Screenshot 2026-08-27 at 2.16.49 pm.png",
+      "dimensions_px": [4046, 2066],
+      "view": "plan",
+      "matrix_2x2": [
+        [0.003135075545, 0.016952982537],
+        [0.016972546102, -0.003112209436]
+      ],
+      "offset_xy": [747.857770414, 794.162520231],
+      "uncertainty_m": [0.015, 0.025],
+      "diagnostic": "933 SIFT inliers; median residual 0.48 px and p90 residual 1.13 px."
+    },
+    "image_2": {
+      "path": "/Users/juju/Documents/Screenshots/Screenshot 2026-08-27 at 2.14.42 pm.png",
+      "dimensions_px": [4012, 1352],
+      "view": "plan_detail",
+      "matrix_2x2": [
+        [0.001190292071, 0.006407450546],
+        [0.006375256424, -0.001172090450]
+      ],
+      "offset_xy": [765.631262500, 813.536565306],
+      "uncertainty_m": [0.015, 0.025],
+      "diagnostic": "Consensus of three prior detail registrations, checked against current occupancy."
+    }
+  },
+  "review_regions": {
+    "cyan_interface": {
+      "polygon": [
+        [766.710, 813.282],
+        [771.316, 838.211],
+        [778.954, 836.809],
+        [774.348, 811.880]
+      ],
+      "purpose": "High-priority WATER-to-SAND/ROCK continuity review; not a fill mask."
+    },
+    "clustered_fade": {
+      "center": [779.503, 816.682],
+      "reference": [784.695, 852.436],
+      "search_radius_m": 4.0,
+      "purpose": "Match outward terrain sparsity using deterministic clustered retention rather than a uniform ramp."
+    },
+    "far_lobe": {
+      "seed": [792.522, 854.620],
+      "maximum_seed_search_m": 2.5,
+      "purpose": "Remove only a detached unsupported WATER component beyond this review location; fail closed if connected to the main sheet."
+    }
+  },
+  "marked_locations": [
+    {"id": "interface_density", "world": [772.536, 822.292], "radius_m": 0.8, "action": "Extend WATER to supported terrain interfaces."},
+    {"id": "good_overlap_reference", "world": [776.171, 827.660], "radius_m": 0.8, "action": "Measure an acceptable WATER/terrain density overlap."},
+    {"id": "southern_interface", "world": [775.841, 809.402], "radius_m": 1.0, "action": "Prioritise high-quality supported interface continuity."},
+    {"id": "interface_gap_1", "world": [771.389, 818.223], "radius_m": 0.55, "action": "Repair the measured WATER-to-terrain gap."},
+    {"id": "interface_gap_2", "world": [773.041, 821.651], "radius_m": 0.55, "action": "Repair the measured WATER-to-terrain gap."},
+    {"id": "small_hole_1", "world": [774.541, 830.502], "radius_m": 0.35, "action": "Fill only the locally supported empty component."},
+    {"id": "small_hole_2", "world": [770.324, 821.010], "radius_m": 0.35, "action": "Fill only the locally supported empty component."},
+    {"id": "density_dip_1", "world": [778.051, 833.917], "radius_m": 0.65, "action": "Remove the square local density discontinuity using a circular audit."},
+    {"id": "density_dip_2", "world": [777.680, 833.446], "radius_m": 0.65, "action": "Cross-view location for the same local density audit."}
+  ],
+  "parameters": {
+    "fine_water_spacing_m": 0.002,
+    "fine_water_selection_radius_m": 0.0018,
+    "terrain_absolute_clearance_m": 0.001,
+    "terrain_clearance_float32_tolerance_m": 0.00008,
+    "terrain_support_radius_m": 0.008,
+    "terrain_support_minimum_neighbours": 12,
+    "terrain_support_maximum_neighbours": 24,
+    "terrain_plane_maximum_residual_m": 0.0015,
+    "surface_model_maximum_spread_m": 0.003,
+    "interface_search_distance_m": 0.04,
+    "hole_search_distance_m": 0.08,
+    "density_dip_search_distance_m": 0.10,
+    "density_audit_radius_m": 0.08,
+    "density_audit_step_m": 0.08,
+    "density_local_reference_inner_fraction": 0.75,
+    "density_local_reference_outer_margin_m": 0.16,
+    "density_reference_neighbours": 12,
+    "density_reference_minimum_windows": 6,
+    "density_shoreline_minimum_terrain_fraction": 0.40,
+    "density_minimum_ratio": 0.85,
+        "density_maximum_ratio": 1.25,
+        "density_support_sampling_pitch_m": 0.002,
+        "density_repair_reservoir_margin_m": 0.08,
+    "density_repair_support_margin_m": 0.08,
+    "far_lobe_grid_pitch_m": 0.02,
+    "far_lobe_bridge_radius_m": 0.06,
+    "far_lobe_detachment_gap_m": 0.15,
+    "far_lobe_maximum_component_fraction": 0.35,
+    "clustered_fade_support_distance_m": 0.12,
+    "clustered_fade_wavelengths_m": [0.08, 0.20, 0.50],
+    "clustered_fade_seed": 120827,
+    "coarse_spacing_m": 0.005,
+    "water_scan_id": 999
+  },
+  "acceptance": {
+    "existing_fine_rows_byte_exact_unless_archived_cull": true,
+    "new_geometry_requires_reference_surface_and_local_terrain_or_water_support": true,
+    "new_water_within_terrain_clearance_rejected": true,
+    "new_water_below_supported_terrain_rejected": true,
+    "fine_additions_scalar_enriched_before_coarse_selection": true,
+    "coarse_rows_are_byte_exact_fine_subset": true,
+    "coarse_same_layer_minimum_spacing_m": 0.005,
+    "terrain_and_vegetation_geometry_unchanged": true,
+    "far_lobe_removal_reversible": true
+  }
+}
