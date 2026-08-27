@@ -963,6 +963,14 @@ struct TimingColouriseGraphKeyDragState {
     std::vector<TimingColouriseKeyHandle> handles;
     std::optional<TimingColouriseKeyHandle> rangeAnchor;
     std::vector<TimingColouriseGraphKeyDragValue> values;
+    // Shake-to-toggle snapping: quick horizontal direction reversals while
+    // dragging flip `snappingDisabled` for the rest of this drag (and back
+    // again on another shake).
+    bool snappingDisabled = false;
+    float shakeLastMouseX = 0.0F;
+    int shakeDirection = 0;
+    int shakeReversals = 0;
+    double shakeLastReversalTime = 0.0;
 };
 
 struct TimingColouriseKeyMarqueeState {
@@ -93899,11 +93907,16 @@ void DrawTimingKeyLaneGroup(
         itemHovered && std::hypot(
                            mouse.x - helpCentre.x,
                            mouse.y - helpCentre.y) <= 8.0F;
+    // In value graphs the time markers hang below the axis so keys resting
+    // at their minimum value stay clear of them.
     const bool markerHovered =
         itemHovered && !keyHelpHovered &&
         nearestSeries != nullptr &&
         nearestDistance <= kMarkerHitRadius &&
-        std::abs(mouse.y - axisY) <= kMarkerHitRadius;
+        (drawsValueGraph
+             ? mouse.y > axisY + 1.0F &&
+                   mouse.y <= axisY + kMarkerHitRadius + 2.0F
+             : std::abs(mouse.y - axisY) <= kMarkerHitRadius);
     const auto sameTrack =
         [](const auto& state,
            const TimingColouriseKeyLaneSeries& lane) {
@@ -94604,7 +94617,8 @@ void DrawTimingKeyLaneGroup(
 
     const auto armKeyDrag =
         [&](const TimingColouriseKeyHandle& clicked,
-            bool requestValueDrag) {
+            bool requestValueDrag,
+            bool suppressTimeOnlyGather = false) {
             std::vector<TimingColouriseKeyHandle> handles;
             if (timings.colouriseKeySelection.has_value() &&
                 timings.colouriseKeySelection->effectId == effect->id &&
@@ -94619,7 +94633,8 @@ void DrawTimingKeyLaneGroup(
                             effect->id
                     ? timings.colouriseKeySelection->rangeAnchor
                     : std::nullopt;
-            if (timings.colouriseGraphTimeOnly) {
+            if (timings.colouriseGraphTimeOnly &&
+                !suppressTimeOnlyGather) {
                 // Gather against the original selection positions rather than
                 // the growing result so tolerance cannot create a transitive
                 // chain into keys at neighbouring times.
@@ -94640,6 +94655,7 @@ void DrawTimingKeyLaneGroup(
                 .originalEffect = *effect,
                 .handles = std::move(handles),
                 .rangeAnchor = rangeAnchor,
+                .shakeLastMouseX = mouse.x,
             };
             if (drag.valueDrag) {
                 for (const auto& handle : drag.handles) {
@@ -94712,9 +94728,65 @@ void DrawTimingKeyLaneGroup(
             openPositionEditor(handle);
         } else if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
             const auto& io = ImGui::GetIO();
-            selectClickedHandle(*nearestSeries, nearestPosition);
-            if (!io.KeyCtrl && !io.KeySuper && !io.KeyShift) {
-                armKeyDrag(handle, false);
+            if (io.KeyCtrl || io.KeySuper || io.KeyShift) {
+                selectClickedHandle(*nearestSeries, nearestPosition);
+            } else {
+                // A time marker addresses the whole moment: it selects
+                // every key at this time across the lanes. But when the
+                // current selection already holds keys here - the user
+                // picked out specific nodes first - the marker drags just
+                // that subset, pulling it away from the rest.
+                const auto atMarkerTime =
+                    [&](const TimingColouriseKeyHandle& candidate) {
+                        return std::abs(
+                                   candidate.position -
+                                   nearestPosition) <=
+                               invisible_places::timing::
+                                   kTimingColouriseKeyTolerance;
+                    };
+                TimingColouriseKeyHandle anchor = handle;
+                const bool selectionAtTime =
+                    timings.colouriseKeySelection.has_value() &&
+                    timings.colouriseKeySelection->effectId ==
+                        effect->id &&
+                    std::any_of(
+                        timings.colouriseKeySelection->keys.begin(),
+                        timings.colouriseKeySelection->keys.end(),
+                        atMarkerTime);
+                if (selectionAtTime) {
+                    for (const auto& selected :
+                         timings.colouriseKeySelection->keys) {
+                        if (atMarkerTime(selected)) {
+                            anchor = selected;
+                            break;
+                        }
+                    }
+                } else {
+                    std::vector<TimingColouriseKeyHandle> cluster;
+                    for (const auto& lane : series) {
+                        for (const float lanePosition :
+                             lane.positions) {
+                            if (std::abs(
+                                    lanePosition - nearestPosition) <=
+                                invisible_places::timing::
+                                    kTimingColouriseKeyTolerance) {
+                                AddUniqueTimingColouriseKeyHandle(
+                                    &cluster,
+                                    TimingColouriseKeyHandleForLane(
+                                        lane,
+                                        lanePosition));
+                            }
+                        }
+                    }
+                    replaceSelection(std::move(cluster), handle);
+                }
+                // The selection is exactly what should move, so the
+                // Time-only coincident gather stays off even when that
+                // mode is enabled.
+                armKeyDrag(
+                    anchor,
+                    false,
+                    /*suppressTimeOnlyGather=*/true);
             }
         }
     } else if (
@@ -94867,6 +94939,33 @@ void DrawTimingKeyLaneGroup(
     };
     if (dragMatches() && itemActive &&
         ImGui::IsMouseDragging(ImGuiMouseButton_Left, 2.0F)) {
+        {
+            // Shake to toggle snapping: several quick horizontal
+            // direction reversals flip it off for the rest of this drag,
+            // and another shake turns it back on.
+            auto& liveDrag = timings.colouriseGraphKeyDrag.value();
+            const double now = ImGui::GetTime();
+            const float shakeDx = mouse.x - liveDrag.shakeLastMouseX;
+            if (std::abs(shakeDx) >= 3.0F) {
+                const int direction = shakeDx > 0.0F ? 1 : -1;
+                if (liveDrag.shakeDirection != 0 &&
+                    direction != liveDrag.shakeDirection &&
+                    std::abs(shakeDx) >= 6.0F) {
+                    if (now - liveDrag.shakeLastReversalTime > 0.6) {
+                        liveDrag.shakeReversals = 0;
+                    }
+                    ++liveDrag.shakeReversals;
+                    liveDrag.shakeLastReversalTime = now;
+                    if (liveDrag.shakeReversals >= 4) {
+                        liveDrag.snappingDisabled =
+                            !liveDrag.snappingDisabled;
+                        liveDrag.shakeReversals = 0;
+                    }
+                }
+                liveDrag.shakeDirection = direction;
+                liveDrag.shakeLastMouseX = mouse.x;
+            }
+        }
         const auto& drag = timings.colouriseGraphKeyDrag.value();
         // In the linked whole-loop lens the offset is an unclamped cycle
         // fraction and moved keys wrap around the loop; unlinked keys keep
@@ -94962,32 +95061,84 @@ void DrawTimingKeyLaneGroup(
                 .position = key.position,
             });
         }
-        bool collision = false;
-        for (const auto& selected : drag.handles) {
-            auto destination = selected;
-            destination.position = cyclicDrag
-                ? movedKeyPosition(selected.position)
-                : selected.position + offset;
-            collision = collision || std::any_of(
-                existingHandles.begin(),
-                existingHandles.end(),
-                [&](const auto& existing) {
-                    return !isDraggedHandle(existing) &&
-                           existing.track == destination.track &&
-                           existing.boundsParameter ==
-                               destination.boundsParameter &&
-                           existing.effectParameter ==
-                               destination.effectParameter &&
-                           existing.stopId == destination.stopId &&
-                           existing.stopParameter ==
-                               destination.stopParameter &&
-                           existing.falloffParameter ==
-                               destination.falloffParameter &&
-                           keysCoincide(
-                               existing.position,
-                               destination.position);
-                });
+        const auto offsetCollides = [&](float candidateOffset) {
+            for (const auto& selected : drag.handles) {
+                auto destination = selected;
+                destination.position = cyclicDrag
+                    ? invisible_places::timing::
+                          WrapTimingColouriseLoopPosition(
+                              selected.position + candidateOffset)
+                    : selected.position + candidateOffset;
+                const bool hit = std::any_of(
+                    existingHandles.begin(),
+                    existingHandles.end(),
+                    [&](const auto& existing) {
+                        return !isDraggedHandle(existing) &&
+                               existing.track == destination.track &&
+                               existing.boundsParameter ==
+                                   destination.boundsParameter &&
+                               existing.effectParameter ==
+                                   destination.effectParameter &&
+                               existing.stopId == destination.stopId &&
+                               existing.stopParameter ==
+                                   destination.stopParameter &&
+                               existing.falloffParameter ==
+                                   destination.falloffParameter &&
+                               keysCoincide(
+                                   existing.position,
+                                   destination.position);
+                    });
+                if (hit) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        // Snap the drag onto other keys' times, unless a dragged key would
+        // land on an occupied position of its own setting - then the whole
+        // group keeps the raw offset. Shake while dragging to toggle
+        // snapping off and on.
+        if (!cyclicDrag && !drag.snappingDisabled) {
+            std::vector<float> draggedPositions;
+            draggedPositions.reserve(drag.handles.size());
+            for (const auto& handle : drag.handles) {
+                draggedPositions.push_back(handle.position);
+            }
+            std::vector<float> snapTargets;
+            snapTargets.reserve(existingHandles.size());
+            for (const auto& existing : existingHandles) {
+                if (!isDraggedHandle(existing)) {
+                    snapTargets.push_back(existing.position);
+                }
+            }
+            const float viewSpan = std::abs(
+                positionForX(maximum.x) - positionForX(minimum.x));
+            const float snapTolerance =
+                7.0F * viewSpan / std::max(1.0F, width);
+            const auto snapped = invisible_places::timing::
+                TimingColouriseSnapKeyDragOffset(
+                    draggedPositions,
+                    snapTargets,
+                    offset,
+                    snapTolerance);
+            if (snapped.has_value()) {
+                float first = 1.0F;
+                float last = 0.0F;
+                for (const auto& handle : drag.handles) {
+                    first = std::min(first, handle.position);
+                    last = std::max(last, handle.position);
+                }
+                const float clampedSnap = std::clamp(
+                    snapped.value(),
+                    -first,
+                    1.0F - last);
+                if (clampedSnap == snapped.value() &&
+                    !offsetCollides(clampedSnap)) {
+                    offset = clampedSnap;
+                }
+            }
         }
+        const bool collision = offsetCollides(offset);
         if (!collision) {
             auto updated = drag.originalEffect;
             // The pre-move effect the Palette Phase re-encode compares
@@ -95719,6 +95870,8 @@ void DrawTimingKeyLaneGroup(
                 continue;
             }
             const float x = xForPosition(drawnPosition);
+            const float markerCentreY =
+                drawsValueGraph ? axisY + 5.0F : axisY;
             const ImU32 drawnColour =
                 markerColour(lane.colour, drawnPosition);
             const bool isHoveredMarker =
@@ -95731,24 +95884,26 @@ void DrawTimingKeyLaneGroup(
                 TimingColouriseKeyHandleForLane(lane, position));
             if (selected) {
                 drawList->AddCircleFilled(
-                    ImVec2{x, axisY},
+                    ImVec2{x, markerCentreY},
                     4.25F,
                     drawnColour);
                 drawList->AddCircle(
-                    ImVec2{x, axisY},
+                    ImVec2{x, markerCentreY},
                     5.75F,
                     ImGui::GetColorU32(ImGuiCol_SliderGrabActive),
                     0,
                     2.0F);
             } else if (isMovedMarker) {
                 drawList->AddCircleFilled(
-                    ImVec2{x, axisY},
+                    ImVec2{x, markerCentreY},
                     4.25F,
                     drawnColour);
             } else if (!isHoveredMarker) {
                 drawList->AddLine(
-                    ImVec2{x, axisY - 4.5F},
-                    ImVec2{x, axisY + 4.5F},
+                    drawsValueGraph
+                        ? ImVec2{x, axisY + 1.5F}
+                        : ImVec2{x, axisY - 4.5F},
+                    ImVec2{x, axisY + (drawsValueGraph ? 8.5F : 4.5F)},
                     drawnColour,
                     2.0F);
             }
@@ -95778,7 +95933,7 @@ void DrawTimingKeyLaneGroup(
                 : nearestPosition;
         const float x = xForPosition(drawnPosition);
         drawList->AddCircleFilled(
-            ImVec2{x, axisY},
+            ImVec2{x, drawsValueGraph ? axisY + 5.0F : axisY},
             4.25F,
             markerColour(
                 nearestSeries->colour,
@@ -95807,6 +95962,17 @@ void DrawTimingKeyLaneGroup(
             1.25F);
     }
 
+    if (dragMatches() &&
+        timings.colouriseGraphKeyDrag->snappingDisabled) {
+        const char* noSnapping = "no snapping";
+        const ImVec2 textSize = ImGui::CalcTextSize(noSnapping);
+        drawList->AddText(
+            ImVec2{
+                helpCentre.x - 12.0F - textSize.x,
+                minimum.y + 3.0F},
+            ImGui::GetColorU32(ImGuiCol_TextDisabled),
+            noSnapping);
+    }
     drawList->AddCircleFilled(
         helpCentre,
         7.0F,

@@ -2591,6 +2591,53 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Timing Colourise key-drag snapping picks the nearest target",
+    "[timing][colourise][keys][snap]") {
+    const std::array dragged{0.20F, 0.40F};
+    const std::array targets{0.50F, 0.90F};
+
+    // 0.40 + 0.095 lands within tolerance of 0.50: snap adjusts the
+    // offset so it lands exactly.
+    const auto snapped =
+        invisible_places::timing::TimingColouriseSnapKeyDragOffset(
+            dragged,
+            targets,
+            0.095F,
+            0.02F);
+    REQUIRE(snapped.has_value());
+    CHECK(snapped.value() == Approx(0.10F));
+
+    // Outside tolerance nothing snaps.
+    CHECK_FALSE(invisible_places::timing::
+                    TimingColouriseSnapKeyDragOffset(
+                        dragged,
+                        targets,
+                        0.15F,
+                        0.02F)
+                        .has_value());
+
+    // The nearest pair wins: 0.20 -> 0.50 needs +0.30, 0.40 -> 0.50
+    // needs +0.10; a raw offset of 0.29 snaps to the former.
+    const auto nearest =
+        invisible_places::timing::TimingColouriseSnapKeyDragOffset(
+            dragged,
+            targets,
+            0.29F,
+            0.02F);
+    REQUIRE(nearest.has_value());
+    CHECK(nearest.value() == Approx(0.30F));
+
+    // An exact hit needs no adjustment.
+    CHECK_FALSE(invisible_places::timing::
+                    TimingColouriseSnapKeyDragOffset(
+                        dragged,
+                        targets,
+                        0.10F,
+                        0.02F)
+                        .has_value());
+}
+
+TEST_CASE(
     "Timing Colourise emissive falloff shapes the level across the bounds",
     "[timing][colourise][emissive][falloff]") {
     using invisible_places::timing::TimingColouriseEmissiveFalloffNode;

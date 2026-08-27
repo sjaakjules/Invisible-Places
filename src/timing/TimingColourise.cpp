@@ -4723,6 +4723,41 @@ bool TransformTimingColouriseEffectSettingsKeys(
     return true;
 }
 
+std::optional<float> TimingColouriseSnapKeyDragOffset(
+    std::span<const float> draggedPositions,
+    std::span<const float> targetPositions,
+    float rawOffset,
+    float tolerance) {
+    if (!std::isfinite(rawOffset) || !std::isfinite(tolerance) ||
+        tolerance <= 0.0F) {
+        return std::nullopt;
+    }
+    std::optional<float> best;
+    float bestDistance = tolerance;
+    for (const float dragged : draggedPositions) {
+        if (!std::isfinite(dragged)) {
+            continue;
+        }
+        for (const float target : targetPositions) {
+            if (!std::isfinite(target)) {
+                continue;
+            }
+            const float candidate = target - dragged;
+            const float distance = std::abs(candidate - rawOffset);
+            if (distance <= bestDistance) {
+                bestDistance = distance;
+                best = candidate;
+            }
+        }
+    }
+    if (best.has_value() &&
+        std::abs(best.value() - rawOffset) <=
+            std::numeric_limits<float>::epsilon()) {
+        return std::nullopt;
+    }
+    return best;
+}
+
 float WrapTimingColouriseLoopPosition(float position) {
     position = FiniteOr(position, 0.0F);
     position -= std::floor(position);

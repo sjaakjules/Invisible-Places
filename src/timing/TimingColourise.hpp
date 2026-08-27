@@ -985,6 +985,18 @@ TimingColouriseEffectSettingsKeySpan(
     TimingColouriseEffect* effect,
     TimingColouriseSettingsKeySpan source,
     TimingColouriseSettingsKeySpan destination);
+// Key-drag snapping: the offset that lands one dragged key exactly on the
+// nearest target position, when any dragged/target pair sits within
+// `tolerance` of doing so under `rawOffset`. Targets are the positions of
+// keys not being dragged; the caller re-runs its own-lane collision check
+// on the snapped offset and falls back to the raw one when snapping would
+// stack keys of the same setting.
+[[nodiscard]] std::optional<float> TimingColouriseSnapKeyDragOffset(
+    std::span<const float> draggedPositions,
+    std::span<const float> targetPositions,
+    float rawOffset,
+    float tolerance);
+
 // Canonicalises a whole-loop phase into [0, 1): 1.0 wraps to 0.0 because loop
 // zero and loop one are the same cyclic instant. Non-finite input maps to 0.
 [[nodiscard]] float WrapTimingColouriseLoopPosition(float position);
