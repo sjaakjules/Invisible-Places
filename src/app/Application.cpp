@@ -96901,6 +96901,39 @@ bool DrawTimingColouriseEffectParameterEditor(
         }
         DrawTimingControlTooltip(
             "Multiply every stop's Colourise Amount by the override value.");
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        static constexpr std::array<const char*, 6>
+            kTimingColouriseBlendModeLabels = {
+                "Normal",
+                "Multiply",
+                "Screen",
+                "Add",
+                "Divide",
+                "Vivid Light",
+            };
+        int blendModeIndex = std::clamp(
+            static_cast<int>(effect->blendMode),
+            0,
+            static_cast<int>(kTimingColouriseBlendModeLabels.size()) - 1);
+        if (ImGui::Combo(
+                "##colouriseBlendMode",
+                &blendModeIndex,
+                kTimingColouriseBlendModeLabels.data(),
+                static_cast<int>(
+                    kTimingColouriseBlendModeLabels.size()))) {
+            effect->blendMode = static_cast<
+                invisible_places::timing::TimingColouriseBlendMode>(
+                blendModeIndex);
+            changed = true;
+        }
+        DrawTimingControlTooltip(
+            "How this feature's colour lays into the colour beneath it "
+            "(earlier features, or the cloud colour). Normal mixes toward "
+            "the palette colour - the historical behaviour. Multiply and "
+            "Divide darken and brighten like the AE exhibition grade's "
+            "washes over a white render; Screen and Add lay colour into "
+            "dark points instead. Vivid Light pushes contrast hard. "
+            "Colourise Amount acts as the layer opacity for every mode.");
     }
     if (drawBelowLabel) {
         drawBelowLabel();

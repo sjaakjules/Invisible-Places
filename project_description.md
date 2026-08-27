@@ -590,6 +590,14 @@ the animation overview.
 
 - Colourise effects retain their palette, phase, colourise-amount, scalar
   field, bounds, fade, and smooth key tracks.
+- Each colourise feature carries a Blend Mode against the colour beneath it
+  (earlier features, or the cloud colour): Normal is the historical mix,
+  while Multiply, Screen, Add, Divide, and Vivid Light reproduce the After
+  Effects layer modes the 2024 exhibition sequences were graded with —
+  multiplied palette washes over a light base, divide to lift shading, and
+  vivid light for hard contrast accents. Colourise Amount acts as the layer
+  opacity in every mode, stack order stays the compositing order, and the
+  live viewport, offline renders, and EXR output blend identically.
 - Palette sampling adds marker-free transforms: a Loop toggle mirrors the
   output so the palette's left colour sits at the centre and the ends match,
   and a Palette Skew warp band attached to the histogram bottom, where

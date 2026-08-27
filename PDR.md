@@ -731,9 +731,14 @@ their time (or a pre-selected subset), and drags shall snap onto other
 keys' times unless a dragged key would stack on its own setting, with a
 mouse shake toggling snapping. Colourise and Emissive settings shall follow
 the selected scalar field through a per-field visual memory unless the user
-opts a feature into one global set. Project schema 85 introduces the
-per-edge fades; the remaining state serializes additively with omitted
-defaults.
+opts a feature into one global set. Each feature's colourise output shall
+carry an authored Blend Mode against the colour beneath it - Normal (the
+historical mix), Multiply, Screen, Add, Divide, and Vivid Light, the
+vocabulary of the 2024 After Effects exhibition grade - applied identically
+in the live viewport and offline renders with Colourise Amount acting as
+the layer opacity, and slot order remaining the compositing order. Project
+schema 85 introduces the per-edge fades; the remaining state serializes
+additively with omitted defaults.
 
 ### 5.8 Procedural Motion
 #### FR-MOTION-1
