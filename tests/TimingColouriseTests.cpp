@@ -1963,14 +1963,14 @@ TEST_CASE(
                     TimingColouriseEffectParameter::EmissiveLevel,
                     0.1F,
                     0.0F,
-                    WaterScenarioInterpolation::Hold));
+                    WaterScenarioInterpolation::Smooth));
     REQUIRE(invisible_places::timing::
                 AddOrUpdateTimingColouriseEffectParameterKey(
                     &emissive,
                     TimingColouriseEffectParameter::EmissiveLevel,
                     0.9F,
                     4.0F,
-                    WaterScenarioInterpolation::Linear));
+                    WaterScenarioInterpolation::Smooth));
     CHECK_FALSE(invisible_places::timing::
                     AddOrUpdateTimingColouriseEffectParameterKey(
                         &emissive,
@@ -2819,11 +2819,14 @@ TEST_CASE(
     REQUIRE(warmPositionKey != effect.paletteStopParameterKeys.end());
     REQUIRE(coolPositionKey != effect.paletteStopParameterKeys.end());
     CHECK(warmPositionKey->scalarValue == Approx(0.75F));
+    // Reversal inherits each track's authored style at the position.
     CHECK(warmPositionKey->interpolation ==
-          WaterScenarioInterpolation::Smooth);
+          WaterScenarioInterpolation::Hold);
     CHECK(coolPositionKey->scalarValue == Approx(0.2F));
+    // No prior position key on this track, so the flip's fresh key uses
+    // the Monotone Spline default.
     CHECK(coolPositionKey->interpolation ==
-          WaterScenarioInterpolation::Smooth);
+          WaterScenarioInterpolation::SmoothVelocity);
 
     const auto positionsById = [](const TimingColourisePalette& palette,
                                   std::string_view id) {
@@ -2967,7 +2970,7 @@ TEST_CASE(
         CHECK(effect.paletteKeys[0].palette.stops.front().id ==
               "first-right");
         CHECK(effect.paletteKeys[0].interpolation ==
-              WaterScenarioInterpolation::Smooth);
+              WaterScenarioInterpolation::Linear);
         CHECK(effect.paletteKeys[1].palette.stops.front().id ==
               secondBefore.stops.front().id);
         CHECK(effect.basePalette.stops.front().id ==
@@ -3054,13 +3057,13 @@ TEST_CASE(
     REQUIRE(atQuarter.stops.size() == 1U);
     CHECK(
         atQuarter.stops[0].position ==
-        Approx(std::lerp(0.0F, 0.3F, smooth(0.75F))));
+        Approx(std::lerp(0.0F, 0.3F, 0.75F)));
     CHECK(
         atQuarter.stops[0].colour[0] ==
         Approx(std::lerp(
             firstColour[0],
             secondColour[0],
-            smooth(1.0F / 6.0F))));
+            1.0F / 6.0F)));
     CHECK(atQuarter.stops[0].colouriseAmount == Approx(0.65F));
 
     const auto atFourTenths =
@@ -3074,7 +3077,7 @@ TEST_CASE(
         Approx(std::lerp(
             firstColour[1],
             secondColour[1],
-            smooth(2.0F / 3.0F))));
+            2.0F / 3.0F)));
 
     const auto atSharedEnd =
         invisible_places::timing::EvaluateTimingColourisePalette(
@@ -5194,12 +5197,13 @@ TEST_CASE(
 
     effect.paletteKeys.front().interpolation =
         WaterScenarioInterpolation::Hold;
-    const auto smoothed =
+    const auto held =
         invisible_places::timing::EvaluateTimingColourisePaletteLut(
             effect,
             0.25F);
-    CHECK(smoothed.front()[0] == Approx(0.84375F));
-    CHECK(smoothed.front()[2] == Approx(0.15625F));
+    // A Hold segment keeps the first snapshot exactly until the next key.
+    CHECK(held.front()[0] == Approx(1.0F));
+    CHECK(held.front()[2] == Approx(0.0F));
 }
 
 TEST_CASE(
@@ -5366,20 +5370,29 @@ TEST_CASE(
         Solid({0.2F, 0.4F, 0.8F}),
         WaterScenarioInterpolation::Linear);
 
-    const auto allSmooth = [](const auto& keys) {
+    const auto allCarry = [](const auto& keys,
+                             WaterScenarioInterpolation style) {
         return std::all_of(
             keys.begin(),
             keys.end(),
-            [](const auto& key) {
-                return key.interpolation ==
-                       WaterScenarioInterpolation::Smooth;
+            [&](const auto& key) {
+                return key.interpolation == style;
             });
     };
-    CHECK(allSmooth(effect.paletteKeys));
-    CHECK(allSmooth(effect.paletteStopParameterKeys));
-    CHECK(allSmooth(effect.effectParameterKeys));
-    CHECK(allSmooth(effect.boundsKeys));
-    CHECK(allSmooth(effect.boundsParameterKeys));
+    // Linear and Hold are stored styles in their own right; sanitize only
+    // rejects the water-track-only modes.
+    CHECK(allCarry(
+        effect.paletteKeys,
+        WaterScenarioInterpolation::Linear));
+    CHECK(allCarry(
+        effect.effectParameterKeys,
+        WaterScenarioInterpolation::Hold));
+    CHECK(allCarry(
+        effect.boundsKeys,
+        WaterScenarioInterpolation::Hold));
+    CHECK(allCarry(
+        effect.boundsParameterKeys,
+        WaterScenarioInterpolation::Linear));
 
     const auto setAllSmoothVelocity = [](auto* keys) {
         for (auto& key : *keys) {

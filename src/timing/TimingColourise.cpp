@@ -224,13 +224,13 @@ bool IsValidInterpolation(
     using invisible_places::water::WaterScenarioInterpolation;
     switch (interpolation) {
         case WaterScenarioInterpolation::Smooth:
+        case WaterScenarioInterpolation::Linear:
+        case WaterScenarioInterpolation::Hold:
         case WaterScenarioInterpolation::SmoothVelocity:
         case WaterScenarioInterpolation::CentripetalCatmullRom:
             return true;
-        case WaterScenarioInterpolation::Linear:
-        case WaterScenarioInterpolation::Hold:
+        // Water-track-only styles; colourise keys never carry them.
         case WaterScenarioInterpolation::SplineHandles:
-        // Setting-track-only sentinel; colourise keys never carry it.
         case WaterScenarioInterpolation::TrackDefault:
             return false;
     }
@@ -576,6 +576,13 @@ std::optional<float> EvaluateScalarKeyTrack(
         });
     if (right == trackEnd) {
         return valueAt(last);
+    }
+    // A key is authoritative at its own instant for every curve style. In
+    // particular a Hold segment ending here must show this key's value, not
+    // hold the previous one through it.
+    if (std::abs(right->position - normalizedPosition) <=
+        kTimingColouriseKeyTolerance) {
+        return valueAt(*right);
     }
     const auto left = right - 1;
     const double segmentDuration =
@@ -2835,7 +2842,7 @@ bool ReverseTimingColourisePaletteAtPosition(
             existing != updated.paletteStopParameterKeys.end()
                 ? existing->interpolation
                 : invisible_places::water::
-                      WaterScenarioInterpolation::Smooth;
+                      WaterScenarioInterpolation::SmoothVelocity;
         if (!AddOrUpdateTimingColourisePaletteStopScalarKey(
                 &updated,
                 stop.id,

@@ -506,7 +506,7 @@ TEST_CASE("Palette stop-property animation and provenance round-trip",
   CHECK(loadedEffect.paletteStopParameterKeys[2].parameter ==
         TimingColourisePaletteStopParameter::ColouriseAmount);
   CHECK(loadedEffect.paletteStopParameterKeys[2].interpolation ==
-        WaterScenarioInterpolation::Smooth);
+        WaterScenarioInterpolation::Hold);
 }
 
 TEST_CASE(
