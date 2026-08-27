@@ -2427,7 +2427,9 @@ TEST_CASE(
     "Timing Colourise new keys default to Monotone Spline",
     "[timing][colourise][keys][default-interpolation]") {
     TimingColouriseEffect effect;
-    effect.basePalette = Solid({0.5F, 0.5F, 0.5F}, 1.0F);
+    effect.basePalette =
+        invisible_places::timing::SanitizeTimingColourisePalette(
+            Solid({0.5F, 0.5F, 0.5F}, 1.0F));
     REQUIRE(invisible_places::timing::
                 AddOrUpdateTimingColouriseEffectParameterKey(
                     &effect,
