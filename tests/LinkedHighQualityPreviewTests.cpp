@@ -99,6 +99,32 @@ std::vector<float> FieldValues(
 }  // namespace
 
 TEST_CASE(
+    "Animation HQ duplicates one unlinked midpoint and retains a linked pair",
+    "[pointcloud][linked-hq]") {
+    const auto localMatrix = glm::translate(
+        glm::mat4{1.0F},
+        glm::vec3{-2.0F, 0.0F, 0.0F});
+    const std::array localMidpoints{localMatrix};
+    const auto local = invisible_places::app::BuildAnimationHqFrustumUnion(
+        localMidpoints);
+    CHECK(local.midpointViewProjections[0U] == localMatrix);
+    CHECK(local.midpointViewProjections[1U] == localMatrix);
+    CHECK(local.Contains({2.0F, 0.0F, 0.0F}));
+    CHECK_FALSE(local.Contains({0.0F, 0.0F, 0.0F}));
+
+    const auto partnerMatrix = glm::translate(
+        glm::mat4{1.0F},
+        glm::vec3{3.0F, 0.0F, 0.0F});
+    const std::array linkedMidpoints{localMatrix, partnerMatrix};
+    const auto linked = invisible_places::app::BuildAnimationHqFrustumUnion(
+        linkedMidpoints);
+    CHECK(linked.midpointViewProjections[0U] == localMatrix);
+    CHECK(linked.midpointViewProjections[1U] == partnerMatrix);
+    CHECK(linked.Contains({-3.0F, 0.0F, 0.0F}));
+    CHECK(linked.Contains({2.0F, 0.0F, 0.0F}));
+}
+
+TEST_CASE(
     "Linked HQ midpoint union pads only the viewport and partitions exactly",
     "[pointcloud][linked-hq]") {
     invisible_places::app::LinkedHqFrustumUnion frustums;

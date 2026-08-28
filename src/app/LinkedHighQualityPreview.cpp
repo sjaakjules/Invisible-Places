@@ -76,6 +76,22 @@ bool LinkedHqFrustumUnion::Contains(
     return false;
 }
 
+LinkedHqFrustumUnion BuildAnimationHqFrustumUnion(
+    std::span<const glm::mat4> midpointViewProjections,
+    float borderFraction) {
+    LinkedHqFrustumUnion result;
+    result.borderFraction = std::max(0.0F, borderFraction);
+    if (midpointViewProjections.empty()) {
+        return result;
+    }
+    result.midpointViewProjections[0U] = midpointViewProjections[0U];
+    result.midpointViewProjections[1U] =
+        midpointViewProjections.size() > 1U
+            ? midpointViewProjections[1U]
+            : midpointViewProjections[0U];
+    return result;
+}
+
 LinkedHqIndexPartition PartitionLinkedHqIndices(
     std::span<const invisible_places::io::Float3> positions,
     const LinkedHqFrustumUnion& frustumUnion,

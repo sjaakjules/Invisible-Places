@@ -52,6 +52,15 @@ struct LinkedHqFrustumUnion {
         const invisible_places::io::Float3& point) const;
 };
 
+// Builds the two-slot union used by the compact patch pipeline. An unlinked
+// animation supplies one midpoint matrix, which is duplicated exactly; a
+// linked pair supplies its two matrices. Empty input keeps the identity
+// defaults, and additional matrices are ignored deliberately because the
+// runtime supports at most one reciprocal pair.
+[[nodiscard]] LinkedHqFrustumUnion BuildAnimationHqFrustumUnion(
+    std::span<const glm::mat4> midpointViewProjections,
+    float borderFraction = kLinkedHqViewportBorderFraction);
+
 struct LinkedHqIndexPartition {
     std::vector<std::uint32_t> inside;
     std::vector<std::uint32_t> outside;
