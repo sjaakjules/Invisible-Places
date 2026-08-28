@@ -263,6 +263,72 @@ TEST_CASE(
     CHECK(mesh.rockResponse.colourise.y == Approx(0.2F));
     CHECK(mesh.rockResponse.colourise.z == Approx(0.3F));
     CHECK(mesh.vegetationResponse.streamDepthMeters == Approx(1.25F));
+
+    WaterSeepageNode seepage;
+    seepage.id = 71U;
+    seepage.selectionReachLimitMeters = 2.0F;
+    seepage.enabledInViewport = true;
+    auto seepageLook = DefaultWaterSeepageLookSettings();
+    WaterFeatureFixedSettingOverlay seepageFixed;
+    seepageFixed.samples = {
+        {.feature = {.kind = WaterKeyedFeatureKind::SeepageNode,
+                     .objectId = seepage.id},
+         .settingId = "visible",
+         .value = false},
+        {.feature = {.kind = WaterKeyedFeatureKind::SeepageNode,
+                     .objectId = seepage.id},
+         .settingId = "selection_reach_limit",
+         .value = 4.75},
+        {.feature = {.kind = WaterKeyedFeatureKind::SeepageNode,
+                     .objectId = seepage.id},
+         .settingId = "seed",
+         .value = std::uint64_t{918U}},
+        {.feature = {.kind = WaterKeyedFeatureKind::SeepageNode,
+                     .objectId = seepage.id},
+         .settingId = "look.quality",
+         .value = std::uint64_t{
+             static_cast<std::uint64_t>(WaterSeepageQuality::Low)}},
+        {.feature = {.kind = WaterKeyedFeatureKind::SeepageNode,
+                     .objectId = seepage.id},
+         .settingId = "look.pattern",
+         .value = std::uint64_t{static_cast<std::uint64_t>(
+             WaterSeepagePattern::ContourPulses)}},
+        {.feature = {.kind = WaterKeyedFeatureKind::SeepageNode,
+                     .objectId = seepage.id},
+         .settingId = "response.blend_mode",
+         .value = std::uint64_t{static_cast<std::uint64_t>(
+             WaterEffectBlendMode::Screen)}},
+    };
+    ApplyWaterFeatureFixedSettingOverlayToSeepageNode(
+        seepageFixed,
+        &seepage,
+        &seepageLook);
+    CHECK_FALSE(seepage.enabledInViewport);
+    CHECK(seepage.selectionReachLimitMeters == Approx(4.75F));
+    CHECK(seepage.seed == 918U);
+    CHECK(seepageLook.quality == WaterSeepageQuality::Low);
+    CHECK(seepageLook.pattern == WaterSeepagePattern::ContourPulses);
+    CHECK(seepageLook.blendMode == WaterEffectBlendMode::Screen);
+    REQUIRE(seepage.fixedSettingLookOverride.has_value());
+
+    // The runtime copy resolves its fixed look before a keyed scalar is
+    // applied. Keyed values remain the final layer without erasing fixed
+    // enum choices such as Pattern or Blend.
+    const auto resolvedFixedLook = ResolveWaterSeepageLook(
+        seepage,
+        {},
+        {},
+        DefaultWaterSeepageLookSettings());
+    CHECK(resolvedFixedLook.pattern ==
+          WaterSeepagePattern::ContourPulses);
+    CHECK(resolvedFixedLook.blendMode == WaterEffectBlendMode::Screen);
+    auto keyedLook = resolvedFixedLook;
+    REQUIRE(ApplyWaterSeepageLookTimingValue(
+        &keyedLook,
+        "look.base_wetness",
+        0.83F));
+    CHECK(keyedLook.baseWetness == Approx(0.83F));
+    CHECK(keyedLook.pattern == WaterSeepagePattern::ContourPulses);
 }
 
 WaterTimingRun Run(

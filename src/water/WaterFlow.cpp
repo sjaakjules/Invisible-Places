@@ -12912,6 +12912,118 @@ void ApplyWaterFeatureTimingOverlayToSeepageNode(
         &node->rainRecessionSeconds);
 }
 
+void ApplyWaterFeatureFixedSettingOverlayToSeepageNode(
+    const WaterFeatureFixedSettingOverlay& overlay,
+    WaterSeepageNode* node,
+    WaterSeepageLookSettings* resolvedLook) {
+    if (node == nullptr) {
+        return;
+    }
+    const WaterKeyedFeatureId feature{
+        .kind = WaterKeyedFeatureKind::SeepageNode,
+        .objectId = node->id,
+    };
+    const auto find = [&](std::string_view id) {
+        return overlay.Find(feature, id);
+    };
+    const auto applyBool = [&](std::string_view id, bool* target) {
+        if (const auto* value = find(id); value != nullptr) {
+            if (const auto* typed = std::get_if<bool>(value)) {
+                *target = *typed;
+            }
+        }
+    };
+    const auto applyFloat = [&](std::string_view id,
+                                float minimum,
+                                float maximum,
+                                float* target) {
+        if (const auto* value = find(id); value != nullptr) {
+            if (const auto* typed = std::get_if<double>(value);
+                typed != nullptr && std::isfinite(*typed)) {
+                *target = std::clamp(
+                    static_cast<float>(*typed), minimum, maximum);
+            }
+        }
+    };
+    const auto applyUint = [&](std::string_view id,
+                               std::uint32_t* target) {
+        if (const auto* value = find(id); value != nullptr) {
+            if (const auto* typed = std::get_if<std::uint64_t>(value)) {
+                *target = static_cast<std::uint32_t>(
+                    std::min<std::uint64_t>(
+                        *typed,
+                        std::numeric_limits<std::uint32_t>::max()));
+            } else if (const auto* typed = std::get_if<std::int64_t>(value);
+                       typed != nullptr && *typed >= 0) {
+                *target = static_cast<std::uint32_t>(
+                    std::min<std::uint64_t>(
+                        static_cast<std::uint64_t>(*typed),
+                        std::numeric_limits<std::uint32_t>::max()));
+            }
+        }
+    };
+    const auto enumIndex = [&](std::string_view id,
+                               std::uint64_t maximum)
+        -> std::optional<std::uint64_t> {
+        const auto* value = find(id);
+        if (value == nullptr) {
+            return std::nullopt;
+        }
+        if (const auto* typed = std::get_if<std::uint64_t>(value)) {
+            return std::min(*typed, maximum);
+        }
+        if (const auto* typed = std::get_if<std::int64_t>(value);
+            typed != nullptr && *typed >= 0) {
+            return std::min(
+                static_cast<std::uint64_t>(*typed), maximum);
+        }
+        return std::nullopt;
+    };
+
+    applyBool("visible", &node->enabledInViewport);
+    applyBool("include_in_export", &node->enabledInExport);
+    applyFloat(
+        "selection_reach_limit",
+        0.05F,
+        50.0F,
+        &node->selectionReachLimitMeters);
+    applyFloat(
+        "selection_width_limit",
+        std::max(0.02F, node->widthMeters),
+        25.0F,
+        &node->selectionWidthLimitMeters);
+    applyFloat("edge_feather", 0.0F, 5.0F, &node->edgeFeatherMeters);
+    applyFloat("surface_depth", 0.005F, 2.0F, &node->depthToleranceMeters);
+    applyFloat("normal_alignment", 0.0F, 1.0F, &node->normalAlignment);
+    applyUint("seed", &node->seed);
+
+    if (resolvedLook != nullptr) {
+        if (const auto value = enumIndex(
+                "look.quality",
+                static_cast<std::uint64_t>(WaterSeepageQuality::High));
+            value.has_value()) {
+            resolvedLook->quality =
+                static_cast<WaterSeepageQuality>(value.value());
+        }
+        if (const auto value = enumIndex(
+                "look.pattern",
+                static_cast<std::uint64_t>(
+                    WaterSeepagePattern::ContourPulses));
+            value.has_value()) {
+            resolvedLook->pattern =
+                static_cast<WaterSeepagePattern>(value.value());
+        }
+        if (const auto value = enumIndex(
+                "response.blend_mode",
+                static_cast<std::uint64_t>(WaterEffectBlendMode::Override));
+            value.has_value()) {
+            resolvedLook->blendMode =
+                static_cast<WaterEffectBlendMode>(value.value());
+        }
+        node->fixedSettingLookOverride = *resolvedLook;
+    }
+}
+
 WaterRainResponseSettings ResolveWaterSeepageNodeRainResponse(
     const WaterSeepageNode& node,
     const WaterFeatureTimingOverlay* overlay) {
@@ -13676,6 +13788,10 @@ WaterSeepageLookSettings ResolveWaterSeepageLook(
     std::span<const WaterSeepageLookProfile> profiles,
     std::span<const WaterSeepageResponseProfile> responseProfiles,
     const WaterSeepageLookSettings& defaultLook) {
+    if (node.fixedSettingLookOverride.has_value()) {
+        return SanitizeSeepageLook(
+            node.fixedSettingLookOverride.value());
+    }
     return ResolveWaterSeepageLook(
         profiles,
         responseProfiles,
@@ -14431,6 +14547,32 @@ void ApplyWaterSeepageRuntimeParameters(
             runtime.seed = authored->seed;
             runtime.noiseRotation = SeepageNoiseRotation(
                 authored->seed ^ (authored->id * 0x9e3779b9U));
+            runtime.selectionReachLimitMeters = std::clamp(
+                SeepageFiniteOr(
+                    authored->selectionReachLimitMeters,
+                    2.34375F),
+                0.001F,
+                1000.0F);
+            runtime.selectionWidthLimitMeters = std::clamp(
+                SeepageFiniteOr(
+                    authored->selectionWidthLimitMeters,
+                    1.215F),
+                0.002F,
+                1000.0F);
+            runtime.pulseStableSpanMeters = std::max(
+                0.005F,
+                runtime.selectionReachLimitMeters /
+                    kWaterSeepageDescentCostFactor);
+            runtime.edgeFeatherMeters = std::clamp(
+                SeepageFiniteOr(authored->edgeFeatherMeters, 0.10F),
+                0.001F,
+                100.0F);
+            runtime.depthToleranceMeters = std::clamp(
+                SeepageFiniteOr(
+                    authored->depthToleranceMeters,
+                    0.15F),
+                0.001F,
+                100.0F);
             runtime.normalAlignment = std::clamp(
                 SeepageFiniteOr(authored->normalAlignment, 0.20F),
                 0.0F,

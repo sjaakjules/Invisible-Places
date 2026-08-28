@@ -1572,6 +1572,10 @@ struct WaterSeepageNode {
     // resolve path never reads them and they are no longer serialized.
     std::optional<WaterSeepageLookSettings> lookOverride;
     std::optional<WaterSeepageLookSettings> tempLookOverride;
+    // Runtime-only resolved look used by animation run variants. Callers set
+    // this only on copied/frozen nodes after resolving the authored Look and
+    // Response profiles; project serialization deliberately ignores it.
+    std::optional<WaterSeepageLookSettings> fixedSettingLookOverride;
 };
 
 inline constexpr std::size_t kWaterSeepageMaximumGuideSamples = 8U;
@@ -2345,6 +2349,10 @@ void ApplyWaterFeatureFixedSettingOverlayToRainSettings(
     const WaterFeatureFixedSettingOverlay& overlay,
     WaterRainSettings* settings,
     WaterRainVisualSettings* visual);
+void ApplyWaterFeatureFixedSettingOverlayToSeepageNode(
+    const WaterFeatureFixedSettingOverlay& overlay,
+    WaterSeepageNode* node,
+    WaterSeepageLookSettings* resolvedLook = nullptr);
 [[nodiscard]] WaterDynamicMeshFlowSettings DefaultWaterDynamicMeshFlowSettings();
 [[nodiscard]] WaterDynamicMeshFlowSettings SanitizeWaterDynamicMeshFlowSettings(
     WaterDynamicMeshFlowSettings settings);

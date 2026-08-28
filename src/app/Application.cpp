@@ -2566,7 +2566,9 @@ std::vector<OfflineRenderJobState::FrozenSeepageLayer> BuildFrozenAnimationSeepa
     PreviewRuntimeState* runtimeState,
     std::span<const invisible_places::renderer::core::SceneRenderState::PointCloudLayerState> exportLayers,
     std::uint64_t effectiveInvocations,
-    const RainRuntimeSettings* rainSettingsOverride = nullptr);
+    const RainRuntimeSettings* rainSettingsOverride = nullptr,
+    const invisible_places::water::WaterFeatureFixedSettingOverlay*
+        fixedSettingOverlay = nullptr);
 std::vector<OfflineRenderJobState::FrozenFlowSourceLayer> BuildFrozenAnimationFlowSourceLayers(
     const PreviewRuntimeState& runtimeState,
     std::span<const invisible_places::renderer::core::SceneRenderState::PointCloudLayerState> exportLayers);
@@ -5153,6 +5155,55 @@ struct WaterFrameState {
         fixedSettingOverlay;
 };
 
+WaterSeepageNode ResolveWaterSeepageNodeFixedSettings(
+    const WaterWorkflowState& water,
+    const WaterSeepageNode& authoredNode,
+    const invisible_places::water::WaterFeatureFixedSettingOverlay& overlay) {
+    auto effectiveNode = authoredNode;
+    // Authored project nodes never own this transient layer. Clearing first
+    // also makes repeated resolution from a frozen copy deterministic.
+    effectiveNode.fixedSettingLookOverride.reset();
+    auto effectiveLook = invisible_places::water::ResolveWaterSeepageLook(
+        effectiveNode,
+        water.seepageLookProfiles,
+        water.seepageResponseProfiles,
+        water.defaultSeepageLook);
+    invisible_places::water::
+        ApplyWaterFeatureFixedSettingOverlayToSeepageNode(
+            overlay,
+            &effectiveNode,
+            &effectiveLook);
+    return effectiveNode;
+}
+
+std::vector<WaterSeepageNode> ResolveWaterSeepageNodesFixedSettings(
+    const WaterWorkflowState& water,
+    const invisible_places::water::WaterFeatureFixedSettingOverlay& overlay) {
+    std::vector<WaterSeepageNode> effectiveNodes;
+    effectiveNodes.reserve(water.seepageNodes.size());
+    for (const auto& node : water.seepageNodes) {
+        effectiveNodes.push_back(
+            ResolveWaterSeepageNodeFixedSettings(water, node, overlay));
+    }
+    return effectiveNodes;
+}
+
+invisible_places::water::WaterFeatureFixedSettingOverlay
+ResolvePresentedWaterFixedSettingOverlay(
+    const PreviewRuntimeState& runtimeState) {
+    const auto* entry = FindScenarioFeatureRuns(
+        runtimeState.water,
+        ActiveWaterTimingScenarioId(runtimeState));
+    const auto* animation =
+        ResolvePresentedAnimationPathForWater(runtimeState);
+    if (entry == nullptr || animation == nullptr) {
+        return {};
+    }
+    return invisible_places::water::BuildWaterFeatureFixedSettingOverlay(
+        entry->waterFeatureTimingRuns,
+        animation->waterFeatureRunSelections);
+}
+
 std::optional<float> WaterFrameExplicitRainLevel(
     const WaterFrameState& frame) {
     const auto* level = frame.featureOverlay.Find(
@@ -5370,12 +5421,16 @@ WaterFrameState ResolveWaterFrameState(
                     if (node == runtimeState->water.seepageNodes.end()) {
                         return std::nullopt;
                     }
-                    return invisible_places::water::
-                        ResolveWaterSeepageLook(
+                    const auto effectiveNode =
+                        ResolveWaterSeepageNodeFixedSettings(
+                            runtimeState->water,
                             *node,
-                            runtimeState->water.seepageLookProfiles,
-                            runtimeState->water.seepageResponseProfiles,
-                            runtimeState->water.defaultSeepageLook);
+                            result.fixedSettingOverlay);
+                    return invisible_places::water::ResolveWaterSeepageLook(
+                        effectiveNode,
+                        runtimeState->water.seepageLookProfiles,
+                        runtimeState->water.seepageResponseProfiles,
+                        runtimeState->water.defaultSeepageLook);
                 });
         }
         const float authoredRainLevel =
@@ -7687,6 +7742,7 @@ struct WaterProfileKeyingContext {
     std::string profileGroup;
     std::string profileName;
 };
+struct WaterFixedVariantUiContext;
 bool DrawWaterSeepageLookControls(
     WaterSeepageLookSettings* look,
     const WaterProfileKeyingContext* keying = nullptr);
@@ -7695,13 +7751,17 @@ bool DrawWaterSeepageLookControls(
 bool DrawWaterSeepageSettingsControls(
     WaterSeepageLookSettings* look,
     const WaterProfileKeyingContext* keying = nullptr,
-    const WaterSeepageLookSettings* baseline = nullptr);
+    const WaterSeepageLookSettings* baseline = nullptr,
+    WaterFixedVariantUiContext* fixedVariant = nullptr,
+    const WaterSeepageLookSettings* variantInherited = nullptr);
 bool DrawWaterSeepageResponseControls(
     invisible_places::water::WaterEffectResponseSettings* response,
     WaterEffectBlendMode* blendMode,
     const WaterProfileKeyingContext* keying = nullptr,
     const invisible_places::water::WaterEffectResponseSettings* baselineResponse = nullptr,
-    const WaterEffectBlendMode* baselineBlendMode = nullptr);
+    const WaterEffectBlendMode* baselineBlendMode = nullptr,
+    WaterFixedVariantUiContext* fixedVariant = nullptr,
+    const WaterEffectBlendMode* variantInheritedBlendMode = nullptr);
 void StartDynamicMeshSurfaceCacheWarmup(PreviewRuntimeState* runtimeState, bool publishStatus = false);
 std::shared_ptr<MeshSurfaceCache> EnsureDynamicMeshSurfaceCache(
     PreviewRuntimeState* runtimeState,
@@ -14037,7 +14097,8 @@ std::string WaterSeepageSurfaceCacheIdentityKey(
 
 std::string WaterSeepageSemanticTopologyKey(
     const PreviewRuntimeState& runtimeState,
-    const PreviewLayerSession& session) {
+    const PreviewLayerSession& session,
+    std::span<const WaterSeepageNode> effectiveNodes = {}) {
     const auto* scene = FindScenePointCloudRuntime(runtimeState, session);
     auto role = NormalizeSceneRoleName(session.sceneRole);
     if (role == "VEGETATION") {
@@ -14054,7 +14115,10 @@ std::string WaterSeepageSemanticTopologyKey(
         << "|role=" << role
         << "|authored="
         << invisible_places::water::WaterSeepageAuthoredTopologyFingerprint(
-               runtimeState.water.seepageNodes,
+               effectiveNodes.empty()
+                   ? std::span<const WaterSeepageNode>{
+                         runtimeState.water.seepageNodes}
+                   : effectiveNodes,
                role);
     return key.str();
 }
@@ -14093,7 +14157,14 @@ void AttachCachedWaterSeepageTopologyToSession(
     if (!IsAuthoredWaterTerrainSession(session)) {
         return;
     }
-    const auto semanticKey = WaterSeepageSemanticTopologyKey(*runtimeState, session);
+    const auto frame = ResolveWaterFrameState(runtimeState);
+    const auto effectiveNodes = ResolveWaterSeepageNodesFixedSettings(
+        runtimeState->water,
+        frame.fixedSettingOverlay);
+    const auto semanticKey = WaterSeepageSemanticTopologyKey(
+        *runtimeState,
+        session,
+        effectiveNodes);
     const auto gridIt = runtimeState->water.seepageRuntimeGrids.find(semanticKey);
     if (gridIt == runtimeState->water.seepageRuntimeGrids.end()) {
         return;
@@ -32287,6 +32358,10 @@ std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
     PreviewRuntimeState& runtimeState) {
     std::vector<OfflinePointLayerSnapshot> layers;
     const auto activeWater = ResolveWaterFrameState(&runtimeState);
+    const auto effectiveSeepageNodes =
+        ResolveWaterSeepageNodesFixedSettings(
+            runtimeState.water,
+            activeWater.fixedSettingOverlay);
     const auto& activeWaterScenario = activeWater.rawScenarioState;
     const auto resolvedShorelines = ResolveShorelinesForFrame(
         runtimeState.water.shorelineInstances,
@@ -32356,13 +32431,16 @@ std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
         }
         WaterSeepageSpatialGrid seepageGrid;
         if (IsAuthoredWaterTerrainSession(session)) {
-            const auto topologyKey = WaterSeepageSemanticTopologyKey(runtimeState, session);
+            const auto topologyKey = WaterSeepageSemanticTopologyKey(
+                runtimeState,
+                session,
+                effectiveSeepageNodes);
             if (const auto settled = runtimeState.water.seepageRuntimeGrids.find(topologyKey);
                 settled != runtimeState.water.seepageRuntimeGrids.end()) {
                 seepageGrid = settled->second;
                 invisible_places::water::ApplyWaterSeepageRuntimeParameters(
                     &seepageGrid,
-                    runtimeState.water.seepageNodes,
+                    effectiveSeepageNodes,
                     runtimeState.water.seepageLookProfiles,
                     runtimeState.water.defaultSeepageLook,
                     activeWater.seepageScenarioState,
@@ -32381,7 +32459,7 @@ std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
                                            ? std::span<const WaterSeepageSurfaceGuide>{}
                                            : std::span<const WaterSeepageSurfaceGuide>{*surfaceGuides};
                 const auto guidedNodes = WaterSeepageNodesWithValidSurfaceGuides(
-                    runtimeState.water.seepageNodes,
+                    effectiveSeepageNodes,
                     guideSpan);
                 seepageGrid = invisible_places::water::BuildWaterSeepageSpatialGrid(
                     guidedNodes,
@@ -34684,7 +34762,8 @@ bool RenderCurrentAnimationFramePreview(
         runtimeState,
         exportPointCloudLayers,
         job.effectiveSeepageInvocations,
-        &job.waterRainSettings);
+        &job.waterRainSettings,
+        &timingSnapshot.fixedSettingOverlay);
     job.frozenFlowSourceLayers = BuildFrozenAnimationFlowSourceLayers(
         *runtimeState,
         exportPointCloudLayers);
@@ -39778,7 +39857,9 @@ std::vector<OfflineRenderJobState::FrozenSeepageLayer> BuildFrozenAnimationSeepa
     PreviewRuntimeState* runtimeState,
     std::span<const invisible_places::renderer::core::SceneRenderState::PointCloudLayerState> exportLayers,
     std::uint64_t effectiveInvocations,
-    const RainRuntimeSettings* rainSettingsOverride) {
+    const RainRuntimeSettings* rainSettingsOverride,
+    const invisible_places::water::WaterFeatureFixedSettingOverlay*
+        fixedSettingOverlay) {
     std::vector<OfflineRenderJobState::FrozenSeepageLayer> frozen;
     if (runtimeState == nullptr) {
         return frozen;
@@ -39787,6 +39868,14 @@ std::vector<OfflineRenderJobState::FrozenSeepageLayer> BuildFrozenAnimationSeepa
         rainSettingsOverride != nullptr
             ? *rainSettingsOverride
             : runtimeState->water.collisionRainSettings;
+    const invisible_places::water::WaterFeatureFixedSettingOverlay emptyOverlay;
+    const auto effectiveNodes = ResolveWaterSeepageNodesFixedSettings(
+        runtimeState->water,
+        fixedSettingOverlay != nullptr ? *fixedSettingOverlay : emptyOverlay);
+    auto exportNodes = effectiveNodes;
+    for (auto& node : exportNodes) {
+        node.enabledInViewport = node.enabledInExport;
+    }
     frozen.reserve(exportLayers.size());
     for (const auto& exportLayer : exportLayers) {
         if (exportLayer.layerId >= runtimeState->sessions.size()) {
@@ -39797,12 +39886,26 @@ std::vector<OfflineRenderJobState::FrozenSeepageLayer> BuildFrozenAnimationSeepa
             !IsAuthoredWaterTerrainSession(session)) {
             continue;
         }
-        const auto topologyKey = WaterSeepageSemanticTopologyKey(*runtimeState, session);
+        const auto topologyKey = WaterSeepageSemanticTopologyKey(
+            *runtimeState,
+            session,
+            effectiveNodes);
         if (const auto settled = runtimeState->water.seepageRuntimeGrids.find(topologyKey);
             settled != runtimeState->water.seepageRuntimeGrids.end()) {
+            auto grid = settled->second;
+            invisible_places::water::ApplyWaterSeepageRuntimeParameters(
+                &grid,
+                exportNodes,
+                runtimeState->water.seepageLookProfiles,
+                runtimeState->water.defaultSeepageLook,
+                std::nullopt,
+                rainSettings,
+                effectiveInvocations,
+                {},
+                runtimeState->water.seepageResponseProfiles);
             frozen.push_back({
                 .layerId = exportLayer.layerId,
-                .grid = settled->second,
+                .grid = std::move(grid),
             });
             continue;
         }
@@ -39816,7 +39919,7 @@ std::vector<OfflineRenderJobState::FrozenSeepageLayer> BuildFrozenAnimationSeepa
                                    ? std::span<const WaterSeepageSurfaceGuide>{}
                                    : std::span<const WaterSeepageSurfaceGuide>{*surfaceGuides};
         const auto guidedNodes = WaterSeepageNodesWithValidSurfaceGuides(
-            runtimeState->water.seepageNodes,
+            exportNodes,
             guideSpan);
         frozen.push_back({
             .layerId = exportLayer.layerId,
@@ -39993,18 +40096,47 @@ ResolvedTimingTakeExportSnapshot BuildQueuedQuickMp4TimingSnapshot(
 std::vector<OfflineRenderJobState::FrozenSeepageLayer>
 BuildQueuedQuickMp4SeepageLayers(
     const QueuedQuickMp4WaterSnapshot& snapshot,
-    const WaterRainSettings& rainSettings) {
+    const WaterRainSettings& rainSettings,
+    const invisible_places::water::WaterFeatureFixedSettingOverlay&
+        fixedSettingOverlay) {
     auto layers = snapshot.baseSeepageLayers;
+    auto effectiveNodes = snapshot.seepageNodes;
+    for (auto& node : effectiveNodes) {
+        WaterSeepageLookSettings authoredLook =
+            invisible_places::water::DefaultWaterSeepageLookSettings();
+        for (const auto& layer : snapshot.baseSeepageLayers) {
+            const auto runtimeNode = std::find_if(
+                layer.grid.nodes.begin(),
+                layer.grid.nodes.end(),
+                [&](const auto& candidate) {
+                    return candidate.id == node.id;
+                });
+            if (runtimeNode != layer.grid.nodes.end()) {
+                authoredLook = runtimeNode->authoredLook;
+                break;
+            }
+        }
+        invisible_places::water::
+            ApplyWaterFeatureFixedSettingOverlayToSeepageNode(
+                fixedSettingOverlay,
+                &node,
+                &authoredLook);
+        node.enabledInViewport = node.enabledInExport;
+    }
     const auto itemScenario = invisible_places::timing::
         ProjectTimingTakeRainToScenarioSnapshot(
             snapshot.authoredFrameControlState,
             rainSettings);
     for (auto& layer : layers) {
-        invisible_places::water::ApplyWaterSeepageScenarioParameters(
+        invisible_places::water::ApplyWaterSeepageRuntimeParameters(
             &layer.grid,
+            effectiveNodes,
+            {},
+            invisible_places::water::DefaultWaterSeepageLookSettings(),
             itemScenario,
             rainSettings,
             snapshot.effectiveSeepageInvocations,
+            {},
             {});
         invisible_places::water::PrepareWaterSeepagePulseFields(
             &layer.grid,
@@ -40706,13 +40838,18 @@ QuickMp4ExportStartResult StartQuickMp4ExportJob(
     }
     const auto effectiveSeepageInvocations =
         waterSnapshot.effectiveSeepageInvocations;
+    const auto timingSnapshot = BuildQueuedQuickMp4TimingSnapshot(
+        request.animationPath,
+        waterSnapshot,
+        effectiveRainProfile);
     auto frozenSeepageLayers = RunExportStartupPhase(
         &startupPhases,
         "Seepage freeze",
         [&] {
             return BuildQueuedQuickMp4SeepageLayers(
                 waterSnapshot,
-                effectiveRainProfile.settings);
+                effectiveRainProfile.settings,
+                timingSnapshot.fixedSettingOverlay);
         });
     auto frozenFlowSourceLayers =
         waterSnapshot.frozenFlowSourceLayers;
@@ -40773,10 +40910,6 @@ QuickMp4ExportStartResult StartQuickMp4ExportJob(
         outputOptions.combinedColorAlphaMattePipe);
     const auto frozenRenderer =
         request.renderSetupDocument->renderer;
-    const auto timingSnapshot = BuildQueuedQuickMp4TimingSnapshot(
-        request.animationPath,
-        waterSnapshot,
-        effectiveRainProfile);
     runtimeState->offlineRenderJob = {
         .active = true,
         .cancelRequested = false,
@@ -41463,7 +41596,10 @@ void StartStillCameraExportCapture(
         runtimeState,
         job.exportPointCloudLayers,
         job.effectiveSeepageInvocations,
-        &job.waterRainSettings);
+        &job.waterRainSettings,
+        job.frozenTimingSnapshot.has_value()
+            ? &job.frozenTimingSnapshot->fixedSettingOverlay
+            : nullptr);
     job.frozenFlowSourceLayers = BuildFrozenAnimationFlowSourceLayers(
         *runtimeState,
         job.exportPointCloudLayers);
@@ -42081,7 +42217,8 @@ void StartAnimationExportJob(
                 runtimeState,
                 exportPointCloudLayers,
                 effectiveSeepageInvocations,
-                &timingSnapshot.effectiveRainProfile->settings);
+                &timingSnapshot.effectiveRainProfile->settings,
+                &timingSnapshot.fixedSettingOverlay);
         });
     auto frozenFlowSourceLayers = BuildFrozenAnimationFlowSourceLayers(
         *runtimeState,
@@ -43752,6 +43889,11 @@ BackgroundRenderPreparationObservation ObserveBackgroundRenderPreparation(
     // Count keys rather than sessions so a coarse live display and a separately
     // loaded full-density export source cannot make preparation wait twice for
     // the same topology.
+    const auto fixedOverlay =
+        ResolvePresentedWaterFixedSettingOverlay(runtimeState);
+    const auto effectiveNodes = ResolveWaterSeepageNodesFixedSettings(
+        runtimeState.water,
+        fixedOverlay);
     std::unordered_set<std::string> requiredSemanticKeys;
     for (const auto& session : runtimeState.sessions) {
         if (!IsRenderablePointCloudSource(runtimeState, session) ||
@@ -43759,7 +43901,10 @@ BackgroundRenderPreparationObservation ObserveBackgroundRenderPreparation(
             continue;
         }
         requiredSemanticKeys.insert(
-            WaterSeepageSemanticTopologyKey(runtimeState, session));
+            WaterSeepageSemanticTopologyKey(
+                runtimeState,
+                session,
+                effectiveNodes));
     }
     observation.requiredSeepageTopologyCount =
         requiredSemanticKeys.size();
@@ -81818,7 +81963,9 @@ std::string_view WaterSeepageResponseTimingSettingId(
 bool DrawWaterSeepageSettingsControls(
     WaterSeepageLookSettings* look,
     const WaterProfileKeyingContext* keying,
-    const WaterSeepageLookSettings* baseline) {
+    const WaterSeepageLookSettings* baseline,
+    WaterFixedVariantUiContext* fixedVariant,
+    const WaterSeepageLookSettings* variantInherited) {
     if (look == nullptr) {
         return false;
     }
@@ -81894,24 +82041,48 @@ bool DrawWaterSeepageSettingsControls(
         WaterSeepageQuality::Balanced,
         WaterSeepageQuality::High,
     }};
-    const bool qualityOpen = ImGui::BeginCombo("Quality", WaterSeepageQualityLabel(look->quality));
-    tooltip(
-        "Controls procedural noise detail. Auto selects High below 10M effective point "
-        "invocations, Balanced from 10-50M, and Low above 50M. World Surfels count as "
-        "six invocations per point.");
-    if (qualityOpen) {
-        for (const auto quality : qualities) {
-            const bool selected = look->quality == quality;
-            if (ImGui::Selectable(WaterSeepageQualityLabel(quality), selected)) {
-                look->quality = quality;
-                changed = true;
+    const auto drawQuality = [&]() {
+        bool valueChanged = false;
+        const bool qualityOpen = ImGui::BeginCombo(
+            "Quality",
+            WaterSeepageQualityLabel(look->quality));
+        tooltip(
+            "Controls procedural noise detail. Auto selects High below 10M effective point "
+            "invocations, Balanced from 10-50M, and Low above 50M. World Surfels count as "
+            "six invocations per point.");
+        if (qualityOpen) {
+            for (const auto quality : qualities) {
+                const bool selected = look->quality == quality;
+                if (ImGui::Selectable(
+                        WaterSeepageQualityLabel(quality), selected)) {
+                    look->quality = quality;
+                    valueChanged = true;
+                }
+                if (selected) {
+                    ImGui::SetItemDefaultFocus();
+                }
             }
-            if (selected) {
-                ImGui::SetItemDefaultFocus();
-            }
+            ImGui::EndCombo();
         }
-        ImGui::EndCombo();
-    }
+        return valueChanged;
+    };
+    const bool qualityChanged = fixedVariant != nullptr
+        ? DrawWaterVariantFixedSettingControl(
+              fixedVariant,
+              "look.quality",
+              invisible_places::water::WaterFeatureFixedSettingValue{
+                  static_cast<std::uint64_t>(
+                      variantInherited != nullptr
+                          ? variantInherited->quality
+                          : look->quality)},
+              drawQuality,
+              [&]() -> invisible_places::water::
+                  WaterFeatureFixedSettingValue {
+                  return static_cast<std::uint64_t>(look->quality);
+              })
+        : drawQuality();
+    changed |= qualityChanged &&
+        (fixedVariant == nullptr || fixedVariant->activeVariant == nullptr);
     if (baseline != nullptr && baseline->quality != look->quality) {
         ImGui::SameLine();
         ImGui::TextDisabled("(%s)", WaterSeepageQualityLabel(baseline->quality));
@@ -81922,26 +82093,50 @@ bool DrawWaterSeepageSettingsControls(
         WaterSeepagePattern::WettingTrickle,
         WaterSeepagePattern::ContourPulses,
     }};
-    const bool patternOpen = ImGui::BeginCombo("Pattern", WaterSeepagePatternLabel(look->pattern));
-    tooltip(
-        "Chooses the Seepage algorithm. Wet Rock Sheen "
-        "uses stable world-space damp patches and angle-dependent reflection; Chaotic Bloom "
-        "uses irregular ridged lobes; Wetting Trickle saturates small patches before short, "
-        "irregular fingers reveal downhill; Contour Pulses sends softly blended irregular "
-        "fronts down the same least-resistance support used by Node Strength.");
-    if (patternOpen) {
-        for (const auto pattern : patterns) {
-            const bool selected = look->pattern == pattern;
-            if (ImGui::Selectable(WaterSeepagePatternLabel(pattern), selected)) {
-                look->pattern = pattern;
-                changed = true;
+    const auto drawPattern = [&]() {
+        bool valueChanged = false;
+        const bool patternOpen = ImGui::BeginCombo(
+            "Pattern",
+            WaterSeepagePatternLabel(look->pattern));
+        tooltip(
+            "Chooses the Seepage algorithm. Wet Rock Sheen "
+            "uses stable world-space damp patches and angle-dependent reflection; Chaotic Bloom "
+            "uses irregular ridged lobes; Wetting Trickle saturates small patches before short, "
+            "irregular fingers reveal downhill; Contour Pulses sends softly blended irregular "
+            "fronts down the same least-resistance support used by Node Strength.");
+        if (patternOpen) {
+            for (const auto pattern : patterns) {
+                const bool selected = look->pattern == pattern;
+                if (ImGui::Selectable(
+                        WaterSeepagePatternLabel(pattern), selected)) {
+                    look->pattern = pattern;
+                    valueChanged = true;
+                }
+                if (selected) {
+                    ImGui::SetItemDefaultFocus();
+                }
             }
-            if (selected) {
-                ImGui::SetItemDefaultFocus();
-            }
+            ImGui::EndCombo();
         }
-        ImGui::EndCombo();
-    }
+        return valueChanged;
+    };
+    const bool patternChanged = fixedVariant != nullptr
+        ? DrawWaterVariantFixedSettingControl(
+              fixedVariant,
+              "look.pattern",
+              invisible_places::water::WaterFeatureFixedSettingValue{
+                  static_cast<std::uint64_t>(
+                      variantInherited != nullptr
+                          ? variantInherited->pattern
+                          : look->pattern)},
+              drawPattern,
+              [&]() -> invisible_places::water::
+                  WaterFeatureFixedSettingValue {
+                  return static_cast<std::uint64_t>(look->pattern);
+              })
+        : drawPattern();
+    changed |= patternChanged &&
+        (fixedVariant == nullptr || fixedVariant->activeVariant == nullptr);
     if (baseline != nullptr && baseline->pattern != look->pattern) {
         ImGui::SameLine();
         ImGui::TextDisabled("(%s)", WaterSeepagePatternLabel(baseline->pattern));
@@ -82240,7 +82435,9 @@ bool DrawWaterSeepageResponseControls(
     WaterEffectBlendMode* blendMode,
     const WaterProfileKeyingContext* keying,
     const invisible_places::water::WaterEffectResponseSettings* baselineResponse,
-    const WaterEffectBlendMode* baselineBlendMode) {
+    const WaterEffectBlendMode* baselineBlendMode,
+    WaterFixedVariantUiContext* fixedVariant,
+    const WaterEffectBlendMode* variantInheritedBlendMode) {
     if (response == nullptr || blendMode == nullptr) {
         return false;
     }
@@ -82314,23 +82511,47 @@ bool DrawWaterSeepageResponseControls(
         WaterEffectBlendMode::Screen,
         WaterEffectBlendMode::Override,
     }};
-    const bool blendOpen = ImGui::BeginCombo("Blend", WaterEffectBlendModeLabel(*blendMode));
-    tooltip(
-        "Controls how overlapping Seepage nodes combine. Max is restrained and stable; Add "
-        "accumulates intensity; Multiply and Screen reshape overlap; Override favours the latest contribution.");
-    if (blendOpen) {
-        for (const auto mode : blendModes) {
-            const bool selected = *blendMode == mode;
-            if (ImGui::Selectable(WaterEffectBlendModeLabel(mode), selected)) {
-                *blendMode = mode;
-                changed = true;
+    const auto drawBlend = [&]() {
+        bool valueChanged = false;
+        const bool blendOpen = ImGui::BeginCombo(
+            "Blend",
+            WaterEffectBlendModeLabel(*blendMode));
+        tooltip(
+            "Controls how overlapping Seepage nodes combine. Max is restrained and stable; Add "
+            "accumulates intensity; Multiply and Screen reshape overlap; Override favours the latest contribution.");
+        if (blendOpen) {
+            for (const auto mode : blendModes) {
+                const bool selected = *blendMode == mode;
+                if (ImGui::Selectable(
+                        WaterEffectBlendModeLabel(mode), selected)) {
+                    *blendMode = mode;
+                    valueChanged = true;
+                }
+                if (selected) {
+                    ImGui::SetItemDefaultFocus();
+                }
             }
-            if (selected) {
-                ImGui::SetItemDefaultFocus();
-            }
+            ImGui::EndCombo();
         }
-        ImGui::EndCombo();
-    }
+        return valueChanged;
+    };
+    const bool blendChanged = fixedVariant != nullptr
+        ? DrawWaterVariantFixedSettingControl(
+              fixedVariant,
+              "response.blend_mode",
+              invisible_places::water::WaterFeatureFixedSettingValue{
+                  static_cast<std::uint64_t>(
+                      variantInheritedBlendMode != nullptr
+                          ? *variantInheritedBlendMode
+                          : *blendMode)},
+              drawBlend,
+              [&]() -> invisible_places::water::
+                  WaterFeatureFixedSettingValue {
+                  return static_cast<std::uint64_t>(*blendMode);
+              })
+        : drawBlend();
+    changed |= blendChanged &&
+        (fixedVariant == nullptr || fixedVariant->activeVariant == nullptr);
     if (baselineBlendMode != nullptr && *baselineBlendMode != *blendMode) {
         ImGui::SameLine();
         ImGui::TextDisabled("(%s)", WaterEffectBlendModeLabel(*baselineBlendMode));
@@ -83134,6 +83355,14 @@ void DrawWaterSeepagePanel(
         *runtimeState,
         {.kind = invisible_places::water::WaterKeyedFeatureKind::SeepageNode,
          .objectId = node->id});
+    auto seepageFixedUi = ResolveWaterFixedVariantUiContext(
+        runtimeState,
+        selectedSeepageFeatures.front());
+    const auto seepageFrame = ResolveWaterFrameState(runtimeState);
+    auto effectiveFixedNode = ResolveWaterSeepageNodeFixedSettings(
+        water,
+        *node,
+        seepageFrame.fixedSettingOverlay);
         // Multi-edit slider bound to the primary's value. While the selected
         // nodes disagree (beyond a small epsilon) the value box renders the
         // word "different"; any change writes the resulting value to every
@@ -83180,6 +83409,69 @@ void DrawWaterSeepagePanel(
         };
         const auto noPerNodeClamp = [](const WaterSeepageNode&, float value) {
             return value;
+        };
+        const auto fixedNodeFloat = [&](std::string_view settingId,
+                                        const char* label,
+                                        float WaterSeepageNode::*field,
+                                        float minimumValue,
+                                        float maximumValue,
+                                        const char* format,
+                                        const std::optional<float>& baseValue,
+                                        ImGuiSliderFlags flags,
+                                        bool rebuildsTopology,
+                                        auto&& clampForNode) {
+            const bool variantActive =
+                seepageFixedUi.activeVariant != nullptr;
+            const bool valueChanged = DrawWaterVariantFixedSettingControl(
+                &seepageFixedUi,
+                settingId,
+                invisible_places::water::WaterFeatureFixedSettingValue{
+                    static_cast<double>(node->*field)},
+                [&]() {
+                    if (!variantActive) {
+                        return multiEditSliderFloat(
+                            label,
+                            field,
+                            minimumValue,
+                            maximumValue,
+                            format,
+                            baseValue,
+                            flags,
+                            clampForNode);
+                    }
+                    float value = effectiveFixedNode.*field;
+                    const bool edited = DrawWaterSliderFloat(
+                        label,
+                        &value,
+                        minimumValue,
+                        maximumValue,
+                        WaterProfileValueFormat(
+                            format,
+                            value,
+                            baseValue)
+                            .c_str(),
+                        flags);
+                    if (edited) {
+                        effectiveFixedNode.*field =
+                            clampForNode(effectiveFixedNode, value);
+                    }
+                    return edited;
+                },
+                [&]() -> invisible_places::water::
+                    WaterFeatureFixedSettingValue {
+                    return static_cast<double>(
+                        variantActive
+                            ? effectiveFixedNode.*field
+                            : node->*field);
+                });
+            if (valueChanged && !variantActive) {
+                if (rebuildsTopology) {
+                    topologyChanged = true;
+                } else {
+                    paramsChanged = true;
+                }
+            }
+            return valueChanged;
         };
         // Keyable settings route through the Timings v2 helper: when the
         // primary node is in a run, edits write keys for every selected
@@ -83451,8 +83743,18 @@ void DrawWaterSeepagePanel(
                     WaterFlowSourceDisplayName(node->name, node->id));
             }
         }
-        bool viewportEnabled = node->enabledInViewport;
-        if (ImGui::Checkbox("Visible", &viewportEnabled)) {
+        bool viewportEnabled = seepageFixedUi.activeVariant != nullptr
+            ? effectiveFixedNode.enabledInViewport
+            : node->enabledInViewport;
+        const bool viewportChanged = DrawWaterVariantFixedSettingControl(
+            &seepageFixedUi,
+            "visible",
+            invisible_places::water::WaterFeatureFixedSettingValue{
+                node->enabledInViewport},
+            [&]() { return ImGui::Checkbox("Visible", &viewportEnabled); },
+            [&]() -> invisible_places::water::
+                WaterFeatureFixedSettingValue { return viewportEnabled; });
+        if (viewportChanged && seepageFixedUi.activeVariant == nullptr) {
             for (const auto index : selectedSeepageIndices) {
                 water.seepageNodes[index].enabledInViewport = viewportEnabled;
             }
@@ -83461,8 +83763,24 @@ void DrawWaterSeepagePanel(
         DrawWaterSeepageParameterTooltip(
             "Includes this node in viewport Seepage evaluation. The node remains saved when disabled.");
         ImGui::SameLine();
-        bool exportEnabled = node->enabledInExport;
-        if (ImGui::Checkbox("Include in Export", &exportEnabled)) {
+        bool exportEnabled = seepageFixedUi.activeVariant != nullptr
+            ? effectiveFixedNode.enabledInExport
+            : node->enabledInExport;
+        const bool includeExportChanged =
+            DrawWaterVariantFixedSettingControl(
+                &seepageFixedUi,
+                "include_in_export",
+                invisible_places::water::WaterFeatureFixedSettingValue{
+                    node->enabledInExport},
+                [&]() {
+                    return ImGui::Checkbox(
+                        "Include in Export",
+                        &exportEnabled);
+                },
+                [&]() -> invisible_places::water::
+                    WaterFeatureFixedSettingValue { return exportEnabled; });
+        if (includeExportChanged &&
+            seepageFixedUi.activeVariant == nullptr) {
             for (const auto index : selectedSeepageIndices) {
                 water.seepageNodes[index].enabledInExport = exportEnabled;
             }
@@ -83745,7 +84063,8 @@ void DrawWaterSeepagePanel(
         EndWaterRegenerativeSettingLabels(nodeInRun);
         if (advancedLimitsOpen) {
             BeginWaterRegenerativeSettingLabels(nodeInRun);
-            topologyChanged |= multiEditSliderFloat(
+            (void)fixedNodeFloat(
+                "selection_reach_limit",
                 "Maximum Selection Reach",
                 &WaterSeepageNode::selectionReachLimitMeters,
                 0.05F,
@@ -83754,6 +84073,7 @@ void DrawWaterSeepagePanel(
                 settingsBaseValue(
                     &WaterSeepageNodeSettings::selectionReachLimitMeters),
                 ImGuiSliderFlags_Logarithmic,
+                true,
                 noPerNodeClamp);
             EndWaterRegenerativeSettingLabels(nodeInRun);
             DrawWaterSeepageParameterTooltip(
@@ -83761,7 +84081,8 @@ void DrawWaterSeepagePanel(
                 "hard ceiling on how far Node Strength can ever push this node. Changing it "
                 "rebuilds only this node's compact support — not keyable.");
             BeginWaterRegenerativeSettingLabels(nodeInRun);
-            topologyChanged |= multiEditSliderFloat(
+            (void)fixedNodeFloat(
+                "selection_width_limit",
                 "Maximum Selection Width",
                 &WaterSeepageNode::selectionWidthLimitMeters,
                 std::max(0.02F, node->widthMeters),
@@ -83770,6 +84091,7 @@ void DrawWaterSeepagePanel(
                 settingsBaseValue(
                     &WaterSeepageNodeSettings::selectionWidthLimitMeters),
                 ImGuiSliderFlags_Logarithmic,
+                true,
                 [](const WaterSeepageNode& target, float value) {
                     return std::clamp(
                         value,
@@ -83785,7 +84107,8 @@ void DrawWaterSeepagePanel(
             ImGui::TreePop();
         }
         BeginWaterRegenerativeSettingLabels(nodeInRun);
-        topologyChanged |= multiEditSliderFloat(
+        (void)fixedNodeFloat(
+            "edge_feather",
             "Edge Feather",
             &WaterSeepageNode::edgeFeatherMeters,
             0.0F,
@@ -83793,13 +84116,15 @@ void DrawWaterSeepagePanel(
             "%.2f m",
             settingsBaseValue(&WaterSeepageNodeSettings::edgeFeatherMeters),
             ImGuiSliderFlags_None,
+            true,
             noPerNodeClamp);
         EndWaterRegenerativeSettingLabels(nodeInRun);
         DrawWaterSeepageParameterTooltip(
             "Softens the sides, start, end, and depth boundary of the affected region. "
             "Rebuilds the node's support — not keyable.");
         BeginWaterRegenerativeSettingLabels(nodeInRun);
-        topologyChanged |= multiEditSliderFloat(
+        (void)fixedNodeFloat(
+            "surface_depth",
             "Surface Depth",
             &WaterSeepageNode::depthToleranceMeters,
             0.005F,
@@ -83808,12 +84133,14 @@ void DrawWaterSeepagePanel(
             settingsBaseValue(
                 &WaterSeepageNodeSettings::depthToleranceMeters),
             ImGuiSliderFlags_Logarithmic,
+            true,
             noPerNodeClamp);
         EndWaterRegenerativeSettingLabels(nodeInRun);
         DrawWaterSeepageParameterTooltip(
             "Maximum depth mismatch allowed while connecting neighbouring authored cache cells. "
             "Rebuilds the node's support — not keyable.");
-        paramsChanged |= multiEditSliderFloat(
+        (void)fixedNodeFloat(
+            "normal_alignment",
             "Normal Alignment",
             &WaterSeepageNode::normalAlignment,
             0.0F,
@@ -83821,6 +84148,7 @@ void DrawWaterSeepagePanel(
             "%.2f",
             settingsBaseValue(&WaterSeepageNodeSettings::normalAlignment),
             ImGuiSliderFlags_None,
+            false,
             noPerNodeClamp);
         DrawWaterSeepageParameterTooltip(
             "Controls rejection of points whose normals disagree with the local guide surface. "
@@ -83886,8 +84214,25 @@ void DrawWaterSeepagePanel(
         if (seedMixed) {
             ImGui::TextDisabled("Seed: different");
         }
-        auto seedValue = node->seed;
-        if (ImGui::InputScalar("Seed", ImGuiDataType_U32, &seedValue)) {
+        auto seedValue = seepageFixedUi.activeVariant != nullptr
+            ? effectiveFixedNode.seed
+            : node->seed;
+        const bool seedChanged = DrawWaterVariantFixedSettingControl(
+            &seepageFixedUi,
+            "seed",
+            invisible_places::water::WaterFeatureFixedSettingValue{
+                static_cast<std::uint64_t>(node->seed)},
+            [&]() {
+                return ImGui::InputScalar(
+                    "Seed",
+                    ImGuiDataType_U32,
+                    &seedValue);
+            },
+            [&]() -> invisible_places::water::
+                WaterFeatureFixedSettingValue {
+                return static_cast<std::uint64_t>(seedValue);
+            });
+        if (seedChanged && seepageFixedUi.activeVariant == nullptr) {
             for (const auto index : selectedSeepageIndices) {
                 water.seepageNodes[index].seed = seedValue;
             }
@@ -84182,7 +84527,16 @@ void DrawWaterSeepagePanel(
                     lookBaseline = lookSettingsByName(
                         assignedLookDescriptor.exactBaseProfileName);
                 }
-                WaterSeepageLookSettings editedLook = ViewedWaterSeepageLook(water, *node);
+                const WaterSeepageLookSettings inheritedLook =
+                    ViewedWaterSeepageLook(water, *node);
+                WaterSeepageLookSettings editedLook =
+                    seepageFixedUi.activeVariant != nullptr
+                        ? invisible_places::water::ResolveWaterSeepageLook(
+                              effectiveFixedNode,
+                              water.seepageLookProfiles,
+                              water.seepageResponseProfiles,
+                              water.defaultSeepageLook)
+                        : inheritedLook;
                 const WaterProfileKeyingContext keying{
                     .runtimeState = runtimeState,
                     .features = selectedSeepageFeatures,
@@ -84192,7 +84546,9 @@ void DrawWaterSeepagePanel(
                 if (DrawWaterSeepageSettingsControls(
                         &editedLook,
                         &keying,
-                        lookBaseline.has_value() ? &lookBaseline.value() : nullptr)) {
+                        lookBaseline.has_value() ? &lookBaseline.value() : nullptr,
+                        &seepageFixedUi,
+                        &inheritedLook)) {
                     // Edits land in the primary node's own copy; every other
                     // selected node references that copy read-only.
                     const auto copyName = CommitWaterFlowObjectProfileEdit(
@@ -84360,7 +84716,15 @@ void DrawWaterSeepagePanel(
                     responseBaseline = responseByName(
                         assignedResponseDescriptor.exactBaseProfileName);
                 }
-                auto viewedLook = ViewedWaterSeepageLook(water, *node);
+                const auto inheritedResponseLook =
+                    ViewedWaterSeepageLook(water, *node);
+                auto viewedLook = seepageFixedUi.activeVariant != nullptr
+                    ? invisible_places::water::ResolveWaterSeepageLook(
+                          effectiveFixedNode,
+                          water.seepageLookProfiles,
+                          water.seepageResponseProfiles,
+                          water.defaultSeepageLook)
+                    : inheritedResponseLook;
                 auto editedResponse = viewedLook.response;
                 auto editedBlendMode = viewedLook.blendMode;
                 const WaterProfileKeyingContext keying{
@@ -84376,7 +84740,9 @@ void DrawWaterSeepagePanel(
                         responseBaseline.has_value() ? &responseBaseline->response
                                                      : nullptr,
                         responseBaseline.has_value() ? &responseBaseline->blendMode
-                                                     : nullptr)) {
+                                                     : nullptr,
+                        &seepageFixedUi,
+                        &inheritedResponseLook.blendMode)) {
                     const auto copyName = CommitWaterFlowObjectProfileEdit(
                         &water.seepageResponseProfiles,
                         &node->responseProfileName,
@@ -84487,7 +84853,17 @@ void DrawWaterSeepagePanel(
         EndPanelSection();
     }
 
-    if (topologyChanged) {
+    if (seepageFixedUi.stateChanged) {
+        InvalidateWaterSeepageTopology(&water);
+        runtimeState->previewRenderStateSignatureValid = false;
+        ApplyFeatureTimelineScrub(runtimeState);
+        if (seepageFixedUi.activeVariant != nullptr) {
+            runtimeState->statusMessage =
+                "Updated fixed Seepage settings in variant " +
+                seepageFixedUi.activeVariant->name + ".";
+            runtimeState->errorMessage.clear();
+        }
+    } else if (topologyChanged) {
         InvalidateWaterSeepageTopology(&water);
     } else if (paramsChanged) {
         InvalidateWaterSeepageParams(&water);
@@ -112402,7 +112778,8 @@ bool PollWaterSeepageSupportJob(PreviewRuntimeState* runtimeState) {
 bool EnsureWaterSeepageSupportSelectionQueued(
     PreviewRuntimeState* runtimeState,
     const PreviewLayerSession& session,
-    std::string_view semanticKey) {
+    std::string_view semanticKey,
+    std::span<const WaterSeepageNode> effectiveNodes = {}) {
     if (runtimeState == nullptr || semanticKey.empty()) {
         return false;
     }
@@ -112423,7 +112800,11 @@ bool EnsureWaterSeepageSupportSelectionQueued(
     }
 
     const auto role = NormalizeWaterSeepageRoleName(session.sceneRole);
-    auto nodes = WaterSeepageNodesForRole(water.seepageNodes, role);
+    auto nodes = WaterSeepageNodesForRole(
+        effectiveNodes.empty()
+            ? std::span<const WaterSeepageNode>{water.seepageNodes}
+            : effectiveNodes,
+        role);
     if (nodes.empty()) {
         water.seepageSupportSelections.emplace(
             std::string{semanticKey},
@@ -112576,6 +112957,10 @@ void EnsureWaterSeepageRuntimeUpToDate(
                                          ? ResolveWaterFrameState(runtimeState)
                                          : WaterFrameState{};
     const auto& activeWater = frameState != nullptr ? *frameState : evaluatedWaterFrame;
+    const auto effectiveSeepageNodes =
+        ResolveWaterSeepageNodesFixedSettings(
+            runtimeState->water,
+            activeWater.fixedSettingOverlay);
     std::size_t totalBytes = 0U;
     std::uint32_t overflowCells = 0U;
     std::unordered_set<std::string> activeAttachmentKeys;
@@ -112597,14 +112982,18 @@ void EnsureWaterSeepageRuntimeUpToDate(
             continue;
         }
         const auto attachmentKey = WaterSeepageLayerAttachmentKey(sessionIndex);
-        const auto semanticKey = WaterSeepageSemanticTopologyKey(*runtimeState, session);
+        const auto semanticKey = WaterSeepageSemanticTopologyKey(
+            *runtimeState,
+            session,
+            effectiveSeepageNodes);
         activeAttachmentKeys.insert(attachmentKey);
         const bool firstSemanticUse = activeSemanticKeys.insert(semanticKey).second;
         if (runtimeState->water.waterSurfaceCache != nullptr &&
             !EnsureWaterSeepageSupportSelectionQueued(
                 runtimeState,
                 session,
-                semanticKey)) {
+                semanticKey,
+                effectiveSeepageNodes)) {
             // Keep the prior descriptor generation visible until the complete
             // node-local connected selection is ready or reports a bounded
             // failure. Never publish a transient fan for a cache-backed scene.
@@ -112631,10 +113020,10 @@ void EnsureWaterSeepageRuntimeUpToDate(
                                        ? std::span<const WaterSeepageSurfaceGuide>{}
                                        : std::span<const WaterSeepageSurfaceGuide>{*surfaceGuides};
             const auto guidedNodes = WaterSeepageNodesWithValidSurfaceGuides(
-                runtimeState->water.seepageNodes,
+                effectiveSeepageNodes,
                 guideSpan);
             const auto roleNodes = WaterSeepageNodesForRole(
-                runtimeState->water.seepageNodes,
+                effectiveSeepageNodes,
                 session.sceneRole);
             const auto supportSpan = !hasConnectedSelection
                                          ? std::span<const WaterSeepageSupportSelection>{}
@@ -112698,7 +113087,7 @@ void EnsureWaterSeepageRuntimeUpToDate(
             // table, references, guide samples, and point cloud remain intact.
             invisible_places::water::ApplyWaterSeepageRuntimeParameters(
                 &gridIt->second,
-                runtimeState->water.seepageNodes,
+                effectiveSeepageNodes,
                 runtimeState->water.seepageLookProfiles,
                 runtimeState->water.defaultSeepageLook,
                 activeWater.seepageScenarioState,
@@ -112819,7 +113208,8 @@ void EnsureWaterSeepageRuntimeUpToDate(
                 WaterSeepageLayerAttachmentKey(patch.layerId);
             const auto semanticKey = WaterSeepageSemanticTopologyKey(
                 *runtimeState,
-                baseSession);
+                baseSession,
+                effectiveSeepageNodes);
             activeAttachmentKeys.insert(attachmentKey);
             activeSemanticKeys.insert(semanticKey);
             const auto gridIt =
@@ -112945,13 +113335,31 @@ void EnsureWaterSeepageRuntimeUpToDate(
 
 bool PreviewWaterSeepageRequiresSceneRedraw(
     const PreviewRuntimeState& runtimeState) {
+    const auto fixedOverlay =
+        ResolvePresentedWaterFixedSettingOverlay(runtimeState);
+    const auto effectiveNodes = ResolveWaterSeepageNodesFixedSettings(
+        runtimeState.water,
+        fixedOverlay);
     std::unordered_set<std::string> visitedSemanticKeys;
-    for (const auto& session : runtimeState.sessions) {
+    for (std::size_t sessionIndex = 0U;
+         sessionIndex < runtimeState.sessions.size();
+         ++sessionIndex) {
+        const auto& session = runtimeState.sessions[sessionIndex];
         if (!IsRenderablePointCloudSource(runtimeState, session) ||
             !IsAuthoredWaterTerrainSession(session)) {
             continue;
         }
-        const auto semanticKey = WaterSeepageSemanticTopologyKey(runtimeState, session);
+        const auto attachment =
+            runtimeState.water.seepageAttachmentSemanticKeys.find(
+                WaterSeepageLayerAttachmentKey(sessionIndex));
+        const auto semanticKey =
+            attachment !=
+                    runtimeState.water.seepageAttachmentSemanticKeys.end()
+                ? attachment->second
+                : WaterSeepageSemanticTopologyKey(
+                      runtimeState,
+                      session,
+                      effectiveNodes);
         if (!visitedSemanticKeys.insert(semanticKey).second) {
             continue;
         }
