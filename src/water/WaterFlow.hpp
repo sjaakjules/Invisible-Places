@@ -1152,6 +1152,20 @@ void AddOrUpdateWaterTimelineSettingKey(
     WaterScenarioInterpolation interpolation =
         WaterScenarioInterpolation::TrackDefault,
     std::optional<std::uint32_t> selectedClipId = std::nullopt);
+struct WaterSettingKeyMove {
+    float sourcePosition = 0.0F;
+    float destinationPosition = 0.0F;
+};
+// Moves a set of keys simultaneously, so one selected key may land on a
+// position vacated by another selected key. The edit is atomic: invalid
+// sources, duplicate destinations, or collisions with unselected keys leave
+// the track unchanged. In cyclic mode 0 and 1 are treated as the same loop
+// phase for collision checks; callers still provide stored positions in
+// [0,1].
+[[nodiscard]] bool MoveWaterSettingKeys(
+    WaterKeyedSettingTrack* track,
+    std::span<const WaterSettingKeyMove> moves,
+    bool cyclic = false);
 // Moves one key without overwriting another key in the same setting track.
 // Source matching and destination occupancy use the same 1e-4 tolerance as
 // insertion and navigation.

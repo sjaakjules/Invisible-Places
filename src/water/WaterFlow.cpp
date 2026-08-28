@@ -10957,38 +10957,85 @@ void AddOrUpdateWaterTimelineSettingKey(
     }
 }
 
-bool MoveWaterSettingKey(
+bool MoveWaterSettingKeys(
     WaterKeyedSettingTrack* track,
-    float sourcePosition,
-    float destinationPosition) {
+    std::span<const WaterSettingKeyMove> moves,
+    bool cyclic) {
     constexpr float kKeyTolerance = 1.0e-4F;
-    if (track == nullptr || !std::isfinite(sourcePosition) ||
-        !std::isfinite(destinationPosition) ||
-        destinationPosition < 0.0F || destinationPosition > 1.0F) {
+    if (track == nullptr || moves.empty()) {
         return false;
     }
-    const auto source = std::find_if(
-        track->keys.begin(),
-        track->keys.end(),
-        [&](const WaterSettingKey& candidate) {
-            return std::abs(candidate.position - sourcePosition) <=
-                   kKeyTolerance;
-        });
-    if (source == track->keys.end()) {
-        return false;
-    }
-    const bool destinationOccupied = std::any_of(
-        track->keys.begin(),
-        track->keys.end(),
-        [&](const WaterSettingKey& candidate) {
-            return &candidate != &*source &&
-                   std::abs(candidate.position - destinationPosition) <=
+
+    const auto positionsCoincide = [&](float left, float right) {
+        const float distance = std::abs(left - right);
+        return cyclic
+            ? std::min(distance, std::abs(1.0F - distance)) <=
+                  kKeyTolerance
+            : distance <= kKeyTolerance;
+    };
+    std::vector<std::size_t> sourceIndices;
+    sourceIndices.reserve(moves.size());
+    for (const auto& move : moves) {
+        if (!std::isfinite(move.sourcePosition) ||
+            !std::isfinite(move.destinationPosition) ||
+            move.destinationPosition < 0.0F ||
+            move.destinationPosition > 1.0F) {
+            return false;
+        }
+        const auto source = std::find_if(
+            track->keys.begin(),
+            track->keys.end(),
+            [&](const WaterSettingKey& candidate) {
+                return std::abs(
+                           candidate.position - move.sourcePosition) <=
                        kKeyTolerance;
-        });
-    if (destinationOccupied) {
-        return false;
+            });
+        if (source == track->keys.end()) {
+            return false;
+        }
+        const auto sourceIndex = static_cast<std::size_t>(
+            std::distance(track->keys.begin(), source));
+        if (std::find(
+                sourceIndices.begin(),
+                sourceIndices.end(),
+                sourceIndex) != sourceIndices.end()) {
+            return false;
+        }
+        sourceIndices.push_back(sourceIndex);
     }
-    source->position = destinationPosition;
+
+    for (std::size_t moveIndex = 0U; moveIndex < moves.size(); ++moveIndex) {
+        const auto& move = moves[moveIndex];
+        for (std::size_t otherMove = moveIndex + 1U;
+             otherMove < moves.size();
+             ++otherMove) {
+            if (positionsCoincide(
+                    move.destinationPosition,
+                    moves[otherMove].destinationPosition)) {
+                return false;
+            }
+        }
+        for (std::size_t keyIndex = 0U;
+             keyIndex < track->keys.size();
+             ++keyIndex) {
+            if (std::find(
+                    sourceIndices.begin(),
+                    sourceIndices.end(),
+                    keyIndex) != sourceIndices.end()) {
+                continue;
+            }
+            if (positionsCoincide(
+                    track->keys[keyIndex].position,
+                    move.destinationPosition)) {
+                return false;
+            }
+        }
+    }
+
+    for (std::size_t index = 0U; index < moves.size(); ++index) {
+        track->keys[sourceIndices[index]].position =
+            moves[index].destinationPosition;
+    }
     std::stable_sort(
         track->keys.begin(),
         track->keys.end(),
@@ -10996,6 +11043,18 @@ bool MoveWaterSettingKey(
             return left.position < right.position;
         });
     return true;
+}
+
+bool MoveWaterSettingKey(
+    WaterKeyedSettingTrack* track,
+    float sourcePosition,
+    float destinationPosition) {
+    const std::array moves{
+        WaterSettingKeyMove{
+            .sourcePosition = sourcePosition,
+            .destinationPosition = destinationPosition,
+        }};
+    return MoveWaterSettingKeys(track, moves);
 }
 
 std::optional<WaterSettingSplineHandlePoint>

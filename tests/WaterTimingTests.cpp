@@ -1670,6 +1670,129 @@ TEST_CASE("Key positions move without overwriting another keyed value",
     CHECK(track.keys[2].position == Approx(0.80F));
 }
 
+TEST_CASE("Selected setting keys move atomically and respect loop collisions",
+          "[water][timing][keyed][edit][group]") {
+    using invisible_places::water::MoveWaterSettingKeys;
+    using invisible_places::water::WaterKeyedSettingTrack;
+    using invisible_places::water::WaterScenarioInterpolation;
+    using invisible_places::water::WaterSettingKeyMove;
+
+    WaterKeyedSettingTrack track{
+        .settingId = "level",
+        .keys = {
+            {.position = 0.20F,
+             .value = 0.25F,
+             .interpolation = WaterScenarioInterpolation::Hold,
+             .clipId = 4U,
+             .outgoingHandleTime = 0.08F},
+            {.position = 0.40F,
+             .value = 0.75F,
+             .interpolation = WaterScenarioInterpolation::SplineHandles,
+             .clipId = 4U,
+             .incomingHandleValue = -0.06F},
+            {.position = 0.80F,
+             .value = 1.00F,
+             .interpolation = WaterScenarioInterpolation::Smooth},
+        },
+    };
+
+    // Simultaneous movement may use a position vacated by another selected
+    // key, while all non-time key data remains attached to its key.
+    const std::array shift{
+        WaterSettingKeyMove{.sourcePosition = 0.20F,
+                            .destinationPosition = 0.40F},
+        WaterSettingKeyMove{.sourcePosition = 0.40F,
+                            .destinationPosition = 0.60F},
+    };
+    REQUIRE(MoveWaterSettingKeys(&track, shift));
+    REQUIRE(track.keys.size() == 3U);
+    CHECK(track.keys[0].position == Approx(0.40F));
+    CHECK(track.keys[0].value == Approx(0.25F));
+    CHECK(track.keys[0].clipId == 4U);
+    CHECK(track.keys[0].outgoingHandleTime == Approx(0.08F));
+    CHECK(track.keys[1].position == Approx(0.60F));
+    CHECK(track.keys[1].value == Approx(0.75F));
+    CHECK(track.keys[1].interpolation ==
+          WaterScenarioInterpolation::SplineHandles);
+    CHECK(track.keys[1].incomingHandleValue == Approx(-0.06F));
+
+    const auto beforeCollision = track;
+    const std::array occupied{
+        WaterSettingKeyMove{.sourcePosition = 0.40F,
+                            .destinationPosition = 0.80F},
+        WaterSettingKeyMove{.sourcePosition = 0.60F,
+                            .destinationPosition = 0.70F},
+    };
+    CHECK_FALSE(MoveWaterSettingKeys(&track, occupied));
+    REQUIRE(track.keys.size() == beforeCollision.keys.size());
+    for (std::size_t index = 0U; index < track.keys.size(); ++index) {
+        CHECK(track.keys[index].position ==
+              Approx(beforeCollision.keys[index].position));
+        CHECK(track.keys[index].value ==
+              Approx(beforeCollision.keys[index].value));
+        CHECK(track.keys[index].interpolation ==
+              beforeCollision.keys[index].interpolation);
+        CHECK(track.keys[index].clipId ==
+              beforeCollision.keys[index].clipId);
+    }
+
+    WaterKeyedSettingTrack cyclic{
+        .settingId = "activity",
+        .keys = {
+            {.position = 0.10F, .value = 0.1F},
+            {.position = 0.55F, .value = 0.5F},
+            {.position = 1.00F, .value = 1.0F},
+        },
+    };
+    const auto beforeLoopCollision = cyclic;
+    const std::array loopCollision{
+        WaterSettingKeyMove{.sourcePosition = 0.10F,
+                            .destinationPosition = 0.00F},
+        WaterSettingKeyMove{.sourcePosition = 0.55F,
+                            .destinationPosition = 0.45F},
+    };
+    CHECK_FALSE(MoveWaterSettingKeys(
+        &cyclic,
+        loopCollision,
+        /*cyclic=*/true));
+    REQUIRE(cyclic.keys.size() == beforeLoopCollision.keys.size());
+    for (std::size_t index = 0U; index < cyclic.keys.size(); ++index) {
+        CHECK(cyclic.keys[index].position ==
+              Approx(beforeLoopCollision.keys[index].position));
+        CHECK(cyclic.keys[index].value ==
+              Approx(beforeLoopCollision.keys[index].value));
+    }
+    REQUIRE(MoveWaterSettingKeys(
+        &cyclic,
+        loopCollision,
+        /*cyclic=*/false));
+    CHECK(cyclic.keys.front().position == Approx(0.0F));
+
+    WaterKeyedSettingTrack wrappedGroup{
+        .settingId = "prominence",
+        .keys = {
+            {.position = 0.50F, .value = 0.5F},
+            {.position = 0.85F, .value = 0.8F},
+            {.position = 0.95F, .value = 0.9F},
+        },
+    };
+    const std::array wrap{
+        WaterSettingKeyMove{.sourcePosition = 0.85F,
+                            .destinationPosition = 0.05F},
+        WaterSettingKeyMove{.sourcePosition = 0.95F,
+                            .destinationPosition = 0.15F},
+    };
+    REQUIRE(MoveWaterSettingKeys(
+        &wrappedGroup,
+        wrap,
+        /*cyclic=*/true));
+    CHECK(wrappedGroup.keys[0].position == Approx(0.05F));
+    CHECK(wrappedGroup.keys[0].value == Approx(0.8F));
+    CHECK(wrappedGroup.keys[1].position == Approx(0.15F));
+    CHECK(wrappedGroup.keys[1].value == Approx(0.9F));
+    CHECK(wrappedGroup.keys[2].position == Approx(0.50F));
+}
+
 TEST_CASE("Setting and feature key deletion only affects the current position",
           "[water][timing][keyed][delete]") {
     using invisible_places::water::RemoveWaterFeatureKeysAtPosition;
