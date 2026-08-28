@@ -1989,7 +1989,12 @@ struct TimingsPanelState {
     std::string newScenarioNameBuffer;
     // Timings v2 feature-run management.
     std::optional<std::size_t> selectedFeatureRunIndex;
+    // Zero selects the parent Base Run row; nonzero identifies a child.
+    std::uint32_t selectedFeatureVariantId = 0U;
     std::string newFeatureRunNameBuffer;
+    std::string newFeatureVariantNameBuffer;
+    std::optional<std::pair<std::uint32_t, std::uint32_t>>
+        pendingFeatureVariantDelete;
     int importScenarioIndex = 0;
     // Pending run import with per-feature duplicate resolution: for each
     // conflicting feature the user chooses Skip (keep it where it is) or
@@ -2330,6 +2335,8 @@ struct ResolvedTimingTakeExportSnapshot {
     std::string sceneGroupName = "Default";
     invisible_places::timing::TimingTakeSceneState state{};
     std::optional<WaterRainProfile> effectiveRainProfile;
+    invisible_places::water::WaterFeatureFixedSettingOverlay
+        fixedSettingOverlay;
 };
 
 struct OfflineRenderJobState {
@@ -2421,6 +2428,8 @@ struct OfflineRenderJobState {
     // per-frame keyed-setting overlay is deterministic for the whole export.
     std::vector<invisible_places::water::WaterFeatureTimingRun>
         frozenFeatureTimingRuns;
+    invisible_places::water::WaterFeatureFixedSettingOverlay
+        frozenFixedSettingOverlay;
     bool frozenOnlyShowWaterFeaturesInRuns = false;
     // Additional shoreline instances frozen with the job; their keyed
     // visual settings evaluate per exported frame from the frozen runs.
@@ -3905,6 +3914,34 @@ std::optional<ResolvedAnimationLinkedPair>
 ResolveActiveAnimationLinkedPair(
     const PreviewRuntimeState& runtimeState);
 
+// One authority for animation-owned state shown in the viewport. Seam is a
+// composite and deliberately keeps the loaded member's saved choices; A/B
+// and Alternating follow the member whose camera/content is presented.
+const AnimationPath* ResolvePresentedAnimationPathForWater(
+    const PreviewRuntimeState& runtimeState) {
+    const auto& panel = runtimeState.animationPanel;
+    if (!panel.currentPath.has_value()) {
+        return nullptr;
+    }
+    const auto pair = ResolveActiveAnimationLinkedPair(runtimeState);
+    if (!pair.has_value() ||
+        panel.linkedViewMode == AnimationLinkedViewMode::Seam) {
+        return &panel.currentPath.value();
+    }
+    std::size_t member = pair->currentMemberIndex;
+    if (panel.linkedViewMode == AnimationLinkedViewMode::A) {
+        member = 0U;
+    } else if (panel.linkedViewMode == AnimationLinkedViewMode::B) {
+        member = 1U;
+    } else if (panel.linkedPresentedMember.has_value() &&
+               panel.linkedPresentedMember.value() < 2U) {
+        member = panel.linkedPresentedMember.value();
+    }
+    return pair->members[member] != nullptr
+        ? pair->members[member]
+        : &panel.currentPath.value();
+}
+
 std::optional<AnimationLinkedPresentation>
 ResolveAnimationLinkedPresentation(
     PreviewRuntimeState* runtimeState,
@@ -4513,7 +4550,18 @@ SnapshotActiveWaterFeatureTimingRuns(
     if (entry == nullptr) {
         return {};
     }
-    return entry->waterFeatureTimingRuns;
+    const auto* animation = ResolvePresentedAnimationPathForWater(
+        runtimeState);
+    const auto selections = animation != nullptr
+        ? std::span{
+              animation->waterFeatureRunSelections.data(),
+              animation->waterFeatureRunSelections.size()}
+        : std::span<const invisible_places::water::
+              WaterFeatureRunSelection>{};
+    return invisible_places::water::
+        MaterializeWaterFeatureTimingRunSelections(
+            entry->waterFeatureTimingRuns,
+            selections);
 }
 
 // Snapshot for a job exporting a specific animation, which may not be the
@@ -4533,7 +4581,16 @@ SnapshotWaterFeatureTimingRunsForAnimation(
     if (entry == nullptr) {
         return {};
     }
-    return entry->waterFeatureTimingRuns;
+    const auto selections = animationPath.has_value()
+        ? std::span{
+              animationPath->waterFeatureRunSelections.data(),
+              animationPath->waterFeatureRunSelections.size()}
+        : std::span<const invisible_places::water::
+              WaterFeatureRunSelection>{};
+    return invisible_places::water::
+        MaterializeWaterFeatureTimingRunSelections(
+            entry->waterFeatureTimingRuns,
+            selections);
 }
 
 const std::vector<invisible_places::timing::TimingColouriseEffect>*
@@ -4641,10 +4698,22 @@ ResolveCurrentTimingTakeExportSnapshot(
     const PreviewRuntimeState& runtimeState,
     const AnimationPath& animationPath,
     std::string* errorMessage) {
-    return ResolveTimingTakeExportSnapshot(
+    auto snapshot = ResolveTimingTakeExportSnapshot(
         runtimeState,
         animationPath.selectedTimingTakeId,
         errorMessage);
+    if (!snapshot.has_value()) {
+        return std::nullopt;
+    }
+    snapshot->fixedSettingOverlay = invisible_places::water::
+        BuildWaterFeatureFixedSettingOverlay(
+            snapshot->state.waterFeatureTimingRuns,
+            animationPath.waterFeatureRunSelections);
+    snapshot->state.waterFeatureTimingRuns = invisible_places::water::
+        MaterializeWaterFeatureTimingRunSelections(
+            snapshot->state.waterFeatureTimingRuns,
+            animationPath.waterFeatureRunSelections);
+    return snapshot;
 }
 
 bool IsWaterFillPointCloudSession(const PreviewLayerSession& session);
@@ -5025,6 +5094,10 @@ struct WaterFrameState {
     std::vector<invisible_places::water::WaterSeepageNodeAnimationStateEntry> nodeStates;
     // Timings v2: every keyed (feature, setting) sampled at normalizedTime.
     invisible_places::water::WaterFeatureTimingOverlay featureOverlay;
+    // Non-keyable settings selected by this animation's run variants. These
+    // apply before featureOverlay, so keyed values remain the final layer.
+    invisible_places::water::WaterFeatureFixedSettingOverlay
+        fixedSettingOverlay;
 };
 
 std::optional<float> WaterFrameExplicitRainLevel(
@@ -5204,15 +5277,30 @@ WaterFrameState ResolveWaterFrameState(
         const auto* entry = FindScenarioFeatureRuns(
             runtimeState->water,
             ActiveWaterTimingScenarioId(*runtimeState));
+        const auto* presentedAnimation =
+            ResolvePresentedAnimationPathForWater(*runtimeState);
+        const std::span<const invisible_places::water::
+                            WaterFeatureRunSelection> selections =
+            presentedAnimation != nullptr
+                ? std::span{
+                      presentedAnimation->waterFeatureRunSelections.data(),
+                      presentedAnimation->waterFeatureRunSelections.size()}
+                : std::span<const invisible_places::water::
+                      WaterFeatureRunSelection>{};
+        std::vector<invisible_places::water::WaterFeatureTimingRun>
+            materializedRuns;
+        if (entry != nullptr) {
+            materializedRuns = invisible_places::water::
+                MaterializeWaterFeatureTimingRunSelections(
+                    entry->waterFeatureTimingRuns,
+                    selections);
+            result.fixedSettingOverlay = invisible_places::water::
+                BuildWaterFeatureFixedSettingOverlay(
+                    entry->waterFeatureTimingRuns,
+                    selections);
+        }
         const std::span<const invisible_places::water::WaterFeatureTimingRun>
-            runs =
-                entry != nullptr
-                    ? std::span{
-                          entry->waterFeatureTimingRuns.data(),
-                          entry->waterFeatureTimingRuns.size()}
-                    : std::span<
-                          const invisible_places::water::
-                              WaterFeatureTimingRun>{};
+            runs{materializedRuns.data(), materializedRuns.size()};
         if (entry != nullptr) {
             ApplyWaterFeatureTimingRunsToFrame(
                 runs,
@@ -5373,17 +5461,28 @@ struct WaterFlowSourceActivityParameters {
 std::optional<WaterFlowSourceActivityParameters> ResolveWaterFlowSourceActivityParameters(
     const WaterWorkflowState& water,
     std::optional<std::uint32_t> sourceId,
-    const invisible_places::water::WaterFeatureTimingOverlay* overlay = nullptr) {
+    const invisible_places::water::WaterFeatureTimingOverlay* overlay = nullptr,
+    const invisible_places::water::WaterFeatureFixedSettingOverlay*
+        fixedOverlay = nullptr) {
     if (!sourceId.has_value()) {
         return std::nullopt;
     }
     const auto applyOverlay = [&](WaterFlowSourceActivityParameters parameters,
                                   invisible_places::water::WaterKeyedFeatureKind kind) {
+        const invisible_places::water::WaterKeyedFeatureId feature{
+            .kind = kind,
+            .objectId = sourceId.value(),
+        };
+        if (fixedOverlay != nullptr) {
+            if (const auto* value =
+                    fixedOverlay->Find(feature, "show_trail");
+                value != nullptr) {
+                if (const auto* typed = std::get_if<bool>(value)) {
+                    parameters.showTrail = *typed;
+                }
+            }
+        }
         if (overlay != nullptr) {
-            const invisible_places::water::WaterKeyedFeatureId feature{
-                .kind = kind,
-                .objectId = sourceId.value(),
-            };
             if (!overlay->Allows(feature)) {
                 parameters.maximumFlowStrength = 0.0F;
                 parameters.rainResponse = 0.0F;
@@ -5438,9 +5537,15 @@ float ResolveWaterFlowSourceActivity(
     const WaterWorkflowState& water,
     std::optional<std::uint32_t> sourceId,
     const std::optional<invisible_places::water::WaterScenarioState>& scenarioState,
-    const invisible_places::water::WaterFeatureTimingOverlay* overlay = nullptr) {
+    const invisible_places::water::WaterFeatureTimingOverlay* overlay = nullptr,
+    const invisible_places::water::WaterFeatureFixedSettingOverlay*
+        fixedOverlay = nullptr) {
     const auto parameters =
-        ResolveWaterFlowSourceActivityParameters(water, sourceId, overlay);
+        ResolveWaterFlowSourceActivityParameters(
+            water,
+            sourceId,
+            overlay,
+            fixedOverlay);
     if (!parameters.has_value()) {
         return 1.0F;
     }
@@ -5461,7 +5566,9 @@ void ApplyWaterFlowSourceActivityToStyle(
     const PreviewLayerSession& session,
     const std::optional<invisible_places::water::WaterScenarioState>& scenarioState,
     PointCloudStyleState* style,
-    const invisible_places::water::WaterFeatureTimingOverlay* overlay = nullptr) {
+    const invisible_places::water::WaterFeatureTimingOverlay* overlay = nullptr,
+    const invisible_places::water::WaterFeatureFixedSettingOverlay*
+        fixedOverlay = nullptr) {
     if (style == nullptr || !session.waterFlowSourceId.has_value()) {
         return;
     }
@@ -5469,7 +5576,8 @@ void ApplyWaterFlowSourceActivityToStyle(
         water,
         session.waterFlowSourceId,
         scenarioState,
-        overlay);
+        overlay,
+        fixedOverlay);
     const auto parameters = ResolveWaterFlowSourceActivityParameters(
         water,
         session.waterFlowSourceId,
@@ -5594,7 +5702,119 @@ void ClearPointCloudStyleShoreline(PointCloudStyleState* style) {
     invisible_places::renderer::pointcloud::
         ApplyPointCloudShorelineWaveSettings(
             style,
-            PointCloudShorelineWaveSettings{});
+        PointCloudShorelineWaveSettings{});
+}
+
+void ApplyWaterShorelineFixedSettingOverlay(
+    const invisible_places::water::WaterKeyedFeatureId& feature,
+    const invisible_places::water::WaterFeatureFixedSettingOverlay* overlay,
+    PointCloudShorelineWaveSettings* settings) {
+    if (overlay == nullptr || settings == nullptr) {
+        return;
+    }
+    const auto find = [&](std::string_view id) {
+        return overlay->Find(feature, id);
+    };
+    const auto applyBool = [&](std::string_view id, bool* target) {
+        if (const auto* value = find(id); value != nullptr) {
+            if (const auto* typed = std::get_if<bool>(value)) {
+                *target = *typed;
+            }
+        }
+    };
+    const auto applyFloat = [&](std::string_view id, float* target) {
+        if (const auto* value = find(id); value != nullptr) {
+            if (const auto* typed = std::get_if<double>(value)) {
+                *target = static_cast<float>(*typed);
+            }
+        }
+    };
+    const auto applyUint = [&](std::string_view id, std::uint32_t* target) {
+        if (const auto* value = find(id); value != nullptr) {
+            if (const auto* typed = std::get_if<std::uint64_t>(value)) {
+                *target = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                    *typed,
+                    std::numeric_limits<std::uint32_t>::max()));
+            }
+        }
+    };
+    const auto applyColour = [&](
+                                 std::string_view id,
+                                 std::array<float, 3U>* target) {
+        if (const auto* value = find(id); value != nullptr) {
+            if (const auto* typed =
+                    std::get_if<std::array<float, 3U>>(value)) {
+                *target = *typed;
+            }
+        }
+    };
+
+    applyBool("enabled", &settings->enabled);
+    if (const auto* value = find("algorithm"); value != nullptr) {
+        if (const auto* typed = std::get_if<std::string>(value)) {
+            if (*typed == "foam_fronts") {
+                settings->algorithm =
+                    PointCloudShorelineWaveAlgorithm::FoamFronts;
+            } else if (*typed == "continuous_bands") {
+                settings->algorithm =
+                    PointCloudShorelineWaveAlgorithm::ContinuousBands;
+            } else if (*typed == "height_foam") {
+                settings->algorithm =
+                    PointCloudShorelineWaveAlgorithm::HeightFoam;
+            }
+        }
+    }
+
+    auto& foam = settings->foamFronts;
+    applyFloat("foam_fronts.boundary_z", &foam.boundaryZ);
+    applyFloat("foam_fronts.height_reach_meters", &foam.heightReachMeters);
+    applyFloat("foam_fronts.edge_fade_meters", &foam.edgeFadeMeters);
+    applyFloat("foam_fronts.direction_x", &foam.directionX);
+    applyFloat("foam_fronts.direction_y", &foam.directionY);
+    applyFloat("foam_fronts.pattern_scale", &foam.patternScale);
+    applyFloat("foam_fronts.wavelength_meters", &foam.wavelengthMeters);
+    applyFloat("foam_fronts.speed", &foam.speed);
+    applyFloat("foam_fronts.warp", &foam.warp);
+    applyFloat("foam_fronts.turbulence", &foam.turbulence);
+    applyFloat("foam_fronts.density", &foam.density);
+    applyFloat("foam_fronts.phase", &foam.phase);
+    applyFloat("foam_fronts.intensity", &foam.intensity);
+    applyFloat("foam_fronts.background_wash", &foam.backgroundWash);
+    applyFloat("foam_fronts.emission_add", &foam.emissionAdd);
+    applyFloat("foam_fronts.opacity_add", &foam.opacityAdd);
+    applyFloat("foam_fronts.opacity_multiply", &foam.opacityMultiply);
+    applyFloat("foam_fronts.point_size_add", &foam.pointSizeAdd);
+    applyFloat("foam_fronts.point_size_multiply", &foam.pointSizeMultiply);
+    applyFloat("foam_fronts.colour_mix", &foam.colourMix);
+    applyColour("foam_fronts.colour", &foam.colour);
+    applyUint("foam_fronts.seed", &foam.seed);
+
+    auto& height = settings->heightFoam;
+    applyFloat("height_foam.runup_z", &height.runupZ);
+    applyFloat("height_foam.break_z", &height.breakZ);
+    applyFloat("height_foam.offshore_reach_meters", &height.offshoreReachMeters);
+    applyFloat("height_foam.edge_fade_meters", &height.edgeFadeMeters);
+    applyFloat("height_foam.direction_x", &height.directionX);
+    applyFloat("height_foam.direction_y", &height.directionY);
+    applyFloat("height_foam.pattern_scale", &height.patternScale);
+    applyFloat("height_foam.wavelength_meters", &height.wavelengthMeters);
+    applyFloat("height_foam.speed", &height.speed);
+    applyFloat("height_foam.warp", &height.warp);
+    applyFloat("height_foam.turbulence", &height.turbulence);
+    applyFloat("height_foam.density", &height.density);
+    applyFloat("height_foam.phase", &height.phase);
+    applyFloat("height_foam.intensity", &height.intensity);
+    applyFloat("height_foam.offshore_foam_strength", &height.offshoreFoamStrength);
+    applyFloat("height_foam.incoming_strength", &height.incomingStrength);
+    applyFloat("height_foam.return_strength", &height.returnStrength);
+    applyFloat("height_foam.emission_add", &height.emissionAdd);
+    applyFloat("height_foam.opacity_add", &height.opacityAdd);
+    applyFloat("height_foam.opacity_multiply", &height.opacityMultiply);
+    applyFloat("height_foam.point_size_add", &height.pointSizeAdd);
+    applyFloat("height_foam.point_size_multiply", &height.pointSizeMultiply);
+    applyFloat("height_foam.colour_mix", &height.colourMix);
+    applyColour("height_foam.colour", &height.colour);
+    applyUint("height_foam.seed", &height.seed);
 }
 
 // Resolves the frame's complete project-owned Shoreline list. Disabled
@@ -5606,7 +5826,9 @@ ResolveShorelinesForFrame(
     const std::vector<PointCloudShorelineInstance>& instances,
     const invisible_places::water::WaterFeatureTimingOverlay* overlay,
     const std::optional<invisible_places::water::WaterScenarioState>&
-        scenarioState = std::nullopt) {
+        scenarioState = std::nullopt,
+    const invisible_places::water::WaterFeatureFixedSettingOverlay*
+        fixedSettingOverlay = nullptr) {
     std::vector<PointCloudShorelineWaveSettings> resolved;
     for (const auto& instance : instances) {
         if (resolved.size() >=
@@ -5614,7 +5836,7 @@ ResolveShorelinesForFrame(
                 kMaxShorelineInstances) {
             break;
         }
-        if (!instance.enabled || !instance.settings.enabled) {
+        if (!instance.enabled) {
             continue;
         }
         const invisible_places::water::WaterKeyedFeatureId feature{
@@ -5625,6 +5847,13 @@ ResolveShorelinesForFrame(
             continue;
         }
         auto settings = instance.settings;
+        ApplyWaterShorelineFixedSettingOverlay(
+            feature,
+            fixedSettingOverlay,
+            &settings);
+        if (!settings.enabled) {
+            continue;
+        }
         settings.applyToWaterFill =
             overlay == nullptr || overlay->AppliesToWaterFill(feature);
         if (overlay != nullptr) {
@@ -23595,10 +23824,20 @@ bool EnsureWaterDynamicMeshFlowGpuUpToDate(
         }
         return false;
     }
-    // Disabled is the common idle state: skip the ground-view and active-
-    // scene lookups (they normalize scene/session paths every frame) and
-    // only keep the overlay session hidden.
-    if (updateOptions == nullptr && !liveSettings.enabled) {
+    auto settings = invisible_places::water::SanitizeWaterDynamicMeshFlowSettings(
+        updateOptions != nullptr && updateOptions->settings != nullptr
+            ? *updateOptions->settings
+            : liveSettings);
+    invisible_places::water::
+        ApplyWaterFeatureFixedSettingOverlayToDynamicMeshFlowSettings(
+            frameState.fixedSettingOverlay,
+            &settings);
+    settings = invisible_places::water::
+        SanitizeWaterDynamicMeshFlowSettings(std::move(settings));
+    // Disabled is the common idle state. Resolve the selected variant first
+    // so a variant may enable a Base-disabled run, then skip the ground-view
+    // and active-scene lookups when the effective setting is still off.
+    if (updateOptions == nullptr && !settings.enabled) {
         if (water.dynamicMeshFlowGpuSessionIndex.has_value() &&
             water.dynamicMeshFlowGpuSessionIndex.value() <
                 runtimeState->sessions.size()) {
@@ -23608,10 +23847,6 @@ bool EnsureWaterDynamicMeshFlowGpuUpToDate(
         }
         return false;
     }
-    auto settings = invisible_places::water::SanitizeWaterDynamicMeshFlowSettings(
-        updateOptions != nullptr && updateOptions->settings != nullptr
-            ? *updateOptions->settings
-            : liveSettings);
     const auto groundView = viewport->WaterGroundFlowView();
     ScenePointCloudRuntime* scene = nullptr;
     if (updateOptions != nullptr &&
@@ -28333,6 +28568,21 @@ const AnimationPath* RegistryAnimationPath(const PreviewRuntimeState& runtimeSta
     return SavedRegistryAnimationPath(runtimeState, fileIndex);
 }
 
+bool RegistryAnimationPathIsModified(
+    const PreviewRuntimeState& runtimeState,
+    std::size_t fileIndex) {
+    const auto& panel = runtimeState.animationPanel;
+    const bool registryDirty =
+        fileIndex < panel.availableFileDirtyFlags.size() &&
+        panel.availableFileDirtyFlags[fileIndex];
+    if (IsCurrentAnimationRegistryIndex(panel, fileIndex)) {
+        return registryDirty || panel.dirty ||
+               panel.currentPathUsesEdited;
+    }
+    return registryDirty ||
+           RegistryAnimationHasEditedVersion(panel, fileIndex);
+}
+
 std::optional<ResolvedAnimationLinkedPair>
 ResolveActiveAnimationLinkedPair(
     const PreviewRuntimeState& runtimeState) {
@@ -28398,6 +28648,92 @@ ResolveActiveAnimationLinkedPair(
         NormalizePathKey(result.memberFilePaths[1U]) + "\n" +
         std::to_string(result.transport.cycleFrames);
     return result;
+}
+
+struct WaterVariantAnimationAuthority {
+    const AnimationPath* path = nullptr;
+    std::optional<std::size_t> registryIndex;
+    bool variantEditingLocked = false;
+};
+
+WaterVariantAnimationAuthority ResolveWaterVariantAnimationAuthority(
+    const PreviewRuntimeState& runtimeState) {
+    WaterVariantAnimationAuthority authority;
+    const auto& panel = runtimeState.animationPanel;
+    if (!panel.currentPath.has_value()) {
+        return authority;
+    }
+    const auto currentIndex = panel.currentFilePath.empty()
+        ? std::optional<std::size_t>{}
+        : FindAnimationRegistryIndex(
+              panel,
+              std::filesystem::path{panel.currentFilePath});
+    const auto pair = ResolveActiveAnimationLinkedPair(runtimeState);
+    if (!pair.has_value()) {
+        authority.path = &panel.currentPath.value();
+        authority.registryIndex = currentIndex;
+        return authority;
+    }
+    if (panel.linkedViewMode == AnimationLinkedViewMode::Seam) {
+        authority.path = &panel.currentPath.value();
+        authority.registryIndex = currentIndex;
+        authority.variantEditingLocked = true;
+        return authority;
+    }
+    std::size_t member = pair->currentMemberIndex;
+    if (panel.linkedViewMode == AnimationLinkedViewMode::A) {
+        member = 0U;
+    } else if (panel.linkedViewMode == AnimationLinkedViewMode::B) {
+        member = 1U;
+    } else if (panel.linkedPresentedMember.has_value() &&
+               panel.linkedPresentedMember.value() < 2U) {
+        member = panel.linkedPresentedMember.value();
+    }
+    authority.path = pair->members[member];
+    authority.registryIndex = pair->memberRegistryIndices[member];
+    return authority;
+}
+
+void SetAnimationWaterFeatureRunSelection(
+    AnimationPath* path,
+    std::uint32_t runId,
+    bool enabled,
+    std::uint32_t variantId) {
+    if (path == nullptr || runId == 0U) {
+        return;
+    }
+    auto found = std::find_if(
+        path->waterFeatureRunSelections.begin(),
+        path->waterFeatureRunSelections.end(),
+        [runId](const auto& selection) {
+            return selection.runId == runId;
+        });
+    const invisible_places::water::WaterFeatureRunSelection selection{
+        .runId = runId,
+        .enabled = enabled,
+        .variantId = enabled ? variantId : 0U,
+    };
+    if (found == path->waterFeatureRunSelections.end()) {
+        path->waterFeatureRunSelections.push_back(selection);
+    } else {
+        *found = selection;
+    }
+    path->waterFeatureRunSelections = invisible_places::water::
+        SanitizeWaterFeatureRunSelections(
+            std::move(path->waterFeatureRunSelections));
+}
+
+void RemoveAnimationWaterFeatureRunSelection(
+    AnimationPath* path,
+    std::uint32_t runId) {
+    if (path == nullptr) {
+        return;
+    }
+    std::erase_if(
+        path->waterFeatureRunSelections,
+        [runId](const auto& selection) {
+            return selection.runId == runId;
+        });
 }
 
 bool SyncLoadedAnimationPositionToLinkedCanonical(
@@ -31902,7 +32238,8 @@ std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
     const auto resolvedShorelines = ResolveShorelinesForFrame(
         runtimeState.water.shorelineInstances,
         &activeWater.featureOverlay,
-        activeWaterScenario);
+        activeWaterScenario,
+        &activeWater.fixedSettingOverlay);
     const auto* activeColouriseEffects =
         ActiveTimingColouriseEffects(runtimeState);
     const bool fastBasicRenderer =
@@ -31950,7 +32287,8 @@ std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
             session,
             activeWaterScenario,
             &style,
-            &activeWater.featureOverlay);
+            &activeWater.featureOverlay,
+            &activeWater.fixedSettingOverlay);
         ClearPointCloudStyleShoreline(&style);
         const bool sessionIsWaterFill =
             IsWaterFillPointCloudSession(session);
@@ -33861,6 +34199,10 @@ invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState
         waterFrame.featureOverlay.Allows({
             .kind = invisible_places::water::WaterKeyedFeatureKind::
                 MeshFlow});
+    invisible_places::water::ApplyWaterFeatureFixedSettingOverlayToRainSettings(
+        waterFrame.fixedSettingOverlay,
+        &renderState.rainSettings,
+        &renderState.rainVisual);
     invisible_places::water::ApplyWaterFeatureTimingOverlayToRainSettings(
         waterFrame.featureOverlay,
         &renderState.rainSettings,
@@ -33877,12 +34219,21 @@ invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState
         // per frame so exports match the preview.
         float frozenStrength = frozenSource.maximumFlowStrength;
         float frozenResponse = frozenSource.rainResponse;
+        bool frozenShowTrail = frozenSource.sourceShowTrail;
         const invisible_places::water::WaterKeyedFeatureId feature{
             .kind = frozenSource.featureKind,
             .objectId = frozenSource.sourceId};
         if (!waterFrame.featureOverlay.Allows(feature)) {
             layerIt->style.waterFlowActivity = 0.0F;
             continue;
+        }
+        if (const auto* fixed = waterFrame.fixedSettingOverlay.Find(
+                feature,
+                "show_trail");
+            fixed != nullptr) {
+            if (const auto* typed = std::get_if<bool>(fixed)) {
+                frozenShowTrail = *typed;
+            }
         }
         if (const auto* keyed =
                 waterFrame.featureOverlay.Find(feature, "strength");
@@ -33900,7 +34251,7 @@ invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState
             scenarioState.rainLevel,
             frozenStrength,
             frozenResponse,
-            frozenSource.sourceShowTrail,
+            frozenShowTrail,
             frozenSource.globalShowTrails);
     }
     if (job.frozenDynamicMeshFlowLayerExported &&
@@ -33913,16 +34264,22 @@ invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState
                        job.frozenDynamicMeshFlowLayerId.value();
             });
         if (layerIt != renderState.pointCloudLayers.end()) {
+            auto effectiveMeshSettings =
+                job.frozenDynamicMeshFlowSettings;
+            invisible_places::water::
+                ApplyWaterFeatureFixedSettingOverlayToDynamicMeshFlowSettings(
+                    waterFrame.fixedSettingOverlay,
+                    &effectiveMeshSettings);
             const float activity =
                 invisible_places::water::
                     EffectiveWaterDynamicMeshFlowLevel(
-                        job.frozenDynamicMeshFlowSettings,
+                        effectiveMeshSettings,
                         waterFrame.meshFlowMoisture,
                         &waterFrame.featureOverlay);
             // Same square-root visibility curve as the live overlay so
             // exported trails match the preview.
             layerIt->style.waterFlowActivity =
-                job.frozenDynamicMeshFlowSettings.showTrails
+                effectiveMeshSettings.showTrails
                     ? std::sqrt(std::clamp(activity, 0.0F, 1.0F))
                     : 0.0F;
         }
@@ -33930,7 +34287,8 @@ invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState
     const auto resolvedShorelines = ResolveShorelinesForFrame(
         job.frozenShorelineInstances,
         &waterFrame.featureOverlay,
-        waterFrame.rawScenarioState);
+        waterFrame.rawScenarioState,
+        &waterFrame.fixedSettingOverlay);
     renderState.rainAppliesToWaterFill =
         waterFrame.featureOverlay.AppliesToWaterFill(
             invisible_places::water::WaterKeyedFeatureId{
@@ -36614,6 +36972,14 @@ ResolvedRenderSetupSnapshot BuildBackgroundWorkerSnapshot(
     snapshot.timing.state = setup.timingState;
     snapshot.timing.state.takeId = snapshot.timing.takeId;
     snapshot.timing.state.sceneGroupName = setup.sceneGroupName;
+    snapshot.timing.fixedSettingOverlay = invisible_places::water::
+        BuildWaterFeatureFixedSettingOverlay(
+            snapshot.timing.state.waterFeatureTimingRuns,
+            setup.animation.waterFeatureRunSelections);
+    snapshot.timing.state.waterFeatureTimingRuns = invisible_places::water::
+        MaterializeWaterFeatureTimingRunSelections(
+            snapshot.timing.state.waterFeatureTimingRuns,
+            setup.animation.waterFeatureRunSelections);
     snapshot.timing.effectiveRainProfile =
         CaptureRenderSetupRainProfileSnapshot(
             setup.authoredWater,
@@ -38829,12 +39195,15 @@ void FreezeAuthoredTimingState(
         ? timingSnapshot->sceneGroupName
         : ActiveWaterTimingSceneGroupName(runtimeState.water);
     job->frozenFeatureTimingRuns.clear();
+    job->frozenFixedSettingOverlay.samples.clear();
     job->frozenOnlyShowWaterFeaturesInRuns = false;
     job->frozenShorelineInstances = runtimeState.water.shorelineInstances;
     job->frozenTimingColouriseEffects.clear();
     if (timingSnapshot != nullptr) {
         job->frozenFeatureTimingRuns =
             timingSnapshot->state.waterFeatureTimingRuns;
+        job->frozenFixedSettingOverlay =
+            timingSnapshot->fixedSettingOverlay;
         job->frozenOnlyShowWaterFeaturesInRuns =
             timingSnapshot->state.onlyShowWaterFeaturesInRuns;
         job->frozenTimingColouriseEffects =
@@ -38851,6 +39220,16 @@ void FreezeAuthoredTimingState(
             timingState->onlyShowWaterFeaturesInRuns;
         job->frozenTimingColouriseEffects =
             timingState->colouriseEffects;
+        if (job->animationPath.has_value()) {
+            job->frozenFixedSettingOverlay = invisible_places::water::
+                BuildWaterFeatureFixedSettingOverlay(
+                    timingState->waterFeatureTimingRuns,
+                    job->animationPath->waterFeatureRunSelections);
+            job->frozenFeatureTimingRuns = invisible_places::water::
+                MaterializeWaterFeatureTimingRunSelections(
+                    timingState->waterFeatureTimingRuns,
+                    job->animationPath->waterFeatureRunSelections);
+        }
     }
     job->frozenAuthoredRainLevel = invisible_places::timing::
         TimingTakeRainAuthoredLevel(job->waterRainSettings);
@@ -38899,6 +39278,14 @@ ResolvedTimingTakeExportSnapshot BuildQueuedQuickMp4TimingSnapshot(
         state != nullptr) {
         result.state = *state;
     }
+    result.fixedSettingOverlay = invisible_places::water::
+        BuildWaterFeatureFixedSettingOverlay(
+            result.state.waterFeatureTimingRuns,
+            animationPath.waterFeatureRunSelections);
+    result.state.waterFeatureTimingRuns = invisible_places::water::
+        MaterializeWaterFeatureTimingRunSelections(
+            result.state.waterFeatureTimingRuns,
+            animationPath.waterFeatureRunSelections);
     result.state.takeId = result.takeId;
     result.state.sceneGroupName = result.sceneGroupName;
     result.effectiveRainProfile = effectiveRainProfile;
@@ -38949,12 +39336,15 @@ void FreezeQueuedQuickMp4AuthoredTimingState(
         ? timingSnapshot->sceneGroupName
         : snapshot.sceneGroupName;
     job->frozenFeatureTimingRuns.clear();
+    job->frozenFixedSettingOverlay.samples.clear();
     job->frozenOnlyShowWaterFeaturesInRuns = false;
     job->frozenShorelineInstances = snapshot.shorelineInstances;
     job->frozenTimingColouriseEffects.clear();
     if (timingSnapshot != nullptr) {
         job->frozenFeatureTimingRuns =
             timingSnapshot->state.waterFeatureTimingRuns;
+        job->frozenFixedSettingOverlay =
+            timingSnapshot->fixedSettingOverlay;
         job->frozenOnlyShowWaterFeaturesInRuns =
             timingSnapshot->state.onlyShowWaterFeaturesInRuns;
         job->frozenTimingColouriseEffects =
@@ -38971,6 +39361,16 @@ void FreezeQueuedQuickMp4AuthoredTimingState(
             timingState->onlyShowWaterFeaturesInRuns;
         job->frozenTimingColouriseEffects =
             timingState->colouriseEffects;
+        if (job->animationPath.has_value()) {
+            job->frozenFixedSettingOverlay = invisible_places::water::
+                BuildWaterFeatureFixedSettingOverlay(
+                    timingState->waterFeatureTimingRuns,
+                    job->animationPath->waterFeatureRunSelections);
+            job->frozenFeatureTimingRuns = invisible_places::water::
+                MaterializeWaterFeatureTimingRunSelections(
+                    timingState->waterFeatureTimingRuns,
+                    job->animationPath->waterFeatureRunSelections);
+        }
     }
     job->frozenAuthoredRainLevel = invisible_places::timing::
         TimingTakeRainAuthoredLevel(job->waterRainSettings);
@@ -39211,6 +39611,7 @@ WaterFrameState ResolveFrozenWaterFrameState(
             0.0F,
             1.0F);
     }
+    result.fixedSettingOverlay = job.frozenFixedSettingOverlay;
     ApplyWaterFeatureTimingRunsToFrame(
         job.frozenFeatureTimingRuns,
         job.frozenOnlyShowWaterFeaturesInRuns,
@@ -51841,9 +52242,179 @@ void DrawWaterProfileBaseColourHint(
         baseValue->at(2));
 }
 
+struct WaterFixedVariantUiContext {
+    invisible_places::water::WaterFeatureTimingRun* run = nullptr;
+    invisible_places::water::WaterFeatureRunVariant* activeVariant = nullptr;
+    invisible_places::water::WaterKeyedFeatureId feature{};
+    bool editingLocked = false;
+    bool stateChanged = false;
+};
+
+using ShorelineFixedVariantUiContext = WaterFixedVariantUiContext;
+
+WaterFixedVariantUiContext ResolveWaterFixedVariantUiContext(
+    PreviewRuntimeState* runtimeState,
+    const invisible_places::water::WaterKeyedFeatureId& feature) {
+    WaterFixedVariantUiContext context{.feature = feature};
+    if (runtimeState == nullptr) {
+        return context;
+    }
+    auto& water = runtimeState->water;
+    auto* timingEntry = invisible_places::timing::FindTimingTakeSceneState(
+        &water.timingTakeSceneStates,
+        ActiveWaterTimingScenarioId(*runtimeState),
+        ActiveWaterTimingSceneGroupName(water));
+    if (timingEntry != nullptr) {
+        for (auto& run : timingEntry->waterFeatureTimingRuns) {
+            if (invisible_places::water::FindWaterFeatureTimeline(
+                    &run,
+                    feature) != nullptr) {
+                context.run = &run;
+                break;
+            }
+        }
+    }
+    const auto authority = ResolveWaterVariantAnimationAuthority(
+        *runtimeState);
+    context.editingLocked = authority.variantEditingLocked;
+    if (context.run == nullptr || authority.path == nullptr) {
+        return context;
+    }
+    const auto resolved = invisible_places::water::
+        ResolveWaterFeatureRunSelection(
+            *context.run,
+            authority.path->waterFeatureRunSelections);
+    if (resolved.enabled && resolved.variantId != 0U) {
+        context.activeVariant = invisible_places::water::
+            FindWaterFeatureRunVariant(
+                context.run,
+                resolved.variantId);
+    }
+    return context;
+}
+
+template <typename DrawControl, typename ReadValue>
+bool DrawWaterVariantFixedSettingControl(
+    WaterFixedVariantUiContext* context,
+    std::string_view settingId,
+    invisible_places::water::WaterFeatureFixedSettingValue inheritedValue,
+    DrawControl&& drawControl,
+    ReadValue&& readValue) {
+    const auto* activeOverride = context != nullptr
+        ? invisible_places::water::FindWaterFeatureRunVariantOverride(
+              context->activeVariant,
+              context->feature,
+              settingId)
+        : nullptr;
+    std::vector<std::string> divergentVariants;
+    if (context != nullptr && context->run != nullptr) {
+        for (const auto& variant : context->run->variants) {
+            const auto* overrideValue = invisible_places::water::
+                FindWaterFeatureRunVariantOverride(
+                    &variant,
+                    context->feature,
+                    settingId);
+            if (overrideValue != nullptr && overrideValue->detached) {
+                divergentVariants.push_back(variant.name);
+            }
+        }
+    }
+    const bool detached = activeOverride != nullptr &&
+        activeOverride->detached;
+    const bool divergent = !divergentVariants.empty();
+    if (detached || divergent) {
+        ImGui::PushStyleColor(
+            ImGuiCol_Text,
+            detached
+                ? ImVec4{0.95F, 0.25F, 0.22F, 1.0F}
+                : ImVec4{1.0F, 0.58F, 0.16F, 1.0F});
+    }
+    if (context != nullptr && context->editingLocked) {
+        ImGui::BeginDisabled();
+    }
+    const bool changed = drawControl();
+    if (context != nullptr && context->editingLocked) {
+        ImGui::EndDisabled();
+    }
+    const bool hovered = ImGui::IsItemHovered(
+        ImGuiHoveredFlags_DelayNormal |
+        ImGuiHoveredFlags_AllowWhenDisabled);
+    if (detached || divergent) {
+        ImGui::PopStyleColor();
+    }
+
+    if (changed && context != nullptr &&
+        context->activeVariant != nullptr && !context->editingLocked) {
+        (void)invisible_places::water::
+            DetachWaterFeatureRunVariantSetting(
+                context->activeVariant,
+                context->feature,
+                settingId,
+                readValue());
+        context->stateChanged = true;
+    } else if (!changed && hovered && context != nullptr &&
+               context->activeVariant != nullptr &&
+               !context->editingLocked &&
+               ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        auto* overrideValue = invisible_places::water::
+            FindWaterFeatureRunVariantOverride(
+                context->activeVariant,
+                context->feature,
+                settingId);
+        if (overrideValue != nullptr && overrideValue->detached) {
+            (void)invisible_places::water::
+                ReattachWaterFeatureRunVariantSetting(
+                    context->activeVariant,
+                    context->feature,
+                    settingId);
+        } else if (overrideValue != nullptr) {
+            // Re-detachment restores the retained value verbatim.
+            overrideValue->detached = true;
+        } else {
+            (void)invisible_places::water::
+                DetachWaterFeatureRunVariantSetting(
+                    context->activeVariant,
+                    context->feature,
+                    settingId,
+                    std::move(inheritedValue));
+        }
+        context->stateChanged = true;
+    }
+
+    if (hovered && (detached || divergent ||
+                    (context != nullptr &&
+                     context->activeVariant != nullptr))) {
+        std::string names;
+        for (const auto& name : divergentVariants) {
+            if (!names.empty()) {
+                names += ", ";
+            }
+            names += name;
+        }
+        if (detached) {
+            ImGui::SetTooltip(
+                "Detached for this variant (red). Double-click to inherit Base again.%s%s",
+                names.empty() ? "" : "\nDetached variants: ",
+                names.c_str());
+        } else if (divergent) {
+            ImGui::SetTooltip(
+                "Inherited here (orange), but detached in: %s.%s",
+                names.c_str(),
+                context != nullptr && context->activeVariant != nullptr
+                    ? " Double-click to detach this variant."
+                    : "");
+        } else {
+            ImGui::SetTooltip(
+                "Inherited from Base Run. Double-click to detach this setting for the active variant.");
+        }
+    }
+    return changed;
+}
+
 bool DrawPointCloudShorelineWavesSection(
     PreviewLayerSession* session,
-    const PointCloudShorelineWaveSettings* savedBaseSettings) {
+    const PointCloudShorelineWaveSettings* savedBaseSettings,
+    ShorelineFixedVariantUiContext* variantContext = nullptr) {
     if (session == nullptr || !BeginPanelSection("Shoreline Waves")) {
         return false;
     }
@@ -52035,10 +52606,95 @@ bool DrawPointCloudShorelineWavesSection(
                         ? std::optional<float>{savedBaseSettings->foamFronts.*member}
                         : std::nullopt);
             };
-            changed |= DrawRangedFloatControl(
+            const auto* activeBoundaryOverride =
+                variantContext != nullptr
+                    ? invisible_places::water::
+                          FindWaterFeatureRunVariantOverride(
+                              variantContext->activeVariant,
+                              variantContext->feature,
+                              "foam_fronts.boundary_z")
+                    : nullptr;
+            std::vector<std::string> divergentBoundaryVariants;
+            if (variantContext != nullptr &&
+                variantContext->run != nullptr) {
+                for (const auto& variant :
+                     variantContext->run->variants) {
+                    const auto* overrideValue = invisible_places::water::
+                        FindWaterFeatureRunVariantOverride(
+                            &variant,
+                            variantContext->feature,
+                            "foam_fronts.boundary_z");
+                    if (overrideValue != nullptr &&
+                        overrideValue->detached) {
+                        divergentBoundaryVariants.push_back(variant.name);
+                    }
+                }
+            }
+            const bool boundaryDetached =
+                activeBoundaryOverride != nullptr &&
+                activeBoundaryOverride->detached;
+            const bool boundaryDiverges =
+                !divergentBoundaryVariants.empty();
+            if (boundaryDetached || boundaryDiverges) {
+                ImGui::PushStyleColor(
+                    ImGuiCol_Text,
+                    boundaryDetached
+                        ? ImVec4{0.95F, 0.25F, 0.22F, 1.0F}
+                        : ImVec4{1.0F, 0.58F, 0.16F, 1.0F});
+            }
+            const bool boundaryChanged = DrawRangedFloatControl(
                 "Boundary Height",
                 &style.shorelineBoundaryZ,
                 {.visualMin = 0.0F, .visualMax = 3.0F, .format = foamFormat("%.3f m", style.shorelineBoundaryZ, &PointCloudFoamFrontsShorelineSettings::boundaryZ).c_str(), .hardMin = -1000.0F, .hardMax = 1000.0F});
+            const bool boundaryHovered = ImGui::IsItemHovered(
+                ImGuiHoveredFlags_DelayNormal |
+                ImGuiHoveredFlags_AllowWhenDisabled);
+            if (boundaryDetached || boundaryDiverges) {
+                ImGui::PopStyleColor();
+            }
+            changed |= boundaryChanged;
+            if (boundaryHovered && boundaryDiverges) {
+                std::string names;
+                for (const auto& name : divergentBoundaryVariants) {
+                    if (!names.empty()) {
+                        names += ", ";
+                    }
+                    names += name;
+                }
+                ImGui::SetTooltip(
+                    boundaryDetached
+                        ? "Detached for this variant (red). Double-click to inherit Base again.\nDetached variants: %s"
+                        : "Inherited here (orange), but detached in: %s. Double-click to detach this variant.",
+                    names.c_str());
+            }
+            if (boundaryHovered && variantContext != nullptr &&
+                variantContext->activeVariant != nullptr &&
+                !variantContext->editingLocked &&
+                ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                auto* overrideValue = invisible_places::water::
+                    FindWaterFeatureRunVariantOverride(
+                        variantContext->activeVariant,
+                        variantContext->feature,
+                        "foam_fronts.boundary_z");
+                if (overrideValue != nullptr && overrideValue->detached) {
+                    (void)invisible_places::water::
+                        ReattachWaterFeatureRunVariantSetting(
+                            variantContext->activeVariant,
+                            variantContext->feature,
+                            "foam_fronts.boundary_z");
+                } else if (overrideValue != nullptr) {
+                    overrideValue->detached = true;
+                } else {
+                    (void)invisible_places::water::
+                        DetachWaterFeatureRunVariantSetting(
+                            variantContext->activeVariant,
+                            variantContext->feature,
+                            "foam_fronts.boundary_z",
+                            static_cast<double>(
+                                style.shorelineBoundaryZ));
+                }
+                variantContext->stateChanged = true;
+            }
             changed |= DrawRangedFloatControl(
                 "Height Reach",
                 &style.shorelineHeightReachMeters,
@@ -62777,10 +63433,79 @@ bool BuildReciprocalPanTimingTakeClonePlan(
         (void)invisible_places::timing::
             RewriteTimingTakeRainTrackProfileMetadata(
                 &plan->sceneStates,
-                cloneDefinition.id,
-                clonedRainProfile->name);
+            cloneDefinition.id,
+            clonedRainProfile->name);
     }
-    for (auto* candidate : candidates) {
+    for (std::size_t role = 0U; role < candidates.size(); ++role) {
+        auto* candidate = candidates[role];
+        for (auto& selection : candidate->waterFeatureRunSelections) {
+            const invisible_places::water::WaterFeatureTimingRun*
+                sourceRun = nullptr;
+            std::string sourceSceneGroup;
+            for (const auto& state :
+                 runtimeState.water.timingTakeSceneStates) {
+                if (state.takeId != sourceTakeIds[role]) {
+                    continue;
+                }
+                const auto found = std::find_if(
+                    state.waterFeatureTimingRuns.begin(),
+                    state.waterFeatureTimingRuns.end(),
+                    [&](const auto& run) {
+                        return run.id == selection.runId;
+                    });
+                if (found != state.waterFeatureTimingRuns.end()) {
+                    sourceRun = &*found;
+                    sourceSceneGroup = state.sceneGroupName;
+                    break;
+                }
+            }
+            if (sourceRun == nullptr) {
+                continue;
+            }
+            const invisible_places::water::WaterFeatureRunVariant*
+                sourceVariant = invisible_places::water::
+                    FindWaterFeatureRunVariant(
+                        sourceRun,
+                        selection.variantId);
+            invisible_places::water::WaterFeatureTimingRun*
+                destinationRun = nullptr;
+            for (auto& state : plan->sceneStates) {
+                if (!sourceSceneGroup.empty() &&
+                    state.sceneGroupName != sourceSceneGroup) {
+                    continue;
+                }
+                const auto found = std::find_if(
+                    state.waterFeatureTimingRuns.begin(),
+                    state.waterFeatureTimingRuns.end(),
+                    [&](const auto& run) {
+                        return run.name == sourceRun->name;
+                    });
+                if (found != state.waterFeatureTimingRuns.end()) {
+                    destinationRun = &*found;
+                    break;
+                }
+            }
+            if (destinationRun == nullptr) {
+                continue;
+            }
+            selection.runId = destinationRun->id;
+            selection.variantId = 0U;
+            if (sourceVariant != nullptr) {
+                const auto destinationVariant = std::find_if(
+                    destinationRun->variants.begin(),
+                    destinationRun->variants.end(),
+                    [&](const auto& variant) {
+                        return variant.name == sourceVariant->name;
+                    });
+                if (destinationVariant !=
+                    destinationRun->variants.end()) {
+                    selection.variantId = destinationVariant->id;
+                }
+            }
+        }
+        candidate->waterFeatureRunSelections = invisible_places::water::
+            SanitizeWaterFeatureRunSelections(
+                std::move(candidate->waterFeatureRunSelections));
         candidate->selectedTimingTakeId = cloneDefinition.id;
     }
     plan->assignedTakeIds = {cloneDefinition.id, cloneDefinition.id};
@@ -75982,11 +76707,99 @@ void DrawWaterDynamicMeshFlowPanel(
         return;
     }
     auto& water = runtimeState->water;
-    auto& settings = water.dynamicMeshFlowSettings;
-    settings.trailProfileName = NormalizeWaterProfileName(settings.trailProfileName);
-    settings.particlePresetName = std::string{
-        invisible_places::water::NormalizeWaterDynamicMeshParticlePresetName(settings.particlePresetName)};
+    auto& authoredSettings = water.dynamicMeshFlowSettings;
+    authoredSettings.trailProfileName =
+        NormalizeWaterProfileName(authoredSettings.trailProfileName);
+    authoredSettings.particlePresetName = std::string{
+        invisible_places::water::NormalizeWaterDynamicMeshParticlePresetName(
+            authoredSettings.particlePresetName)};
+    const invisible_places::water::WaterKeyedFeatureId meshFeature{
+        .kind = invisible_places::water::WaterKeyedFeatureKind::MeshFlow};
+    auto meshFixedUi = ResolveWaterFixedVariantUiContext(
+        runtimeState,
+        meshFeature);
+    auto effectiveFixedSettings = authoredSettings;
+    {
+        const auto waterFrame = ResolveWaterFrameState(runtimeState);
+        invisible_places::water::
+            ApplyWaterFeatureFixedSettingOverlayToDynamicMeshFlowSettings(
+                waterFrame.fixedSettingOverlay,
+                &effectiveFixedSettings);
+    }
+    auto* fixedSettings = meshFixedUi.activeVariant != nullptr
+        ? &effectiveFixedSettings
+        : &authoredSettings;
+    auto& settings = *fixedSettings;
     bool liveChanged = false;
+    const auto noteBaseFixedEdit = [&](bool changed) {
+        if (changed && meshFixedUi.activeVariant == nullptr) {
+            liveChanged = true;
+        }
+    };
+    const auto drawFixedBool = [&](std::string_view settingId,
+                                   const char* label,
+                                   bool* value,
+                                   bool inheritedValue) {
+        return DrawWaterVariantFixedSettingControl(
+            &meshFixedUi,
+            settingId,
+            invisible_places::water::WaterFeatureFixedSettingValue{
+                inheritedValue},
+            [&]() { return ImGui::Checkbox(label, value); },
+            [&]() -> invisible_places::water::
+                WaterFeatureFixedSettingValue { return *value; });
+    };
+    const auto drawFixedFloat = [&](std::string_view settingId,
+                                    const char* label,
+                                    float* value,
+                                    float inheritedValue,
+                                    float minimum,
+                                    float maximum,
+                                    const char* format,
+                                    ImGuiSliderFlags flags =
+                                        ImGuiSliderFlags_None) {
+        return DrawWaterVariantFixedSettingControl(
+            &meshFixedUi,
+            settingId,
+            invisible_places::water::WaterFeatureFixedSettingValue{
+                static_cast<double>(inheritedValue)},
+            [&]() {
+                return DrawWaterSliderFloat(
+                    label,
+                    value,
+                    minimum,
+                    maximum,
+                    format,
+                    flags);
+            },
+            [&]() -> invisible_places::water::
+                WaterFeatureFixedSettingValue {
+                return static_cast<double>(*value);
+            });
+    };
+    const auto drawFixedColour = [&](
+                                     std::string_view settingId,
+                                     const char* label,
+                                     invisible_places::io::Float3* value,
+                                     const invisible_places::io::Float3&
+                                         inheritedValue) {
+        std::array<float, 3U> colour{value->x, value->y, value->z};
+        const bool changed = DrawWaterVariantFixedSettingControl(
+            &meshFixedUi,
+            settingId,
+            invisible_places::water::WaterFeatureFixedSettingValue{
+                std::array<float, 3U>{
+                    inheritedValue.x,
+                    inheritedValue.y,
+                    inheritedValue.z}},
+            [&]() { return ImGui::ColorEdit3(label, colour.data()); },
+            [&]() -> invisible_places::water::
+                WaterFeatureFixedSettingValue { return colour; });
+        if (changed) {
+            *value = {colour[0U], colour[1U], colour[2U]};
+        }
+        return changed;
+    };
 
     if (BeginPanelSection("Active Scene Ground")) {
         const auto* scene = ActiveWaterSurfaceScene(runtimeState);
@@ -76098,12 +76911,16 @@ void DrawWaterDynamicMeshFlowPanel(
         {.kind = invisible_places::water::WaterKeyedFeatureKind::MeshFlow});
 
     if (BeginPanelSection("Activity and Sources")) {
-        liveChanged |= ImGui::Checkbox("Enabled##DynamicMeshFlowGpu", &settings.enabled);
-        liveChanged |= ImGui::Checkbox("Show Trails", &settings.showTrails);
-        const invisible_places::water::WaterKeyedFeatureId
-            meshFeature{
-                .kind = invisible_places::water::
-                    WaterKeyedFeatureKind::MeshFlow};
+        noteBaseFixedEdit(drawFixedBool(
+            "enabled",
+            "Enabled##DynamicMeshFlowGpu",
+            &settings.enabled,
+            authoredSettings.enabled));
+        noteBaseFixedEdit(drawFixedBool(
+            "show_trails",
+            "Show Trails",
+            &settings.showTrails,
+            authoredSettings.showTrails));
         const auto drawMeshTimingSetting =
             [&](const char* settingId,
                 const char* label,
@@ -76137,7 +76954,7 @@ void DrawWaterDynamicMeshFlowPanel(
         drawMeshTimingSetting(
             "level",
             "Activity",
-            &settings.activity,
+            &authoredSettings.activity,
             0.0F,
             1.0F,
             "%.2f",
@@ -76145,7 +76962,7 @@ void DrawWaterDynamicMeshFlowPanel(
         drawMeshTimingSetting(
             "rain_gain",
             "Rain Gain",
-            &settings.rainGain,
+            &authoredSettings.rainGain,
             0.0F,
             2.0F,
             "%.2f",
@@ -76153,7 +76970,7 @@ void DrawWaterDynamicMeshFlowPanel(
         drawMeshTimingSetting(
             "moisture_persistence",
             "Moisture Persistence",
-            &settings.moisturePersistenceMultiplier,
+            &authoredSettings.moisturePersistenceMultiplier,
             0.0F,
             4.0F,
             "%.2f x",
@@ -76161,7 +76978,7 @@ void DrawWaterDynamicMeshFlowPanel(
         drawMeshTimingSetting(
             "rain_rise_seconds",
             "Rain Rise",
-            &settings.rainRiseSeconds,
+            &authoredSettings.rainRiseSeconds,
             0.0F,
             120.0F,
             "%.1f s",
@@ -76169,7 +76986,7 @@ void DrawWaterDynamicMeshFlowPanel(
         drawMeshTimingSetting(
             "rain_recession_seconds",
             "Rain Recession",
-            &settings.rainRecessionSeconds,
+            &authoredSettings.rainRecessionSeconds,
             0.0F,
             300.0F,
             "%.1f s",
@@ -76177,18 +76994,22 @@ void DrawWaterDynamicMeshFlowPanel(
         ImGui::TextDisabled(
             "Dry entry: vegetation-supported Ground ordered by distance "
             "from the sampled surface's +X rim.");
-        liveChanged |= DrawWaterSliderFloat(
+        noteBaseFixedEdit(drawFixedFloat(
+            "dry_concavity_focus",
             "Dry Concavity Focus",
             &settings.dryConcavityFocus,
+            authoredSettings.dryConcavityFocus,
             0.0F,
             1.0F,
-            "%.2f");
-        liveChanged |= DrawWaterSliderFloat(
+            "%.2f"));
+        noteBaseFixedEdit(drawFixedFloat(
+            "edge_coverage",
             "Edge Coverage",
             &settings.edgeCoverage,
+            authoredSettings.edgeCoverage,
             0.0F,
             1.0F,
-            "%.2f");
+            "%.2f"));
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
             ImGui::SetTooltip(
                 "Low keeps dry trails at the most likely (convergent) "
@@ -76196,25 +77017,29 @@ void DrawWaterDynamicMeshFlowPanel(
                 "whole +X rim so trails reach the rock edge everywhere, "
                 "regardless of moisture.");
         }
-        liveChanged |= DrawWaterSliderFloat(
+        noteBaseFixedEdit(drawFixedFloat(
+            "rain_distributed_source_fraction",
             "Rain-Fed Source Share",
             &settings.rainDistributedSourceFraction,
+            authoredSettings.rainDistributedSourceFraction,
             0.0F,
             1.0F,
-            "%.2f");
-        liveChanged |= DrawWaterSliderFloat(
+            "%.2f"));
+        noteBaseFixedEdit(drawFixedFloat(
+            "rain_spawn_spread",
             "Rain Spread",
             &settings.rainSpawnSpread,
+            authoredSettings.rainSpawnSpread,
             0.0F,
             1.0F,
-            "%.2f");
+            "%.2f"));
 
         const auto meshFrame =
             ResolveWaterFrameState(runtimeState);
         const float effectiveLevel =
             invisible_places::water::
                 EffectiveWaterDynamicMeshFlowLevel(
-                    settings,
+                    authoredSettings,
                     meshFrame.meshFlowMoisture,
                     &meshFrame.featureOverlay);
         ImGui::TextDisabled(
@@ -76293,40 +77118,64 @@ void DrawWaterDynamicMeshFlowPanel(
     }
 
     if (BeginPanelSection("Motion and Irregularity")) {
-        liveChanged |= DrawWaterSliderFloat(
+        noteBaseFixedEdit(drawFixedFloat(
+            "speed",
             "Speed",
             &settings.speedMetersPerSecond,
+            authoredSettings.speedMetersPerSecond,
             0.01F,
             2.0F,
             "%.2f m/s",
-            ImGuiSliderFlags_Logarithmic);
-        liveChanged |= DrawWaterSliderFloat("Downhill Pull", &settings.downhillWeight, 0.0F, 3.0F, "%.2f");
-        liveChanged |= DrawWaterSliderFloat("Inertia", &settings.inertia, 0.0F, 0.98F, "%.2f");
-        liveChanged |= DrawWaterSliderFloat(
+            ImGuiSliderFlags_Logarithmic));
+        noteBaseFixedEdit(drawFixedFloat(
+            "downhill_weight",
+            "Downhill Pull",
+            &settings.downhillWeight,
+            authoredSettings.downhillWeight,
+            0.0F,
+            3.0F,
+            "%.2f"));
+        noteBaseFixedEdit(drawFixedFloat(
+            "inertia",
+            "Inertia",
+            &settings.inertia,
+            authoredSettings.inertia,
+            0.0F,
+            0.98F,
+            "%.2f"));
+        noteBaseFixedEdit(drawFixedFloat(
+            "particle_noise_strength",
             "Individual Noise",
             &settings.particleNoiseStrength,
+            authoredSettings.particleNoiseStrength,
             0.0F,
             2.0F,
-            "%.2f");
-        liveChanged |= DrawWaterSliderFloat(
+            "%.2f"));
+        noteBaseFixedEdit(drawFixedFloat(
+            "particle_noise_scale",
             "Individual Scale",
             &settings.particleNoiseScaleMeters,
+            authoredSettings.particleNoiseScaleMeters,
             0.01F,
             2.0F,
             "%.2f m",
-            ImGuiSliderFlags_Logarithmic);
-        liveChanged |= DrawWaterSliderFloat(
+            ImGuiSliderFlags_Logarithmic));
+        noteBaseFixedEdit(drawFixedFloat(
+            "particle_noise_speed",
             "Individual Motion",
             &settings.particleNoiseSpeed,
+            authoredSettings.particleNoiseSpeed,
             0.0F,
             3.0F,
-            "%.2f");
-        liveChanged |= DrawWaterSliderFloat(
+            "%.2f"));
+        noteBaseFixedEdit(drawFixedFloat(
+            "surface_surge",
             "Surface Surge",
             &settings.surfaceSurge,
+            authoredSettings.surfaceSurge,
             0.0F,
             1.0F,
-            "%.2f");
+            "%.2f"));
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
             ImGui::SetTooltip(
                 "Splits trails into slow, steady aquifer filaments and "
@@ -76334,92 +77183,118 @@ void DrawWaterDynamicMeshFlowPanel(
                 "it with stretched streaks. 0 keeps one uniform steady "
                 "population.");
         }
-        liveChanged |= DrawWaterSliderFloat(
+        noteBaseFixedEdit(drawFixedFloat(
+            "shared_wind_strength",
             "Shared Wind",
             &settings.sharedWindStrength,
+            authoredSettings.sharedWindStrength,
             0.0F,
             2.0F,
-            "%.2f");
-        liveChanged |= DrawWaterSliderFloat(
+            "%.2f"));
+        noteBaseFixedEdit(drawFixedFloat(
+            "shared_wind_scale",
             "Wind Scale",
             &settings.sharedWindScaleMeters,
+            authoredSettings.sharedWindScaleMeters,
             0.1F,
             12.0F,
             "%.2f m",
-            ImGuiSliderFlags_Logarithmic);
-        liveChanged |= DrawWaterSliderFloat(
+            ImGuiSliderFlags_Logarithmic));
+        noteBaseFixedEdit(drawFixedFloat(
+            "shared_wind_speed",
             "Wind Motion",
             &settings.sharedWindSpeed,
+            authoredSettings.sharedWindSpeed,
             0.0F,
             1.0F,
-            "%.2f");
+            "%.2f"));
         EndPanelSection();
     }
 
     if (BeginPanelSection("Trail Appearance")) {
-        liveChanged |= DrawWaterSliderFloat(
+        noteBaseFixedEdit(drawFixedFloat(
+            "trail_width",
             "Width",
             &settings.trailWidthMeters,
+            authoredSettings.trailWidthMeters,
             0.0005F,
             0.05F,
             "%.4f m",
-            ImGuiSliderFlags_Logarithmic);
-        liveChanged |= DrawWaterSliderFloat(
+            ImGuiSliderFlags_Logarithmic));
+        noteBaseFixedEdit(drawFixedFloat(
+            "trail_streak_length",
             "Streak Length",
             &settings.trailStreakLengthMeters,
+            authoredSettings.trailStreakLengthMeters,
             0.002F,
             0.80F,
             "%.3f m",
-            ImGuiSliderFlags_Logarithmic);
-        liveChanged |= DrawWaterSliderFloat(
+            ImGuiSliderFlags_Logarithmic));
+        noteBaseFixedEdit(drawFixedFloat(
+            "surface_offset",
             "Surface Offset",
             &settings.surfaceOffsetMeters,
+            authoredSettings.surfaceOffsetMeters,
             -0.02F,
             0.08F,
-            "%.3f m");
-        liveChanged |= DrawWaterSliderFloat(
+            "%.3f m"));
+        noteBaseFixedEdit(drawFixedFloat(
+            "contact_fade_seconds",
             "Contact Fade",
             &settings.contactFadeSeconds,
+            authoredSettings.contactFadeSeconds,
             0.05F,
             8.0F,
             "%.2f s",
-            ImGuiSliderFlags_Logarithmic);
-        liveChanged |= DrawWaterSliderFloat(
+            ImGuiSliderFlags_Logarithmic));
+        noteBaseFixedEdit(drawFixedFloat(
+            "trail_opacity_dry",
             "Dry Opacity",
             &settings.trailOpacityDry,
+            authoredSettings.trailOpacityDry,
             0.0F,
             0.50F,
-            "%.3f");
-        liveChanged |= DrawWaterSliderFloat(
+            "%.3f"));
+        noteBaseFixedEdit(drawFixedFloat(
+            "trail_opacity_wet",
             "Wet Opacity",
             &settings.trailOpacityWet,
+            authoredSettings.trailOpacityWet,
             0.0F,
             0.75F,
-            "%.3f");
-        liveChanged |= DrawWaterSliderFloat(
+            "%.3f"));
+        noteBaseFixedEdit(drawFixedFloat(
+            "trail_emission_dry",
             "Dry Emission",
             &settings.trailEmissionDry,
+            authoredSettings.trailEmissionDry,
             0.0F,
             2.0F,
-            "%.3f");
-        liveChanged |= DrawWaterSliderFloat(
+            "%.3f"));
+        noteBaseFixedEdit(drawFixedFloat(
+            "trail_emission_wet",
             "Wet Emission",
             &settings.trailEmissionWet,
+            authoredSettings.trailEmissionWet,
             0.0F,
             3.0F,
-            "%.3f");
-        liveChanged |= DrawWaterSliderFloat(
+            "%.3f"));
+        noteBaseFixedEdit(drawFixedFloat(
+            "trail_exposure",
             "Exposure",
             &settings.trailExposure,
+            authoredSettings.trailExposure,
             0.0F,
             4.0F,
-            "%.2f");
-        liveChanged |= DrawWaterSliderFloat(
+            "%.2f"));
+        noteBaseFixedEdit(drawFixedFloat(
+            "trail_wetness_floor",
             "Wetness Floor",
             &settings.trailWetnessFloor,
+            authoredSettings.trailWetnessFloor,
             0.0F,
             1.0F,
-            "%.2f");
+            "%.2f"));
         DrawWaterSeepageParameterTooltip(
             "Trails read at least this wet regardless of Rain-fed moisture, "
             "so the underground-water filaments stay visible in dry scenes. "
@@ -76428,76 +77303,153 @@ void DrawWaterDynamicMeshFlowPanel(
     }
 
     if (BeginPanelSection("ROCK Contact Response")) {
-        liveChanged |= DrawWaterSliderFloat(
+        noteBaseFixedEdit(drawFixedFloat(
+            "contact_upward_reach",
             "Upward Reach",
             &settings.contactUpwardReachMeters,
+            authoredSettings.contactUpwardReachMeters,
             0.0F,
             2.0F,
-            "%.2f m");
+            "%.2f m"));
         DrawWaterSeepageParameterTooltip(
             "How far above a terrain contact the wetting response blends, for "
             "both ROCK and VEG contacts. Points above the collision now fade "
             "in smoothly instead of cutting off at the impact height.");
         auto& response = settings.rockResponse;
-        liveChanged |= DrawWaterSliderFloat("Radius##MeshRock", &response.radiusMeters, 0.0F, 0.75F, "%.3f m");
-        liveChanged |= DrawWaterSliderFloat("Opacity##MeshRock", &response.opacityAdd, 0.0F, 2.0F, "%.2f");
-        liveChanged |= DrawWaterSliderFloat("Emission##MeshRock", &response.emissionAdd, 0.0F, 4.0F, "%.2f");
-        float colour[3] = {response.colourise.x, response.colourise.y, response.colourise.z};
-        if (ImGui::ColorEdit3("Tint##MeshRock", colour)) {
-            response.colourise = {colour[0], colour[1], colour[2]};
-            liveChanged = true;
-        }
-        liveChanged |= DrawWaterSliderFloat(
+        const auto& authoredResponse = authoredSettings.rockResponse;
+        noteBaseFixedEdit(drawFixedFloat(
+            "rock.radius",
+            "Radius##MeshRock",
+            &response.radiusMeters,
+            authoredResponse.radiusMeters,
+            0.0F,
+            0.75F,
+            "%.3f m"));
+        noteBaseFixedEdit(drawFixedFloat(
+            "rock.opacity_add",
+            "Opacity##MeshRock",
+            &response.opacityAdd,
+            authoredResponse.opacityAdd,
+            0.0F,
+            2.0F,
+            "%.2f"));
+        noteBaseFixedEdit(drawFixedFloat(
+            "rock.emission_add",
+            "Emission##MeshRock",
+            &response.emissionAdd,
+            authoredResponse.emissionAdd,
+            0.0F,
+            4.0F,
+            "%.2f"));
+        noteBaseFixedEdit(drawFixedColour(
+            "rock.colour",
+            "Tint##MeshRock",
+            &response.colourise,
+            authoredResponse.colourise));
+        noteBaseFixedEdit(drawFixedFloat(
+            "rock.colour_mix",
             "Colour Mix##MeshRock",
             &response.colouriseAmount,
+            authoredResponse.colouriseAmount,
             0.0F,
             1.0F,
-            "%.2f");
-        liveChanged |= DrawWaterSliderFloat(
+            "%.2f"));
+        noteBaseFixedEdit(drawFixedFloat(
+            "rock.persistence_seconds",
             "Persistence##MeshRock",
             &response.persistenceSeconds,
+            authoredResponse.persistenceSeconds,
             0.0F,
             30.0F,
-            "%.2f s");
+            "%.2f s"));
         EndPanelSection();
     }
 
     if (BeginPanelSection("VEG Understory Response")) {
         auto& response = settings.vegetationResponse;
-        liveChanged |= DrawWaterSliderFloat("Radius##MeshVeg", &response.radiusMeters, 0.0F, 0.75F, "%.3f m");
-        liveChanged |= DrawWaterSliderFloat("Opacity##MeshVeg", &response.opacityAdd, 0.0F, 2.0F, "%.2f");
-        liveChanged |= DrawWaterSliderFloat("Emission##MeshVeg", &response.emissionAdd, 0.0F, 4.0F, "%.2f");
-        float colour[3] = {response.colourise.x, response.colourise.y, response.colourise.z};
-        if (ImGui::ColorEdit3("Tint##MeshVeg", colour)) {
-            response.colourise = {colour[0], colour[1], colour[2]};
-            liveChanged = true;
-        }
-        liveChanged |= DrawWaterSliderFloat(
-            "Colour Mix##MeshVeg",
-            &response.colouriseAmount,
+        const auto& authoredResponse =
+            authoredSettings.vegetationResponse;
+        noteBaseFixedEdit(drawFixedFloat(
+            "vegetation.radius",
+            "Radius##MeshVeg",
+            &response.radiusMeters,
+            authoredResponse.radiusMeters,
             0.0F,
-            1.0F,
-            "%.2f");
-        liveChanged |= DrawWaterSliderFloat("Twinkle", &response.twinkle, 0.0F, 4.0F, "%.2f");
-        liveChanged |= DrawWaterSliderFloat(
-            "Stream Depth",
-            &response.streamDepthMeters,
+            0.75F,
+            "%.3f m"));
+        noteBaseFixedEdit(drawFixedFloat(
+            "vegetation.opacity_add",
+            "Opacity##MeshVeg",
+            &response.opacityAdd,
+            authoredResponse.opacityAdd,
             0.0F,
             2.0F,
-            "%.2f m");
-        liveChanged |= DrawWaterSliderFloat(
+            "%.2f"));
+        noteBaseFixedEdit(drawFixedFloat(
+            "vegetation.emission_add",
+            "Emission##MeshVeg",
+            &response.emissionAdd,
+            authoredResponse.emissionAdd,
+            0.0F,
+            4.0F,
+            "%.2f"));
+        noteBaseFixedEdit(drawFixedColour(
+            "vegetation.colour",
+            "Tint##MeshVeg",
+            &response.colourise,
+            authoredResponse.colourise));
+        noteBaseFixedEdit(drawFixedFloat(
+            "vegetation.colour_mix",
+            "Colour Mix##MeshVeg",
+            &response.colouriseAmount,
+            authoredResponse.colouriseAmount,
+            0.0F,
+            1.0F,
+            "%.2f"));
+        noteBaseFixedEdit(drawFixedFloat(
+            "vegetation.twinkle",
+            "Twinkle",
+            &response.twinkle,
+            authoredResponse.twinkle,
+            0.0F,
+            4.0F,
+            "%.2f"));
+        noteBaseFixedEdit(drawFixedFloat(
+            "vegetation.stream_depth",
+            "Stream Depth",
+            &response.streamDepthMeters,
+            authoredResponse.streamDepthMeters,
+            0.0F,
+            2.0F,
+            "%.2f m"));
+        noteBaseFixedEdit(drawFixedFloat(
+            "vegetation.persistence_seconds",
             "Persistence##MeshVeg",
             &response.persistenceSeconds,
+            authoredResponse.persistenceSeconds,
             0.0F,
             30.0F,
-            "%.2f s");
+            "%.2f s"));
         EndPanelSection();
     }
 
     if (liveChanged) {
-        settings = invisible_places::water::SanitizeWaterDynamicMeshFlowSettings(settings);
+        authoredSettings = invisible_places::water::
+            SanitizeWaterDynamicMeshFlowSettings(authoredSettings);
         ++water.dynamicMeshFlowParameterUpdateCount;
         runtimeState->previewRenderStateSignatureValid = false;
+    }
+    if (meshFixedUi.stateChanged) {
+        water.dynamicMeshFlowResetRequested = true;
+        ++water.dynamicMeshFlowParameterUpdateCount;
+        runtimeState->previewRenderStateSignatureValid = false;
+        ApplyFeatureTimelineScrub(runtimeState);
+        if (meshFixedUi.activeVariant != nullptr) {
+            runtimeState->statusMessage =
+                "Updated fixed Mesh Flow settings in variant " +
+                meshFixedUi.activeVariant->name + ".";
+            runtimeState->errorMessage.clear();
+        }
     }
     return;
 }
@@ -77491,6 +78443,104 @@ void DrawKeyedGlobalLevelRow(
         &edited);
 }
 
+std::size_t DetachChangedShorelineFixedSettings(
+    invisible_places::water::WaterFeatureRunVariant* variant,
+    const invisible_places::water::WaterKeyedFeatureId& feature,
+    const PointCloudShorelineWaveSettings& before,
+    const PointCloudShorelineWaveSettings& after) {
+    if (variant == nullptr) {
+        return 0U;
+    }
+    std::size_t changed = 0U;
+    const auto detach = [&](std::string_view id, auto value) {
+        (void)invisible_places::water::DetachWaterFeatureRunVariantSetting(
+            variant,
+            feature,
+            id,
+            invisible_places::water::WaterFeatureFixedSettingValue{value});
+        ++changed;
+    };
+    if (before.enabled != after.enabled) {
+        detach("enabled", after.enabled);
+    }
+    if (before.algorithm != after.algorithm) {
+        const char* algorithm = after.algorithm ==
+                PointCloudShorelineWaveAlgorithm::HeightFoam
+            ? "height_foam"
+            : after.algorithm ==
+                      PointCloudShorelineWaveAlgorithm::ContinuousBands
+                  ? "continuous_bands"
+                  : "foam_fronts";
+        detach("algorithm", std::string{algorithm});
+    }
+    const auto detachFloat = [&](std::string_view id,
+                                 float oldValue,
+                                 float newValue) {
+        if (std::abs(oldValue - newValue) > 1.0e-6F) {
+            detach(id, static_cast<double>(newValue));
+        }
+    };
+    const auto detachUint = [&](std::string_view id,
+                                std::uint32_t oldValue,
+                                std::uint32_t newValue) {
+        if (oldValue != newValue) {
+            detach(id, static_cast<std::uint64_t>(newValue));
+        }
+    };
+    const auto detachColour = [&](
+                                  std::string_view id,
+                                  const std::array<float, 3U>& oldValue,
+                                  const std::array<float, 3U>& newValue) {
+        if (oldValue != newValue) {
+            detach(id, newValue);
+        }
+    };
+
+    const auto& oldFoam = before.foamFronts;
+    const auto& foam = after.foamFronts;
+    detachFloat("foam_fronts.boundary_z", oldFoam.boundaryZ, foam.boundaryZ);
+    detachFloat("foam_fronts.height_reach_meters", oldFoam.heightReachMeters, foam.heightReachMeters);
+    detachFloat("foam_fronts.edge_fade_meters", oldFoam.edgeFadeMeters, foam.edgeFadeMeters);
+    detachFloat("foam_fronts.direction_x", oldFoam.directionX, foam.directionX);
+    detachFloat("foam_fronts.direction_y", oldFoam.directionY, foam.directionY);
+    detachFloat("foam_fronts.pattern_scale", oldFoam.patternScale, foam.patternScale);
+    detachFloat("foam_fronts.wavelength_meters", oldFoam.wavelengthMeters, foam.wavelengthMeters);
+    detachFloat("foam_fronts.speed", oldFoam.speed, foam.speed);
+    detachFloat("foam_fronts.warp", oldFoam.warp, foam.warp);
+    detachFloat("foam_fronts.turbulence", oldFoam.turbulence, foam.turbulence);
+    detachFloat("foam_fronts.density", oldFoam.density, foam.density);
+    detachFloat("foam_fronts.phase", oldFoam.phase, foam.phase);
+    detachFloat("foam_fronts.background_wash", oldFoam.backgroundWash, foam.backgroundWash);
+    detachFloat("foam_fronts.opacity_multiply", oldFoam.opacityMultiply, foam.opacityMultiply);
+    detachFloat("foam_fronts.point_size_add", oldFoam.pointSizeAdd, foam.pointSizeAdd);
+    detachColour("foam_fronts.colour", oldFoam.colour, foam.colour);
+    detachUint("foam_fronts.seed", oldFoam.seed, foam.seed);
+
+    const auto& oldHeight = before.heightFoam;
+    const auto& height = after.heightFoam;
+    detachFloat("height_foam.runup_z", oldHeight.runupZ, height.runupZ);
+    detachFloat("height_foam.break_z", oldHeight.breakZ, height.breakZ);
+    detachFloat("height_foam.offshore_reach_meters", oldHeight.offshoreReachMeters, height.offshoreReachMeters);
+    detachFloat("height_foam.edge_fade_meters", oldHeight.edgeFadeMeters, height.edgeFadeMeters);
+    detachFloat("height_foam.direction_x", oldHeight.directionX, height.directionX);
+    detachFloat("height_foam.direction_y", oldHeight.directionY, height.directionY);
+    detachFloat("height_foam.pattern_scale", oldHeight.patternScale, height.patternScale);
+    detachFloat("height_foam.wavelength_meters", oldHeight.wavelengthMeters, height.wavelengthMeters);
+    detachFloat("height_foam.speed", oldHeight.speed, height.speed);
+    detachFloat("height_foam.warp", oldHeight.warp, height.warp);
+    detachFloat("height_foam.turbulence", oldHeight.turbulence, height.turbulence);
+    detachFloat("height_foam.density", oldHeight.density, height.density);
+    detachFloat("height_foam.phase", oldHeight.phase, height.phase);
+    detachFloat("height_foam.offshore_foam_strength", oldHeight.offshoreFoamStrength, height.offshoreFoamStrength);
+    detachFloat("height_foam.incoming_strength", oldHeight.incomingStrength, height.incomingStrength);
+    detachFloat("height_foam.return_strength", oldHeight.returnStrength, height.returnStrength);
+    detachFloat("height_foam.opacity_multiply", oldHeight.opacityMultiply, height.opacityMultiply);
+    detachFloat("height_foam.point_size_add", oldHeight.pointSizeAdd, height.pointSizeAdd);
+    detachColour("height_foam.colour", oldHeight.colour, height.colour);
+    detachUint("height_foam.seed", oldHeight.seed, height.seed);
+    return changed;
+}
+
 // Complete project-owned Shoreline effect list. Every object uses a saved
 // base profile and at most one object-specific derived copy.
 void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState) {
@@ -77714,11 +78764,52 @@ void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState) {
             .kind = invisible_places::water::WaterKeyedFeatureKind::
                 ShorelineInstance,
             .objectId = instance.id};
+        auto* timingEntry = invisible_places::timing::
+            FindTimingTakeSceneState(
+                &water.timingTakeSceneStates,
+                ActiveWaterTimingScenarioId(*runtimeState),
+                ActiveWaterTimingSceneGroupName(water));
+        invisible_places::water::WaterFeatureTimingRun* featureRun = nullptr;
+        if (timingEntry != nullptr) {
+            for (auto& candidate : timingEntry->waterFeatureTimingRuns) {
+                if (invisible_places::water::FindWaterFeatureTimeline(
+                        &candidate,
+                        feature) != nullptr) {
+                    featureRun = &candidate;
+                    break;
+                }
+            }
+        }
+        const auto variantAuthority =
+            ResolveWaterVariantAnimationAuthority(*runtimeState);
+        auto resolvedRunSelection = featureRun != nullptr &&
+                variantAuthority.path != nullptr
+            ? invisible_places::water::ResolveWaterFeatureRunSelection(
+                  *featureRun,
+                  variantAuthority.path->waterFeatureRunSelections)
+            : invisible_places::water::ResolvedWaterFeatureRunSelection{};
+        auto* activeVariant = resolvedRunSelection.enabled &&
+                resolvedRunSelection.variantId != 0U
+            ? invisible_places::water::FindWaterFeatureRunVariant(
+                  featureRun,
+                  resolvedRunSelection.variantId)
+            : nullptr;
+        auto effectiveFixedSettings = instance.settings;
+        if (timingEntry != nullptr && variantAuthority.path != nullptr) {
+            const auto fixedOverlay = invisible_places::water::
+                BuildWaterFeatureFixedSettingOverlay(
+                    timingEntry->waterFeatureTimingRuns,
+                    variantAuthority.path->waterFeatureRunSelections);
+            ApplyWaterShorelineFixedSettingOverlay(
+                feature,
+                &fixedOverlay,
+                &effectiveFixedSettings);
+        }
         DrawEmbeddedWaterFeatureTimeline(runtimeState, feature);
         const std::array<invisible_places::water::WaterKeyedFeatureId, 1>
             keyedFeatures{feature};
         const bool heightFoamActive =
-            instance.settings.algorithm ==
+            effectiveFixedSettings.algorithm ==
             invisible_places::renderer::pointcloud::
                 PointCloudShorelineWaveAlgorithm::HeightFoam;
         const auto keyedScalarRow = [&](const char* settingId,
@@ -77897,16 +78988,55 @@ void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState) {
         invisible_places::renderer::pointcloud::
             ApplyPointCloudShorelineWaveSettings(
                 &editSession.pointStyle,
-                instance.settings);
-        if (DrawPointCloudShorelineWavesSection(
+                effectiveFixedSettings);
+        ShorelineFixedVariantUiContext fixedUiContext{
+            .run = featureRun,
+            .activeVariant = activeVariant,
+            .feature = feature,
+            .editingLocked = variantAuthority.variantEditingLocked,
+        };
+        ImGui::BeginDisabled(
+            variantAuthority.variantEditingLocked ||
+            RenderSetupAuthoringLocked(runtimeState));
+        const bool fixedEditorChanged = DrawPointCloudShorelineWavesSection(
                 &editSession,
                 savedBaseSettings.has_value()
                     ? &savedBaseSettings.value()
-                    : nullptr)) {
-            instance.settings = invisible_places::renderer::pointcloud::
+                    : nullptr,
+                &fixedUiContext);
+        ImGui::EndDisabled();
+        if (variantAuthority.variantEditingLocked) {
+            ImGui::TextDisabled(
+                "Seam view uses the loaded animation's saved version; switch to A, B, or A/B to edit fixed variant settings.");
+        }
+        if (fixedEditorChanged) {
+            const auto editedSettings = invisible_places::renderer::pointcloud::
                 ExtractPointCloudShorelineWaveSettings(
                     editSession.pointStyle);
-            instanceSettingsChanged = true;
+            if (activeVariant != nullptr) {
+                const auto detached = DetachChangedShorelineFixedSettings(
+                    activeVariant,
+                    feature,
+                    effectiveFixedSettings,
+                    editedSettings);
+                if (detached > 0U) {
+                    runtimeState->statusMessage =
+                        "Detached " + std::to_string(detached) +
+                        (detached == 1U ? " fixed setting in "
+                                        : " fixed settings in ") +
+                        activeVariant->name + ".";
+                    runtimeState->errorMessage.clear();
+                    fixedUiContext.stateChanged = true;
+                }
+            } else {
+                instance.settings = editedSettings;
+                instanceSettingsChanged = true;
+            }
+        }
+        if (fixedUiContext.stateChanged) {
+            ApplyFeatureTimelineScrub(runtimeState);
+            InvalidateWaterSeepageParams(&water);
+            runtimeState->previewRenderStateSignatureValid = false;
         }
         if (instanceSettingsChanged) {
             std::string baseName =
@@ -78278,6 +79408,26 @@ void DrawWaterGpuRainPanel(
     const std::array<invisible_places::water::WaterKeyedFeatureId, 1>
         rainFeatures{rainFeature};
     bool liveChanged = false;
+    auto rainFixedUi = ResolveWaterFixedVariantUiContext(
+        runtimeState,
+        rainFeature);
+    auto effectiveRainFixedSettings = settings;
+    {
+        const auto waterFrame = ResolveWaterFrameState(runtimeState);
+        invisible_places::water::
+            ApplyWaterFeatureFixedSettingOverlayToRainSettings(
+                waterFrame.fixedSettingOverlay,
+                &effectiveRainFixedSettings,
+                nullptr);
+    }
+    auto* fixedRainSettings = rainFixedUi.activeVariant != nullptr
+        ? &effectiveRainFixedSettings
+        : &settings;
+    const auto noteBaseFixedEdit = [&](bool changed) {
+        if (changed && rainFixedUi.activeVariant == nullptr) {
+            liveChanged = true;
+        }
+    };
     const auto baseRainSettingValue =
         [&](std::string_view settingId) -> std::optional<float> {
             if (!savedBaseSettings.has_value() ||
@@ -78350,29 +79500,70 @@ void DrawWaterGpuRainPanel(
             invisible_places::timing::kTimingTakeRainTrackProfileGroup,
             rainTrackProfileName,
             "Rain");
-        liveChanged |= ImGui::Checkbox("Enabled##GpuRain", &settings.enabled);
+        noteBaseFixedEdit(DrawWaterVariantFixedSettingControl(
+            &rainFixedUi,
+            "enabled",
+            invisible_places::water::WaterFeatureFixedSettingValue{
+                settings.enabled},
+            [&]() {
+                return ImGui::Checkbox(
+                    "Enabled##GpuRain",
+                    &fixedRainSettings->enabled);
+            },
+            [&]() -> invisible_places::water::
+                WaterFeatureFixedSettingValue {
+                return fixedRainSettings->enabled;
+            }));
         DrawWaterProfileBaseBoolHint(
-            settings.enabled,
+            fixedRainSettings->enabled,
             savedBaseSettings.has_value()
                 ? std::optional<bool>{savedBaseSettings->enabled}
                 : std::nullopt);
         const auto intensityLabel = invisible_places::water::WaterRainIntensityPresetLabel(
-            static_cast<WaterRainIntensityPreset>(settings.intensityPreset));
-        if (ImGui::BeginCombo("Intensity", intensityLabel.data())) {
-            for (const auto preset : invisible_places::water::AllWaterRainIntensityPresets()) {
-                const auto runtimePreset = static_cast<invisible_places::water::RainIntensityPreset>(preset);
-                const bool selected = settings.intensityPreset == runtimePreset;
-                const auto label = invisible_places::water::WaterRainIntensityPresetLabel(preset);
-                if (ImGui::Selectable(label.data(), selected) && !selected) {
-                    settings.intensityPreset = runtimePreset;
-                    liveChanged = true;
+            static_cast<WaterRainIntensityPreset>(
+                fixedRainSettings->intensityPreset));
+        noteBaseFixedEdit(DrawWaterVariantFixedSettingControl(
+            &rainFixedUi,
+            "intensity_preset",
+            invisible_places::water::WaterFeatureFixedSettingValue{
+                std::string{invisible_places::water::
+                    WaterRainIntensityPresetNameForStorage(
+                        static_cast<WaterRainIntensityPreset>(
+                            settings.intensityPreset))}},
+            [&]() {
+                bool changed = false;
+                if (ImGui::BeginCombo("Intensity", intensityLabel.data())) {
+                    for (const auto preset : invisible_places::water::
+                             AllWaterRainIntensityPresets()) {
+                        const auto runtimePreset = static_cast<
+                            invisible_places::water::RainIntensityPreset>(
+                                preset);
+                        const bool selected =
+                            fixedRainSettings->intensityPreset ==
+                            runtimePreset;
+                        const auto label = invisible_places::water::
+                            WaterRainIntensityPresetLabel(preset);
+                        if (ImGui::Selectable(label.data(), selected) &&
+                            !selected) {
+                            fixedRainSettings->intensityPreset =
+                                runtimePreset;
+                            changed = true;
+                        }
+                        if (selected) {
+                            ImGui::SetItemDefaultFocus();
+                        }
+                    }
+                    ImGui::EndCombo();
                 }
-                if (selected) {
-                    ImGui::SetItemDefaultFocus();
-                }
-            }
-            ImGui::EndCombo();
-        }
+                return changed;
+            },
+            [&]() -> invisible_places::water::
+                WaterFeatureFixedSettingValue {
+                return std::string{invisible_places::water::
+                    WaterRainIntensityPresetNameForStorage(
+                        static_cast<WaterRainIntensityPreset>(
+                            fixedRainSettings->intensityPreset))};
+            }));
         drawRainBaseTextHint(
             intensityLabel,
             savedBaseSettings.has_value()
@@ -78391,23 +79582,40 @@ void DrawWaterGpuRainPanel(
             ImGuiSliderFlags_None,
             "Animates rain births continuously. A keyed zero stops new rain "
             "while existing impact effects finish fading.");
-        int activeParticles = static_cast<int>(settings.activeParticleCount);
-        if (DrawWaterSliderInt(
-                "Particle Limit",
-                &activeParticles,
-                1,
-                32768,
-                WaterProfileValueFormat(
-                    "%d",
-                    activeParticles,
-                    savedBaseSettings.has_value()
-                        ? std::optional<int>{static_cast<int>(
-                              savedBaseSettings->activeParticleCount)}
-                        : std::nullopt)
-                    .c_str())) {
-            settings.activeParticleCount = static_cast<std::uint32_t>(std::clamp(activeParticles, 1, 32768));
-            liveChanged = true;
-        }
+        int activeParticles = static_cast<int>(
+            fixedRainSettings->activeParticleCount);
+        noteBaseFixedEdit(DrawWaterVariantFixedSettingControl(
+            &rainFixedUi,
+            "particle_limit",
+            invisible_places::water::WaterFeatureFixedSettingValue{
+                static_cast<std::uint64_t>(settings.activeParticleCount)},
+            [&]() {
+                if (!DrawWaterSliderInt(
+                        "Particle Limit",
+                        &activeParticles,
+                        1,
+                        32768,
+                        WaterProfileValueFormat(
+                            "%d",
+                            activeParticles,
+                            savedBaseSettings.has_value()
+                                ? std::optional<int>{static_cast<int>(
+                                      savedBaseSettings
+                                          ->activeParticleCount)}
+                                : std::nullopt)
+                            .c_str())) {
+                    return false;
+                }
+                fixedRainSettings->activeParticleCount =
+                    static_cast<std::uint32_t>(
+                        std::clamp(activeParticles, 1, 32768));
+                return true;
+            },
+            [&]() -> invisible_places::water::
+                WaterFeatureFixedSettingValue {
+                return static_cast<std::uint64_t>(
+                    fixedRainSettings->activeParticleCount);
+            }));
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
             ImGui::SetTooltip(
                 "The integer particle cap is immediate but not keyable. Use "
@@ -78449,15 +79657,28 @@ void DrawWaterGpuRainPanel(
             0.0F,
             4.0F,
             "%.2f");
-        int seed = static_cast<int>(settings.seed);
+        int seed = static_cast<int>(fixedRainSettings->seed);
         const bool rainInRun = WaterFeatureIsInTimingRun(
             *runtimeState,
             {.kind = invisible_places::water::WaterKeyedFeatureKind::Rain});
         BeginWaterRegenerativeSettingLabels(rainInRun);
-        if (ImGui::InputInt("Seed", &seed)) {
-            settings.seed = static_cast<std::uint32_t>(std::max(0, seed));
-            liveChanged = true;
-        }
+        noteBaseFixedEdit(DrawWaterVariantFixedSettingControl(
+            &rainFixedUi,
+            "seed",
+            invisible_places::water::WaterFeatureFixedSettingValue{
+                static_cast<std::uint64_t>(settings.seed)},
+            [&]() {
+                if (!ImGui::InputInt("Seed", &seed)) {
+                    return false;
+                }
+                fixedRainSettings->seed = static_cast<std::uint32_t>(
+                    std::max(0, seed));
+                return true;
+            },
+            [&]() -> invisible_places::water::
+                WaterFeatureFixedSettingValue {
+                return static_cast<std::uint64_t>(fixedRainSettings->seed);
+            }));
         const bool seedHovered =
             ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal);
         EndWaterRegenerativeSettingLabels(rainInRun);
@@ -78646,55 +79867,91 @@ void DrawWaterGpuRainPanel(
             0.0F,
             12.0F,
             "%.1f m/s");
-        liveChanged |= DrawWaterSliderFloat(
-            "Spawn Height",
-            &settings.spawnHeightMeters,
-            0.1F,
-            80.0F,
-            WaterProfileValueFormat(
-                "%.1f m",
-                settings.spawnHeightMeters,
-                savedBaseSettings.has_value()
-                    ? std::optional<float>{
-                          savedBaseSettings->spawnHeightMeters}
-                    : std::nullopt)
-                .c_str());
+        noteBaseFixedEdit(DrawWaterVariantFixedSettingControl(
+            &rainFixedUi,
+            "spawn_height",
+            invisible_places::water::WaterFeatureFixedSettingValue{
+                static_cast<double>(settings.spawnHeightMeters)},
+            [&]() {
+                return DrawWaterSliderFloat(
+                    "Spawn Height",
+                    &fixedRainSettings->spawnHeightMeters,
+                    0.1F,
+                    80.0F,
+                    WaterProfileValueFormat(
+                        "%.1f m",
+                        fixedRainSettings->spawnHeightMeters,
+                        savedBaseSettings.has_value()
+                            ? std::optional<float>{
+                                  savedBaseSettings->spawnHeightMeters}
+                            : std::nullopt)
+                        .c_str());
+            },
+            [&]() -> invisible_places::water::
+                WaterFeatureFixedSettingValue {
+                return static_cast<double>(
+                    fixedRainSettings->spawnHeightMeters);
+            }));
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
             ImGui::SetTooltip(
                 "Applies to newly born drops only, so it remains authored "
                 "rather than mixing old and new spawn heights in a key.");
         }
-        liveChanged |= DrawWaterSliderFloat(
-            "Spawn Radius",
-            &settings.spawnRadiusMeters,
-            0.5F,
-            80.0F,
-            WaterProfileValueFormat(
-                "%.1f m",
-                settings.spawnRadiusMeters,
-                savedBaseSettings.has_value()
-                    ? std::optional<float>{
-                          savedBaseSettings->spawnRadiusMeters}
-                    : std::nullopt)
-                .c_str());
+        noteBaseFixedEdit(DrawWaterVariantFixedSettingControl(
+            &rainFixedUi,
+            "spawn_radius",
+            invisible_places::water::WaterFeatureFixedSettingValue{
+                static_cast<double>(settings.spawnRadiusMeters)},
+            [&]() {
+                return DrawWaterSliderFloat(
+                    "Spawn Radius",
+                    &fixedRainSettings->spawnRadiusMeters,
+                    0.5F,
+                    80.0F,
+                    WaterProfileValueFormat(
+                        "%.1f m",
+                        fixedRainSettings->spawnRadiusMeters,
+                        savedBaseSettings.has_value()
+                            ? std::optional<float>{
+                                  savedBaseSettings->spawnRadiusMeters}
+                            : std::nullopt)
+                        .c_str());
+            },
+            [&]() -> invisible_places::water::
+                WaterFeatureFixedSettingValue {
+                return static_cast<double>(
+                    fixedRainSettings->spawnRadiusMeters);
+            }));
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
             ImGui::SetTooltip(
                 "Applies to newly born drops only and is not keyable.");
         }
-        liveChanged |= DrawWaterSliderFloat(
-            "Camera Death",
-            &settings.cameraDeathDistanceMeters,
-            1.0F,
-            250.0F,
-            WaterProfileValueFormat(
-                "%.1f m",
-                settings.cameraDeathDistanceMeters,
-                savedBaseSettings.has_value()
-                    ? std::optional<float>{
-                          savedBaseSettings->cameraDeathDistanceMeters}
-                    : std::nullopt)
-                .c_str(),
-            ImGuiSliderFlags_Logarithmic);
+        noteBaseFixedEdit(DrawWaterVariantFixedSettingControl(
+            &rainFixedUi,
+            "camera_death_distance",
+            invisible_places::water::WaterFeatureFixedSettingValue{
+                static_cast<double>(settings.cameraDeathDistanceMeters)},
+            [&]() {
+                return DrawWaterSliderFloat(
+                    "Camera Death",
+                    &fixedRainSettings->cameraDeathDistanceMeters,
+                    1.0F,
+                    250.0F,
+                    WaterProfileValueFormat(
+                        "%.1f m",
+                        fixedRainSettings->cameraDeathDistanceMeters,
+                        savedBaseSettings.has_value()
+                            ? std::optional<float>{savedBaseSettings
+                                  ->cameraDeathDistanceMeters}
+                            : std::nullopt)
+                        .c_str(),
+                    ImGuiSliderFlags_Logarithmic);
+            },
+            [&]() -> invisible_places::water::
+                WaterFeatureFixedSettingValue {
+                return static_cast<double>(
+                    fixedRainSettings->cameraDeathDistanceMeters);
+            }));
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
             ImGui::SetTooltip(
                 "This threshold kills drops abruptly, so it remains "
@@ -78704,16 +79961,27 @@ void DrawWaterGpuRainPanel(
     }
 
     if (BeginPanelSection("Impact Effects")) {
-        liveChanged |= ImGui::Checkbox(
-            "Enabled##RainImpacts",
-            &settings.impactEffectsEnabled);
+        noteBaseFixedEdit(DrawWaterVariantFixedSettingControl(
+            &rainFixedUi,
+            "effects.enabled",
+            invisible_places::water::WaterFeatureFixedSettingValue{
+                settings.impactEffectsEnabled},
+            [&]() {
+                return ImGui::Checkbox(
+                    "Enabled##RainImpacts",
+                    &fixedRainSettings->impactEffectsEnabled);
+            },
+            [&]() -> invisible_places::water::
+                WaterFeatureFixedSettingValue {
+                return fixedRainSettings->impactEffectsEnabled;
+            }));
         DrawWaterProfileBaseBoolHint(
-            settings.impactEffectsEnabled,
+            fixedRainSettings->impactEffectsEnabled,
             savedBaseSettings.has_value()
                 ? std::optional<bool>{
                       savedBaseSettings->impactEffectsEnabled}
                 : std::nullopt);
-        if (!settings.impactEffectsEnabled) {
+        if (!fixedRainSettings->impactEffectsEnabled) {
             ImGui::BeginDisabled();
         }
         // The effects are no longer tied to their originating cloud type:
@@ -78721,25 +79989,62 @@ void DrawWaterGpuRainPanel(
         // Rings and Wetness consume every ground impact, while Droplets
         // consume vegetation impacts. Each response is applied by effect
         // after collision, so none of these sliders selects a cloud role.
-        liveChanged |= ImGui::Checkbox("Rings", &settings.sandEffectsEnabled);
+        noteBaseFixedEdit(DrawWaterVariantFixedSettingControl(
+            &rainFixedUi,
+            "effects.rings_enabled",
+            invisible_places::water::WaterFeatureFixedSettingValue{
+                settings.sandEffectsEnabled},
+            [&]() {
+                return ImGui::Checkbox(
+                    "Rings",
+                    &fixedRainSettings->sandEffectsEnabled);
+            },
+            [&]() -> invisible_places::water::
+                WaterFeatureFixedSettingValue {
+                return fixedRainSettings->sandEffectsEnabled;
+            }));
         DrawWaterProfileBaseBoolHint(
-            settings.sandEffectsEnabled,
+            fixedRainSettings->sandEffectsEnabled,
             savedBaseSettings.has_value()
                 ? std::optional<bool>{
                       savedBaseSettings->sandEffectsEnabled}
                 : std::nullopt);
-        liveChanged |= ImGui::Checkbox("Wetness", &settings.rockEffectsEnabled);
+        noteBaseFixedEdit(DrawWaterVariantFixedSettingControl(
+            &rainFixedUi,
+            "effects.wetness_enabled",
+            invisible_places::water::WaterFeatureFixedSettingValue{
+                settings.rockEffectsEnabled},
+            [&]() {
+                return ImGui::Checkbox(
+                    "Wetness",
+                    &fixedRainSettings->rockEffectsEnabled);
+            },
+            [&]() -> invisible_places::water::
+                WaterFeatureFixedSettingValue {
+                return fixedRainSettings->rockEffectsEnabled;
+            }));
         DrawWaterProfileBaseBoolHint(
-            settings.rockEffectsEnabled,
+            fixedRainSettings->rockEffectsEnabled,
             savedBaseSettings.has_value()
                 ? std::optional<bool>{
                       savedBaseSettings->rockEffectsEnabled}
                 : std::nullopt);
-        liveChanged |= ImGui::Checkbox(
-            "Droplets",
-            &settings.vegetationEffectsEnabled);
+        noteBaseFixedEdit(DrawWaterVariantFixedSettingControl(
+            &rainFixedUi,
+            "effects.droplets_enabled",
+            invisible_places::water::WaterFeatureFixedSettingValue{
+                settings.vegetationEffectsEnabled},
+            [&]() {
+                return ImGui::Checkbox(
+                    "Droplets",
+                    &fixedRainSettings->vegetationEffectsEnabled);
+            },
+            [&]() -> invisible_places::water::
+                WaterFeatureFixedSettingValue {
+                return fixedRainSettings->vegetationEffectsEnabled;
+            }));
         DrawWaterProfileBaseBoolHint(
-            settings.vegetationEffectsEnabled,
+            fixedRainSettings->vegetationEffectsEnabled,
             savedBaseSettings.has_value()
                 ? std::optional<bool>{
                       savedBaseSettings->vegetationEffectsEnabled}
@@ -78784,7 +80089,7 @@ void DrawWaterGpuRainPanel(
             ImGuiSliderFlags_None,
             "Scales vegetation-impact droplets on every rendered cloud "
             "inside the Droplets height band.");
-        if (!settings.impactEffectsEnabled) {
+        if (!fixedRainSettings->impactEffectsEnabled) {
             ImGui::EndDisabled();
         }
         EndPanelSection();
@@ -79112,6 +80417,17 @@ void DrawWaterGpuRainPanel(
             ImGui::TextDisabled("%s", warning.c_str());
         }
         EndPanelSection();
+    }
+    if (rainFixedUi.stateChanged) {
+        water.seepageParamsFingerprints.clear();
+        runtimeState->previewRenderStateSignatureValid = false;
+        viewport->ResetRainRuntime();
+        if (rainFixedUi.activeVariant != nullptr) {
+            runtimeState->statusMessage =
+                "Updated fixed Rain settings in variant " +
+                rainFixedUi.activeVariant->name + ".";
+            runtimeState->errorMessage.clear();
+        }
     }
     if (liveChanged) {
         if (CommitActiveTimingTakeRainEdit(runtimeState) == nullptr) {
@@ -82540,14 +83856,50 @@ void DrawWaterPanel(
                     selectedEmitter->position = {position[0], position[1], position[2]};
                     MarkWaterPathDirty(runtimeState, selectedEmitter->id);
                 }
-                bool activityChanged = false;
-                activityChanged |=
-                    ImGui::Checkbox("Show Trail", &selectedEmitter->showTrail);
+                const invisible_places::water::WaterKeyedFeatureId feature{
+                    .kind = invisible_places::water::WaterKeyedFeatureKind::
+                        FlowSource,
+                    .objectId = selectedEmitter->id};
+                auto flowFixedUi = ResolveWaterFixedVariantUiContext(
+                    runtimeState,
+                    feature);
+                bool effectiveShowTrail = selectedEmitter->showTrail;
                 {
-                    const invisible_places::water::WaterKeyedFeatureId feature{
-                        .kind = invisible_places::water::WaterKeyedFeatureKind::
-                            FlowSource,
-                        .objectId = selectedEmitter->id};
+                    const auto frame = ResolveWaterFrameState(runtimeState);
+                    if (const auto* value = frame.fixedSettingOverlay.Find(
+                            feature,
+                            "show_trail");
+                        value != nullptr) {
+                        if (const auto* typed = std::get_if<bool>(value)) {
+                            effectiveShowTrail = *typed;
+                        }
+                    }
+                }
+                bool* showTrailEdit = flowFixedUi.activeVariant != nullptr
+                    ? &effectiveShowTrail
+                    : &selectedEmitter->showTrail;
+                bool activityChanged = false;
+                const bool showTrailChanged =
+                    DrawWaterVariantFixedSettingControl(
+                        &flowFixedUi,
+                        "show_trail",
+                        invisible_places::water::
+                            WaterFeatureFixedSettingValue{
+                                selectedEmitter->showTrail},
+                        [&]() {
+                            return ImGui::Checkbox(
+                                "Show Trail",
+                                showTrailEdit);
+                        },
+                        [&]() -> invisible_places::water::
+                            WaterFeatureFixedSettingValue {
+                            return *showTrailEdit;
+                        });
+                if (showTrailChanged &&
+                    flowFixedUi.activeVariant == nullptr) {
+                    activityChanged = true;
+                }
+                {
                     float edited = selectedEmitter->maximumFlowStrength;
                     if (DrawKeyedWaterSettingSlider(
                             runtimeState,
@@ -82588,6 +83940,13 @@ void DrawWaterPanel(
                 if (activityChanged) {
                     runtimeState->previewRenderStateSignatureValid = false;
                 }
+                if (flowFixedUi.stateChanged) {
+                    runtimeState->previewRenderStateSignatureValid = false;
+                    runtimeState->statusMessage =
+                        "Updated fixed Flow visibility in variant " +
+                        flowFixedUi.activeVariant->name + ".";
+                    runtimeState->errorMessage.clear();
+                }
                 const auto activityFrame =
                     ResolveWaterFrameState(runtimeState);
                 ImGui::TextDisabled(
@@ -82596,7 +83955,8 @@ void DrawWaterPanel(
                         water,
                         selectedEmitter->id,
                         activityFrame.rawScenarioState,
-                        &activityFrame.featureOverlay));
+                        &activityFrame.featureOverlay,
+                        &activityFrame.fixedSettingOverlay));
                 const auto selectedIndex = water.selectedEmitterIndex.value();
                 const bool movingSelected =
                     water.movingEmitterIndex.has_value() &&
@@ -82750,13 +84110,48 @@ void DrawWaterPanel(
                             water.trailProfiles,
                             source.trailProfileName,
                             water.selectedTrailProfileName));
+                auto flowFixedUi = ResolveWaterFixedVariantUiContext(
+                    runtimeState,
+                    feature);
+                bool effectiveShowTrail = source.showTrail;
+                {
+                    const auto frame = ResolveWaterFrameState(runtimeState);
+                    if (const auto* value = frame.fixedSettingOverlay.Find(
+                            feature,
+                            "show_trail");
+                        value != nullptr) {
+                        if (const auto* typed = std::get_if<bool>(value)) {
+                            effectiveShowTrail = *typed;
+                        }
+                    }
+                }
+                bool* showTrailEdit = flowFixedUi.activeVariant != nullptr
+                    ? &effectiveShowTrail
+                    : &source.showTrail;
                 bool activityChanged = false;
                 bool keyedSettingsChanged = false;
                 bool responsiveBaseChanged = false;
                 BeginWaterRegenerativeSettingLabels(pathInRun);
-                activityChanged |=
-                    ImGui::Checkbox("Show Trail", &source.showTrail);
+                const bool showTrailChanged =
+                    DrawWaterVariantFixedSettingControl(
+                        &flowFixedUi,
+                        "show_trail",
+                        invisible_places::water::
+                            WaterFeatureFixedSettingValue{source.showTrail},
+                        [&]() {
+                            return ImGui::Checkbox(
+                                "Show Trail",
+                                showTrailEdit);
+                        },
+                        [&]() -> invisible_places::water::
+                            WaterFeatureFixedSettingValue {
+                            return *showTrailEdit;
+                        });
                 EndWaterRegenerativeSettingLabels(pathInRun);
+                if (showTrailChanged &&
+                    flowFixedUi.activeVariant == nullptr) {
+                    activityChanged = true;
+                }
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
                     ImGui::SetTooltip(
                         "Immediate authored visibility. Key Maximum Flow Strength to zero for an animated fade; this switch is not keyed.");
@@ -82928,6 +84323,13 @@ void DrawWaterPanel(
                 if (activityChanged) {
                     runtimeState->previewRenderStateSignatureValid = false;
                 }
+                if (flowFixedUi.stateChanged) {
+                    runtimeState->previewRenderStateSignatureValid = false;
+                    runtimeState->statusMessage =
+                        "Updated fixed Flow visibility in variant " +
+                        flowFixedUi.activeVariant->name + ".";
+                    runtimeState->errorMessage.clear();
+                }
                 if (responsiveBaseChanged) {
                     RefreshResolvedWaterFlowSourceSettings(runtimeState);
                     runtimeState->statusMessage =
@@ -82948,7 +84350,8 @@ void DrawWaterPanel(
                         water,
                         source.id,
                         activityFrame.rawScenarioState,
-                        &activityFrame.featureOverlay));
+                        &activityFrame.featureOverlay,
+                        &activityFrame.fixedSettingOverlay));
                 bool refreshTrails = false;
                 BeginWaterRegenerativeSettingLabels(pathInRun);
                 if (ImGui::Checkbox("Use Surface Guide", &source.useSurfaceGuide)) {
@@ -91358,56 +92761,178 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                 entry.waterFeatureTimingRuns.size()) {
             timings.selectedFeatureRunIndex.reset();
         }
-        for (std::size_t index = 0U;
-             index < entry.waterFeatureTimingRuns.size();
-             ++index) {
-            auto& run = entry.waterFeatureTimingRuns[index];
-            ImGui::PushID(static_cast<int>(run.id));
-            const bool selected =
-                timings.selectedFeatureRunIndex == index;
-            std::size_t keyCount = 0U;
-            for (const auto& timeline : run.features) {
-                for (const auto& setting : timeline.settings) {
-                    keyCount += setting.keys.size();
+        std::array<std::size_t, 2U> animationColumns{};
+        std::array<std::filesystem::path, 2U> animationColumnPaths{};
+        std::size_t animationColumnCount = 0U;
+        if (const auto pair = ResolveActiveAnimationLinkedPair(*runtimeState);
+            pair.has_value()) {
+            animationColumns = pair->memberRegistryIndices;
+            animationColumnPaths = pair->memberFilePaths;
+            animationColumnCount = 2U;
+        } else if (!runtimeState->animationPanel.currentFilePath.empty()) {
+            const auto index = FindAnimationRegistryIndex(
+                runtimeState->animationPanel,
+                std::filesystem::path{
+                    runtimeState->animationPanel.currentFilePath});
+            if (index.has_value()) {
+                animationColumns[0U] = index.value();
+                animationColumnPaths[0U] =
+                    runtimeState->animationPanel.availableFiles[index.value()];
+                animationColumnCount = 1U;
+            }
+        }
+        const auto selectRunRow = [&](std::size_t index,
+                                      std::uint32_t variantId) {
+            ClearTimingColouriseEditorFocus(runtimeState);
+            timings.selectedFeatureRunIndex = index;
+            timings.selectedFeatureVariantId = variantId;
+            timings.pendingRunDeleteIndex.reset();
+            timings.pendingFeatureVariantDelete.reset();
+            timings.waterRunKeyHelpHover.reset();
+            timings.globalWaterKeyHelpHover.reset();
+            timings.waterRunMarkSelection.reset();
+        };
+        const auto drawVersionCheckbox = [&](
+                                             WaterFeatureTimingRun& run,
+                                             std::uint32_t variantId,
+                                             std::size_t column) {
+            const auto* animation = RegistryAnimationPath(
+                *runtimeState,
+                animationColumns[column]);
+            const auto resolved = animation != nullptr
+                ? invisible_places::water::ResolveWaterFeatureRunSelection(
+                      run,
+                      animation->waterFeatureRunSelections)
+                : invisible_places::water::
+                      ResolvedWaterFeatureRunSelection{.enabled = false};
+            bool checked = resolved.enabled &&
+                resolved.variantId == variantId;
+            ImGui::PushID(static_cast<int>(column));
+            ImGui::PushID(static_cast<int>(variantId));
+            if (ImGui::Checkbox("##AnimationRunVersion", &checked)) {
+                auto* mutableAnimation = MutableRegistryAnimationPath(
+                    runtimeState,
+                    animationColumns[column]);
+                if (mutableAnimation != nullptr) {
+                    SetAnimationWaterFeatureRunSelection(
+                        mutableAnimation,
+                        run.id,
+                        checked,
+                        checked ? variantId : 0U);
+                    invalidateFeatureRunEvaluation();
                 }
             }
-            if (ImGui::Checkbox("##RunEnabled", &run.enabled)) {
-                invalidateFeatureRunEvaluation();
-            }
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+                const auto filename =
+                    animationColumnPaths[column].filename().string();
                 ImGui::SetTooltip(
-                    run.enabled
-                        ? "Run is on. Uncheck to mute it: its water "
-                          "features stop animating and play their base "
-                          "settings, while every key is kept."
-                        : "Run is muted. Its keys are kept but do not "
-                          "drive the water features until checked again.");
-            }
-            ImGui::SameLine();
-            const std::string label =
-                run.name + " (" + std::to_string(run.features.size()) +
-                (run.features.size() == 1U ? " feature, " : " features, ") +
-                std::to_string(keyCount) +
-                (keyCount == 1U ? " key, " : " keys, ") +
-                std::to_string(run.marks.size()) +
-                (run.marks.size() == 1U ? " mark)" : " marks)");
-            if (!run.enabled) {
-                ImGui::PushStyleColor(
-                    ImGuiCol_Text,
-                    ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
-            }
-            if (ImGui::Selectable(label.c_str(), selected)) {
-                ClearTimingColouriseEditorFocus(runtimeState);
-                timings.selectedFeatureRunIndex = index;
-                timings.pendingRunDeleteIndex.reset();
-                timings.waterRunKeyHelpHover.reset();
-                timings.globalWaterKeyHelpHover.reset();
-                timings.waterRunMarkSelection.reset();
-            }
-            if (!run.enabled) {
-                ImGui::PopStyleColor();
+                    "%s animation: %s\nOnly one Base/variant version of this run can be checked.",
+                    column == 0U ? "A" : "B",
+                    filename.c_str());
             }
             ImGui::PopID();
+            ImGui::PopID();
+        };
+
+        if (ImGui::BeginTable(
+                "##FeatureRunHierarchy",
+                static_cast<int>(1U + animationColumnCount),
+                ImGuiTableFlags_BordersInnerV |
+                    ImGuiTableFlags_RowBg |
+                    ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn(
+                "Run / Variant",
+                ImGuiTableColumnFlags_WidthStretch);
+            for (std::size_t column = 0U;
+                 column < animationColumnCount;
+                 ++column) {
+                ImGui::TableSetupColumn(
+                    column == 0U ? "A" : "B",
+                    ImGuiTableColumnFlags_WidthFixed,
+                    28.0F);
+            }
+            ImGui::TableHeadersRow();
+            for (std::size_t index = 0U;
+                 index < entry.waterFeatureTimingRuns.size();
+                 ++index) {
+                auto& run = entry.waterFeatureTimingRuns[index];
+                ImGui::PushID(static_cast<int>(run.id));
+                std::size_t keyCount = 0U;
+                for (const auto& timeline : run.features) {
+                    for (const auto& setting : timeline.settings) {
+                        keyCount += setting.keys.size();
+                    }
+                }
+                const std::string label =
+                    run.name + " / Base Run (" +
+                    std::to_string(run.features.size()) +
+                    (run.features.size() == 1U ? " feature, " : " features, ") +
+                    std::to_string(keyCount) +
+                    (keyCount == 1U ? " key)" : " keys)");
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGuiTreeNodeFlags flags =
+                    ImGuiTreeNodeFlags_DefaultOpen |
+                    ImGuiTreeNodeFlags_OpenOnArrow |
+                    ImGuiTreeNodeFlags_SpanFullWidth;
+                if (timings.selectedFeatureRunIndex == index &&
+                    timings.selectedFeatureVariantId == 0U) {
+                    flags |= ImGuiTreeNodeFlags_Selected;
+                }
+                if (run.variants.empty()) {
+                    flags |= ImGuiTreeNodeFlags_Leaf |
+                        ImGuiTreeNodeFlags_NoTreePushOnOpen;
+                }
+                const bool open = ImGui::TreeNodeEx(
+                    "##BaseRunRow",
+                    flags,
+                    "%s",
+                    label.c_str());
+                if (ImGui::IsItemClicked() &&
+                    !ImGui::IsItemToggledOpen()) {
+                    selectRunRow(index, 0U);
+                }
+                for (std::size_t column = 0U;
+                     column < animationColumnCount;
+                     ++column) {
+                    ImGui::TableSetColumnIndex(
+                        static_cast<int>(column + 1U));
+                    drawVersionCheckbox(run, 0U, column);
+                }
+                if (open && !run.variants.empty()) {
+                    for (const auto& variant : run.variants) {
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGuiTreeNodeFlags childFlags =
+                            ImGuiTreeNodeFlags_Leaf |
+                            ImGuiTreeNodeFlags_NoTreePushOnOpen |
+                            ImGuiTreeNodeFlags_SpanFullWidth;
+                        if (timings.selectedFeatureRunIndex == index &&
+                            timings.selectedFeatureVariantId == variant.id) {
+                            childFlags |= ImGuiTreeNodeFlags_Selected;
+                        }
+                        ImGui::TreeNodeEx(
+                            reinterpret_cast<void*>(
+                                static_cast<std::uintptr_t>(variant.id)),
+                            childFlags,
+                            "%s",
+                            variant.name.c_str());
+                        if (ImGui::IsItemClicked()) {
+                            selectRunRow(index, variant.id);
+                        }
+                        for (std::size_t column = 0U;
+                             column < animationColumnCount;
+                             ++column) {
+                            ImGui::TableSetColumnIndex(
+                                static_cast<int>(column + 1U));
+                            drawVersionCheckbox(run, variant.id, column);
+                        }
+                    }
+                    ImGui::TreePop();
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
         }
         InputTextString("New Run Name", &timings.newFeatureRunNameBuffer);
         ImGui::SameLine();
@@ -91421,6 +92946,7 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
             entry.waterFeatureTimingRuns.push_back(std::move(run));
             timings.selectedFeatureRunIndex =
                 entry.waterFeatureTimingRuns.size() - 1U;
+            timings.selectedFeatureVariantId = 0U;
             timings.waterRunKeyHelpHover.reset();
             timings.globalWaterKeyHelpHover.reset();
             timings.waterRunMarkSelection.reset();
@@ -91431,41 +92957,170 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
             auto& run = entry.waterFeatureTimingRuns[
                 timings.selectedFeatureRunIndex.value()];
             ImGui::Separator();
-            InputTextString("Run Name", &run.name);
-            if (!run.enabled) {
-                ImGui::TextDisabled(
-                    "Muted: this run's features play their base settings. "
-                    "Keys stay editable here and return when re-enabled.");
+            auto* selectedVariant =
+                invisible_places::water::FindWaterFeatureRunVariant(
+                    &run,
+                    timings.selectedFeatureVariantId);
+            if (timings.selectedFeatureVariantId != 0U &&
+                selectedVariant == nullptr) {
+                timings.selectedFeatureVariantId = 0U;
             }
-            const bool deleteArmed =
-                timings.pendingRunDeleteIndex ==
-                timings.selectedFeatureRunIndex;
-            if (ImGui::Button(
-                    deleteArmed ? "Confirm Delete Run" : "Delete Run")) {
+            if (timings.selectedFeatureVariantId == 0U) {
+                InputTextString("Run Name", &run.name);
+                const bool deleteArmed =
+                    timings.pendingRunDeleteIndex ==
+                    timings.selectedFeatureRunIndex;
+                if (ImGui::Button(
+                        deleteArmed
+                            ? "Confirm Delete Run"
+                            : "Delete Run")) {
+                    if (deleteArmed) {
+                        const auto deletedRunId = run.id;
+                        for (std::size_t animationIndex = 0U;
+                             animationIndex < runtimeState->animationPanel
+                                 .availableFiles.size();
+                             ++animationIndex) {
+                            const auto* animation = RegistryAnimationPath(
+                                *runtimeState,
+                                animationIndex);
+                            if (animation == nullptr ||
+                                std::none_of(
+                                    animation->waterFeatureRunSelections.begin(),
+                                    animation->waterFeatureRunSelections.end(),
+                                    [deletedRunId](const auto& selection) {
+                                        return selection.runId == deletedRunId;
+                                    })) {
+                                continue;
+                            }
+                            RemoveAnimationWaterFeatureRunSelection(
+                                MutableRegistryAnimationPath(
+                                    runtimeState,
+                                    animationIndex),
+                                deletedRunId);
+                        }
+                        entry.waterFeatureTimingRuns.erase(
+                            entry.waterFeatureTimingRuns.begin() +
+                            static_cast<std::ptrdiff_t>(
+                                timings.selectedFeatureRunIndex.value()));
+                        timings.selectedFeatureRunIndex.reset();
+                        timings.selectedFeatureVariantId = 0U;
+                        timings.pendingRunDeleteIndex.reset();
+                        timings.waterRunKeyHelpHover.reset();
+                        timings.globalWaterKeyHelpHover.reset();
+                        timings.waterRunMarkSelection.reset();
+                        timings.waterRunMarkDrag.reset();
+                        timings.waterRunMarkEdit.reset();
+                        timings.waterRunMarkHelpHover.reset();
+                        invalidateFeatureRunEvaluation();
+                    } else {
+                        timings.pendingRunDeleteIndex =
+                            timings.selectedFeatureRunIndex;
+                    }
+                }
                 if (deleteArmed) {
-                    entry.waterFeatureTimingRuns.erase(
-                        entry.waterFeatureTimingRuns.begin() +
-                        static_cast<std::ptrdiff_t>(
-                            timings.selectedFeatureRunIndex.value()));
-                    timings.selectedFeatureRunIndex.reset();
-                    timings.pendingRunDeleteIndex.reset();
-                    timings.waterRunKeyHelpHover.reset();
-                    timings.globalWaterKeyHelpHover.reset();
-                    timings.waterRunMarkSelection.reset();
-                    timings.waterRunMarkDrag.reset();
-                    timings.waterRunMarkEdit.reset();
-                    timings.waterRunMarkHelpHover.reset();
-                    invalidateFeatureRunEvaluation();
-                } else {
-                    timings.pendingRunDeleteIndex =
-                        timings.selectedFeatureRunIndex;
+                    ImGui::SameLine();
+                    ImGui::TextDisabled(
+                        "Deletes this run, every variant, and its shared keys.");
+                }
+            } else if (selectedVariant != nullptr) {
+                InputTextString("Variant Name", &selectedVariant->name);
+                const auto deletionKey = std::pair{
+                    run.id, selectedVariant->id};
+                const bool deleteArmed =
+                    timings.pendingFeatureVariantDelete == deletionKey;
+                if (ImGui::Button(
+                        deleteArmed
+                            ? "Confirm Delete Variant"
+                            : "Delete Variant")) {
+                    if (!deleteArmed) {
+                        timings.pendingFeatureVariantDelete = deletionKey;
+                    } else {
+                        const auto deletedVariantId = selectedVariant->id;
+                        for (std::size_t animationIndex = 0U;
+                             animationIndex < runtimeState->animationPanel
+                                 .availableFiles.size();
+                             ++animationIndex) {
+                            const auto* animation = RegistryAnimationPath(
+                                *runtimeState,
+                                animationIndex);
+                            if (animation == nullptr) {
+                                continue;
+                            }
+                            const auto reference = std::find_if(
+                                animation->waterFeatureRunSelections.begin(),
+                                animation->waterFeatureRunSelections.end(),
+                                [&](const auto& selection) {
+                                    return selection.runId == run.id &&
+                                        selection.enabled &&
+                                        selection.variantId == deletedVariantId;
+                                });
+                            if (reference ==
+                                animation->waterFeatureRunSelections.end()) {
+                                continue;
+                            }
+                            SetAnimationWaterFeatureRunSelection(
+                                MutableRegistryAnimationPath(
+                                    runtimeState,
+                                    animationIndex),
+                                run.id,
+                                true,
+                                0U);
+                        }
+                        std::erase_if(
+                            run.variants,
+                            [deletedVariantId](const auto& variant) {
+                                return variant.id == deletedVariantId;
+                            });
+                        timings.selectedFeatureVariantId = 0U;
+                        timings.pendingFeatureVariantDelete.reset();
+                        runtimeState->statusMessage =
+                            "Deleted the variant; saved animation references now use Base Run.";
+                        runtimeState->errorMessage.clear();
+                        invalidateFeatureRunEvaluation();
+                    }
+                }
+                if (deleteArmed) {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled(
+                        "Its remembered detached values will be removed.");
                 }
             }
-            if (deleteArmed) {
-                ImGui::SameLine();
-                ImGui::TextDisabled(
-                    "Deletes this run and its keys for this Timing Take and scene only.");
+
+            InputTextString(
+                "New Variant Name",
+                &timings.newFeatureVariantNameBuffer);
+            ImGui::SameLine();
+            if (ImGui::Button("New Variant")) {
+                const auto id = invisible_places::water::
+                    AllocateWaterFeatureRunVariantId(&run);
+                if (id != 0U) {
+                    auto name = timings.newFeatureVariantNameBuffer.empty()
+                        ? "Variant " + std::to_string(id)
+                        : timings.newFeatureVariantNameBuffer;
+                    std::size_t suffix = 2U;
+                    const auto stem = name;
+                    while (std::any_of(
+                        run.variants.begin(),
+                        run.variants.end(),
+                        [&](const auto& variant) {
+                            return variant.name == name;
+                        })) {
+                        name = stem + " " + std::to_string(suffix++);
+                    }
+                    run.variants.push_back({
+                        .id = id,
+                        .name = std::move(name),
+                    });
+                    timings.selectedFeatureVariantId = id;
+                    timings.newFeatureVariantNameBuffer.clear();
+                    timings.pendingFeatureVariantDelete.reset();
+                    runtimeState->statusMessage =
+                        "Created an inheriting variant. Existing animation choices were unchanged.";
+                    runtimeState->errorMessage.clear();
+                }
             }
+            DrawTimingControlTooltip(
+                "A new variant inherits every Base setting until a fixed setting is edited or double-clicked.");
         }
 
         if (timings.selectedFeatureRunIndex.has_value()) {
@@ -92118,6 +93773,14 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                                     [&](const auto& timeline) {
                                         return timeline.feature == feature;
                                     });
+                                for (auto& variant : existingRun.variants) {
+                                    std::erase_if(
+                                        variant.overrides,
+                                        [&](const auto& overrideValue) {
+                                            return overrideValue.feature ==
+                                                feature;
+                                        });
+                                }
                             }
                         } else {
                             std::erase_if(
@@ -92125,6 +93788,14 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                                 [&](const auto& timeline) {
                                     return timeline.feature == feature;
                                 });
+                            for (auto& variant : imported.variants) {
+                                std::erase_if(
+                                    variant.overrides,
+                                    [&](const auto& overrideValue) {
+                                        return overrideValue.feature ==
+                                            feature;
+                                    });
+                            }
                         }
                     }
                     entry.waterFeatureTimingRuns.push_back(
@@ -107537,7 +109208,7 @@ void DrawFocusedWaterRunCombo(
                       entry->waterFeatureTimingRuns,
                       feature.value())
             : nullptr;
-    const std::string preview =
+    const std::string runPreview =
         !feature.has_value()
             ? "No water feature in focus"
             : scenarioId.empty()
@@ -107545,85 +109216,156 @@ void DrawFocusedWaterRunCombo(
                   : currentRun != nullptr
                         ? currentRun->name
                         : "Not in a run";
-
-    ImGui::SetNextItemWidth(-FLT_MIN);
-    const bool available =
+    const bool runAvailable =
         feature.has_value() && !scenarioId.empty() &&
         entry != nullptr && !entry->waterFeatureTimingRuns.empty();
     const bool renderSetupReadOnly =
         RenderSetupAuthoringLocked(runtimeState);
-    ImGui::BeginDisabled(!available || renderSetupReadOnly);
-    if (ImGui::BeginCombo(
-            "Water Run##FocusedWaterRun",
-            preview.c_str())) {
-        if (currentRun == nullptr) {
-            ImGui::TextDisabled("Not in a run");
-            ImGui::Separator();
-        }
-        for (const auto& run : entry->waterFeatureTimingRuns) {
-            const bool selected =
-                currentRun != nullptr &&
-                currentRun->id == run.id;
-            if (ImGui::Selectable(
-                    run.name.c_str(),
-                    selected)) {
-                auto& mutableEntry =
-                    EnsureScenarioFeatureRuns(
+    const auto authority = ResolveWaterVariantAnimationAuthority(
+        *runtimeState);
+    const auto resolvedSelection = currentRun != nullptr &&
+            authority.path != nullptr
+        ? invisible_places::water::ResolveWaterFeatureRunSelection(
+              *currentRun,
+              authority.path->waterFeatureRunSelections)
+        : invisible_places::water::ResolvedWaterFeatureRunSelection{};
+    const std::string variantPreview = currentRun == nullptr
+        ? "Base Run"
+        : !resolvedSelection.enabled
+              ? "Off"
+              : resolvedSelection.variant != nullptr
+                    ? resolvedSelection.variant->name
+                    : "Base Run";
+
+    if (ImGui::BeginTable(
+            "##FocusedWaterRunAndVariant",
+            2,
+            ImGuiTableFlags_SizingStretchSame)) {
+        ImGui::TableNextColumn();
+        ImGui::TextDisabled("Water Run");
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::BeginDisabled(!runAvailable || renderSetupReadOnly);
+        if (ImGui::BeginCombo(
+                "##FocusedWaterRun",
+                runPreview.c_str())) {
+            if (currentRun == nullptr) {
+                ImGui::TextDisabled("Not in a run");
+                ImGui::Separator();
+            }
+            for (const auto& run : entry->waterFeatureTimingRuns) {
+                const bool selected =
+                    currentRun != nullptr && currentRun->id == run.id;
+                if (ImGui::Selectable(run.name.c_str(), selected)) {
+                    auto& mutableEntry = EnsureScenarioFeatureRuns(
                         &water,
                         scenarioId);
-                if (invisible_places::timing::
-                        AssignWaterFeatureToTimingRun(
-                            &mutableEntry,
-                            feature.value(),
-                            run.id)) {
-                    const auto featureLabel =
-                        WaterKeyedFeatureDisplayLabel(
-                            *runtimeState,
-                            feature.value());
-                    runtimeState->statusMessage =
-                        featureLabel + " now belongs to " +
-                        run.name + ".";
-                    runtimeState->errorMessage.clear();
-                    ApplyFeatureTimelineScrub(runtimeState);
-                    InvalidateWaterSeepageParams(&water);
-                    runtimeState
-                        ->previewRenderStateSignatureValid =
-                        false;
+                    if (invisible_places::timing::
+                            AssignWaterFeatureToTimingRun(
+                                &mutableEntry,
+                                feature.value(),
+                                run.id)) {
+                        runtimeState->statusMessage =
+                            WaterKeyedFeatureDisplayLabel(
+                                *runtimeState,
+                                feature.value()) +
+                            " now belongs to " + run.name + ".";
+                        runtimeState->errorMessage.clear();
+                        ApplyFeatureTimelineScrub(runtimeState);
+                        InvalidateWaterSeepageParams(&water);
+                        runtimeState->previewRenderStateSignatureValid =
+                            false;
+                    }
+                }
+                if (selected) {
+                    ImGui::SetItemDefaultFocus();
                 }
             }
-            if (selected) {
-                ImGui::SetItemDefaultFocus();
+            ImGui::EndCombo();
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(
+                ImGuiHoveredFlags_DelayNormal |
+                ImGuiHoveredFlags_AllowWhenDisabled)) {
+            if (renderSetupReadOnly) {
+                ImGui::SetTooltip(
+                    "Loaded render setups are read-only. Clear the setup in Export before changing run assignments.");
+            } else if (!feature.has_value()) {
+                ImGui::SetTooltip(
+                    "Select a keyable Water feature or source first.");
+            } else if (scenarioId.empty()) {
+                ImGui::SetTooltip(
+                    "Choose a Timing Take for the loaded animation first.");
+            } else if (!runAvailable) {
+                ImGui::SetTooltip(
+                    "Create a Feature Run in Timings, then assign this feature here.");
+            } else {
+                ImGui::SetTooltip(
+                    "Assign the focused Water feature to a shared run.");
             }
         }
-        ImGui::EndCombo();
-    }
-    ImGui::EndDisabled();
-    if (ImGui::IsItemHovered(
-            ImGuiHoveredFlags_DelayNormal |
-            ImGuiHoveredFlags_AllowWhenDisabled)) {
-        if (renderSetupReadOnly) {
-            ImGui::SetTooltip(
-                "Loaded render setups are read-only. Clear the setup in Export before changing run assignments.");
-        } else if (!feature.has_value()) {
-            ImGui::SetTooltip(
-                "Select a keyable Water feature or source first.");
-        } else if (scenarioId.empty()) {
-            ImGui::SetTooltip(
-                "Choose a Timing Take for the loaded animation first.");
-        } else if (
-            entry == nullptr ||
-            entry->waterFeatureTimingRuns.empty()) {
-            ImGui::SetTooltip(
-                "Create a feature run in the Timings tab, then assign %s here.",
-                WaterKeyedFeatureDisplayLabel(
-                    *runtimeState,
-                    feature.value())
-                    .c_str());
-        } else {
-            ImGui::SetTooltip(
-                "Assign the focused water feature to a run, or move it "
-                "between runs while preserving all active and dormant keys.");
+
+        ImGui::TableNextColumn();
+        ImGui::TextDisabled("Variant");
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        const bool variantAvailable = currentRun != nullptr &&
+            authority.path != nullptr &&
+            authority.registryIndex.has_value();
+        ImGui::BeginDisabled(
+            !variantAvailable || renderSetupReadOnly ||
+            authority.variantEditingLocked);
+        if (ImGui::BeginCombo(
+                "##FocusedWaterVariant",
+                variantPreview.c_str())) {
+            const auto choose = [&](bool enabled, std::uint32_t variantId) {
+                auto* path = MutableRegistryAnimationPath(
+                    runtimeState,
+                    authority.registryIndex.value());
+                if (path == nullptr) {
+                    return;
+                }
+                SetAnimationWaterFeatureRunSelection(
+                    path,
+                    currentRun->id,
+                    enabled,
+                    variantId);
+                ApplyFeatureTimelineScrub(runtimeState);
+                InvalidateWaterSeepageParams(&water);
+                runtimeState->previewRenderStateSignatureValid = false;
+            };
+            if (ImGui::Selectable(
+                    "Off",
+                    !resolvedSelection.enabled)) {
+                choose(false, 0U);
+            }
+            if (ImGui::Selectable(
+                    "Base Run",
+                    resolvedSelection.enabled &&
+                        resolvedSelection.variantId == 0U)) {
+                choose(true, 0U);
+            }
+            for (const auto& variant : currentRun->variants) {
+                if (ImGui::Selectable(
+                        variant.name.c_str(),
+                        resolvedSelection.enabled &&
+                            resolvedSelection.variantId == variant.id)) {
+                    choose(true, variant.id);
+                }
+            }
+            ImGui::EndCombo();
         }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(
+                ImGuiHoveredFlags_DelayNormal |
+                ImGuiHoveredFlags_AllowWhenDisabled)) {
+            if (authority.variantEditingLocked) {
+                ImGui::SetTooltip(
+                    "Seam view uses the loaded animation's saved version for both halves. Switch to A, B, or A/B to change a member's version.");
+            } else {
+                ImGui::SetTooltip(
+                    "Choose Off, Base Run, or a saved variant for the animation currently shown in the viewport.");
+            }
+        }
+        ImGui::EndTable();
     }
     ImGui::Spacing();
 }
@@ -109669,18 +111411,40 @@ bool PreviewLiveVisualEffectsRequireSceneRedraw(
     auto effectiveRain = runtimeState.water.collisionRainSettings;
     auto scenario = ResolveActiveWaterScenarioState(runtimeState);
     invisible_places::water::WaterFeatureTimingOverlay overlay;
+    invisible_places::water::WaterFeatureFixedSettingOverlay fixedOverlay;
     const invisible_places::water::WaterFeatureTimingOverlay* overlayPtr =
         nullptr;
     if (const auto* entry = FindScenarioFeatureRuns(
             runtimeState.water,
             ActiveWaterTimingScenarioId(runtimeState));
         entry != nullptr) {
+        const auto* presentedAnimation =
+            ResolvePresentedAnimationPathForWater(runtimeState);
+        const auto selections = presentedAnimation != nullptr
+            ? std::span{
+                  presentedAnimation->waterFeatureRunSelections.data(),
+                  presentedAnimation->waterFeatureRunSelections.size()}
+            : std::span<const invisible_places::water::
+                  WaterFeatureRunSelection>{};
+        const auto materializedRuns = invisible_places::water::
+            MaterializeWaterFeatureTimingRunSelections(
+                entry->waterFeatureTimingRuns,
+                selections);
         overlay = invisible_places::water::BuildWaterFeatureTimingOverlay(
-            entry->waterFeatureTimingRuns,
+            materializedRuns,
             CurrentAuthoredTrackPosition(runtimeState),
             CurrentAnimationTimingIsCyclic(runtimeState),
             entry->onlyShowWaterFeaturesInRuns);
+        fixedOverlay = invisible_places::water::
+            BuildWaterFeatureFixedSettingOverlay(
+                entry->waterFeatureTimingRuns,
+                selections);
         overlayPtr = &overlay;
+        invisible_places::water::
+            ApplyWaterFeatureFixedSettingOverlayToRainSettings(
+                fixedOverlay,
+                &effectiveRain,
+                nullptr);
         invisible_places::water::ApplyWaterFeatureTimingOverlayToRainSettings(
             overlay,
             &effectiveRain,
@@ -109725,7 +111489,8 @@ bool PreviewLiveVisualEffectsRequireSceneRedraw(
         ResolveShorelinesForFrame(
             runtimeState.water.shorelineInstances,
             overlayPtr,
-            scenario);
+            scenario,
+            &fixedOverlay);
 
     for (std::size_t sessionIndex = 0; sessionIndex < runtimeState.sessions.size(); ++sessionIndex) {
         const auto& session = runtimeState.sessions[sessionIndex];
@@ -109838,6 +111603,10 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
     const auto* activeColouriseEffects =
         ActiveTimingColouriseEffects(runtimeState);
     renderState.rainVisual = runtimeState.water.rainVisual;
+    invisible_places::water::ApplyWaterFeatureFixedSettingOverlayToRainSettings(
+        waterFrame.fixedSettingOverlay,
+        &renderState.rainSettings,
+        &renderState.rainVisual);
     invisible_places::water::ApplyWaterFeatureTimingOverlayToRainSettings(
         waterFrame.featureOverlay,
         &renderState.rainSettings,
@@ -109846,7 +111615,8 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
     const auto resolvedShorelines = ResolveShorelinesForFrame(
         runtimeState.water.shorelineInstances,
         &waterFrame.featureOverlay,
-        activeWaterScenario);
+        activeWaterScenario,
+        &waterFrame.fixedSettingOverlay);
     if (resolvedShorelines.size() > 1U) {
         renderState.additionalShorelines.assign(
             resolvedShorelines.begin() + 1,
@@ -109911,7 +111681,8 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                 session,
                 activeWaterScenario,
                 &renderStyle,
-                &waterFrame.featureOverlay);
+                &waterFrame.featureOverlay,
+                &waterFrame.fixedSettingOverlay);
             ClearPointCloudStyleShoreline(&renderStyle);
             const bool sessionIsWaterFill =
                 IsWaterFillPointCloudSession(session);
@@ -110031,7 +111802,8 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                 baseSession,
                 activeWaterScenario,
                 &renderStyle,
-                &waterFrame.featureOverlay);
+                &waterFrame.featureOverlay,
+                &waterFrame.fixedSettingOverlay);
             ClearPointCloudStyleShoreline(&renderStyle);
             renderState.pointCloudLayers.push_back(
                 {.layerId = patch.layerId,
@@ -118147,6 +119919,10 @@ std::optional<WaterIntegrationCapturedFrame> RenderWaterIntegrationOfflineCompar
 
     auto rainSettings = runtimeState->water.collisionRainSettings;
     auto rainVisual = runtimeState->water.rainVisual;
+    invisible_places::water::ApplyWaterFeatureFixedSettingOverlayToRainSettings(
+        frameState.fixedSettingOverlay,
+        &rainSettings,
+        &rainVisual);
     invisible_places::water::ApplyWaterFeatureTimingOverlayToRainSettings(
         frameState.featureOverlay,
         &rainSettings,

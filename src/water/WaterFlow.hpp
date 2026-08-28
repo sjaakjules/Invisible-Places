@@ -19,6 +19,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 #include <glm/mat3x3.hpp>
@@ -549,6 +550,47 @@ struct WaterKeyedFeatureId {
         const WaterKeyedFeatureId&) = default;
 };
 
+// Fixed (non-keyable) settings use one type-safe carrier for project-owned
+// run variants. The value deliberately stays independent of renderer/UI
+// types so animation files and Timing Takes can retain remembered overrides
+// even when the corresponding feature is not currently loaded.
+using WaterFeatureFixedSettingValue = std::variant<
+    bool,
+    std::int64_t,
+    std::uint64_t,
+    double,
+    std::string,
+    std::array<float, 2U>,
+    std::array<float, 3U>,
+    std::array<float, 4U>>;
+
+enum class WaterFeatureFixedSettingInvalidation : std::uint8_t {
+    LiveUpdate = 0,
+    RainReset,
+    CacheInvalidation,
+    Rebuild,
+};
+
+// Stable-setting descriptors are intentionally small. Feature-specific
+// authoring code owns the typed read/write conversion while this common
+// metadata gives variant edits the same invalidation path as Base edits.
+struct WaterFeatureFixedSettingDescriptor {
+    std::string_view id;
+    WaterFeatureFixedSettingInvalidation invalidation =
+        WaterFeatureFixedSettingInvalidation::LiveUpdate;
+};
+
+// Canonical registry for fixed settings that may be detached by a run
+// variant. IDs are serialization/runtime identities and therefore must never
+// be repurposed. Keyable settings are intentionally absent: their per-frame
+// tracks remain shared by Base and every variant.
+[[nodiscard]] std::span<const WaterFeatureFixedSettingDescriptor>
+WaterFeatureFixedSettings(WaterKeyedFeatureKind kind);
+[[nodiscard]] const WaterFeatureFixedSettingDescriptor*
+FindWaterFeatureFixedSetting(
+    WaterKeyedFeatureKind kind,
+    std::string_view settingId);
+
 struct WaterSettingKey {
     float position = 0.0F;
     float value = 0.0F;
@@ -746,6 +788,30 @@ struct WaterFeatureRunMark {
     float position = 0.0F;
 };
 
+struct WaterFeatureRunVariantOverride {
+    WaterKeyedFeatureId feature{};
+    std::string settingId;
+    WaterFeatureFixedSettingValue value{false};
+    // False records remain serialized. They are the remembered value used
+    // if this setting is detached again later.
+    bool detached = true;
+
+    friend bool operator==(
+        const WaterFeatureRunVariantOverride&,
+        const WaterFeatureRunVariantOverride&) = default;
+};
+
+struct WaterFeatureRunVariant {
+    // Zero is permanently reserved for Base Run.
+    std::uint32_t id = 0U;
+    std::string name = "Variant";
+    std::vector<WaterFeatureRunVariantOverride> overrides;
+
+    friend bool operator==(
+        const WaterFeatureRunVariant&,
+        const WaterFeatureRunVariant&) = default;
+};
+
 struct WaterFeatureTimingRun {
     std::uint32_t id = 0U;
     std::string name = "Run";
@@ -755,6 +821,42 @@ struct WaterFeatureTimingRun {
     bool enabled = true;
     std::vector<WaterFeatureTimeline> features;
     std::vector<WaterFeatureRunMark> marks;
+    std::vector<WaterFeatureRunVariant> variants;
+    // Monotonic allocator: deleting a variant never makes its id reusable.
+    std::uint32_t nextVariantId = 1U;
+};
+
+// Animation-owned choice for one project-owned run. An absent record is the
+// legacy state and resolves through WaterFeatureTimingRun::enabled; explicit
+// records distinguish Off from Base Run. variantId zero always means Base.
+struct WaterFeatureRunSelection {
+    std::uint32_t runId = 0U;
+    bool enabled = true;
+    std::uint32_t variantId = 0U;
+
+    friend bool operator==(
+        const WaterFeatureRunSelection&,
+        const WaterFeatureRunSelection&) = default;
+};
+
+struct ResolvedWaterFeatureRunSelection {
+    bool enabled = true;
+    std::uint32_t variantId = 0U;
+    const WaterFeatureRunVariant* variant = nullptr;
+};
+
+struct WaterFeatureFixedSettingSample {
+    WaterKeyedFeatureId feature{};
+    std::string settingId;
+    WaterFeatureFixedSettingValue value{false};
+};
+
+struct WaterFeatureFixedSettingOverlay {
+    std::vector<WaterFeatureFixedSettingSample> samples;
+
+    [[nodiscard]] const WaterFeatureFixedSettingValue* Find(
+        const WaterKeyedFeatureId& feature,
+        std::string_view settingId) const;
 };
 
 struct WaterScenarioFeatureRuns {
@@ -937,6 +1039,51 @@ SanitizeWaterKeyedSettingsProfileLibrary(
     std::string_view objectName);
 [[nodiscard]] WaterFeatureTimingRun SanitizeWaterFeatureTimingRun(
     WaterFeatureTimingRun run);
+[[nodiscard]] std::uint32_t AllocateWaterFeatureRunVariantId(
+    WaterFeatureTimingRun* run);
+[[nodiscard]] WaterFeatureRunVariant* FindWaterFeatureRunVariant(
+    WaterFeatureTimingRun* run,
+    std::uint32_t variantId);
+[[nodiscard]] const WaterFeatureRunVariant* FindWaterFeatureRunVariant(
+    const WaterFeatureTimingRun* run,
+    std::uint32_t variantId);
+[[nodiscard]] WaterFeatureRunVariantOverride*
+FindWaterFeatureRunVariantOverride(
+    WaterFeatureRunVariant* variant,
+    const WaterKeyedFeatureId& feature,
+    std::string_view settingId);
+[[nodiscard]] const WaterFeatureRunVariantOverride*
+FindWaterFeatureRunVariantOverride(
+    const WaterFeatureRunVariant* variant,
+    const WaterKeyedFeatureId& feature,
+    std::string_view settingId);
+// Writes rememberedValue and detaches. Reattaching only flips detached,
+// retaining that value for a later detach.
+[[nodiscard]] WaterFeatureRunVariantOverride*
+DetachWaterFeatureRunVariantSetting(
+    WaterFeatureRunVariant* variant,
+    const WaterKeyedFeatureId& feature,
+    std::string_view settingId,
+    WaterFeatureFixedSettingValue rememberedValue);
+[[nodiscard]] bool ReattachWaterFeatureRunVariantSetting(
+    WaterFeatureRunVariant* variant,
+    const WaterKeyedFeatureId& feature,
+    std::string_view settingId);
+[[nodiscard]] std::vector<WaterFeatureRunSelection>
+SanitizeWaterFeatureRunSelections(
+    std::vector<WaterFeatureRunSelection> selections);
+[[nodiscard]] ResolvedWaterFeatureRunSelection
+ResolveWaterFeatureRunSelection(
+    const WaterFeatureTimingRun& run,
+    std::span<const WaterFeatureRunSelection> selections);
+[[nodiscard]] std::vector<WaterFeatureTimingRun>
+MaterializeWaterFeatureTimingRunSelections(
+    std::span<const WaterFeatureTimingRun> runs,
+    std::span<const WaterFeatureRunSelection> selections);
+[[nodiscard]] WaterFeatureFixedSettingOverlay
+BuildWaterFeatureFixedSettingOverlay(
+    std::span<const WaterFeatureTimingRun> runs,
+    std::span<const WaterFeatureRunSelection> selections);
 // Mark ids are unique within a run. Default names are unique across the
 // supplied scene's runs and use the user-facing Mark 00, Mark 01 sequence.
 [[nodiscard]] std::uint32_t AllocateWaterFeatureRunMarkId(
@@ -2178,11 +2325,20 @@ void ApplyWaterFeatureTimingOverlayToRainSettings(
     const WaterFeatureTimingOverlay& overlay,
     WaterRainSettings* settings,
     WaterRainVisualSettings* visual);
+// Applies only variant-owned, non-keyable Rain values. Call this before the
+// keyed overlay so an authored animation track remains the final layer.
+void ApplyWaterFeatureFixedSettingOverlayToRainSettings(
+    const WaterFeatureFixedSettingOverlay& overlay,
+    WaterRainSettings* settings,
+    WaterRainVisualSettings* visual);
 [[nodiscard]] WaterDynamicMeshFlowSettings DefaultWaterDynamicMeshFlowSettings();
 [[nodiscard]] WaterDynamicMeshFlowSettings SanitizeWaterDynamicMeshFlowSettings(
     WaterDynamicMeshFlowSettings settings);
 void ApplyWaterFeatureTimingOverlayToDynamicMeshFlowSettings(
     const WaterFeatureTimingOverlay& overlay,
+    WaterDynamicMeshFlowSettings* settings);
+void ApplyWaterFeatureFixedSettingOverlayToDynamicMeshFlowSettings(
+    const WaterFeatureFixedSettingOverlay& overlay,
     WaterDynamicMeshFlowSettings* settings);
 [[nodiscard]] WaterRainResponseSettings
 ResolveWaterDynamicMeshFlowRainResponse(

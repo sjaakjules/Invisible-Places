@@ -185,7 +185,7 @@ struct AnimationLinkedSeamSample {
 struct AnimationPath {
     // Original file schema retained only for application-level migration
     // bookkeeping. Serialization always writes the current schema.
-    std::uint32_t sourceSchemaVersion = 25U;
+    std::uint32_t sourceSchemaVersion = 26U;
     std::string name = "Animation";
     std::uint32_t durationFrames = 180;
     // Deprecated schema-22 migration marker. A nonzero value identifies the
@@ -214,6 +214,10 @@ struct AnimationPath {
     std::vector<AnimationLocalizedKeyCorrection> localizedKeyCorrections;
     std::string selectedTimingTakeId =
         std::string{invisible_places::timing::kAuthoredTimingTakeId};
+    // Per-animation Base/variant/Off choices for project-owned water runs.
+    // Missing entries retain legacy WaterFeatureTimingRun::enabled behavior.
+    std::vector<invisible_places::water::WaterFeatureRunSelection>
+        waterFeatureRunSelections;
     // Project visual selected when this animation was saved. Empty is the
     // backward-compatible state for older files and leaves the current
     // project visual unchanged when the animation is loaded.

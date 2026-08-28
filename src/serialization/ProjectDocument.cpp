@@ -15,6 +15,7 @@
 #include <optional>
 #include <sstream>
 #include <string_view>
+#include <type_traits>
 #include <unordered_set>
 
 #include <nlohmann/json.hpp>
@@ -2726,6 +2727,44 @@ AnimationExportSettings ParseAnimationExportSettings(const json& settingsJson) {
 json SerializeWaterScenarioTrack(const WaterScenarioTrack& track);
 WaterScenarioTrack ParseWaterScenarioTrack(const json& trackJson);
 
+json SerializeWaterFeatureRunSelections(
+    std::span<const invisible_places::water::WaterFeatureRunSelection>
+        selections) {
+    auto result = json::array();
+    for (const auto& selection : selections) {
+        if (selection.runId == 0U) {
+            continue;
+        }
+        result.push_back({
+            {"run_id", selection.runId},
+            {"enabled", selection.enabled},
+            {"variant_id", selection.variantId},
+        });
+    }
+    return result;
+}
+
+std::vector<invisible_places::water::WaterFeatureRunSelection>
+ParseWaterFeatureRunSelections(const json& selectionsJson) {
+    std::vector<invisible_places::water::WaterFeatureRunSelection>
+        selections;
+    if (!selectionsJson.is_array()) {
+        return selections;
+    }
+    for (const auto& selectionJson : selectionsJson) {
+        if (!selectionJson.is_object()) {
+            continue;
+        }
+        selections.push_back({
+            .runId = selectionJson.value("run_id", 0U),
+            .enabled = selectionJson.value("enabled", true),
+            .variantId = selectionJson.value("variant_id", 0U),
+        });
+    }
+    return invisible_places::water::SanitizeWaterFeatureRunSelections(
+        std::move(selections));
+}
+
 json SerializeAnimationPath(const AnimationPath& path) {
     json pathJson{
         {"schema_version", kAnimationDocumentSchemaVersion},
@@ -2748,6 +2787,11 @@ json SerializeAnimationPath(const AnimationPath& path) {
         {"water_scenario_tracks", json::array()},
         {"keys", json::array()},
     };
+    if (!path.waterFeatureRunSelections.empty()) {
+        pathJson["water_feature_run_selections"] =
+            SerializeWaterFeatureRunSelections(
+                path.waterFeatureRunSelections);
+    }
     if (!path.preferredBlendPartnerFileName.empty()) {
         pathJson["preferred_blend_partner_file_name"] =
             path.preferredBlendPartnerFileName;
@@ -2825,6 +2869,10 @@ AnimationPath ParseAnimationPath(const json& pathJson) {
             pathJson.value(
                 "selected_timing_take_id",
                 path.selectedWaterScenarioId));
+    if (pathJson.contains("water_feature_run_selections")) {
+        path.waterFeatureRunSelections = ParseWaterFeatureRunSelections(
+            pathJson.at("water_feature_run_selections"));
+    }
     if (pathJson.contains("export_settings")) {
         path.exportSettings = ParseAnimationExportSettings(pathJson.at("export_settings"));
     }
@@ -4437,6 +4485,141 @@ ParseWaterFeatureSettingsClip(const json& clipJson) {
     };
 }
 
+json SerializeWaterFeatureFixedSettingValue(
+    const invisible_places::water::WaterFeatureFixedSettingValue& value) {
+    return std::visit(
+        [](const auto& typedValue) -> json {
+            using Value = std::decay_t<decltype(typedValue)>;
+            if constexpr (std::is_same_v<Value, bool>) {
+                return {{"type", "bool"}, {"value", typedValue}};
+            } else if constexpr (std::is_same_v<Value, std::int64_t>) {
+                return {{"type", "int"}, {"value", typedValue}};
+            } else if constexpr (std::is_same_v<Value, std::uint64_t>) {
+                return {{"type", "uint"}, {"value", typedValue}};
+            } else if constexpr (std::is_same_v<Value, double>) {
+                return {{"type", "number"}, {"value", typedValue}};
+            } else if constexpr (std::is_same_v<Value, std::string>) {
+                return {{"type", "enum"}, {"value", typedValue}};
+            } else if constexpr (
+                std::is_same_v<Value, std::array<float, 2U>>) {
+                return {{"type", "vec2"}, {"value", typedValue}};
+            } else if constexpr (
+                std::is_same_v<Value, std::array<float, 3U>>) {
+                return {{"type", "vec3"}, {"value", typedValue}};
+            } else {
+                return {{"type", "colour"}, {"value", typedValue}};
+            }
+        },
+        value);
+}
+
+std::optional<invisible_places::water::WaterFeatureFixedSettingValue>
+ParseWaterFeatureFixedSettingValue(const json& valueJson) {
+    if (!valueJson.is_object() || !valueJson.contains("value")) {
+        return std::nullopt;
+    }
+    const auto type = valueJson.value("type", std::string{});
+    const auto& value = valueJson.at("value");
+    try {
+        if (type == "bool" && value.is_boolean()) {
+            return value.get<bool>();
+        }
+        if (type == "int" && value.is_number_integer()) {
+            return value.get<std::int64_t>();
+        }
+        if (type == "uint" && value.is_number_unsigned()) {
+            return value.get<std::uint64_t>();
+        }
+        if (type == "number" && value.is_number()) {
+            const auto parsed = value.get<double>();
+            return std::isfinite(parsed)
+                ? std::optional<invisible_places::water::
+                      WaterFeatureFixedSettingValue>{parsed}
+                : std::nullopt;
+        }
+        if (type == "enum" && value.is_string()) {
+            return value.get<std::string>();
+        }
+        if (type == "vec2" && value.is_array() && value.size() == 2U) {
+            return value.get<std::array<float, 2U>>();
+        }
+        if (type == "vec3" && value.is_array() && value.size() == 3U) {
+            return value.get<std::array<float, 3U>>();
+        }
+        if (type == "colour" && value.is_array() && value.size() == 4U) {
+            return value.get<std::array<float, 4U>>();
+        }
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+json SerializeWaterFeatureRunVariant(
+    const invisible_places::water::WaterFeatureRunVariant& variant) {
+    auto overridesJson = json::array();
+    for (const auto& overrideValue : variant.overrides) {
+        overridesJson.push_back({
+            {"kind", std::string{
+                invisible_places::water::WaterKeyedFeatureKindName(
+                    overrideValue.feature.kind)}},
+            {"object_id", overrideValue.feature.objectId},
+            {"setting_id", overrideValue.settingId},
+            {"detached", overrideValue.detached},
+            {"typed_value", SerializeWaterFeatureFixedSettingValue(
+                overrideValue.value)},
+        });
+    }
+    return {
+        {"id", variant.id},
+        {"name", variant.name},
+        {"overrides", std::move(overridesJson)},
+    };
+}
+
+std::optional<invisible_places::water::WaterFeatureRunVariant>
+ParseWaterFeatureRunVariant(const json& variantJson) {
+    if (!variantJson.is_object()) {
+        return std::nullopt;
+    }
+    invisible_places::water::WaterFeatureRunVariant variant{
+        .id = variantJson.value("id", 0U),
+        .name = variantJson.value("name", std::string{"Variant"}),
+    };
+    if (variantJson.contains("overrides") &&
+        variantJson.at("overrides").is_array()) {
+        for (const auto& overrideJson : variantJson.at("overrides")) {
+            if (!overrideJson.is_object()) {
+                continue;
+            }
+            const auto kind = invisible_places::water::
+                ParseWaterKeyedFeatureKindName(
+                    overrideJson.value("kind", std::string{}));
+            if (!kind.has_value() ||
+                !overrideJson.contains("typed_value")) {
+                continue;
+            }
+            auto value = ParseWaterFeatureFixedSettingValue(
+                overrideJson.at("typed_value"));
+            const auto settingId = overrideJson.value(
+                "setting_id", std::string{});
+            if (!value.has_value() || settingId.empty()) {
+                continue;
+            }
+            variant.overrides.push_back({
+                .feature = {
+                    .kind = kind.value(),
+                    .objectId = overrideJson.value("object_id", 0U),
+                },
+                .settingId = settingId,
+                .value = std::move(value.value()),
+                .detached = overrideJson.value("detached", true),
+            });
+        }
+    }
+    return variant;
+}
+
 json SerializeWaterFeatureTimingRun(
     const invisible_places::water::WaterFeatureTimingRun& input) {
     const auto run = invisible_places::water::SanitizeWaterFeatureTimingRun(
@@ -4490,6 +4673,17 @@ json SerializeWaterFeatureTimingRun(
         }
         runJson["marks"] = std::move(marksJson);
     }
+    if (!run.variants.empty()) {
+        auto variantsJson = json::array();
+        for (const auto& variant : run.variants) {
+            variantsJson.push_back(
+                SerializeWaterFeatureRunVariant(variant));
+        }
+        runJson["variants"] = std::move(variantsJson);
+    }
+    if (run.nextVariantId > 1U) {
+        runJson["next_variant_id"] = run.nextVariantId;
+    }
     // Enabled is the norm; emitting only the muted state keeps documents
     // with all-enabled runs byte-identical to earlier schema output.
     if (!run.enabled) {
@@ -4504,6 +4698,16 @@ invisible_places::water::WaterFeatureTimingRun ParseWaterFeatureTimingRun(
     run.id = runJson.value("id", 0U);
     run.name = runJson.value("name", std::string{"Run"});
     run.enabled = runJson.value("enabled", true);
+    run.nextVariantId = runJson.value("next_variant_id", 1U);
+    if (runJson.contains("variants") &&
+        runJson.at("variants").is_array()) {
+        for (const auto& variantJson : runJson.at("variants")) {
+            auto variant = ParseWaterFeatureRunVariant(variantJson);
+            if (variant.has_value()) {
+                run.variants.push_back(std::move(variant.value()));
+            }
+        }
+    }
     if (runJson.contains("marks") && runJson.at("marks").is_array()) {
         for (const auto& markJson : runJson.at("marks")) {
             if (!markJson.is_object()) {

@@ -740,6 +740,20 @@ the layer opacity, and slot order remaining the compositing order. Project
 schema 85 introduces the per-edge fades; the remaining state serializes
 additively with omitted defaults.
 
+#### FR-STYLE-19
+Each Water Feature Run shall support project-owned named variants that share
+the run's feature membership, keys, clips, and marks while storing sparse,
+typed overrides only for detached non-keyable settings. Variants shall inherit
+live Base Run values for every attached setting, retain the last detached
+value across reattachment, and expose divergent state directly on the fixed
+controls. Each animation shall independently persist whether each run is Off,
+uses Base Run, or uses one variant; a linked pair shall expose independent A/B
+choices with one active version per run per member. Preview and export shall
+resolve the animation actually presented or rendered, apply fixed overrides
+before shared keyed tracks, and freeze the effective state in render setups.
+Project schema 86 and animation schema 26 introduce these records; missing or
+stale selections safely preserve legacy enabled state or fall back to Base.
+
 ### 5.8 Procedural Motion
 #### FR-MOTION-1
 Dynamic point motion shall be procedural and non-destructive.

@@ -5406,6 +5406,58 @@ void MergeWaterFeatureRunMarksKeepingFirst(
     }
 }
 
+void MergeWaterFeatureRunVariantsKeepingFirst(
+    invisible_places::water::WaterFeatureTimingRun* destination,
+    const invisible_places::water::WaterFeatureTimingRun& source,
+    std::optional<invisible_places::water::WaterKeyedFeatureId>
+        onlyFeature = std::nullopt) {
+    if (destination == nullptr) {
+        return;
+    }
+    destination->nextVariantId = std::max(
+        destination->nextVariantId,
+        source.nextVariantId);
+    for (const auto& sourceVariant : source.variants) {
+        auto destinationVariant = std::find_if(
+            destination->variants.begin(),
+            destination->variants.end(),
+            [&](const auto& candidate) {
+                return candidate.name == sourceVariant.name;
+            });
+        if (destinationVariant == destination->variants.end()) {
+            invisible_places::water::WaterFeatureRunVariant copied{
+                .id = sourceVariant.id,
+                .name = sourceVariant.name,
+            };
+            if (copied.id == 0U ||
+                invisible_places::water::FindWaterFeatureRunVariant(
+                    destination,
+                    copied.id) != nullptr) {
+                copied.id = invisible_places::water::
+                    AllocateWaterFeatureRunVariantId(destination);
+            }
+            if (copied.id == 0U) {
+                continue;
+            }
+            destination->variants.push_back(std::move(copied));
+            destinationVariant = std::prev(destination->variants.end());
+        }
+        for (const auto& overrideValue : sourceVariant.overrides) {
+            if (onlyFeature.has_value() &&
+                overrideValue.feature != onlyFeature.value()) {
+                continue;
+            }
+            if (invisible_places::water::
+                    FindWaterFeatureRunVariantOverride(
+                        &*destinationVariant,
+                        overrideValue.feature,
+                        overrideValue.settingId) == nullptr) {
+                destinationVariant->overrides.push_back(overrideValue);
+            }
+        }
+    }
+}
+
 }  // namespace
 
 void MergeTimingTakeSceneStateKeepingFirst(
@@ -5489,6 +5541,10 @@ void MergeTimingTakeSceneStateKeepingFirst(
             MergeWaterFeatureRunMarksKeepingFirst(
                 firstOwnerRun,
                 run.marks);
+            MergeWaterFeatureRunVariantsKeepingFirst(
+                firstOwnerRun,
+                run,
+                run.features[featureIndex].feature);
             firstOwnerRun->enabled =
                 firstOwnerRun->enabled || run.enabled;
             run.features.erase(
@@ -5555,6 +5611,9 @@ void MergeTimingTakeSceneStateKeepingFirst(
         // empty organizational group instead of duplicating the feature.
         auto* targetRun = ensureDestinationRun();
         targetRun->enabled = targetRun->enabled || sourceRun.enabled;
+        MergeWaterFeatureRunVariantsKeepingFirst(
+            targetRun,
+            sourceRun);
         bool targetReceivedFeature = sourceRun.features.empty();
         for (const auto& sourceFeature : sourceRun.features) {
             auto [owningRun, destinationFeature] =
@@ -5567,6 +5626,12 @@ void MergeTimingTakeSceneStateKeepingFirst(
                 MergeWaterFeatureTimelineKeepingFirst(
                     destinationFeature,
                     sourceFeature);
+                if (owningRun != targetRun) {
+                    MergeWaterFeatureRunVariantsKeepingFirst(
+                        owningRun,
+                        sourceRun,
+                        sourceFeature.feature);
+                }
                 continue;
             }
             invisible_places::water::WaterFeatureTimeline merged{

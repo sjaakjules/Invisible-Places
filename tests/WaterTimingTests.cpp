@@ -50,6 +50,221 @@ WaterTimingKey Key(
     return key;
 }
 
+TEST_CASE(
+    "Water run variants preserve remembered overrides and resolve per animation",
+    "[water][timing][variants]") {
+    using namespace invisible_places::water;
+
+    WaterFeatureTimingRun run;
+    run.id = 7U;
+    run.name = "Shoreline";
+    run.enabled = true;
+    run.features.push_back({
+        .feature = {
+            .kind = WaterKeyedFeatureKind::ShorelineInstance,
+            .objectId = 41U,
+        },
+    });
+    run.variants.push_back({.id = 3U, .name = "Lower boundary"});
+    run.nextVariantId = 4U;
+    auto* overrideValue = DetachWaterFeatureRunVariantSetting(
+        &run.variants.front(),
+        run.features.front().feature,
+        "foam_fronts.boundary_z",
+        1.125);
+    REQUIRE(overrideValue != nullptr);
+    CHECK(overrideValue->detached);
+
+    const std::vector<WaterFeatureRunSelection> selected{{
+        .runId = run.id,
+        .enabled = true,
+        .variantId = 3U,
+    }};
+    const auto overlay = BuildWaterFeatureFixedSettingOverlay(
+        std::span{&run, 1U},
+        selected);
+    const auto* value = overlay.Find(
+        run.features.front().feature,
+        "foam_fronts.boundary_z");
+    REQUIRE(value != nullptr);
+    REQUIRE(std::holds_alternative<double>(*value));
+    CHECK(std::get<double>(*value) == Approx(1.125));
+
+    REQUIRE(ReattachWaterFeatureRunVariantSetting(
+        &run.variants.front(),
+        run.features.front().feature,
+        "foam_fronts.boundary_z"));
+    CHECK_FALSE(overrideValue->detached);
+    CHECK(std::get<double>(overrideValue->value) == Approx(1.125));
+    CHECK(BuildWaterFeatureFixedSettingOverlay(
+              std::span{&run, 1U},
+              selected)
+              .samples.empty());
+
+    // Explicit re-detachment restores the retained value instead of taking
+    // a fresh snapshot from Base.
+    overrideValue->detached = true;
+    const auto restored = BuildWaterFeatureFixedSettingOverlay(
+        std::span{&run, 1U},
+        selected);
+    REQUIRE(restored.samples.size() == 1U);
+    CHECK(std::get<double>(restored.samples.front().value) == Approx(1.125));
+
+    const std::vector<WaterFeatureRunSelection> off{{
+        .runId = run.id,
+        .enabled = false,
+        .variantId = 3U,
+    }};
+    CHECK(BuildWaterFeatureFixedSettingOverlay(
+              std::span{&run, 1U},
+              off)
+              .samples.empty());
+    const auto muted = MaterializeWaterFeatureTimingRunSelections(
+        std::span{&run, 1U},
+        off);
+    REQUIRE(muted.size() == 1U);
+    CHECK_FALSE(muted.front().enabled);
+
+    const std::vector<WaterFeatureRunSelection> missingVariant{{
+        .runId = run.id,
+        .enabled = true,
+        .variantId = 999U,
+    }};
+    const auto fallback = ResolveWaterFeatureRunSelection(
+        run,
+        missingVariant);
+    CHECK(fallback.enabled);
+    CHECK(fallback.variantId == 0U);
+    CHECK(fallback.variant == nullptr);
+}
+
+TEST_CASE(
+    "Water run variant and animation selection sanitizers repair duplicate ids",
+    "[water][timing][variants][sanitize]") {
+    using namespace invisible_places::water;
+
+    WaterFeatureTimingRun run;
+    run.id = 9U;
+    run.nextVariantId = 12U;
+    run.variants = {
+        {.id = 4U, .name = "A"},
+        {.id = 4U, .name = "A"},
+        {.id = 0U, .name = ""},
+    };
+    run = SanitizeWaterFeatureTimingRun(std::move(run));
+    REQUIRE(run.variants.size() == 3U);
+    CHECK(run.variants[0].id == 4U);
+    CHECK(run.variants[1].id == 12U);
+    CHECK(run.variants[2].id == 13U);
+    CHECK(run.variants[0].name == "A");
+    CHECK(run.variants[1].name == "A 2");
+    CHECK(run.variants[2].name == "Variant");
+    CHECK(run.nextVariantId == 14U);
+    CHECK(AllocateWaterFeatureRunVariantId(&run) == 14U);
+
+    auto selections = SanitizeWaterFeatureRunSelections({
+        {.runId = 0U, .enabled = true, .variantId = 0U},
+        {.runId = 9U, .enabled = true, .variantId = 4U},
+        {.runId = 9U, .enabled = false, .variantId = 12U},
+    });
+    REQUIRE(selections.size() == 1U);
+    CHECK(selections.front().runId == 9U);
+    CHECK_FALSE(selections.front().enabled);
+    CHECK(selections.front().variantId == 12U);
+}
+
+TEST_CASE(
+    "Fixed variant descriptors stay disjoint from keyed settings and Rain resolves in layer order",
+    "[water][timing][variants][fixed]") {
+    using namespace invisible_places::water;
+
+    for (const auto kind : {
+             WaterKeyedFeatureKind::Rain,
+             WaterKeyedFeatureKind::MeshFlow,
+             WaterKeyedFeatureKind::SeepageNode,
+             WaterKeyedFeatureKind::FlowSource,
+             WaterKeyedFeatureKind::FlowPath,
+             WaterKeyedFeatureKind::ShorelineInstance}) {
+        std::vector<std::string_view> ids;
+        for (const auto& descriptor : WaterFeatureFixedSettings(kind)) {
+            CHECK_FALSE(descriptor.id.empty());
+            CHECK(FindWaterKeyableSetting(kind, descriptor.id) == nullptr);
+            CHECK(std::find(ids.begin(), ids.end(), descriptor.id) == ids.end());
+            ids.push_back(descriptor.id);
+            CHECK(FindWaterFeatureFixedSetting(kind, descriptor.id) ==
+                  &descriptor);
+        }
+    }
+
+    WaterRainSettings settings = DefaultWaterRainSettings();
+    WaterRainVisualSettings visual = RainVisualPreset("Rain Fine Lines");
+    WaterFeatureFixedSettingOverlay fixed;
+    fixed.samples = {
+        {.feature = {.kind = WaterKeyedFeatureKind::Rain},
+         .settingId = "enabled",
+         .value = false},
+        {.feature = {.kind = WaterKeyedFeatureKind::Rain},
+         .settingId = "particle_limit",
+         .value = std::uint64_t{1234U}},
+        {.feature = {.kind = WaterKeyedFeatureKind::Rain},
+         .settingId = "spawn_height",
+         .value = 7.5},
+        {.feature = {.kind = WaterKeyedFeatureKind::Rain},
+         .settingId = "intensity_preset",
+         .value = std::string{"heavy_downpour"}},
+    };
+    ApplyWaterFeatureFixedSettingOverlayToRainSettings(
+        fixed,
+        &settings,
+        &visual);
+    CHECK_FALSE(settings.enabled);
+    CHECK(settings.activeParticleCount == 1234U);
+    CHECK(settings.spawnHeightMeters == Approx(7.5F));
+    CHECK(settings.intensityPreset == RainIntensityPreset::HeavyDownpour);
+
+    WaterFeatureTimingOverlay keyed;
+    keyed.samples.push_back({
+        .feature = {.kind = WaterKeyedFeatureKind::Rain},
+        .settingId = "level",
+        .value = 0.4F,
+    });
+    ApplyWaterFeatureTimingOverlayToRainSettings(
+        keyed,
+        &settings,
+        &visual);
+    CHECK(settings.enabled);
+    CHECK(settings.rainLevel == Approx(0.4F));
+    // Keyed evaluation does not disturb unrelated fixed values.
+    CHECK(settings.activeParticleCount == 1234U);
+    CHECK(settings.spawnHeightMeters == Approx(7.5F));
+
+    WaterDynamicMeshFlowSettings mesh;
+    WaterFeatureFixedSettingOverlay meshFixed;
+    meshFixed.samples = {
+        {.feature = {.kind = WaterKeyedFeatureKind::MeshFlow},
+         .settingId = "show_trails",
+         .value = false},
+        {.feature = {.kind = WaterKeyedFeatureKind::MeshFlow},
+         .settingId = "trail_width",
+         .value = 0.0125},
+        {.feature = {.kind = WaterKeyedFeatureKind::MeshFlow},
+         .settingId = "rock.colour",
+         .value = std::array<float, 3U>{0.1F, 0.2F, 0.3F}},
+        {.feature = {.kind = WaterKeyedFeatureKind::MeshFlow},
+         .settingId = "vegetation.stream_depth",
+         .value = 1.25},
+    };
+    ApplyWaterFeatureFixedSettingOverlayToDynamicMeshFlowSettings(
+        meshFixed,
+        &mesh);
+    CHECK_FALSE(mesh.showTrails);
+    CHECK(mesh.trailWidthMeters == Approx(0.0125F));
+    CHECK(mesh.rockResponse.colourise.x == Approx(0.1F));
+    CHECK(mesh.rockResponse.colourise.y == Approx(0.2F));
+    CHECK(mesh.rockResponse.colourise.z == Approx(0.3F));
+    CHECK(mesh.vegetationResponse.streamDepthMeters == Approx(1.25F));
+}
+
 WaterTimingRun Run(
     WaterTimingFeature feature,
     std::vector<WaterTimingKey> keys,

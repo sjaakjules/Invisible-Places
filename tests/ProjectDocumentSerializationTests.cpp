@@ -324,6 +324,78 @@ TEST_CASE("Pre-resume-state projects migrate their last animation and selected s
   CHECK(loaded->activeAnimationPosition == Catch::Approx(0.0F));
 }
 
+TEST_CASE("Water Feature Run variants and remembered values round-trip",
+          "[project][serialization][water][variants]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::timing::TimingTakeSceneState;
+  using invisible_places::water::WaterFeatureTimingRun;
+  using invisible_places::water::WaterKeyedFeatureKind;
+
+  WaterFeatureTimingRun run;
+  run.id = 22U;
+  run.name = "Coast";
+  run.nextVariantId = 8U;
+  run.features.push_back({
+      .feature = {
+          .kind = WaterKeyedFeatureKind::ShorelineInstance,
+          .objectId = 91U,
+      },
+  });
+  run.variants = {{
+      .id = 7U,
+      .name = "Animation A low sand",
+      .overrides = {
+          {.feature = run.features.front().feature,
+           .settingId = "foam_fronts.boundary_z",
+           .value = 1.275,
+           .detached = true},
+          {.feature = run.features.front().feature,
+           .settingId = "foam_fronts.seed",
+           .value = std::uint64_t{42U},
+           .detached = false},
+          {.feature = run.features.front().feature,
+           .settingId = "foam_fronts.colour",
+           .value = std::array<float, 3U>{0.2F, 0.4F, 0.8F},
+           .detached = true},
+      },
+  }};
+
+  TimingTakeSceneState state;
+  state.takeId = "coast-take";
+  state.sceneGroupName = "Beach";
+  state.waterFeatureTimingRuns.push_back(run);
+  ProjectDocument document;
+  document.timingTakeStates.push_back(state);
+
+  TemporaryProjectFile file{
+      "invisible_places_water_run_variants_round_trip.json"};
+  std::string error;
+  REQUIRE(SaveProjectDocument(document, file.path, &error));
+  const auto loaded = LoadProjectDocument(file.path, &error);
+  INFO(error);
+  REQUIRE(loaded.has_value());
+  REQUIRE(loaded->timingTakeStates.size() == 1U);
+  REQUIRE(loaded->timingTakeStates.front()
+              .waterFeatureTimingRuns.size() == 1U);
+  const auto& loadedRun = loaded->timingTakeStates.front()
+                              .waterFeatureTimingRuns.front();
+  REQUIRE(loadedRun.variants.size() == 1U);
+  CHECK(loadedRun.nextVariantId == 8U);
+  CHECK(loadedRun.variants.front().name == "Animation A low sand");
+  REQUIRE(loadedRun.variants.front().overrides.size() == 3U);
+  CHECK(std::get<double>(
+            loadedRun.variants.front().overrides[0].value) ==
+        Catch::Approx(1.275));
+  CHECK_FALSE(loadedRun.variants.front().overrides[1].detached);
+  CHECK(std::get<std::uint64_t>(
+            loadedRun.variants.front().overrides[1].value) == 42U);
+  CHECK(std::get<std::array<float, 3U>>(
+            loadedRun.variants.front().overrides[2].value)[2] ==
+        Catch::Approx(0.8F));
+}
+
 TEST_CASE("Palette stop-property animation and provenance round-trip",
           "[project][serialization][colourise][palette]") {
   using invisible_places::serialization::LoadProjectDocument;
@@ -3096,6 +3168,50 @@ TEST_CASE("Project preserves independent Flow and Mesh Flow edited trail shadows
         Catch::Approx(0.8F));
   CHECK(loaded->waterDynamicMeshFlowSettings.trailProfileName ==
         "Default_edited");
+}
+
+TEST_CASE("Animation Water run Base variant and Off selections round-trip",
+          "[animation][serialization][water][variants]") {
+  using invisible_places::camera::AnimationPath;
+  using invisible_places::serialization::AnimationPathFromJson;
+  using invisible_places::serialization::AnimationPathToJson;
+  using invisible_places::serialization::kAnimationDocumentSchemaVersion;
+
+  AnimationPath path;
+  path.name = "Linked A";
+  path.waterFeatureRunSelections = {
+      {.runId = 5U, .enabled = true, .variantId = 0U},
+      {.runId = 8U, .enabled = true, .variantId = 3U},
+      {.runId = 11U, .enabled = false, .variantId = 0U},
+  };
+  const auto saved = AnimationPathToJson(path);
+  CHECK(saved.at("schema_version") == kAnimationDocumentSchemaVersion);
+  REQUIRE(saved.at("water_feature_run_selections").size() == 3U);
+
+  std::string error;
+  const auto loaded = AnimationPathFromJson(saved, &error);
+  INFO(error);
+  REQUIRE(loaded.has_value());
+  CHECK(loaded->waterFeatureRunSelections ==
+        path.waterFeatureRunSelections);
+
+  auto legacy = saved;
+  legacy["schema_version"] = 25U;
+  legacy.erase("water_feature_run_selections");
+  const auto legacyLoaded = AnimationPathFromJson(legacy, &error);
+  INFO(error);
+  REQUIRE(legacyLoaded.has_value());
+  CHECK(legacyLoaded->waterFeatureRunSelections.empty());
+
+  auto malformed = saved;
+  malformed["water_feature_run_selections"].push_back({
+      {"run_id", 8U}, {"enabled", false}, {"variant_id", 99U}});
+  const auto sanitized = AnimationPathFromJson(malformed, &error);
+  INFO(error);
+  REQUIRE(sanitized.has_value());
+  REQUIRE(sanitized->waterFeatureRunSelections.size() == 3U);
+  CHECK_FALSE(sanitized->waterFeatureRunSelections[1].enabled);
+  CHECK(sanitized->waterFeatureRunSelections[1].variantId == 99U);
 }
 
 TEST_CASE("Animation preferred blend partner round-trips without a velocity link",
