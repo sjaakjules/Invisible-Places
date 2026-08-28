@@ -1,6 +1,7 @@
 #include "app/Application.hpp"
 
 #include "app/AnimationRegistryOrder.hpp"
+#include "app/BackgroundRenderPreparation.hpp"
 #include "app/LinkedHighQualityPreview.hpp"
 #include "app/ManualFlowPathEditMath.hpp"
 #include "app/PointDensityParity.hpp"
@@ -4040,6 +4041,13 @@ std::uint64_t EffectiveExportWaterSeepageShaderInvocations(
 void ForgetWaterSeepageLayerAttachment(
     WaterWorkflowState* water,
     std::size_t sessionIndex);
+void EnsureWaterSeepageRuntimeUpToDate(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    const WaterFrameState* frameState);
+bool WaterFlowIntegrationJobsSettled(
+    const PreviewRuntimeState& runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport);
 
 const invisible_places::water::WaterScenarioDefinition* FindWaterScenarioDefinition(
     const WaterWorkflowState& water,
@@ -42368,6 +42376,57 @@ int RunBackgroundRenderStatusMonitor(
     }
 }
 
+BackgroundRenderPreparationObservation ObserveBackgroundRenderPreparation(
+    const PreviewRuntimeState& runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport,
+    bool initialFlowRefreshRequested) {
+    BackgroundRenderPreparationObservation observation{
+        .layerLoadActive = runtimeState.pendingLoad.has_value(),
+        .scalarFieldLoadActive =
+            runtimeState.pendingScalarFieldLoad.has_value(),
+        .queuedLayerLoadCount =
+            runtimeState.persistence.queuedLoads.size(),
+        .waterSurfaceWarmupActive =
+            runtimeState.water.waterSurfaceCacheWarmup.worker.joinable(),
+        .waterSurfacePreprocessPending =
+            runtimeState.water.waterSurfaceCachePreprocessPending,
+        .initialFlowRefreshRequested = initialFlowRefreshRequested,
+        .flowJobsSettled =
+            WaterFlowIntegrationJobsSettled(runtimeState, viewport),
+        .seepageSupportActive =
+            runtimeState.water.seepageSupportJob.worker.joinable() ||
+            runtimeState.water.seepageSupportJob.shared != nullptr,
+    };
+
+    if (runtimeState.water.seepageNodes.empty()) {
+        return observation;
+    }
+
+    // One semantic grid is shared by every density of one authored scene role.
+    // Count keys rather than sessions so a coarse live display and a separately
+    // loaded full-density export source cannot make preparation wait twice for
+    // the same topology.
+    std::unordered_set<std::string> requiredSemanticKeys;
+    for (const auto& session : runtimeState.sessions) {
+        if (!IsRenderablePointCloudSource(runtimeState, session) ||
+            !IsAuthoredWaterTerrainSession(session)) {
+            continue;
+        }
+        requiredSemanticKeys.insert(
+            WaterSeepageSemanticTopologyKey(runtimeState, session));
+    }
+    observation.requiredSeepageTopologyCount =
+        requiredSemanticKeys.size();
+    observation.readySeepageTopologyCount =
+        static_cast<std::size_t>(std::count_if(
+            requiredSemanticKeys.begin(),
+            requiredSemanticKeys.end(),
+            [&](const std::string& key) {
+                return runtimeState.water.seepageRuntimeGrids.contains(key);
+            }));
+    return observation;
+}
+
 int RunBackgroundRenderWorker(
     const BackgroundRenderWorkerOptions& options,
     platform::Window* window,
@@ -42487,6 +42546,7 @@ int RunBackgroundRenderWorker(
     bool observedActiveExport = false;
     bool workerCancellationRequested = false;
     bool preparationTimedOut = false;
+    bool initialFlowRefreshRequested = false;
     std::filesystem::path lastOutputPath;
     std::filesystem::path lastLogPath;
     std::uint32_t lastRenderedFrames = 0U;
@@ -42516,30 +42576,64 @@ int RunBackgroundRenderWorker(
             PollWaterFlowTrailBuildJob(runtimeState, viewport);
             CommitReadySceneDisplaySwitches(runtimeState, viewport);
             StartQueuedLayerLoadIfIdle(runtimeState);
+
+            if (!runtimeState->offlineRenderJob.active && !exportStarted) {
+                // A display commit can make the authoritative Water scene usable
+                // during this pass, so give its cache a second chance to install
+                // or start before deciding that preparation has settled.
+                EnsureWaterSurfaceCacheReady(runtimeState, viewport);
+                const auto waterFrameState =
+                    ResolveWaterFrameState(runtimeState);
+                EnsureWaterSeepageRuntimeUpToDate(
+                    runtimeState,
+                    viewport,
+                    &waterFrameState);
+
+                // ApplyProjectDocumentToRuntime deliberately discards generated
+                // Flow sessions. Staged scene loads do not issue the interactive
+                // refresh callback, so detached workers must request one
+                // explicitly after the shared surface and ordinary load queues
+                // have settled.
+                if (!initialFlowRefreshRequested &&
+                    !runtimeState->pendingLoad.has_value() &&
+                    !runtimeState->pendingScalarFieldLoad.has_value() &&
+                    runtimeState->persistence.queuedLoads.empty() &&
+                    !runtimeState->water.waterSurfaceCacheWarmup.worker
+                         .joinable() &&
+                    !runtimeState->water.waterSurfaceCachePreprocessPending) {
+                    initialFlowRefreshRequested =
+                        QueueWaterFlowTrailRefresh(
+                            runtimeState,
+                            WaterOverlayRefreshPersistence::InMemoryOnly);
+                }
+            }
         }
 
         if (!workerCancellationRequested &&
-            !runtimeState->offlineRenderJob.active && !exportStarted &&
-            !runtimeState->pendingLoad.has_value() &&
-            !runtimeState->pendingScalarFieldLoad.has_value() &&
-            runtimeState->persistence.queuedLoads.empty()) {
-            StartAnimationExportJob(runtimeState, viewport, true);
-            if (runtimeState->offlineRenderJob.active) {
-                exportStarted = true;
-                observedActiveExport = true;
-            } else if (!runtimeState->errorMessage.empty()) {
-                WriteBackgroundWorkerStatus(
-                    statusPath,
-                    "failed",
-                    runtimeState->errorMessage,
-                    options.setupPath,
-                    nullptr,
-                    expectedTotalFrames);
-                UpdateBackgroundRenderPackageStatus(
-                    options.setupPath,
-                    RenderSetupStatus::Failed,
-                    runtimeState->errorMessage);
-                return 2;
+            !runtimeState->offlineRenderJob.active && !exportStarted) {
+            const auto preparation = ObserveBackgroundRenderPreparation(
+                *runtimeState,
+                *viewport,
+                initialFlowRefreshRequested);
+            if (BackgroundRenderPreparationReady(preparation)) {
+                StartAnimationExportJob(runtimeState, viewport, true);
+                if (runtimeState->offlineRenderJob.active) {
+                    exportStarted = true;
+                    observedActiveExport = true;
+                } else if (!runtimeState->errorMessage.empty()) {
+                    WriteBackgroundWorkerStatus(
+                        statusPath,
+                        "failed",
+                        runtimeState->errorMessage,
+                        options.setupPath,
+                        nullptr,
+                        expectedTotalFrames);
+                    UpdateBackgroundRenderPackageStatus(
+                        options.setupPath,
+                        RenderSetupStatus::Failed,
+                        runtimeState->errorMessage);
+                    return 2;
+                }
             }
         }
 
