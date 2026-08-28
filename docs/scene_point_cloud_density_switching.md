@@ -23,20 +23,25 @@ Ordinary framing, placement, and editing can use the committed runtime display s
 
 Point-cloud loading and shared-surface build/load plus GPU preprocessing use one exclusive high-memory slot. The active display commits first; the shared surface cache then takes the slot before inactive queued loads, and the remaining work resumes only after preprocessing completes. Mesh Flow consumes the Ground table in that cache and has no separate dynamic-mesh warmup.
 
-## Linked A/B HQ Live Override
+## Animation HQ Live Override
 
-The session-only **HQ** control beside **Seam / A / B** is deliberately separate
-from the saved Visible Point Cloud selector. For the active reciprocal pair it
-resolves one common grouped scene and its exact complete 1 mm and 5 mm bundles.
+The session-only **HQ** control in the animation-view header is deliberately
+separate from the saved Visible Point Cloud selector. An ordinary unlinked
+animation resolves its associated grouped scene directly. A reciprocal pair
+resolves one scene shared by both members. In either case HQ uses the exact
+complete 1 mm and 5 mm bundles.
 If 5 mm is not the committed display, those three sessions load hidden and are
-owned only by the linked live override; the saved selection is unchanged. HQ
+owned only by the animation live override; the saved selection is unchanged. HQ
 off then presents complete 5 mm ROCK/SAND/VEG.
 
 After the baseline and shared-water cache settle, a utility-priority,
-cancellable worker evaluates A and B at normalized `0.5`. Each member uses its
-authored live-view aspect ratio or the current live aspect as a legacy
-fallback. The two frusta keep authored near/far depth and extend X/Y by 5% of
-the full viewport on every side. The filtered PLY reader streams only 1 mm
+cancellable worker evaluates the active animation at normalized `0.5`; a
+reciprocal pair evaluates both A and B. Each animation uses its authored
+live-view aspect ratio or the current live aspect as a legacy fallback. An
+unlinked animation duplicates its one midpoint matrix into the existing
+two-slot patch pipeline, so its union is exactly one view. The frusta keep
+authored near/far depth and extend X/Y by 5% of the full viewport on every
+side. The filtered PLY reader streams only 1 mm
 ROCK and VEG, preserves source order and original 32-bit point indices, and
 materialises only points whose centres pass either padded frustum. It does not
 stat, open, or allocate 1 mm SAND. The identical predicate partitions the
@@ -48,7 +53,7 @@ selected. A resource-mutation batch publishes masks on toggle and clears them
 on disable/failure, so preparation and cancellation always leave a complete
 5 mm frame. Empty outside sets omit that base draw rather than interpreting an
 empty renderer mask as “draw all.” Prepared CPU/GPU data stays in memory for
-instant Seam/A/B toggling and is released when the pair, midpoint matrices or
+instant toggling and is released when the animation selection, midpoint matrices or
 fallback aspect, project path, or any of the five sources actually read (all
 three 5 mm roles plus 1 mm ROCK/VEG) changes.
 

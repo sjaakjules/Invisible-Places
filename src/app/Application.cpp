@@ -2,7 +2,9 @@
 
 #include "app/AnimationRegistryOrder.hpp"
 #include "app/BackgroundRenderPreparation.hpp"
+#include "app/BackgroundRenderQueue.hpp"
 #include "app/LinkedHighQualityPreview.hpp"
+#include "app/LinkedAnimationExportSelection.hpp"
 #include "app/ManualFlowPathEditMath.hpp"
 #include "app/PointDensityParity.hpp"
 #include "app/PointVisualSelection.hpp"
@@ -353,7 +355,7 @@ struct ProjectSettings {
     // blend in the live viewport (never in exports). Off preserves the
     // original preview appearance exactly.
     bool previewPerformanceMode = false;
-    // Linked A/B HQ patch density (1000, 2000 or 3000 micrometres). Above
+    // Animation HQ patch density (1000, 2000 or 3000 micrometres). Above
     // 1 mm the 1 mm scan is thinned to one centred parent per cell of that
     // spacing (density-preserving quotas, like the 5 mm display cache) and
     // declares the nominal spacing so the density compensation matches the
@@ -985,6 +987,15 @@ struct TimingColouriseKeyMarqueeState {
     std::vector<TimingColouriseKeyHandle> baseSelection;
 };
 
+// Stable, session-only identity for one settings key. Setting tracks already
+// enforce unique positions within 1e-4, so (feature, setting, position) is
+// sufficient without adding persistence-only ids to the project schema.
+struct WaterRunKeyHandle {
+    invisible_places::water::WaterKeyedFeatureId feature{};
+    std::string settingId;
+    float position = 0.0F;
+};
+
 // Water run graph interaction state is identity-based, never pointer-based:
 // runs, features, and tracks are re-resolved from these ids every frame so a
 // deleted or reimported run simply drops the interaction instead of dangling.
@@ -1005,6 +1016,26 @@ struct WaterRunKeyDragState {
     // radius off-centre snaps the key to the cursor on the first frame.
     float grabOffsetX = 0.0F;
     float grabOffsetY = 0.0F;
+    // The displayed copy matters in a wrapped focus window: +1.05 and -0.95
+    // are the same authored phase but imply different drag directions.
+    float unwrappedDisplayPositionAtStart = 0.0F;
+    std::size_t primaryIndex = 0U;
+    // Original handles define one rigid time offset for the full selection;
+    // current handles locate the keys after each successful live update.
+    std::vector<WaterRunKeyHandle> originalKeys;
+    std::vector<WaterRunKeyHandle> currentKeys;
+    std::optional<WaterRunKeyHandle> rangeAnchor;
+};
+
+struct WaterRunKeyMarqueeState {
+    std::string scenarioId;
+    std::uint32_t runId = 0U;
+    ImGuiID surfaceId = 0U;
+    float startX = 0.0F;
+    float startY = 0.0F;
+    float currentX = 0.0F;
+    float currentY = 0.0F;
+    std::vector<WaterRunKeyHandle> baseSelection;
 };
 
 struct WaterRunSplineHandleDragState {
@@ -1033,15 +1064,6 @@ struct WaterRunKeyEditState {
         invisible_places::water::WaterScenarioInterpolation::TrackDefault;
     bool requestKeyboardFocus = false;
     std::string errorMessage;
-};
-
-// Stable, session-only identity for one settings key. Setting tracks already
-// enforce unique positions within 1e-4, so (feature, setting, position) is
-// sufficient without adding persistence-only ids to the project schema.
-struct WaterRunKeyHandle {
-    invisible_places::water::WaterKeyedFeatureId feature{};
-    std::string settingId;
-    float position = 0.0F;
 };
 
 // Selected run-graph keys. The first three identity fields retain the
@@ -1741,6 +1763,11 @@ struct AnimationPanelState {
     // the main loop restarts the batch automatically once loads go idle, so
     // the click does not have to be repeated.
     bool quickMp4BatchStartPending = false;
+    // The selected files and preset are captured by either Export Selected or
+    // Queue to Active Export. They remain stable while an earlier foreground
+    // render finishes or full-density sources hydrate.
+    std::vector<std::filesystem::path> pendingQuickMp4BatchFiles;
+    std::optional<ExportPreset> pendingQuickMp4BatchPreset;
     // Setup timings recorded while the batch queue was built; the first
     // started batch job absorbs them into its export log.
     std::vector<ExportStartupPhase> quickMp4QueuePhases;
@@ -2027,6 +2054,7 @@ struct TimingsPanelState {
     };
     std::vector<WaterPinnedSettingOverlay> waterPinnedSettingOverlays;
     std::optional<WaterRunKeyDragState> waterRunKeyDrag;
+    std::optional<WaterRunKeyMarqueeState> waterRunKeyMarquee;
     std::optional<WaterRunSplineHandleDragState> waterRunSplineHandleDrag;
     std::optional<WaterRunKeyEditState> waterRunKeyEdit;
     std::optional<WaterRunKeySelectionState> waterRunKeySelection;
@@ -3690,7 +3718,7 @@ struct AnimationReciprocalPanSmoothingJobRuntime {
     std::shared_ptr<AnimationReciprocalPanSmoothingJobShared> shared;
 };
 
-// Runtime-only linked-view density assembly. Neither the synthetic layer ids
+// Runtime-only animation-view density assembly. Neither the synthetic layer ids
 // nor the hidden 5 mm baseline sessions are serialized or included by the
 // canonical export-source resolver.
 struct LinkedHqSelectionRequest {
@@ -3791,6 +3819,23 @@ struct LinkedHqPreviewRuntime {
     std::string failureMessage;
 };
 
+enum class CurrentAnimationExportDestination {
+    Foreground,
+    Background,
+};
+
+// The modal captures the pair identity and any background predecessors at
+// click time. A later registry or queue change therefore cannot silently
+// redirect an A/B choice to a different animation pair.
+struct LinkedAnimationExportDialogState {
+    bool active = false;
+    bool openRequested = false;
+    CurrentAnimationExportDestination destination =
+        CurrentAnimationExportDestination::Foreground;
+    std::string sessionPairId;
+    std::vector<std::filesystem::path> backgroundDependencies;
+};
+
 struct PreviewRuntimeState {
     std::filesystem::path dataRoot;
     std::vector<PreviewLayerSession> sessions;
@@ -3853,6 +3898,14 @@ struct PreviewRuntimeState {
     // alter the queued render.
     std::shared_ptr<ResolvedRenderSetupSnapshot>
         pendingCurrentRenderSnapshot;
+    // Additional members selected by Export Both. They are already frozen
+    // before A starts and are promoted only after the preceding linked
+    // member completes successfully.
+    std::deque<std::shared_ptr<ResolvedRenderSetupSnapshot>>
+        queuedCurrentRenderSnapshots;
+    bool linkedCurrentRenderSequenceActive = false;
+    bool linkedCurrentRenderSequenceMemberRunning = false;
+    LinkedAnimationExportDialogState linkedAnimationExportDialog{};
     // Export Current defers its heavy setup by one frame so the click paints
     // the "Starting export" card before the app pauses for setup work.
     bool currentExportStartQueued = false;
@@ -32760,6 +32813,7 @@ bool SpawnDetachedBackgroundRenderWorker(
     const std::filesystem::path& dataRoot,
     const std::filesystem::path& setupPath,
     const std::filesystem::path& statusPath,
+    std::span<const std::filesystem::path> waitForStatusPaths,
     std::uint32_t throttleMilliseconds,
     std::int64_t* processId,
     std::string* errorMessage) {
@@ -32777,9 +32831,13 @@ bool SpawnDetachedBackgroundRenderWorker(
         setupPath.string(),
         "--background-render-status",
         statusPath.string(),
-        "--background-render-throttle-ms",
-        std::to_string(throttleMilliseconds),
     };
+    for (const auto& dependency : waitForStatusPaths) {
+        arguments.emplace_back("--background-render-wait-for-status");
+        arguments.push_back(dependency.string());
+    }
+    arguments.emplace_back("--background-render-throttle-ms");
+    arguments.push_back(std::to_string(throttleMilliseconds));
     std::vector<char*> argv;
     argv.reserve(arguments.size() + 1U);
     for (auto& argument : arguments) {
@@ -32847,6 +32905,7 @@ bool SpawnDetachedBackgroundRenderWorker(
     (void)dataRoot;
     (void)setupPath;
     (void)statusPath;
+    (void)waitForStatusPaths;
     (void)throttleMilliseconds;
     (void)processId;
     if (errorMessage != nullptr) {
@@ -33019,7 +33078,8 @@ bool SpawnDetachedBackgroundRenderStatusMonitor(
 std::optional<ResolvedRenderSetupSnapshot>
 ResolveCurrentRenderSetupSnapshot(
     PreviewRuntimeState* runtimeState,
-    std::string* errorMessage);
+    std::string* errorMessage,
+    std::optional<std::size_t> linkedMemberIndex = std::nullopt);
 
 // Current-animation exports are WYSIWYG for the Visual, while Shoreline is
 // composed independently from the frozen Water effect list later.
@@ -34819,6 +34879,52 @@ std::string FormatAdaptiveDuration(std::chrono::steady_clock::duration elapsed) 
     return output.str();
 }
 
+// Frame rendering is commonly sub-second, where the whole-second duration
+// formatter intentionally loses too much information. Keep milliseconds for
+// those values and retain compact adaptive units for genuinely long frames.
+std::string FormatFrameRenderSeconds(double seconds) {
+    if (!std::isfinite(seconds) || seconds < 0.0) {
+        seconds = 0.0;
+    }
+    if (seconds < 1.0) {
+        const double milliseconds = seconds * 1000.0;
+        const int precision = milliseconds < 10.0 ? 2
+            : milliseconds < 100.0 ? 1
+                                     : 0;
+        return FormatFixed(milliseconds, precision) + " ms";
+    }
+    if (seconds < 60.0) {
+        return FormatFixed(seconds, seconds < 10.0 ? 2 : 1) + " sec";
+    }
+    return FormatAdaptiveDuration(
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>{seconds}));
+}
+
+std::string FormatFrameRenderDuration(
+    std::chrono::steady_clock::duration duration) {
+    return FormatFrameRenderSeconds(
+        std::chrono::duration<double>(duration).count());
+}
+
+std::optional<double> AverageFrameRenderSeconds(
+    std::span<const float> durations) {
+    if (durations.empty()) {
+        return std::nullopt;
+    }
+    const double total = std::accumulate(
+        durations.begin(), durations.end(), 0.0);
+    return total / static_cast<double>(durations.size());
+}
+
+void DrawExportFrameDurationProgressBar(
+    std::span<const float> durations,
+    std::size_t totalFrames,
+    float progress,
+    float currentFrameProgress,
+    const char* widgetId);
+void DrawExportFrameDurationProgressBar(const OfflineRenderJobState& job);
+
 std::string FormatLocalTime(std::chrono::system_clock::time_point timePoint, const char* format);
 
 std::string FormatEtaClock(std::chrono::steady_clock::duration remaining) {
@@ -34912,8 +35018,8 @@ std::size_t ExportFrameTimingWarmupCount(std::size_t frameCount) {
 // pace estimation. Passing this already-trimmed span to the bounds helper
 // makes it impossible for an omitted warm-up frame to affect the Y scale.
 std::span<const float> SteadyExportFrameDurations(
-    const std::vector<float>& durations) {
-    return std::span<const float>{durations}.subspan(
+    std::span<const float> durations) {
+    return durations.subspan(
         ExportFrameTimingWarmupCount(durations.size()));
 }
 
@@ -35013,7 +35119,8 @@ std::string ExportTimingStatusSuffix(const OfflineRenderJobState& job) {
     if (!average.has_value()) {
         return {};
     }
-    std::string suffix = " Avg " + FormatAdaptiveDuration(average.value()) + "/frame";
+    std::string suffix =
+        " Avg " + FormatFrameRenderDuration(average.value()) + "/frame";
     const auto remaining = RemainingExportRenderDuration(job);
     if (remaining.has_value()) {
         suffix += ", ETA " + FormatAdaptiveDuration(remaining.value()) +
@@ -36588,7 +36695,8 @@ CaptureRenderSetupSourceFingerprints(
 std::optional<ResolvedRenderSetupSnapshot>
 ResolveCurrentRenderSetupSnapshot(
     PreviewRuntimeState* runtimeState,
-    std::string* errorMessage) {
+    std::string* errorMessage,
+    std::optional<std::size_t> linkedMemberIndex) {
     if (runtimeState == nullptr ||
         !runtimeState->animationPanel.currentPath.has_value() ||
         runtimeState->animationPanel.currentPath->keys.size() < 2U) {
@@ -36603,17 +36711,82 @@ ResolveCurrentRenderSetupSnapshot(
     ResolvedRenderSetupSnapshot snapshot;
     snapshot.animationPath =
         runtimeState->animationPanel.currentPath.value();
+    std::filesystem::path selectedAnimationFilePath =
+        runtimeState->animationPanel.currentFilePath;
+    bool selectedAnimationModified =
+        runtimeState->animationPanel.dirty;
+    if (const auto currentRegistryIndex = FindAnimationRegistryIndex(
+            runtimeState->animationPanel,
+            selectedAnimationFilePath);
+        currentRegistryIndex.has_value()) {
+        selectedAnimationModified = RegistryAnimationPathIsModified(
+            *runtimeState,
+            currentRegistryIndex.value());
+    }
     snapshot.normalizedPosition = std::clamp(
         runtimeState->animationPanel.scrubAmount,
         0.0F,
         1.0F);
+    const auto pair = ResolveActiveAnimationLinkedPair(*runtimeState);
+    if (linkedMemberIndex.has_value()) {
+        if (runtimeState->activeRenderSetupOverride.has_value()) {
+            if (errorMessage != nullptr) {
+                *errorMessage =
+                    "A loaded historical render setup already identifies one "
+                    "animation and cannot be redirected to another linked member.";
+            }
+            return std::nullopt;
+        }
+        if (!pair.has_value() || linkedMemberIndex.value() >= 2U ||
+            pair->members[linkedMemberIndex.value()] == nullptr ||
+            pair->members[linkedMemberIndex.value()]->keys.size() < 2U) {
+            if (errorMessage != nullptr) {
+                *errorMessage =
+                    "The selected linked animation member is no longer available. "
+                    "Reload the reciprocal pair and try again.";
+            }
+            return std::nullopt;
+        }
+
+        const auto member = linkedMemberIndex.value();
+        snapshot.animationPath = *pair->members[member];
+        selectedAnimationFilePath = pair->memberFilePaths[member];
+        selectedAnimationModified = RegistryAnimationPathIsModified(
+            *runtimeState,
+            pair->memberRegistryIndices[member]);
+
+        // normalizedPosition is descriptive metadata for a full-path export.
+        // Preserve an exact occurrence when this canonical phase belongs to
+        // the member; otherwise retain that member's previous local playhead
+        // without clamping an unavailable shared frame onto an endpoint.
+        const auto& panel = runtimeState->animationPanel;
+        const float previousLocal =
+            panel.linkedMemberLocalPlayheadsValid[member]
+                ? panel.linkedMemberLocalPlayheads[member]
+            : member == pair->currentMemberIndex
+                ? panel.scrubAmount
+                : 0.0F;
+        if (panel.linkedCanonicalCycleFrameValid &&
+            panel.linkedCanonicalPairId == pair->sessionPairId) {
+            const auto local = invisible_places::camera::
+                ResolveAnimationReciprocalLoopNearestLocalPosition(
+                    pair->transport,
+                    member,
+                    panel.linkedCanonicalCycleFrame,
+                    previousLocal);
+            snapshot.normalizedPosition = local.has_value()
+                                              ? local.value()
+                                              : previousLocal;
+        } else {
+            snapshot.normalizedPosition = previousLocal;
+        }
+    }
     // A linked pair renders whichever member the viewport presents at the
     // shared clock. The loaded member's scrubAmount cannot describe a frame
     // it has no occurrence of (it freezes at the overlap edge there), and a
     // presented partner camera would otherwise be previewed from the wrong
     // path.
-    if (const auto pair = ResolveActiveAnimationLinkedPair(*runtimeState);
-        pair.has_value() &&
+    if (!linkedMemberIndex.has_value() && pair.has_value() &&
         runtimeState->animationPanel.linkedViewCameraAttached) {
         if (const auto presentation = ResolveAnimationLinkedPresentation(
                 runtimeState,
@@ -36627,6 +36800,11 @@ ResolveCurrentRenderSetupSnapshot(
                 presentation->localPosition,
                 0.0F,
                 1.0F);
+            selectedAnimationFilePath =
+                pair->memberFilePaths[presentation->memberIndex];
+            selectedAnimationModified = RegistryAnimationPathIsModified(
+                *runtimeState,
+                pair->memberRegistryIndices[presentation->memberIndex]);
         }
     }
     snapshot.framePreviewUsesPlaybackDensity =
@@ -36696,7 +36874,7 @@ ResolveCurrentRenderSetupSnapshot(
         snapshot.timing.state.waterFeatureTimingRuns,
         snapshot.timing.state.colouriseEffects,
         snapshot.visual.visualName,
-        runtimeState->animationPanel.dirty);
+        selectedAnimationModified);
     snapshot.provenance.exportPresetName =
         snapshot.exportPreset.name;
     if (loadedOverride != nullptr) {
@@ -36726,7 +36904,7 @@ ResolveCurrentRenderSetupSnapshot(
     document.sourceProjectIdentity =
         RenderSetupProjectIdentity(*runtimeState);
     document.originalAnimationPath =
-        runtimeState->animationPanel.currentFilePath;
+        selectedAnimationFilePath;
     document.sceneGroupName =
         snapshot.timing.sceneGroupName;
     document.timingTakeId = snapshot.timing.takeId;
@@ -36734,7 +36912,7 @@ ResolveCurrentRenderSetupSnapshot(
         snapshot.provenance.timingTakeName;
     document.visualName = snapshot.visual.visualName;
     document.animationModified =
-        runtimeState->animationPanel.dirty;
+        selectedAnimationModified;
     document.animation = snapshot.animationPath;
     document.exportPreset = snapshot.exportPreset;
     document.livePointVisual =
@@ -36821,30 +36999,13 @@ ResolveCurrentRenderSetupSnapshot(
     return snapshot;
 }
 
-bool QueueCurrentAnimationBackgroundRender(
-    PreviewRuntimeState* runtimeState) {
+std::optional<std::filesystem::path> QueueBackgroundRenderSetupDocument(
+    PreviewRuntimeState* runtimeState,
+    RenderSetupDocument setup,
+    std::span<const std::filesystem::path> waitForStatusPaths) {
     if (runtimeState == nullptr) {
-        return false;
+        return std::nullopt;
     }
-    if (runtimeState->offlineRenderJob.active ||
-        runtimeState->pendingCurrentRenderSnapshot != nullptr ||
-        runtimeState->pendingFramePreviewSnapshot != nullptr) {
-        runtimeState->errorMessage =
-            "Wait for the current preview or foreground export to finish.";
-        runtimeState->statusMessage.clear();
-        return false;
-    }
-
-    std::string snapshotError;
-    auto snapshot = ResolveCurrentRenderSetupSnapshot(
-        runtimeState,
-        &snapshotError);
-    if (!snapshot.has_value()) {
-        runtimeState->errorMessage = std::move(snapshotError);
-        runtimeState->statusMessage.clear();
-        return false;
-    }
-    auto setup = std::move(snapshot->document);
     setup.status = RenderSetupStatus::Rendering;
     setup.createdUtc =
         invisible_places::serialization::CurrentUtcTimestamp();
@@ -36863,7 +37024,7 @@ bool QueueCurrentAnimationBackgroundRender(
             "Could not create the background render package: " +
             createError.message() + ".";
         runtimeState->statusMessage.clear();
-        return false;
+        return std::nullopt;
     }
     const auto setupPath = jobDirectory / "render.iprender.json";
     const auto statusPath = BackgroundRenderStatusPath(setupPath);
@@ -36879,12 +37040,16 @@ bool QueueCurrentAnimationBackgroundRender(
             "Could not freeze the background render package: " +
             saveError;
         runtimeState->statusMessage.clear();
-        return false;
+        return std::nullopt;
     }
 
     invisible_places::serialization::BackgroundRenderStatusDocument status;
     status.state = "queued";
-    status.message = "Waiting for the detached render worker to start.";
+    status.message = waitForStatusPaths.empty()
+        ? "Waiting for the detached render worker to start."
+        : "Queued behind " + std::to_string(waitForStatusPaths.size()) +
+              " background export" +
+              (waitForStatusPaths.size() == 1U ? "." : "s.");
     status.setupPath = setupPath;
     status.cancellationSupported = true;
     status.totalFrames = static_cast<std::uint32_t>(
@@ -36908,7 +37073,7 @@ bool QueueCurrentAnimationBackgroundRender(
             "Could not create the background render status: " +
             saveError;
         runtimeState->statusMessage.clear();
-        return false;
+        return std::nullopt;
     }
 
     std::int64_t processId = 0;
@@ -36917,6 +37082,7 @@ bool QueueCurrentAnimationBackgroundRender(
             runtimeState->dataRoot,
             setupPath,
             statusPath,
+            waitForStatusPaths,
             24U,
             &processId,
             &saveError)) {
@@ -36935,11 +37101,14 @@ bool QueueCurrentAnimationBackgroundRender(
             saveError);
         runtimeState->errorMessage = std::move(saveError);
         runtimeState->statusMessage.clear();
-        return false;
+        return std::nullopt;
     }
-    status.state = "starting";
-    status.message =
-        "Detached low-priority render worker is starting.";
+    status.state = waitForStatusPaths.empty() ? "starting" : "queued";
+    status.message = waitForStatusPaths.empty()
+        ? "Detached low-priority render worker is starting."
+        : "Queued behind " + std::to_string(waitForStatusPaths.size()) +
+              " background export" +
+              (waitForStatusPaths.size() == 1U ? "." : "s.");
     status.processId = processId;
     status.updatedUtc =
         invisible_places::serialization::CurrentUtcTimestamp();
@@ -36950,11 +37119,302 @@ bool QueueCurrentAnimationBackgroundRender(
     runtimeState->backgroundRender.latestStatusPath = statusPath;
     runtimeState->backgroundRender.latestStatus = status;
     runtimeState->backgroundRender.readError.clear();
-    runtimeState->statusMessage =
-        "Queued background render in " + jobDirectory.string() +
-        ". You can close or rebuild the editor; the worker will continue.";
+    runtimeState->errorMessage.clear();
+    return statusPath;
+}
+
+bool QueueCurrentAnimationBackgroundRender(
+    PreviewRuntimeState* runtimeState,
+    std::span<const std::filesystem::path> waitForStatusPaths = {}) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+    if (runtimeState->pendingCurrentRenderSnapshot != nullptr ||
+        runtimeState->pendingFramePreviewSnapshot != nullptr) {
+        runtimeState->errorMessage =
+            "Wait for the pending preview or foreground export request to finish.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    std::string snapshotError;
+    auto snapshot = ResolveCurrentRenderSetupSnapshot(
+        runtimeState,
+        &snapshotError);
+    if (!snapshot.has_value()) {
+        runtimeState->errorMessage = std::move(snapshotError);
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    const auto statusPath = QueueBackgroundRenderSetupDocument(
+        runtimeState,
+        std::move(snapshot->document),
+        waitForStatusPaths);
+    if (!statusPath.has_value()) {
+        return false;
+    }
+    runtimeState->statusMessage = waitForStatusPaths.empty()
+        ? "Started a detached background render. You can close or rebuild "
+          "the editor; the worker will continue."
+        : "Queued the current render setup behind the active background "
+          "export queue. You can close or rebuild the editor; every worker "
+          "will continue.";
+    return true;
+}
+
+std::optional<std::vector<ResolvedRenderSetupSnapshot>>
+ResolveLinkedAnimationExportSnapshots(
+    PreviewRuntimeState* runtimeState,
+    LinkedAnimationExportSelection selection,
+    std::string_view expectedSessionPairId,
+    std::string* errorMessage) {
+    if (runtimeState == nullptr) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "The linked animation export is unavailable.";
+        }
+        return std::nullopt;
+    }
+    const auto pair = ResolveActiveAnimationLinkedPair(*runtimeState);
+    if (!pair.has_value() ||
+        (!expectedSessionPairId.empty() &&
+         pair->sessionPairId != expectedSessionPairId)) {
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "The linked animation pair changed while choosing an export "
+                "target. Reopen the export chooser and try again.";
+        }
+        return std::nullopt;
+    }
+
+    const auto plan = ResolveLinkedAnimationExportMemberPlan(selection);
+    std::vector<ResolvedRenderSetupSnapshot> snapshots;
+    snapshots.reserve(plan.count);
+    for (std::size_t index = 0U; index < plan.count; ++index) {
+        std::string snapshotError;
+        auto snapshot = ResolveCurrentRenderSetupSnapshot(
+            runtimeState,
+            &snapshotError,
+            plan.memberIndices[index]);
+        if (!snapshot.has_value()) {
+            if (errorMessage != nullptr) {
+                *errorMessage = std::move(snapshotError);
+            }
+            return std::nullopt;
+        }
+        snapshots.push_back(std::move(snapshot.value()));
+    }
+    if (errorMessage != nullptr) {
+        errorMessage->clear();
+    }
+    return snapshots;
+}
+
+bool QueueLinkedAnimationBackgroundRender(
+    PreviewRuntimeState* runtimeState,
+    LinkedAnimationExportSelection selection,
+    std::string_view expectedSessionPairId,
+    std::span<const std::filesystem::path> waitForStatusPaths) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+    if (runtimeState->pendingCurrentRenderSnapshot != nullptr ||
+        runtimeState->pendingFramePreviewSnapshot != nullptr) {
+        runtimeState->errorMessage =
+            "Wait for the pending preview or foreground export request to finish.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    std::string snapshotError;
+    auto snapshots = ResolveLinkedAnimationExportSnapshots(
+        runtimeState,
+        selection,
+        expectedSessionPairId,
+        &snapshotError);
+    if (!snapshots.has_value()) {
+        runtimeState->errorMessage = std::move(snapshotError);
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    std::vector<std::filesystem::path> dependencies{
+        waitForStatusPaths.begin(),
+        waitForStatusPaths.end()};
+    std::size_t queuedCount = 0U;
+    for (auto& snapshot : snapshots.value()) {
+        const auto statusPath = QueueBackgroundRenderSetupDocument(
+            runtimeState,
+            std::move(snapshot.document),
+            dependencies);
+        if (!statusPath.has_value()) {
+            if (queuedCount > 0U && !runtimeState->errorMessage.empty()) {
+                runtimeState->errorMessage +=
+                    " " + std::to_string(queuedCount) +
+                    " linked member export was already queued.";
+            }
+            return false;
+        }
+        ++queuedCount;
+        // B waits on A. A already waits transitively on every predecessor
+        // captured when the chooser opened, so no worker overlaps another.
+        dependencies.assign(1U, statusPath.value());
+    }
+
+    runtimeState->statusMessage = queuedCount == 2U
+        ? "Queued linked animations A then B as detached background exports. "
+          "You can close or rebuild the editor; both workers will continue."
+        : waitForStatusPaths.empty()
+            ? "Started the selected linked animation as a detached background "
+              "render. You can close or rebuild the editor; the worker will continue."
+            : "Queued the selected linked animation behind the active background "
+              "export queue.";
     runtimeState->errorMessage.clear();
     return true;
+}
+
+bool QueueCurrentAnimationForegroundRender(
+    PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+    if (!runtimeState->offlineRenderJob.active) {
+        runtimeState->errorMessage =
+            "No foreground export is currently active.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    if (runtimeState->pendingCurrentRenderSnapshot != nullptr ||
+        !runtimeState->queuedCurrentRenderSnapshots.empty() ||
+        runtimeState->linkedCurrentRenderSequenceActive) {
+        runtimeState->errorMessage =
+            "A current render setup is already queued behind the active export.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    if (runtimeState->pendingFramePreviewSnapshot != nullptr) {
+        runtimeState->errorMessage =
+            "Cancel the pending frame preview before queuing another export.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    std::string snapshotError;
+    auto snapshot = ResolveCurrentRenderSetupSnapshot(
+        runtimeState,
+        &snapshotError);
+    if (!snapshot.has_value()) {
+        runtimeState->errorMessage = std::move(snapshotError);
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    runtimeState->pendingCurrentRenderSnapshot =
+        std::make_shared<ResolvedRenderSetupSnapshot>(
+            std::move(snapshot.value()));
+    runtimeState->statusMessage =
+        "Queued the frozen current render setup behind the active foreground export.";
+    runtimeState->errorMessage.clear();
+    return true;
+}
+
+bool QueueLinkedAnimationForegroundRender(
+    PreviewRuntimeState* runtimeState,
+    LinkedAnimationExportSelection selection,
+    std::string_view expectedSessionPairId) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+    if (runtimeState->pendingCurrentRenderSnapshot != nullptr ||
+        !runtimeState->queuedCurrentRenderSnapshots.empty() ||
+        runtimeState->currentExportStartQueued) {
+        runtimeState->errorMessage =
+            "A current render setup is already pending or queued.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    if (runtimeState->pendingFramePreviewSnapshot != nullptr) {
+        runtimeState->errorMessage =
+            "Cancel the pending frame preview before queuing another export.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    std::string snapshotError;
+    auto snapshots = ResolveLinkedAnimationExportSnapshots(
+        runtimeState,
+        selection,
+        expectedSessionPairId,
+        &snapshotError);
+    if (!snapshots.has_value() || snapshots->empty()) {
+        runtimeState->errorMessage = snapshotError.empty()
+            ? "No linked animation was selected for export."
+            : std::move(snapshotError);
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+
+    runtimeState->pendingCurrentRenderSnapshot =
+        std::make_shared<ResolvedRenderSetupSnapshot>(
+            std::move(snapshots->front()));
+    for (std::size_t index = 1U; index < snapshots->size(); ++index) {
+        runtimeState->queuedCurrentRenderSnapshots.push_back(
+            std::make_shared<ResolvedRenderSetupSnapshot>(
+                std::move((*snapshots)[index])));
+    }
+    runtimeState->linkedCurrentRenderSequenceActive =
+        snapshots->size() > 1U;
+    runtimeState->linkedCurrentRenderSequenceMemberRunning = false;
+    if (runtimeState->offlineRenderJob.active) {
+        runtimeState->statusMessage = snapshots->size() > 1U
+            ? "Queued linked animations A then B behind the active foreground export queue."
+            : "Queued the selected linked animation behind the active foreground export.";
+    } else {
+        runtimeState->currentExportStartQueued = true;
+        runtimeState->statusMessage = snapshots->size() > 1U
+            ? "Starting linked export A; B will follow automatically."
+            : "Starting the selected linked animation export...";
+    }
+    runtimeState->errorMessage.clear();
+    return true;
+}
+
+void RequestCurrentAnimationExport(
+    PreviewRuntimeState* runtimeState,
+    CurrentAnimationExportDestination destination,
+    std::span<const std::filesystem::path> backgroundDependencies = {}) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    // Historical render setups are immutable, single-animation documents;
+    // only a live reciprocal pair needs an A/B target decision.
+    const auto pair = runtimeState->activeRenderSetupOverride.has_value()
+        ? std::optional<ResolvedAnimationLinkedPair>{}
+        : ResolveActiveAnimationLinkedPair(*runtimeState);
+    if (pair.has_value()) {
+        auto& dialog = runtimeState->linkedAnimationExportDialog;
+        dialog.active = true;
+        dialog.openRequested = true;
+        dialog.destination = destination;
+        dialog.sessionPairId = pair->sessionPairId;
+        dialog.backgroundDependencies.assign(
+            backgroundDependencies.begin(),
+            backgroundDependencies.end());
+        runtimeState->statusMessage =
+            "Choose whether to export linked animation A, B, or both.";
+        runtimeState->errorMessage.clear();
+        return;
+    }
+
+    if (destination == CurrentAnimationExportDestination::Background) {
+        (void)QueueCurrentAnimationBackgroundRender(
+            runtimeState,
+            backgroundDependencies);
+    } else if (runtimeState->offlineRenderJob.active) {
+        (void)QueueCurrentAnimationForegroundRender(runtimeState);
+    } else {
+        // Preserve the ordinary unlinked path's one-frame UI defer.
+        runtimeState->currentExportStartQueued = true;
+        runtimeState->statusMessage = "Starting export...";
+        runtimeState->errorMessage.clear();
+    }
 }
 
 ResolvedRenderSetupSnapshot BuildBackgroundWorkerSnapshot(
@@ -37249,6 +37709,14 @@ RenderSetupDocument BuildQueuedQuickMp4RenderSetupDocument(
         runtimeState.projectSettings.proResAlphaPreviewEnabled;
     document.renderer.gaussianSplatFootprintBoost =
         runtimeState.projectSettings.gaussianSplatFootprintBoost;
+    document.renderer.setupViewportWidth =
+        static_cast<std::uint32_t>(std::max(
+            1,
+            runtimeState.liveFramebufferViewportSize.width));
+    document.renderer.setupViewportHeight =
+        static_cast<std::uint32_t>(std::max(
+            1,
+            runtimeState.liveFramebufferViewportSize.height));
     document.renderer.densityPolicy = "finest_available";
     document.summary =
         invisible_places::serialization::SummarizeRenderSetupTiming(
@@ -37259,6 +37727,236 @@ RenderSetupDocument BuildQueuedQuickMp4RenderSetupDocument(
             runtimeState,
             timingSnapshot.sceneGroupName);
     return document;
+}
+
+struct BackgroundBatchRenderSetupPlan {
+    std::vector<RenderSetupDocument> documents;
+    std::size_t skipped = 0U;
+    std::string modeLabel;
+};
+
+std::optional<BackgroundBatchRenderSetupPlan>
+BuildSelectedBackgroundBatchRenderSetups(
+    PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return std::nullopt;
+    }
+    UpdateActiveRenderSetupPreparation(runtimeState);
+    if (runtimeState->activeRenderSetupOverride.has_value() &&
+        (runtimeState->activeRenderSetupOverride->preparing ||
+         runtimeState->activeRenderSetupOverride->preparationFailed)) {
+        runtimeState->errorMessage =
+            runtimeState->activeRenderSetupOverride->preparationFailed
+                ? "Clear the failed render-setup override before queuing a "
+                  "saved-animation batch."
+                : "Wait for the loaded render setup to finish preparing "
+                  "before queuing a saved-animation batch.";
+        runtimeState->statusMessage.clear();
+        return std::nullopt;
+    }
+
+    auto& panel = runtimeState->animationPanel;
+    EnsureExportPresets(runtimeState);
+    auto effectivePreset = ViewedExportPreset(*runtimeState);
+    effectivePreset.mode = ActiveExportMode(runtimeState);
+    effectivePreset.quality = NormalizeExportQualityForMode(
+        effectivePreset.mode,
+        effectivePreset.quality);
+    effectivePreset.useVideoToolbox = AnimationExportUsesVideoToolbox(
+        effectivePreset.mode,
+        effectivePreset.useVideoToolbox);
+    effectivePreset.externalAlphaMatte =
+        effectivePreset.mode ==
+                invisible_places::output::AnimationExportMode::TestMp4
+            ? effectivePreset.externalAlphaMatte
+            : AnimationExportWritesAlphaMatteVideoPair(
+                  effectivePreset.mode,
+                  effectivePreset.externalAlphaMatte);
+    effectivePreset.settings = RenderSettingsFromExportPreset(
+        effectivePreset,
+        runtimeState->renderSettings.outputDirectory);
+    NormalizeAnimationRenderSettings(&effectivePreset.settings);
+    if (!AnimationExportWritesVideo(effectivePreset.mode) &&
+        !AnimationExportWritesPngStack(effectivePreset.mode)) {
+        runtimeState->errorMessage =
+            std::string{AnimationExportModeLabel(effectivePreset.mode)} +
+            " is not a saved-animation batch export preset.";
+        runtimeState->statusMessage.clear();
+        return std::nullopt;
+    }
+
+    std::vector<std::filesystem::path> selectedFiles;
+    for (const auto& filePath : panel.availableFiles) {
+        if (AnimationFileSelectedForExport(panel, filePath)) {
+            selectedFiles.push_back(filePath);
+        }
+    }
+    if (selectedFiles.empty()) {
+        runtimeState->errorMessage =
+            "Select at least one saved animation for background batch export.";
+        runtimeState->statusMessage.clear();
+        return std::nullopt;
+    }
+
+    const auto visualSessionIndex =
+        ResolveVisiblePointCloudLookdevIndex(*runtimeState);
+    if (!visualSessionIndex.has_value()) {
+        runtimeState->errorMessage =
+            "Load and show a LiDAR layer with saved visuals before queuing "
+            "a background batch.";
+        runtimeState->statusMessage.clear();
+        return std::nullopt;
+    }
+    EnsurePointVisuals(
+        &runtimeState->sessions[visualSessionIndex.value()]);
+    if (!ResolveSavedPointVisualExportSelection(runtimeState).has_value()) {
+        runtimeState->errorMessage =
+            "Save the current point visual before queuing a background "
+            "batch; exports always render a saved named visual.";
+        runtimeState->statusMessage.clear();
+        return std::nullopt;
+    }
+    if (AnimationExportRequiresFfmpeg(effectivePreset.mode) &&
+        !invisible_places::output::FfmpegExecutableAvailable(
+            invisible_places::output::DefaultFfmpegExecutablePath())) {
+        runtimeState->errorMessage =
+            std::string{AnimationExportModeLabel(effectivePreset.mode)} +
+            " background export requires ffmpeg.";
+        runtimeState->statusMessage.clear();
+        return std::nullopt;
+    }
+
+    const auto projectSnapshot = BuildProjectDocument(*runtimeState);
+    const auto rendererMode = VisibleGeneratedWaterTrailOverlayPresent(
+                                  *runtimeState)
+        ? PointCloudRendererMode::Beauty
+        : runtimeState->projectSettings.pointCloudRendererMode;
+    BackgroundBatchRenderSetupPlan plan;
+    plan.modeLabel = AnimationExportModeLabel(effectivePreset.mode);
+    std::string loadError;
+    for (const auto& animationFilePath : selectedFiles) {
+        const bool currentInMemory =
+            panel.currentPath.has_value() &&
+            !panel.currentFilePath.empty() &&
+            PathsLexicallyEqual(
+                std::filesystem::path{panel.currentFilePath},
+                animationFilePath);
+        std::optional<AnimationPath> loadedAnimation;
+        if (currentInMemory) {
+            loadedAnimation = panel.currentPath;
+        } else {
+            loadedAnimation = invisible_places::serialization::
+                LoadAnimationPath(animationFilePath, &loadError);
+            if (loadedAnimation.has_value()) {
+                invisible_places::app::workspace::ResolveAnimationPath(
+                    &loadedAnimation.value(),
+                    WorkspaceRoots(*runtimeState));
+            }
+        }
+        if (!loadedAnimation.has_value() ||
+            loadedAnimation->keys.size() < 2U) {
+            ++plan.skipped;
+            continue;
+        }
+
+        auto animationPath = std::move(loadedAnimation.value());
+        EmbedAnimationWaterScenarioFallbacks(
+            &animationPath,
+            runtimeState->water.seepageScenarios);
+        RecompileWaterTimingTracks(
+            &runtimeState->water,
+            &animationPath,
+            runtimeState->exportUsesEditedScenario);
+        const auto animationVisual = ResolveSavedPointVisualExportSelection(
+            runtimeState,
+            animationPath.selectedPointVisualName);
+        if (!animationVisual.has_value()) {
+            ++plan.skipped;
+            continue;
+        }
+        std::string timingError;
+        const auto timingSnapshot = ResolveCurrentTimingTakeExportSnapshot(
+            *runtimeState,
+            animationPath,
+            &timingError);
+        if (!timingSnapshot.has_value() ||
+            !timingSnapshot->effectiveRainProfile.has_value()) {
+            ++plan.skipped;
+            continue;
+        }
+        auto provenance = CollectRenderSetupProvenance(
+            *runtimeState,
+            &animationPath,
+            timingSnapshot->sceneGroupName,
+            timingSnapshot->takeId,
+            timingSnapshot->state.waterFeatureTimingRuns,
+            timingSnapshot->state.colouriseEffects,
+            animationVisual->visualName,
+            currentInMemory && panel.dirty);
+        plan.documents.push_back(BuildQueuedQuickMp4RenderSetupDocument(
+            *runtimeState,
+            projectSnapshot,
+            animationPath,
+            animationFilePath,
+            effectivePreset,
+            animationVisual.value(),
+            timingSnapshot.value(),
+            provenance,
+            rendererMode));
+    }
+    if (plan.documents.empty()) {
+        runtimeState->errorMessage =
+            "No background batch render setups could be built. Check each "
+            "animation's Visual and Timing Take.";
+        runtimeState->statusMessage.clear();
+        return std::nullopt;
+    }
+    return plan;
+}
+
+bool QueueSelectedAnimationsBackgroundRender(
+    PreviewRuntimeState* runtimeState,
+    std::span<const std::filesystem::path> waitForStatusPaths = {}) {
+    auto plan = BuildSelectedBackgroundBatchRenderSetups(runtimeState);
+    if (!plan.has_value()) {
+        return false;
+    }
+    std::vector<std::filesystem::path> dependencies{
+        waitForStatusPaths.begin(),
+        waitForStatusPaths.end()};
+    std::size_t queued = 0U;
+    for (auto& document : plan->documents) {
+        const auto statusPath = QueueBackgroundRenderSetupDocument(
+            runtimeState,
+            std::move(document),
+            dependencies);
+        if (!statusPath.has_value()) {
+            break;
+        }
+        ++queued;
+        dependencies.assign(1U, statusPath.value());
+    }
+    if (queued == 0U) {
+        return false;
+    }
+    runtimeState->statusMessage =
+        "Queued " + std::to_string(queued) + " background " +
+        plan->modeLabel + " export" + (queued == 1U ? "" : "s") +
+        " in a detached sequential queue" +
+        (plan->skipped > 0U
+             ? "; skipped " + std::to_string(plan->skipped) +
+                   " invalid animation" +
+                   (plan->skipped == 1U ? "" : "s")
+             : std::string{}) +
+        ". You can close or rebuild the editor; the queue will continue.";
+    const bool complete = queued == plan->documents.size();
+    if (complete) {
+        runtimeState->errorMessage.clear();
+    } else if (!runtimeState->errorMessage.empty()) {
+        runtimeState->statusMessage +=
+            " The packages created before the failure remain queued.";
+    }
+    return complete;
 }
 
 void SynchronizeOfflineRenderJobProvenanceCounts(
@@ -40301,6 +40999,49 @@ bool StartNextQueuedQuickMp4Export(
     return false;
 }
 
+bool StageSelectedQuickMp4Batch(
+    PreviewRuntimeState* runtimeState,
+    bool queuedBehindActiveExport) {
+    if (runtimeState == nullptr) {
+        return false;
+    }
+    auto& panel = runtimeState->animationPanel;
+    if (panel.quickMp4BatchStartPending) {
+        runtimeState->errorMessage =
+            "A saved-animation batch is already queued.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    std::vector<std::filesystem::path> selectedFiles;
+    for (const auto& filePath : panel.availableFiles) {
+        if (AnimationFileSelectedForExport(panel, filePath)) {
+            selectedFiles.push_back(filePath);
+        }
+    }
+    if (selectedFiles.empty()) {
+        runtimeState->errorMessage =
+            "Select at least one saved animation before queuing the batch.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    const auto preset = ViewedExportPreset(*runtimeState);
+    if (!AnimationExportWritesVideo(preset.mode) &&
+        !AnimationExportWritesPngStack(preset.mode)) {
+        runtimeState->errorMessage =
+            "Batch export needs a video or PNG-stack preset.";
+        runtimeState->statusMessage.clear();
+        return false;
+    }
+    panel.pendingQuickMp4BatchFiles = std::move(selectedFiles);
+    panel.pendingQuickMp4BatchPreset = preset;
+    panel.quickMp4BatchStartPending = true;
+    runtimeState->statusMessage = queuedBehindActiveExport
+        ? "Queued the selected batch behind the active foreground export."
+        : "Starting batch export...";
+    runtimeState->errorMessage.clear();
+    return true;
+}
+
 void StartSelectedQuickMp4Batch(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
@@ -40309,7 +41050,12 @@ void StartSelectedQuickMp4Batch(
     }
     // Every path through this function either starts the batch or reports
     // why it cannot; only the full-density wait below re-arms the retry.
-    runtimeState->animationPanel.quickMp4BatchStartPending = false;
+    auto& panel = runtimeState->animationPanel;
+    panel.quickMp4BatchStartPending = false;
+    auto selectedFiles = std::move(panel.pendingQuickMp4BatchFiles);
+    auto queuedPreset = std::move(panel.pendingQuickMp4BatchPreset);
+    panel.pendingQuickMp4BatchFiles.clear();
+    panel.pendingQuickMp4BatchPreset.reset();
     if (runtimeState->pendingCurrentRenderSnapshot != nullptr ||
         runtimeState->pendingFramePreviewSnapshot != nullptr) {
         runtimeState->errorMessage =
@@ -40332,14 +41078,15 @@ void StartSelectedQuickMp4Batch(
         return;
     }
 
-    auto& panel = runtimeState->animationPanel;
     panel.quickMp4Queue.clear();
     panel.quickMp4QueueTotal = 0;
     panel.quickMp4QueueCompleted = 0;
     panel.quickMp4QueueSkipped = 0;
     panel.quickMp4QueuePhases.clear();
     EnsureExportPresets(runtimeState);
-    const auto activePreset = ViewedExportPreset(*runtimeState);
+    const auto activePreset = queuedPreset.has_value()
+        ? queuedPreset.value()
+        : ViewedExportPreset(*runtimeState);
     const auto activeMode = activePreset.mode;
     const auto activeQuality = NormalizeExportQualityForMode(activeMode, activePreset.quality);
     const bool activeUseVideoToolbox =
@@ -40368,11 +41115,12 @@ void StartSelectedQuickMp4Batch(
         activeExternalAlphaMatte;
     effectiveBatchPreset.settings = settings;
 
-    std::vector<std::filesystem::path> selectedFiles;
-    selectedFiles.reserve(panel.availableFiles.size());
-    for (const auto& filePath : panel.availableFiles) {
-        if (AnimationFileSelectedForExport(panel, filePath)) {
-            selectedFiles.push_back(filePath);
+    if (selectedFiles.empty()) {
+        selectedFiles.reserve(panel.availableFiles.size());
+        for (const auto& filePath : panel.availableFiles) {
+            if (AnimationFileSelectedForExport(panel, filePath)) {
+                selectedFiles.push_back(filePath);
+            }
         }
     }
 
@@ -40405,6 +41153,8 @@ void StartSelectedQuickMp4Batch(
         // sources are ready instead of requiring a second click.
         if (runtimeState->errorMessage.empty()) {
             panel.quickMp4BatchStartPending = true;
+            panel.pendingQuickMp4BatchFiles = selectedFiles;
+            panel.pendingQuickMp4BatchPreset = activePreset;
             if (!runtimeState->statusMessage.empty()) {
                 runtimeState->statusMessage += " ";
             }
@@ -41040,6 +41790,36 @@ void StartStillCameraExportJob(
     StartStillCameraExportCapture(runtimeState, viewport);
 }
 
+class LinkedCurrentRenderSequenceStartGuard {
+public:
+    explicit LinkedCurrentRenderSequenceStartGuard(
+        PreviewRuntimeState* runtimeState)
+        : runtimeState_{runtimeState},
+          armed_{runtimeState != nullptr &&
+                 runtimeState->linkedCurrentRenderSequenceActive &&
+                 runtimeState->pendingCurrentRenderSnapshot != nullptr} {}
+
+    ~LinkedCurrentRenderSequenceStartGuard() {
+        if (!armed_ || runtimeState_ == nullptr ||
+            runtimeState_->offlineRenderJob.active ||
+            runtimeState_->errorMessage.empty()) {
+            return;
+        }
+        runtimeState_->pendingCurrentRenderSnapshot.reset();
+        runtimeState_->queuedCurrentRenderSnapshots.clear();
+        runtimeState_->linkedCurrentRenderSequenceActive = false;
+        runtimeState_->linkedCurrentRenderSequenceMemberRunning = false;
+    }
+
+    [[nodiscard]] bool Armed() const {
+        return armed_;
+    }
+
+private:
+    PreviewRuntimeState* runtimeState_ = nullptr;
+    bool armed_ = false;
+};
+
 void StartAnimationExportJob(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport,
@@ -41047,9 +41827,8 @@ void StartAnimationExportJob(
     if (runtimeState == nullptr || runtimeState->offlineRenderJob.active) {
         return;
     }
-    // A current-animation export supersedes a batch click that is still
-    // waiting for sources, so the stale batch cannot fire later by surprise.
-    runtimeState->animationPanel.quickMp4BatchStartPending = false;
+    const LinkedCurrentRenderSequenceStartGuard linkedSequenceStart{
+        runtimeState};
     if (runtimeState->pendingFramePreviewSnapshot != nullptr) {
         runtimeState->errorMessage =
             "Cancel or finish the pending frame preview before starting an "
@@ -41487,6 +42266,9 @@ void StartAnimationExportJob(
         runtimeState->statusMessage.clear();
         return;
     }
+    if (linkedSequenceStart.Armed()) {
+        runtimeState->linkedCurrentRenderSequenceMemberRunning = true;
+    }
     AcquireExportPowerAssertion(runtimeState);
     runtimeState->offlineRenderJob.worker = std::jthread{
         RunAnimationExportWriter,
@@ -41520,6 +42302,8 @@ void FinishOfflineRenderJob(
     auto finalStatusMessage = statusMessage;
     auto finalErrorMessage = errorMessage;
     auto& job = runtimeState->offlineRenderJob;
+    const bool completedLinkedSequenceMember =
+        runtimeState->linkedCurrentRenderSequenceMemberRunning;
     const bool clearQuickMp4Queue = job.quickMp4BatchJob && !finalErrorMessage.empty();
     RefreshAnimationExportWriterProgress(&job);
     if (job.worker.joinable()) {
@@ -41539,10 +42323,13 @@ void FinishOfflineRenderJob(
         job.cancelRequested ||
         finalStatusMessage.find("cancelled") != std::string::npos ||
         finalStatusMessage.find("Cancelling") != std::string::npos;
-    const bool retainExportSourcesForNextBatchItem =
-        job.quickMp4BatchJob && !renderWasCancelled &&
-        finalErrorMessage.empty() &&
-        !runtimeState->animationPanel.quickMp4Queue.empty();
+    const bool retainExportSourcesForNextQueuedItem =
+        !renderWasCancelled && finalErrorMessage.empty() &&
+        ((job.quickMp4BatchJob &&
+          !runtimeState->animationPanel.quickMp4Queue.empty()) ||
+         runtimeState->pendingCurrentRenderSnapshot != nullptr ||
+         (completedLinkedSequenceMember &&
+          !runtimeState->queuedCurrentRenderSnapshots.empty()));
     const auto renderSetupStatus =
         renderWasCancelled
             ? RenderSetupStatus::Cancelled
@@ -41581,7 +42368,7 @@ void FinishOfflineRenderJob(
         }
     }
 
-    if (!retainExportSourcesForNextBatchItem) {
+    if (!retainExportSourcesForNextQueuedItem) {
         const auto released =
             ReleaseExportOnlyPointCloudSources(runtimeState, viewport);
         if (!released.warning.empty()) {
@@ -41607,6 +42394,26 @@ void FinishOfflineRenderJob(
     job.writerFinishRequested = false;
     job.frameSampleState = {};
     job.writerState.reset();
+    if (completedLinkedSequenceMember) {
+        runtimeState->linkedCurrentRenderSequenceMemberRunning = false;
+        if (renderWasCancelled || !finalErrorMessage.empty()) {
+            runtimeState->pendingCurrentRenderSnapshot.reset();
+            runtimeState->queuedCurrentRenderSnapshots.clear();
+            runtimeState->linkedCurrentRenderSequenceActive = false;
+        } else if (!runtimeState->queuedCurrentRenderSnapshots.empty()) {
+            runtimeState->pendingCurrentRenderSnapshot =
+                std::move(
+                    runtimeState->queuedCurrentRenderSnapshots.front());
+            runtimeState->queuedCurrentRenderSnapshots.pop_front();
+            if (!finalStatusMessage.empty()) {
+                finalStatusMessage += " ";
+            }
+            finalStatusMessage +=
+                "Starting the next linked animation export.";
+        } else {
+            runtimeState->linkedCurrentRenderSequenceActive = false;
+        }
+    }
     if (clearQuickMp4Queue) {
         runtimeState->animationPanel.quickMp4Queue.clear();
         runtimeState->animationPanel.quickMp4QueueTotal = 0;
@@ -42196,6 +43003,9 @@ void WriteBackgroundWorkerStatus(
         status.totalFrames =
             static_cast<std::uint32_t>(job->frames.size());
         status.progress = ExportRenderProgressFraction(*job);
+        status.currentFrameProgress = static_cast<float>(
+            ExportCurrentFrameSampleFraction(*job));
+        status.frameRenderSeconds = job->frameRenderSeconds;
     } else {
         status.totalFrames = expectedTotalFrames;
     }
@@ -42204,6 +43014,98 @@ void WriteBackgroundWorkerStatus(
         status,
         statusPath,
         &ignoredError);
+}
+
+enum class BackgroundRenderDependencyWaitResult : std::uint8_t {
+    Ready,
+    Cancelled,
+};
+
+BackgroundRenderDependencyWaitResult WaitForBackgroundRenderDependencies(
+    const BackgroundRenderWorkerOptions& options) {
+    if (options.waitForStatusPaths.empty()) {
+        return BackgroundRenderDependencyWaitResult::Ready;
+    }
+    const auto statusPath = options.statusPath.empty()
+        ? BackgroundRenderStatusPath(options.setupPath)
+        : options.statusPath;
+    std::uint32_t expectedTotalFrames = 0U;
+    if (const auto ownStatus = invisible_places::serialization::
+            LoadBackgroundRenderStatusDocument(statusPath);
+        ownStatus.has_value()) {
+        expectedTotalFrames = ownStatus->totalFrames;
+    }
+
+    ApplyBackgroundWorkerProcessPriority();
+    auto nextStatusAt = std::chrono::steady_clock::time_point{};
+    while (true) {
+        std::error_code cancellationError;
+        if (std::filesystem::is_regular_file(
+                BackgroundRenderCancellationRequestPath(statusPath),
+                cancellationError)) {
+            WriteBackgroundWorkerStatus(
+                statusPath,
+                "cancelled",
+                "Queued background render cancelled before startup.",
+                options.setupPath,
+                nullptr,
+                expectedTotalFrames);
+            UpdateBackgroundRenderPackageStatus(
+                options.setupPath,
+                RenderSetupStatus::Cancelled);
+            return BackgroundRenderDependencyWaitResult::Cancelled;
+        }
+
+        std::vector<BackgroundRenderDependencyObservation> observations;
+        observations.reserve(options.waitForStatusPaths.size());
+        for (const auto& dependencyPath : options.waitForStatusPaths) {
+            std::string readError;
+            const auto dependency = invisible_places::serialization::
+                LoadBackgroundRenderStatusDocument(
+                    dependencyPath,
+                    &readError);
+            observations.push_back({
+                .statusLoaded = dependency.has_value(),
+                .terminal = dependency.has_value() &&
+                    BackgroundRenderStatusTerminal(dependency->state),
+                .processId = dependency.has_value()
+                    ? dependency->processId
+                    : 0,
+                .processAlive = dependency.has_value() &&
+                    BackgroundRenderProcessAlive(dependency->processId),
+                .statusFresh =
+                    BackgroundRenderStatusIsFresh(dependencyPath),
+            });
+        }
+        const auto remaining =
+            CountBlockingBackgroundRenderDependencies(observations);
+        if (remaining == 0U) {
+            WriteBackgroundWorkerStatus(
+                statusPath,
+                "starting",
+                "Background queue predecessors finished; starting the "
+                "detached render worker.",
+                options.setupPath,
+                nullptr,
+                expectedTotalFrames);
+            return BackgroundRenderDependencyWaitResult::Ready;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= nextStatusAt) {
+            nextStatusAt = now + std::chrono::milliseconds{500};
+            WriteBackgroundWorkerStatus(
+                statusPath,
+                "queued",
+                "Waiting for " + std::to_string(remaining) +
+                    " earlier background export" +
+                    (remaining == 1U ? "." : "s."),
+                options.setupPath,
+                nullptr,
+                expectedTotalFrames);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{250});
+    }
 }
 
 std::string BackgroundRenderWorkerPhase(
@@ -42311,10 +43213,19 @@ bool DrawBackgroundRenderWorkerMonitor(
         progressOverlay = "Preparing 0 / " +
                           std::to_string(totalFrames) + " frames";
     }
-    ImGui::ProgressBar(
-        std::clamp(progress, 0.0F, 1.0F),
-        ImVec2{-FLT_MIN, 22.0F},
-        progressOverlay.c_str());
+    if (job.active) {
+        DrawExportFrameDurationProgressBar(
+            job.frameRenderSeconds,
+            totalFrames,
+            progress,
+            static_cast<float>(ExportCurrentFrameSampleFraction(job)),
+            "##BackgroundWorkerDurationProgress");
+    } else {
+        ImGui::ProgressBar(
+            std::clamp(progress, 0.0F, 1.0F),
+            ImVec2{-FLT_MIN, 22.0F},
+            progressOverlay.c_str());
+    }
 
     if (job.active) {
         ImGui::Text(
@@ -42323,6 +43234,14 @@ bool DrawBackgroundRenderWorkerMonitor(
             totalFrames,
             std::min<std::uint32_t>(job.writtenFrameCount, totalFrames),
             job.pendingFrameCount);
+        const auto average = AverageExportFrameRenderDuration(job);
+        if (average.has_value()) {
+            ImGui::Text(
+                "Average render: %s / frame",
+                FormatFrameRenderDuration(average.value()).c_str());
+        } else {
+            ImGui::TextDisabled("Average render: calculating...");
+        }
     }
 
     const auto elapsed = std::chrono::steady_clock::now() - startedAt;
@@ -42449,10 +43368,36 @@ bool DrawAttachedBackgroundRenderStatusMonitor(
                 << (std::clamp(status->progress, 0.0F, 1.0F) *
                     100.0F)
                 << '%';
-        ImGui::ProgressBar(
-            std::clamp(status->progress, 0.0F, 1.0F),
-            ImVec2{-FLT_MIN, 22.0F},
-            overlay.str().c_str());
+        if (!status->frameRenderSeconds.empty()) {
+            DrawExportFrameDurationProgressBar(
+                status->frameRenderSeconds,
+                status->totalFrames,
+                status->progress,
+                status->currentFrameProgress,
+                "##AttachedBackgroundDurationProgress");
+            if (status->totalFrames > 0U) {
+                ImGui::Text(
+                    "Captured %u / %u frames",
+                    std::min(
+                        status->renderedFrames,
+                        status->totalFrames),
+                    status->totalFrames);
+            }
+        } else {
+            ImGui::ProgressBar(
+                std::clamp(status->progress, 0.0F, 1.0F),
+                ImVec2{-FLT_MIN, 22.0F},
+                overlay.str().c_str());
+        }
+        if (const auto average = AverageFrameRenderSeconds(
+                status->frameRenderSeconds);
+            average.has_value()) {
+            ImGui::Text(
+                "Average render: %s / frame",
+                FormatFrameRenderSeconds(average.value()).c_str());
+        } else {
+            ImGui::TextDisabled("Average render: calculating...");
+        }
         ImGui::Text(
             "Monitoring: %s",
             FormatAdaptiveDuration(observedElapsed).c_str());
@@ -43199,6 +44144,8 @@ int RunBackgroundRenderWorker(
                                                static_cast<float>(lastTotalFrames)
                                          : 0.0F)
                                   : 1.0F;
+            status.frameRenderSeconds =
+                runtimeState->offlineRenderJob.frameRenderSeconds;
             status.updatedUtc =
                 invisible_places::serialization::CurrentUtcTimestamp();
             invisible_places::serialization::
@@ -43257,7 +44204,9 @@ void DrawExportTimingSummary(const OfflineRenderJobState& job, bool stableLayout
     }
     const auto average = AverageExportFrameRenderDuration(job);
     if (average.has_value()) {
-        ImGui::Text("Average render: %s / frame", FormatAdaptiveDuration(average.value()).c_str());
+        ImGui::Text(
+            "Average render: %s / frame",
+            FormatFrameRenderDuration(average.value()).c_str());
     } else {
         ImGui::TextDisabled("Average render: calculating...");
     }
@@ -43908,6 +44857,7 @@ void DrawAnimationExportSection(
         const bool framePreviewDisabled =
             runtimeState->offlineRenderJob.active ||
             runtimeState->pendingCurrentRenderSnapshot != nullptr ||
+            !runtimeState->queuedCurrentRenderSnapshots.empty() ||
             viewport == nullptr ||
             !panel.currentPath.has_value();
         if (framePreviewDisabled) {
@@ -43984,6 +44934,8 @@ void DrawAnimationExportSection(
     }
 
     auto& job = runtimeState->offlineRenderJob;
+    const auto activeBackgroundStatusPaths =
+        ActiveBackgroundRenderStatusPaths(*runtimeState);
     if (job.active) {
         RefreshAnimationExportWriterProgress(&job);
         const float frameProgress = ExportRenderProgressFraction(job);
@@ -44043,6 +44995,69 @@ void DrawAnimationExportSection(
         if (ImGui::Button(job.cancelRequested ? "Cancelling..." : "Cancel Export")) {
             RequestOfflineRenderCancellation(&job);
         }
+        ImGui::SeparatorText("Queue Current Render Setup");
+        const auto queuedSetup = CurrentRenderSetupProvenance(*runtimeState);
+        DrawRenderSetupProvenanceDetails(
+            queuedSetup,
+            panel.currentPath.has_value()
+                ? std::string_view{panel.currentPath->name}
+                : std::string_view{},
+            false);
+        const bool activeQueueUnavailable =
+            runtimeState->pendingCurrentRenderSnapshot != nullptr ||
+            !runtimeState->queuedCurrentRenderSnapshots.empty() ||
+            runtimeState->pendingFramePreviewSnapshot != nullptr ||
+            runtimeState->linkedAnimationExportDialog.active;
+        ImGui::BeginDisabled(activeQueueUnavailable);
+        if (ImGui::Button(
+                "Queue to Active Export##CurrentRenderSetup")) {
+            RequestCurrentAnimationExport(
+                runtimeState,
+                CurrentAnimationExportDestination::Foreground);
+        }
+        ImGui::EndDisabled();
+        if (!activeBackgroundStatusPaths.empty()) {
+            ImGui::SameLine();
+            ImGui::BeginDisabled(
+                runtimeState->pendingFramePreviewSnapshot != nullptr ||
+                runtimeState->pendingCurrentRenderSnapshot != nullptr ||
+                runtimeState->linkedAnimationExportDialog.active);
+            if (ImGui::Button(
+                    "Queue to Background Export##CurrentRenderSetup")) {
+                RequestCurrentAnimationExport(
+                    runtimeState,
+                    CurrentAnimationExportDestination::Background,
+                    activeBackgroundStatusPaths);
+            }
+            ImGui::EndDisabled();
+        }
+        if (runtimeState->pendingCurrentRenderSnapshot != nullptr ||
+            !runtimeState->queuedCurrentRenderSnapshots.empty()) {
+            ImGui::TextDisabled(
+                runtimeState->queuedCurrentRenderSnapshots.empty() &&
+                        !runtimeState->linkedCurrentRenderSequenceMemberRunning
+                    ? "One frozen current render setup is queued behind the foreground export queue."
+                    : runtimeState->linkedCurrentRenderSequenceMemberRunning
+                        ? "The remaining linked member is queued after this foreground export."
+                        : "Two frozen linked animation exports (A then B) are queued behind the foreground export queue.");
+            if (ImGui::Button(
+                    runtimeState->linkedCurrentRenderSequenceMemberRunning
+                        ? "Cancel Remaining Linked Export"
+                        : "Cancel Queued Current Export")) {
+                const bool linkedMemberRunning =
+                    runtimeState->linkedCurrentRenderSequenceMemberRunning;
+                runtimeState->pendingCurrentRenderSnapshot.reset();
+                runtimeState->queuedCurrentRenderSnapshots.clear();
+                runtimeState->linkedCurrentRenderSequenceActive = false;
+                if (!linkedMemberRunning) {
+                    runtimeState->linkedCurrentRenderSequenceMemberRunning =
+                        false;
+                }
+                runtimeState->statusMessage =
+                    "Cancelled the queued current export.";
+                runtimeState->errorMessage.clear();
+            }
+        }
         EndPanelSection();
         return;
     }
@@ -44074,6 +45089,9 @@ void DrawAnimationExportSection(
             "Current render setup frozen; preparing finest-density sources.");
         if (ImGui::Button("Cancel Pending Export")) {
             runtimeState->pendingCurrentRenderSnapshot.reset();
+            runtimeState->queuedCurrentRenderSnapshots.clear();
+            runtimeState->linkedCurrentRenderSequenceActive = false;
+            runtimeState->linkedCurrentRenderSequenceMemberRunning = false;
             runtimeState->statusMessage =
                 "Cancelled the pending animation export.";
             runtimeState->errorMessage.clear();
@@ -44087,6 +45105,7 @@ void DrawAnimationExportSection(
         const bool exportAvailable =
             !runtimeState->currentExportStartQueued &&
             runtimeState->pendingFramePreviewSnapshot == nullptr &&
+            !runtimeState->linkedAnimationExportDialog.active &&
             ResolveCurrentPointVisualExportSelection(runtimeState).has_value();
         if (!exportAvailable) {
             ImGui::BeginDisabled();
@@ -44098,11 +45117,9 @@ void DrawAnimationExportSection(
                 ? "Export Current " + std::string{AnimationExportModeLabel(panel.exportMode)}
                 : "Export HQ EXR Stack";
         if (ImGui::Button(exportButtonLabel.c_str())) {
-            // Deferring the heavy setup one frame paints the Starting Export
-            // card before the app pauses for setup work.
-            runtimeState->currentExportStartQueued = true;
-            runtimeState->statusMessage = "Starting export...";
-            runtimeState->errorMessage.clear();
+            RequestCurrentAnimationExport(
+                runtimeState,
+                CurrentAnimationExportDestination::Foreground);
         }
         if (!exportAvailable) {
             ImGui::EndDisabled();
@@ -44121,8 +45138,16 @@ void DrawAnimationExportSection(
         if (!exportAvailable) {
             ImGui::BeginDisabled();
         }
-        if (ImGui::Button("Render in Background")) {
-            QueueCurrentAnimationBackgroundRender(runtimeState);
+        const bool queuesBehindBackground =
+            !activeBackgroundStatusPaths.empty();
+        if (ImGui::Button(
+                queuesBehindBackground
+                    ? "Queue to Background Export##CurrentRenderSetup"
+                    : "Render in Background##CurrentRenderSetup")) {
+            RequestCurrentAnimationExport(
+                runtimeState,
+                CurrentAnimationExportDestination::Background,
+                activeBackgroundStatusPaths);
         }
         if (!exportAvailable) {
             ImGui::EndDisabled();
@@ -44131,10 +45156,15 @@ void DrawAnimationExportSection(
                 ImGuiHoveredFlags_DelayNormal |
                 ImGuiHoveredFlags_AllowWhenDisabled)) {
             ImGui::SetTooltip(
-                "Freezes this exact render setup and launches a detached, "
-                "low-priority worker. The worker survives closing or "
-                "rebuilding this app. It shares the GPU, so the reopened "
-                "editor may still run more slowly while it renders.");
+                queuesBehindBackground
+                    ? "Freezes this exact render setup and appends a detached "
+                      "worker to the active background queue. It waits without "
+                      "loading the scene or opening Vulkan, and survives closing "
+                      "or rebuilding this app."
+                    : "Freezes this exact render setup and launches a detached, "
+                      "low-priority worker. The worker survives closing or "
+                      "rebuilding this app. It shares the GPU, so the reopened "
+                      "editor may still run more slowly while it renders.");
         }
     }
 
@@ -44150,9 +45180,25 @@ void DrawAnimationExportSection(
              (status.processId > 0 &&
               !BackgroundRenderProcessAlive(status.processId)));
         ImGui::SeparatorText("Latest Background Render");
-        ImGui::ProgressBar(
-            std::clamp(status.progress, 0.0F, 1.0F),
-            ImVec2{-FLT_MIN, 0.0F});
+        if (!status.frameRenderSeconds.empty()) {
+            DrawExportFrameDurationProgressBar(
+                status.frameRenderSeconds,
+                status.totalFrames,
+                status.progress,
+                status.currentFrameProgress,
+                "##LatestBackgroundDurationProgress");
+        } else {
+            ImGui::ProgressBar(
+                std::clamp(status.progress, 0.0F, 1.0F),
+                ImVec2{-FLT_MIN, 0.0F});
+        }
+        if (const auto average = AverageFrameRenderSeconds(
+                status.frameRenderSeconds);
+            average.has_value()) {
+            ImGui::TextDisabled(
+                "Average render: %s / frame",
+                FormatFrameRenderSeconds(average.value()).c_str());
+        }
         ImGui::TextWrapped(
             "%s: %s",
             disconnected ? "disconnected" : status.state.c_str(),
@@ -44250,6 +45296,133 @@ void DrawAnimationExportSection(
     EndPanelSection();
 }
 
+void DrawLinkedAnimationExportDialog(
+    PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    auto& dialog = runtimeState->linkedAnimationExportDialog;
+    if (dialog.openRequested) {
+        ImGui::OpenPopup("Export Linked Animations");
+        dialog.openRequested = false;
+    }
+    if (!dialog.active) {
+        return;
+    }
+
+    bool open = true;
+    ImGui::SetNextWindowSize(ImVec2{560.0F, 0.0F}, ImGuiCond_Appearing);
+    if (ImGui::BeginPopupModal(
+            "Export Linked Animations",
+            &open,
+            ImGuiWindowFlags_AlwaysAutoResize)) {
+        const auto pair = ResolveActiveAnimationLinkedPair(*runtimeState);
+        const bool pairStillMatches =
+            pair.has_value() &&
+            pair->sessionPairId == dialog.sessionPairId;
+        ImGui::TextWrapped(
+            dialog.destination ==
+                    CurrentAnimationExportDestination::Background
+                ? "Choose which member to freeze and send to the detached background export queue."
+                : "Choose which member to freeze and send to the foreground export queue.");
+        ImGui::TextDisabled(
+            "The current linked-loop time and Seam/A/B view will not change.");
+        ImGui::Spacing();
+
+        const auto execute = [&](LinkedAnimationExportSelection selection) {
+            const auto destination = dialog.destination;
+            const auto pairId = dialog.sessionPairId;
+            const auto dependencies = dialog.backgroundDependencies;
+            dialog = LinkedAnimationExportDialogState{};
+            ImGui::CloseCurrentPopup();
+            if (destination ==
+                CurrentAnimationExportDestination::Background) {
+                (void)QueueLinkedAnimationBackgroundRender(
+                    runtimeState,
+                    selection,
+                    pairId,
+                    dependencies);
+            } else {
+                (void)QueueLinkedAnimationForegroundRender(
+                    runtimeState,
+                    selection,
+                    pairId);
+            }
+        };
+
+        if (!pairStillMatches) {
+            ImGui::TextColored(
+                ImVec4{0.92F, 0.58F, 0.18F, 1.0F},
+                "The reciprocal pair changed after the export button was clicked.");
+            ImGui::TextWrapped(
+                "Close this chooser, confirm the linked animations, and start the export again.");
+        } else {
+            const auto memberLabel = [&](std::size_t member) {
+                const auto* animation = pair->members[member];
+                if (animation != nullptr && !animation->name.empty()) {
+                    return animation->name;
+                }
+                return pair->memberFilePaths[member].stem().string();
+            };
+            const auto memberButton = [&](
+                const char* role,
+                std::size_t member,
+                LinkedAnimationExportSelection selection) {
+                const auto label =
+                    std::string{"Export "} + role + " — " +
+                    memberLabel(member) + "##LinkedExport" + role;
+                if (ImGui::Button(label.c_str(), ImVec2{-FLT_MIN, 0.0F})) {
+                    execute(selection);
+                    return true;
+                }
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+                    ImGui::SetTooltip(
+                        "%s",
+                        pair->memberFilePaths[member].string().c_str());
+                }
+                return false;
+            };
+            if (memberButton(
+                    "A",
+                    0U,
+                    LinkedAnimationExportSelection::A)) {
+                ImGui::EndPopup();
+                return;
+            }
+            if (memberButton(
+                    "B",
+                    1U,
+                    LinkedAnimationExportSelection::B)) {
+                ImGui::EndPopup();
+                return;
+            }
+            if (ImGui::Button(
+                    "Export Both — A then B##LinkedExportBoth",
+                    ImVec2{-FLT_MIN, 0.0F})) {
+                execute(LinkedAnimationExportSelection::Both);
+                ImGui::EndPopup();
+                return;
+            }
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+                ImGui::SetTooltip(
+                    "A: %s\nB: %s\nExports are serialized so their GPU work never overlaps.",
+                    pair->memberFilePaths[0U].string().c_str(),
+                    pair->memberFilePaths[1U].string().c_str());
+            }
+        }
+
+        ImGui::Spacing();
+        if (ImGui::Button("Cancel##LinkedExport")) {
+            dialog = LinkedAnimationExportDialogState{};
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+    if (!open) {
+        dialog = LinkedAnimationExportDialogState{};
+    }
+}
+
 void DrawAnimationFramePreviewWindow(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
@@ -44335,12 +45508,17 @@ void DrawAnimationFramePreviewWindow(
 // The render-progress bar drawn as a per-frame duration graph: each
 // completed frame adds a column positioned within the steady timing range,
 // so small pace changes remain legible.
-void DrawExportFrameDurationProgressBar(const OfflineRenderJobState& job) {
-    const float fraction = ExportRenderProgressFraction(job);
+void DrawExportFrameDurationProgressBar(
+    std::span<const float> durations,
+    std::size_t totalFrames,
+    float progress,
+    float currentFrameProgress,
+    const char* widgetId) {
+    const float fraction = std::clamp(progress, 0.0F, 1.0F);
     const ImVec2 size{
         std::max(ImGui::GetContentRegionAvail().x, 60.0F),
         ImGui::GetFrameHeight()};
-    ImGui::InvisibleButton("##ExportDurationProgress", size);
+    ImGui::InvisibleButton(widgetId, size);
     const ImVec2 minimum = ImGui::GetItemRectMin();
     const ImVec2 maximum = ImGui::GetItemRectMax();
     auto* drawList = ImGui::GetWindowDrawList();
@@ -44350,10 +45528,9 @@ void DrawExportFrameDurationProgressBar(const OfflineRenderJobState& job) {
         maximum,
         ImGui::GetColorU32(ImGuiCol_FrameBg),
         rounding);
-    const auto& durations = job.frameRenderSeconds;
     const auto steadyDurations = SteadyExportFrameDurations(durations);
     const std::size_t warmup = durations.size() - steadyDurations.size();
-    const std::size_t totalFrames = std::max<std::size_t>(job.frames.size(), 1U);
+    totalFrames = std::max<std::size_t>(totalFrames, 1U);
     const float width = std::max(1.0F, maximum.x - minimum.x);
     const float height = std::max(1.0F, maximum.y - minimum.y);
     const auto bounds = ExportFrameDurationBounds(steadyDurations);
@@ -44404,8 +45581,10 @@ void DrawExportFrameDurationProgressBar(const OfflineRenderJobState& job) {
     // height, growing with its sample progress.
     if (!steadyDurations.empty() &&
         durations.size() < totalFrames) {
-        const auto partial =
-            static_cast<float>(ExportCurrentFrameSampleFraction(job));
+        const auto partial = std::clamp(
+            currentFrameProgress,
+            0.0F,
+            1.0F);
         if (partial > 0.0F) {
             const float frameWidth =
                 width / static_cast<float>(totalFrames);
@@ -44439,6 +45618,22 @@ void DrawExportFrameDurationProgressBar(const OfflineRenderJobState& job) {
             minimum.y + (height - textSize.y) * 0.5F},
         ImGui::GetColorU32(ImGuiCol_Text),
         overlay.c_str());
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+        ImGui::SetTooltip(
+            "Each column is one rendered frame; its height is the frame's "
+            "render time within the post-warm-up min/max range. The first "
+            "%zu warm-up frames are omitted from the timing scale.",
+            kExportFrameTimingWarmupFrames);
+    }
+}
+
+void DrawExportFrameDurationProgressBar(const OfflineRenderJobState& job) {
+    DrawExportFrameDurationProgressBar(
+        job.frameRenderSeconds,
+        job.frames.size(),
+        ExportRenderProgressFraction(job),
+        static_cast<float>(ExportCurrentFrameSampleFraction(job)),
+        "##ExportDurationProgress");
 }
 
 // Detailed per-frame timing graph under the elapsed time: duration columns
@@ -55054,7 +56249,10 @@ void PublishLinkedHqStageProgress(
 }
 
 // waitingForScene distinguishes the common scene still loading (Waiting in
-// the UI, resolved again next frame) from a pair that can never prepare.
+// the UI, resolved again next frame) from an animation selection that can
+// never prepare. A reciprocal pair contributes its two midpoint views; an
+// ordinary animation contributes one midpoint view twice so the same compact
+// ROCK/VEG patch pipeline remains available without inventing a link.
 std::optional<LinkedHqSelectionRequest> ResolveLinkedHqSelectionRequest(
     const PreviewRuntimeState& runtimeState,
     const invisible_places::renderer::core::VulkanViewportShell& viewport,
@@ -55064,15 +56262,29 @@ std::optional<LinkedHqSelectionRequest> ResolveLinkedHqSelectionRequest(
         *waitingForScene = false;
     }
     const auto pair = ResolveActiveAnimationLinkedPair(runtimeState);
-    if (!pair.has_value()) {
+    const auto& panel = runtimeState.animationPanel;
+    const AnimationPath* localAnimation =
+        panel.currentPath.has_value() ? &panel.currentPath.value() : nullptr;
+    if (!pair.has_value() && localAnimation == nullptr) {
         if (errorMessage != nullptr) {
             errorMessage->clear();
         }
         return std::nullopt;
     }
 
-    auto firstAssociations = pair->members[0U]->associatedLayerPaths;
-    auto secondAssociations = pair->members[1U]->associatedLayerPaths;
+    const AnimationPath* firstAnimation = pair.has_value()
+        ? pair->members[0U]
+        : localAnimation;
+    const AnimationPath* secondAnimation = pair.has_value()
+        ? pair->members[1U]
+        : nullptr;
+    if (firstAnimation == nullptr) {
+        return std::nullopt;
+    }
+    auto firstAssociations = firstAnimation->associatedLayerPaths;
+    auto secondAssociations = secondAnimation != nullptr
+        ? secondAnimation->associatedLayerPaths
+        : firstAssociations;
     CanonicalizeAssociatedLayerPathsForSceneGroups(
         runtimeState,
         &firstAssociations);
@@ -55084,9 +56296,8 @@ std::optional<LinkedHqSelectionRequest> ResolveLinkedHqSelectionRequest(
     const SceneDisplayBundleRuntime* fiveMillimeterBundle = nullptr;
     const SceneDisplayBundleRuntime* oneMillimeterBundle = nullptr;
     for (const auto& association : firstAssociations) {
-        if (!AssociatedLayerPathsContain(
-                secondAssociations,
-                association)) {
+        if (secondAnimation != nullptr &&
+            !AssociatedLayerPathsContain(secondAssociations, association)) {
             continue;
         }
         const auto sceneGroup =
@@ -55121,15 +56332,20 @@ std::optional<LinkedHqSelectionRequest> ResolveLinkedHqSelectionRequest(
         oneMillimeterBundle == nullptr) {
         if (errorMessage != nullptr) {
             *errorMessage =
-                "HQ requires the linked animations to share one grouped "
-                "scene with complete 1 mm and 5 mm ROCK/SAND/VEG bundles.";
+                secondAnimation != nullptr
+                    ? "HQ requires the linked animations to share one grouped "
+                      "scene with complete 1 mm and 5 mm ROCK/SAND/VEG bundles."
+                    : "HQ requires the animation to use a grouped scene with "
+                      "complete 1 mm and 5 mm ROCK/SAND/VEG bundles.";
         }
         return std::nullopt;
     }
     if (!selectedScene->displayLoaded || !selectedScene->displayVisible) {
         if (errorMessage != nullptr) {
             *errorMessage =
-                "HQ is waiting for the linked scene to become visible.";
+                secondAnimation != nullptr
+                    ? "HQ is waiting for the linked scene to become visible."
+                    : "HQ is waiting for the animation scene to become visible.";
         }
         if (waitingForScene != nullptr) {
             *waitingForScene = true;
@@ -55138,7 +56354,10 @@ std::optional<LinkedHqSelectionRequest> ResolveLinkedHqSelectionRequest(
     }
 
     LinkedHqSelectionRequest request;
-    request.pairSessionId = pair->sessionPairId;
+    request.pairSessionId = pair.has_value()
+        ? pair->sessionPairId
+        : "local:" + NormalizePathKey(
+              std::filesystem::path{panel.currentFilePath});
     request.sceneGroupName = selectedScene->sceneGroupName;
     request.patchSpacingMicrometres = SanitizeLinkedHqPatchSpacing(
         runtimeState.projectSettings.linkedHqPatchSpacingMicrometres);
@@ -55148,23 +56367,35 @@ std::optional<LinkedHqSelectionRequest> ResolveLinkedHqSelectionRequest(
         oneMillimeterBundle->sessionIndices;
 
     const float fallbackAspect = CurrentAspectRatio(viewport);
-    for (std::size_t member = 0U; member < 2U; ++member) {
+    std::array<glm::mat4, 2U> midpointViewProjections{};
+    const std::size_t midpointCount = pair.has_value() ? 2U : 1U;
+    for (std::size_t member = 0U; member < midpointCount; ++member) {
+        const auto* animation = pair.has_value()
+            ? pair->members[member]
+            : firstAnimation;
+        if (animation == nullptr) {
+            return std::nullopt;
+        }
         const auto defaultSize =
-            AnimationDefaultLiveViewWindowSize(*pair->members[member]);
+            AnimationDefaultLiveViewWindowSize(*animation);
         const float authoredAspect = defaultSize.has_value()
             ? static_cast<float>(defaultSize->width) /
                   static_cast<float>(std::max(1, defaultSize->height))
             : fallbackAspect;
         const auto evaluation = invisible_places::camera::EvaluateAnimationPath(
-            *pair->members[member],
+            *animation,
             invisible_places::camera::AnimationPathDurationSeconds(
-                *pair->members[member]) *
+                *animation) *
                 0.5F);
         invisible_places::camera::OrbitCamera midpointCamera;
         midpointCamera.ApplyState(evaluation.camera);
-        request.midpointFrustums.midpointViewProjections[member] =
+        midpointViewProjections[member] =
             midpointCamera.Matrices(authoredAspect).viewProjection;
     }
+    request.midpointFrustums = BuildAnimationHqFrustumUnion(
+        std::span<const glm::mat4>{
+            midpointViewProjections.data(),
+            midpointCount});
 
     const auto rockRole = invisible_places::scene::ScenePointCloudRoleIndex(
         invisible_places::scene::ScenePointCloudRole::Rock);
@@ -55679,7 +56910,7 @@ bool PollLinkedHqPreparation(
     hq.failureMessage.clear();
     runtimeState->previewRenderStateSignatureValid = false;
     runtimeState->statusMessage =
-        "HQ linked preview is ready (1 mm ROCK/VEG midpoint patches; "
+        "HQ animation preview is ready (1 mm ROCK/VEG midpoint patches; "
         "5 mm elsewhere).";
     if (wasEnabled || hq.reenableAfterPublish) {
         (void)SetLinkedHqPreviewEnabled(runtimeState, viewport, true);
@@ -55765,8 +56996,8 @@ bool SetLinkedHqPreviewEnabled(
         .temporalHistoryResetRequested = true;
     runtimeState->previewRenderStateSignatureValid = false;
     runtimeState->statusMessage = enabled
-        ? "HQ linked preview enabled."
-        : "HQ linked preview disabled; showing complete 5 mm points.";
+        ? "HQ animation preview enabled."
+        : "HQ animation preview disabled; showing complete 5 mm points.";
     runtimeState->errorMessage.clear();
     return true;
 }
@@ -58624,6 +59855,7 @@ bool ToggleLastWaterKeyEdit(PreviewRuntimeState* runtimeState) {
         undo ? history.before : history.after);
     history.showingBefore = undo;
     timings.waterRunKeyDrag.reset();
+    timings.waterRunKeyMarquee.reset();
     timings.waterRunSplineHandleDrag.reset();
     timings.waterRunKeyEdit.reset();
     timings.waterRunKeySelection.reset();
@@ -60102,6 +61334,161 @@ void EnsureLinkedSeamedViewPair(
     state->renderedSourceIndex = 0U;
 }
 
+void DrawAnimationHqPreviewControls(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    bool linkedPair) {
+    if (runtimeState == nullptr || viewport == nullptr) {
+        return;
+    }
+    auto& hq = runtimeState->linkedHqPreview;
+    ImGui::SameLine();
+    if (hq.ready && hq.baselineReady) {
+        if (hq.enabled) {
+            ImGui::PushStyleColor(
+                ImGuiCol_Button,
+                ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+        }
+        const bool pressed = ImGui::SmallButton("HQ");
+        if (hq.enabled) {
+            ImGui::PopStyleColor();
+        }
+        if (pressed) {
+            (void)SetLinkedHqPreviewEnabled(
+                runtimeState,
+                viewport,
+                !hq.enabled);
+        }
+    } else if (hq.stage == LinkedHqPreparationStage::Failed) {
+        if (ImGui::SmallButton("HQ Retry")) {
+            hq.retryRequested = true;
+            runtimeState->statusMessage =
+                "Retrying HQ animation-preview preparation.";
+            runtimeState->errorMessage.clear();
+        }
+    } else {
+        const float progress = std::clamp(
+            hq.displayedProgress,
+            0.0F,
+            0.99F);
+        const std::string progressLabel =
+            "HQ " + std::to_string(static_cast<int>(std::floor(
+                          progress * 100.0F))) +
+            "%";
+        const ImVec2 size{
+            ImGui::CalcTextSize("HQ 100%").x +
+                ImGui::GetStyle().FramePadding.x * 2.0F,
+            ImGui::GetFrameHeight(),
+        };
+        ImGui::BeginDisabled();
+        ImGui::InvisibleButton("##LinkedHqProgress", size);
+        ImGui::EndDisabled();
+        const auto minimum = ImGui::GetItemRectMin();
+        const auto maximum = ImGui::GetItemRectMax();
+        auto* drawList = ImGui::GetWindowDrawList();
+        drawList->AddRectFilled(
+            minimum,
+            maximum,
+            ImGui::GetColorU32(ImGuiCol_Button),
+            ImGui::GetStyle().FrameRounding);
+        if (progress > 0.0F) {
+            drawList->PushClipRect(
+                minimum,
+                ImVec2{
+                    minimum.x +
+                        (maximum.x - minimum.x) * progress,
+                    maximum.y,
+                },
+                true);
+            drawList->AddRectFilled(
+                minimum,
+                maximum,
+                ImGui::GetColorU32(ImGuiCol_ButtonActive),
+                ImGui::GetStyle().FrameRounding);
+            drawList->PopClipRect();
+        }
+        const auto labelSize =
+            ImGui::CalcTextSize(progressLabel.c_str());
+        drawList->AddText(
+            ImVec2{
+                minimum.x +
+                    ((maximum.x - minimum.x) - labelSize.x) * 0.5F,
+                minimum.y +
+                    ((maximum.y - minimum.y) - labelSize.y) * 0.5F,
+            },
+            ImGui::GetColorU32(ImGuiCol_TextDisabled),
+            progressLabel.c_str());
+    }
+    if (ImGui::IsItemHovered(
+            ImGuiHoveredFlags_DelayNormal |
+            ImGuiHoveredFlags_AllowWhenDisabled)) {
+        if (hq.stage == LinkedHqPreparationStage::Failed) {
+            ImGui::SetTooltip(
+                "HQ preparation failed. Click to retry.\n%s",
+                hq.failureMessage.c_str());
+        } else if (hq.ready && hq.baselineReady) {
+            ImGui::SetTooltip(
+                linkedPair
+                    ? "HQ is independent of Seam/A/B. It uses 1 mm ROCK and "
+                      "VEG inside the two padded animation midpoint views, "
+                      "5 mm ROCK/VEG elsewhere, and complete 5 mm SAND. "
+                      "Exports remain complete 1 mm."
+                    : "HQ uses 1 mm ROCK and VEG inside the padded animation "
+                      "midpoint view, 5 mm ROCK/VEG elsewhere, and complete "
+                      "5 mm SAND. The animation does not need to be linked; "
+                      "exports remain complete 1 mm.");
+        } else {
+            ImGui::SetTooltip(
+                "HQ %s (%.0f%%). The complete 5 mm view remains visible "
+                "until both 1 mm ROCK/VEG patches are ready.%s%s",
+                LinkedHqPreparationStageName(hq.stage),
+                std::min(hq.displayedProgress, 0.99F) * 100.0F,
+                hq.failureMessage.empty() ? "" : "\n",
+                hq.failureMessage.c_str());
+        }
+    }
+
+    auto& spacingSetting =
+        runtimeState->projectSettings.linkedHqPatchSpacingMicrometres;
+    int spacingChoice = 0;
+    for (std::size_t choice = 0U;
+         choice < kLinkedHqPatchSpacingChoicesMicrometres.size();
+         ++choice) {
+        if (kLinkedHqPatchSpacingChoicesMicrometres[choice] ==
+            SanitizeLinkedHqPatchSpacing(spacingSetting)) {
+            spacingChoice = static_cast<int>(choice);
+        }
+    }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(
+        ImGui::CalcTextSize("3 mm").x +
+        ImGui::GetFrameHeight() +
+        ImGui::GetStyle().FramePadding.x * 2.0F);
+    if (ImGui::Combo(
+            "##LinkedHqPatchSpacing",
+            &spacingChoice,
+            "1 mm\0002 mm\0003 mm\000")) {
+        spacingSetting = kLinkedHqPatchSpacingChoicesMicrometres[
+            static_cast<std::size_t>(std::clamp(
+                spacingChoice,
+                0,
+                static_cast<int>(
+                    kLinkedHqPatchSpacingChoicesMicrometres.size()) -
+                    1))];
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+        ImGui::SetTooltip(
+            "HQ patch spacing inside the animation midpoint view%s.\n"
+            "1 mm keeps every 1 mm ROCK/VEG point (slowest, export-exact).\n"
+            "2 mm / 3 mm keep one centred point per 2 mm / 3 mm cell (a "
+            "quarter / a ninth of the points, density preserving like the "
+            "5 mm display cache); footprint compensation restores the 1 mm "
+            "coverage. 2 mm reads like 1 mm; 3 mm thins fine vegetation.\n"
+            "Saved with the project; changing it rescans the 1 mm sources.",
+            linkedPair ? "s" : "");
+    }
+}
+
 void DrawLinkedSeamedViewHeaderControls(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
@@ -60118,7 +61505,15 @@ void DrawLinkedSeamedViewHeaderControls(
     const auto* current = currentIndex.has_value()
         ? RegistryAnimationPath(*runtimeState, currentIndex.value())
         : nullptr;
-    if (current == nullptr || !current->velocityBlendLink.has_value()) {
+    if (current == nullptr) {
+        return;
+    }
+    if (!current->velocityBlendLink.has_value()) {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Animation View");
+        ImGui::SameLine();
+        ImGui::TextDisabled("Local view");
+        DrawAnimationHqPreviewControls(runtimeState, viewport, false);
         return;
     }
     const auto partnerIndex = FindAnimationRegistryIndexByFileName(
@@ -60271,154 +61666,14 @@ void DrawLinkedSeamedViewHeaderControls(
             memberAvailable[1U],
             bTooltip);
 
-        auto& hq = runtimeState->linkedHqPreview;
-        ImGui::SameLine();
-        if (hq.ready && hq.baselineReady) {
-            if (hq.enabled) {
-                ImGui::PushStyleColor(
-                    ImGuiCol_Button,
-                    ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
-            }
-            const bool pressed = ImGui::SmallButton("HQ");
-            if (hq.enabled) {
-                ImGui::PopStyleColor();
-            }
-            if (pressed) {
-                (void)SetLinkedHqPreviewEnabled(
-                    runtimeState,
-                    viewport,
-                    !hq.enabled);
-            }
-        } else if (hq.stage == LinkedHqPreparationStage::Failed) {
-            if (ImGui::SmallButton("HQ Retry")) {
-                hq.retryRequested = true;
-                runtimeState->statusMessage =
-                    "Retrying HQ linked-preview preparation.";
-                runtimeState->errorMessage.clear();
-            }
-        } else {
-            const float progress = std::clamp(
-                hq.displayedProgress,
-                0.0F,
-                0.99F);
-            const std::string progressLabel =
-                "HQ " + std::to_string(static_cast<int>(std::floor(
-                              progress * 100.0F))) +
-                "%";
-            const ImVec2 size{
-                ImGui::CalcTextSize("HQ 100%").x +
-                    ImGui::GetStyle().FramePadding.x * 2.0F,
-                ImGui::GetFrameHeight(),
-            };
-            ImGui::BeginDisabled();
-            ImGui::InvisibleButton("##LinkedHqProgress", size);
-            ImGui::EndDisabled();
-            const auto minimum = ImGui::GetItemRectMin();
-            const auto maximum = ImGui::GetItemRectMax();
-            auto* drawList = ImGui::GetWindowDrawList();
-            drawList->AddRectFilled(
-                minimum,
-                maximum,
-                ImGui::GetColorU32(ImGuiCol_Button),
-                ImGui::GetStyle().FrameRounding);
-            if (progress > 0.0F) {
-                drawList->PushClipRect(
-                    minimum,
-                    ImVec2{
-                        minimum.x +
-                            (maximum.x - minimum.x) * progress,
-                        maximum.y,
-                    },
-                    true);
-                drawList->AddRectFilled(
-                    minimum,
-                    maximum,
-                    ImGui::GetColorU32(ImGuiCol_ButtonActive),
-                    ImGui::GetStyle().FrameRounding);
-                drawList->PopClipRect();
-            }
-            const auto labelSize =
-                ImGui::CalcTextSize(progressLabel.c_str());
-            drawList->AddText(
-                ImVec2{
-                    minimum.x +
-                        ((maximum.x - minimum.x) - labelSize.x) * 0.5F,
-                    minimum.y +
-                        ((maximum.y - minimum.y) - labelSize.y) * 0.5F,
-                },
-                ImGui::GetColorU32(ImGuiCol_TextDisabled),
-                progressLabel.c_str());
-        }
-        if (ImGui::IsItemHovered(
-                ImGuiHoveredFlags_DelayNormal |
-                ImGuiHoveredFlags_AllowWhenDisabled)) {
-            if (hq.stage == LinkedHqPreparationStage::Failed) {
-                ImGui::SetTooltip(
-                    "HQ preparation failed. Click to retry.\n%s",
-                    hq.failureMessage.c_str());
-            } else if (hq.ready && hq.baselineReady) {
-                ImGui::SetTooltip(
-                    "HQ is independent of Seam/A/B. It uses 1 mm ROCK and "
-                    "VEG inside the two padded midpoint views (at the patch "
-                    "spacing chosen beside it), 5 mm ROCK/VEG elsewhere, and "
-                    "complete 5 mm SAND. Exports remain complete 1 mm.");
-            } else {
-                ImGui::SetTooltip(
-                    "HQ %s (%.0f%%). The complete 5 mm view remains visible "
-                    "until both 1 mm ROCK/VEG patches are ready.%s%s",
-                    LinkedHqPreparationStageName(hq.stage),
-                    std::min(hq.displayedProgress, 0.99F) * 100.0F,
-                    hq.failureMessage.empty() ? "" : "\n",
-                    hq.failureMessage.c_str());
-            }
-        }
-        // Patch density. Changing it re-prepares the patches for the pair
-        // (the selection fingerprint includes the spacing); a live HQ view
-        // comes back automatically once the new patches publish.
-        auto& spacingSetting =
-            runtimeState->projectSettings.linkedHqPatchSpacingMicrometres;
-        int spacingChoice = 0;
-        for (std::size_t choice = 0U;
-             choice < kLinkedHqPatchSpacingChoicesMicrometres.size();
-             ++choice) {
-            if (kLinkedHqPatchSpacingChoicesMicrometres[choice] ==
-                SanitizeLinkedHqPatchSpacing(spacingSetting)) {
-                spacingChoice = static_cast<int>(choice);
-            }
-        }
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(
-            ImGui::CalcTextSize("3 mm").x +
-            ImGui::GetFrameHeight() +
-            ImGui::GetStyle().FramePadding.x * 2.0F);
-        if (ImGui::Combo(
-                "##LinkedHqPatchSpacing",
-                &spacingChoice,
-                "1 mm\0002 mm\0003 mm\000")) {
-            spacingSetting = kLinkedHqPatchSpacingChoicesMicrometres[
-                static_cast<std::size_t>(std::clamp(
-                    spacingChoice,
-                    0,
-                    static_cast<int>(
-                        kLinkedHqPatchSpacingChoicesMicrometres.size()) -
-                        1))];
-        }
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
-            ImGui::SetTooltip(
-                "HQ patch spacing inside the two midpoint views.\n"
-                "1 mm keeps every 1 mm ROCK/VEG point (slowest, export-exact).\n"
-                "2 mm / 3 mm keep one centred point per 2 mm / 3 mm cell (a "
-                "quarter / a ninth of the points, density preserving like the "
-                "5 mm display cache); the footprint compensation restores the "
-                "1 mm coverage. 2 mm reads like 1 mm; 3 mm thins fine vegetation.\n"
-                "Saved with the project; changing it rescans the 1 mm sources.");
-        }
+        DrawAnimationHqPreviewControls(runtimeState, viewport, true);
     } else if (failure.has_value()) {
         ImGui::SameLine();
         ImGui::TextDisabled("Local view");
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
             ImGui::SetTooltip("%s", failure->c_str());
         }
+        DrawAnimationHqPreviewControls(runtimeState, viewport, false);
     }
     if (timingShared &&
         panel.linkedViewMode == AnimationLinkedViewMode::Alternating) {
@@ -63678,6 +64933,7 @@ void ResetTimingTakeEditorSelections(PreviewRuntimeState* runtimeState) {
     timings.colourisePalettePicker.reset();
     timings.colourisePaletteDrag.reset();
     timings.waterRunKeyDrag.reset();
+    timings.waterRunKeyMarquee.reset();
     timings.waterRunSplineHandleDrag.reset();
     timings.waterRunKeyEdit.reset();
     timings.waterRunKeySelection.reset();
@@ -63739,6 +64995,7 @@ void ClearWaterFeatureRunEditorFocus(PreviewRuntimeState* runtimeState) {
     timings.selectedFeatureRunIndex.reset();
     timings.pendingRunDeleteIndex.reset();
     timings.waterRunKeyDrag.reset();
+    timings.waterRunKeyMarquee.reset();
     timings.waterRunSplineHandleDrag.reset();
     timings.waterRunKeyEdit.reset();
     timings.waterRunKeySelection.reset();
@@ -87052,19 +88309,63 @@ void DrawExportBatchSection(
     const std::string batchButtonLabel =
         "Export Selected " + std::string{AnimationExportModeLabel(batchMode)};
     const bool exportButtonDisabled =
-        runtimeState->offlineRenderJob.active || !batchModeCanExport;
+        runtimeState->offlineRenderJob.active ||
+        panel.quickMp4BatchStartPending ||
+        !batchModeCanExport;
     if (exportButtonDisabled) {
         ImGui::BeginDisabled();
     }
     if (ImGui::Button(batchButtonLabel.c_str())) {
         // Deferring the queue build one frame paints the pending state and
         // the Starting Export card before the setup work pauses the app.
-        panel.quickMp4BatchStartPending = true;
-        runtimeState->statusMessage = "Starting batch export...";
-        runtimeState->errorMessage.clear();
+        (void)StageSelectedQuickMp4Batch(runtimeState, false);
     }
     if (exportButtonDisabled) {
         ImGui::EndDisabled();
+    }
+    if (runtimeState->offlineRenderJob.active) {
+        ImGui::SameLine();
+        ImGui::BeginDisabled(
+            panel.quickMp4BatchStartPending || !batchModeCanExport);
+        if (ImGui::Button(
+                "Queue to Active Export##BatchExport")) {
+            (void)StageSelectedQuickMp4Batch(runtimeState, true);
+        }
+        ImGui::EndDisabled();
+    }
+    const auto activeBackgroundStatusPaths =
+        ActiveBackgroundRenderStatusPaths(*runtimeState);
+    const bool canStartBackgroundBatch =
+        !runtimeState->offlineRenderJob.active ||
+        !activeBackgroundStatusPaths.empty();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(
+        !canStartBackgroundBatch || !batchModeCanExport ||
+        selectedCount == 0U);
+    if (ImGui::Button(
+            activeBackgroundStatusPaths.empty()
+                ? "Render Selected in Background##BatchExport"
+                : "Queue to Background Export##BatchExport")) {
+        (void)QueueSelectedAnimationsBackgroundRender(
+            runtimeState,
+            activeBackgroundStatusPaths);
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(
+            ImGuiHoveredFlags_DelayNormal |
+            ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip(
+            !canStartBackgroundBatch
+                ? "A foreground export is active. Queue this batch to the "
+                  "active export, or wait before starting a new detached "
+                  "background queue."
+            : activeBackgroundStatusPaths.empty()
+                ? "Freezes every selected animation as its own render package "
+                  "and runs them sequentially in detached low-priority workers. "
+                  "The batch survives closing or rebuilding the editor."
+                : "Freezes every selected animation and appends the packages "
+                  "to the active detached background queue. Waiting workers do "
+                  "not load the scene or open Vulkan.");
     }
     ImGui::SameLine();
     ImGui::TextDisabled("%zu selected", selectedCount);
@@ -87074,10 +88375,15 @@ void DrawExportBatchSection(
     if (panel.quickMp4BatchStartPending) {
         ImGui::TextColored(
             ImVec4{0.86F, 0.62F, 0.16F, 1.0F},
-            "Preparing full-density export sources; the batch starts "
-            "automatically when they are ready.");
+            runtimeState->offlineRenderJob.active
+                ? "Batch queued behind the active foreground export; it "
+                  "starts automatically when the queue is free."
+                : "Preparing full-density export sources; the batch starts "
+                  "automatically when they are ready.");
         if (ImGui::Button("Cancel Pending Batch Export")) {
             panel.quickMp4BatchStartPending = false;
+            panel.pendingQuickMp4BatchFiles.clear();
+            panel.pendingQuickMp4BatchPreset.reset();
             runtimeState->statusMessage =
                 "Cancelled the pending batch export.";
             runtimeState->errorMessage.clear();
@@ -87457,6 +88763,7 @@ void DrawExportPanel(
         EndPanelSection();
     }
     DrawAnimationExportSection(runtimeState, viewport);
+    DrawLinkedAnimationExportDialog(runtimeState);
     DrawExportBatchSection(runtimeState, viewport);
     DrawStillCameraExportSection(runtimeState, *viewport);
 }
@@ -87977,6 +89284,88 @@ bool ApplyInterpolationToSelectedWaterRunKeys(
     return true;
 }
 
+struct WaterRunKeyMove {
+    WaterRunKeyHandle source;
+    WaterRunKeyHandle destination;
+};
+
+// Preflight every affected setting track before changing any of them. This
+// makes a multi-setting graph drag one atomic edit even when selected keys
+// exchange/vacate positions inside an individual track.
+bool MoveWaterRunKeysAtomically(
+    invisible_places::water::WaterFeatureTimingRun* run,
+    std::span<const WaterRunKeyMove> moves,
+    bool cyclic) {
+    if (run == nullptr || moves.empty()) {
+        return false;
+    }
+    struct TrackCandidate {
+        invisible_places::water::WaterFeatureTimeline* timeline = nullptr;
+        invisible_places::water::WaterKeyedSettingTrack* target = nullptr;
+        invisible_places::water::WaterKeyedSettingTrack candidate;
+        std::vector<invisible_places::water::WaterSettingKeyMove> moves;
+        std::vector<std::uint32_t> affectedClipIds;
+    };
+    std::vector<TrackCandidate> candidates;
+    for (const auto& move : moves) {
+        if (move.source.feature != move.destination.feature ||
+            move.source.settingId != move.destination.settingId) {
+            return false;
+        }
+        const auto resolved = ResolveWaterRunKey(run, move.source);
+        if (resolved.timeline == nullptr || resolved.track == nullptr ||
+            resolved.key == nullptr) {
+            return false;
+        }
+        auto candidate = std::find_if(
+            candidates.begin(),
+            candidates.end(),
+            [&](const TrackCandidate& existing) {
+                return existing.target == resolved.track;
+            });
+        if (candidate == candidates.end()) {
+            candidates.push_back(TrackCandidate{
+                .timeline = resolved.timeline,
+                .target = resolved.track,
+                .candidate = *resolved.track,
+            });
+            candidate = std::prev(candidates.end());
+        }
+        candidate->moves.push_back({
+            .sourcePosition = move.source.position,
+            .destinationPosition = move.destination.position,
+        });
+        if (resolved.key->clipId != 0U &&
+            std::find(
+                candidate->affectedClipIds.begin(),
+                candidate->affectedClipIds.end(),
+                resolved.key->clipId) ==
+                candidate->affectedClipIds.end()) {
+            candidate->affectedClipIds.push_back(resolved.key->clipId);
+        }
+    }
+    for (auto& candidate : candidates) {
+        if (!invisible_places::water::MoveWaterSettingKeys(
+                &candidate.candidate,
+                candidate.moves,
+                cyclic)) {
+            return false;
+        }
+    }
+    for (auto& candidate : candidates) {
+        candidate.target->keys = std::move(candidate.candidate.keys);
+    }
+    for (const auto& candidate : candidates) {
+        for (const auto clipId : candidate.affectedClipIds) {
+            (void)invisible_places::water::
+                SynchronizeWaterFeatureClipBounds(
+                    candidate.timeline,
+                    clipId);
+        }
+    }
+    return true;
+}
+
 void DrawWaterRunTimingGraph(
     const char* id,
     PreviewRuntimeState* runtimeState,
@@ -87996,6 +89385,12 @@ void DrawWaterRunTimingGraph(
         invisible_places::camera::ResolveAnimationTimingLoopWindow(
             runtimeState->animationPanel.currentPath.value())
             .has_value();
+    if (timings.waterRunKeyMarquee.has_value() &&
+        (timings.waterRunKeyMarquee->scenarioId != scenarioId ||
+         timings.waterRunKeyMarquee->runId != run->id ||
+         !ImGui::IsMouseDown(ImGuiMouseButton_Left))) {
+        timings.waterRunKeyMarquee.reset();
+    }
     ImGui::PushID(id);
     constexpr float kCompactLaneHeight = 14.0F;
     constexpr float kTimeRailSeparation = 17.0F;
@@ -88012,7 +89407,8 @@ void DrawWaterRunTimingGraph(
     ImGui::InvisibleButton(
         "##WaterRunGraphSurface",
         size,
-        ImGuiButtonFlags_MouseButtonLeft);
+        ImGuiButtonFlags_MouseButtonLeft |
+            ImGuiButtonFlags_MouseButtonRight);
     const ImGuiID surfaceId = ImGui::GetItemID();
     const bool itemFocused = ImGui::IsItemFocused();
     const bool itemActive = ImGui::IsItemActive();
@@ -88372,7 +89768,11 @@ void DrawWaterRunTimingGraph(
          findMatchingSeries(timings.waterRunKeyDrag.value()).has_value()) ||
         (timings.waterRunSplineHandleDrag.has_value() &&
          findMatchingSeries(
-             timings.waterRunSplineHandleDrag.value()).has_value());
+             timings.waterRunSplineHandleDrag.value()).has_value()) ||
+        (timings.waterRunKeyMarquee.has_value() &&
+         timings.waterRunKeyMarquee->scenarioId == scenarioId &&
+         timings.waterRunKeyMarquee->runId == run->id &&
+         timings.waterRunKeyMarquee->surfaceId == surfaceId);
     constexpr double kHelpHoverGraceSeconds = 2.5;
     const double helpNow = ImGui::GetTime();
     if (itemHovered && !graphDragActive) {
@@ -88458,6 +89858,13 @@ void DrawWaterRunTimingGraph(
             runtimeState,
             position);
     };
+    // Selection and key editing own the left button. Scrubbing is isolated
+    // on the right button so a selection gesture never moves the playhead
+    // before it has even resolved its keys.
+    if (itemActive && ImGui::IsMouseDown(ImGuiMouseButton_Right) &&
+        !keyHelpHovered) {
+        scrubTo(positionForX(mouse.x));
+    }
     const auto selectKey = [&](std::size_t index,
                                float position,
                                bool useKeyboardModifiers) {
@@ -88565,6 +89972,19 @@ void DrawWaterRunTimingGraph(
             }
             return;
         }
+        if (selectionMatchesRun() && isKeySelected(index, position) &&
+            timings.waterRunKeySelection->keys.size() > 1U) {
+            // A plain grab of one selected member must preserve the group;
+            // otherwise the drag would collapse a carefully built marquee
+            // or modifier selection back to a single key.
+            SetWaterRunKeySelectionPrimary(
+                &timings.waterRunKeySelection.value(),
+                clicked);
+            timings.waterRunKeySelection->rangeAnchor = clicked;
+            timings.waterRunKeySelection->clipDriven = false;
+            timings.waterClipSelection.reset();
+            return;
+        }
         ReplaceWaterRunKeySelection(
             &timings,
             scenarioId,
@@ -88580,6 +90000,30 @@ void DrawWaterRunTimingGraph(
                              bool value) {
         BeginWaterKeyEditTransaction(runtimeState, scenarioId);
         selectKey(index, position, /*useKeyboardModifiers=*/false);
+        const auto clicked = keyHandle(index, position);
+        std::vector<WaterRunKeyHandle> handles{clicked};
+        std::optional<WaterRunKeyHandle> rangeAnchor;
+        if (selectionMatchesRun() &&
+            std::any_of(
+                timings.waterRunKeySelection->keys.begin(),
+                timings.waterRunKeySelection->keys.end(),
+                [&](const WaterRunKeyHandle& selected) {
+                    return WaterRunKeyHandleMatches(selected, clicked);
+                })) {
+            handles = timings.waterRunKeySelection->keys;
+            rangeAnchor = timings.waterRunKeySelection->rangeAnchor;
+        }
+        const auto primary = std::find_if(
+            handles.begin(),
+            handles.end(),
+            [&](const WaterRunKeyHandle& handle) {
+                return WaterRunKeyHandleMatches(handle, clicked);
+            });
+        const std::size_t primaryIndex = primary != handles.end()
+            ? static_cast<std::size_t>(
+                  std::distance(handles.begin(), primary))
+            : 0U;
+        timings.waterRunKeyMarquee.reset();
         timings.waterRunSplineHandleDrag.reset();
         timings.waterRunKeyDrag = WaterRunKeyDragState{
             .scenarioId = scenarioId,
@@ -88594,6 +90038,13 @@ void DrawWaterRunTimingGraph(
             .grabOffsetY =
                 value ? mouse.y - yForValue(series[index], keyValue)
                       : 0.0F,
+            .unwrappedDisplayPositionAtStart =
+                timelineCoordinates.ViewFractionToUnwrappedDisplay(
+                    (xForPosition(position) - minimum.x) / width),
+            .primaryIndex = primaryIndex,
+            .originalKeys = handles,
+            .currentKeys = std::move(handles),
+            .rangeAnchor = rangeAnchor,
         };
     };
     const auto armSplineHandleDrag =
@@ -88604,6 +90055,7 @@ void DrawWaterRunTimingGraph(
             handle.point.anchorPosition,
             /*useKeyboardModifiers=*/false);
         timings.waterRunKeyDrag.reset();
+        timings.waterRunKeyMarquee.reset();
         timings.waterRunSplineHandleDrag = WaterRunSplineHandleDragState{
             .scenarioId = scenarioId,
             .runId = run->id,
@@ -88631,6 +90083,7 @@ void DrawWaterRunTimingGraph(
         }
         selectKey(index, position, /*useKeyboardModifiers=*/false);
         timings.waterRunKeyDrag.reset();
+        timings.waterRunKeyMarquee.reset();
         timings.waterRunSplineHandleDrag.reset();
         timings.waterRunKeyEdit = WaterRunKeyEditState{
             .scenarioId = scenarioId,
@@ -88723,6 +90176,7 @@ void DrawWaterRunTimingGraph(
     if (itemFocused && !ImGui::GetIO().WantTextInput &&
         !timings.waterRunKeyEdit.has_value() &&
         !timings.waterRunKeyDrag.has_value() &&
+        !timings.waterRunKeyMarquee.has_value() &&
         !timings.waterRunSplineHandleDrag.has_value()) {
         const bool command =
             ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeySuper;
@@ -88756,20 +90210,12 @@ void DrawWaterRunTimingGraph(
         }
     }
 
-    const bool scrubOnKey =
-        [&](float position) {
-            return std::abs(
-                       CurrentAuthoredTrackPosition(*runtimeState) -
-                       position) <= kKeyTolerance;
-        }(hoveredDotSeries.has_value() ? hoveredDotPosition
-                                       : nearestMarkerPosition);
-
     if (keyHelpHovered) {
         ImGui::SetTooltip(
-            "Click or drag empty graph space to scrub; double-click it to add a key on the nearest curve.\n"
-            "Click a key to select it. Drag a curve dot to change time and value; drag its lower marker to retime only.\n"
-            "Double-click a curve dot for exact editing. On the lower rail, double-click once to jump to a key and again to edit it.\n"
-            "Cmd/Ctrl-click toggles selection, Shift-click selects a range, and Cmd/Ctrl+A selects this graph. Delete or Backspace removes selected keys; Esc clears.\n"
+            "Right-click or right-drag to scrub; double-click empty graph space to add a key on the nearest curve.\n"
+            "Left-click a key to select it. Drag a selected curve dot or lower marker to retime the whole selection; the grabbed curve dot also changes value.\n"
+            "Double-click a curve dot or lower marker for exact editing.\n"
+            "Left-drag empty space to marquee-select. Cmd/Ctrl-click toggles selection, Shift-click selects a range, and Cmd/Ctrl+A selects this graph. Delete or Backspace removes selected keys; Esc clears.\n"
             "A selected Spline Handles key exposes circular controls that drag in time and value.");
     } else if (hoveredSplineHandle.has_value()) {
         const auto& handle =
@@ -88805,7 +90251,6 @@ void DrawWaterRunTimingGraph(
             openKeyEditor(index, hoveredDotPosition);
         } else if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
             handledInteraction = true;
-            scrubTo(hoveredDotPosition);
             const auto& io = ImGui::GetIO();
             if (io.KeyCtrl || io.KeySuper || io.KeyShift) {
                 selectKey(
@@ -88835,14 +90280,9 @@ void DrawWaterRunTimingGraph(
             keyMembershipLabel(index, nearestMarkerPosition).c_str());
         if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
             handledInteraction = true;
-            if (scrubOnKey) {
-                openKeyEditor(index, nearestMarkerPosition);
-            } else {
-                scrubTo(nearestMarkerPosition);
-            }
+            openKeyEditor(index, nearestMarkerPosition);
         } else if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
             handledInteraction = true;
-            scrubTo(nearestMarkerPosition);
             const auto& io = ImGui::GetIO();
             if (io.KeyCtrl || io.KeySuper || io.KeyShift) {
                 selectKey(
@@ -88884,6 +90324,36 @@ void DrawWaterRunTimingGraph(
                 position,
                 valueForY(series[target.value()], mouse.y));
         }
+    } else if (
+        itemHovered && !keyHelpHovered &&
+        ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        const auto& io = ImGui::GetIO();
+        const bool additive =
+            io.KeyCtrl || io.KeySuper || io.KeyShift;
+        std::vector<WaterRunKeyHandle> base;
+        if (additive && selectionMatchesRun()) {
+            base = timings.waterRunKeySelection->keys;
+        }
+        ReplaceWaterRunKeySelection(
+            &timings,
+            scenarioId,
+            run->id,
+            base,
+            /*clipDriven=*/false);
+        timings.waterClipSelection.reset();
+        timings.waterRunKeyDrag.reset();
+        timings.waterRunSplineHandleDrag.reset();
+        timings.waterRunKeyMarquee = WaterRunKeyMarqueeState{
+            .scenarioId = scenarioId,
+            .runId = run->id,
+            .surfaceId = surfaceId,
+            .startX = mouse.x,
+            .startY = mouse.y,
+            .currentX = mouse.x,
+            .currentY = mouse.y,
+            .baseSelection = std::move(base),
+        };
+        handledInteraction = true;
     }
 
     // Resolve any live drag against this graph's series.
@@ -88896,27 +90366,66 @@ void DrawWaterRunTimingGraph(
             ? findMatchingSeries(
                   timings.waterRunSplineHandleDrag.value())
             : std::nullopt;
-    if (!handledInteraction && !draggedSeries.has_value() &&
-        !draggedSplineHandleSeries.has_value() &&
-        itemActive &&
+    const auto marqueeMatches = [&] {
+        return timings.waterRunKeyMarquee.has_value() &&
+               timings.waterRunKeyMarquee->scenarioId == scenarioId &&
+               timings.waterRunKeyMarquee->runId == run->id &&
+               timings.waterRunKeyMarquee->surfaceId == surfaceId;
+    };
+    if (marqueeMatches() &&
         ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-        // Water setting graphs retain their established left-button local
-        // scrubber. Visual Feature graphs reserve left drag for marquee
-        // selection and use the right button for scrubbing instead.
-        const float scrubPosition = positionForX(mouse.x);
-        if (std::abs(
-                CurrentAuthoredTrackPosition(*runtimeState) -
-                scrubPosition) >
-            std::numeric_limits<float>::epsilon()) {
-            scrubTo(scrubPosition);
+        auto& marquee = timings.waterRunKeyMarquee.value();
+        marquee.currentX = mouse.x;
+        marquee.currentY = mouse.y;
+        if (ImGui::IsMouseDragging(ImGuiMouseButton_Left, 2.0F)) {
+            const ImVec2 selectionMinimum{
+                std::min(marquee.startX, marquee.currentX),
+                std::min(marquee.startY, marquee.currentY)};
+            const ImVec2 selectionMaximum{
+                std::max(marquee.startX, marquee.currentX),
+                std::max(marquee.startY, marquee.currentY)};
+            const auto pointInside = [&](ImVec2 point) {
+                return point.x >= selectionMinimum.x &&
+                       point.x <= selectionMaximum.x &&
+                       point.y >= selectionMinimum.y &&
+                       point.y <= selectionMaximum.y;
+            };
+            auto selected = marquee.baseSelection;
+            for (std::size_t index = 0U;
+                 index < series.size();
+                 ++index) {
+                for (const auto& key : sortedKeys[index]) {
+                    if (!positionInView(key.position)) {
+                        continue;
+                    }
+                    const float x = xForPosition(key.position);
+                    if (!pointInside(ImVec2{
+                            x,
+                            yForValue(series[index], key.value)}) &&
+                        !pointInside(ImVec2{x, axisY})) {
+                        continue;
+                    }
+                    const auto candidate = keyHandle(index, key.position);
+                    if (std::none_of(
+                            selected.begin(),
+                            selected.end(),
+                            [&](const WaterRunKeyHandle& existing) {
+                                return WaterRunKeyHandleMatches(
+                                    existing,
+                                    candidate);
+                            })) {
+                        selected.push_back(candidate);
+                    }
+                }
+            }
+            ReplaceWaterRunKeySelection(
+                &timings,
+                scenarioId,
+                run->id,
+                std::move(selected),
+                /*clipDriven=*/false);
+            timings.waterClipSelection.reset();
         }
-    }
-    if (!handledInteraction && itemHovered &&
-        ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
-        !ImGui::GetIO().KeyCtrl && !ImGui::GetIO().KeySuper &&
-        !ImGui::GetIO().KeyShift) {
-        timings.waterRunKeySelection.reset();
-        timings.waterClipSelection.reset();
     }
     if (draggedSplineHandleSeries.has_value() &&
         itemActive &&
@@ -88947,86 +90456,119 @@ void DrawWaterRunTimingGraph(
     if (draggedSeries.has_value() && itemActive &&
         ImGui::IsMouseDragging(ImGuiMouseButton_Left, 2.0F)) {
         auto& drag = timings.waterRunKeyDrag.value();
-        auto* track = series[draggedSeries.value()].track;
-        if (track != nullptr) {
-            // Captured before any move: the snapshot still holds the key at
-            // its pre-move position, and the dragged key must keep its
-            // authored interpolation through every AddOrUpdate replacement.
-            const auto draggedInterpolation = keyInterpolationAt(
-                draggedSeries.value(),
-                drag.currentPosition);
-            const float destination =
-                positionForX(mouse.x - drag.grabOffsetX);
-            const bool destinationOccupied =
-                invisible_places::water::WaterSettingKeyCountAtPosition(
-                    *track,
-                    destination) > 0U;
-            if (std::abs(destination - drag.currentPosition) >
-                    kKeyTolerance &&
-                !destinationOccupied) {
-                const std::uint32_t movedClipId = keyClipIdAt(
-                    draggedSeries.value(),
-                    drag.currentPosition);
-                if (invisible_places::water::MoveWaterSettingKey(
-                        track,
-                        drag.currentPosition,
-                        destination)) {
-                    if (movedClipId != 0U) {
-                        (void)invisible_places::water::
-                            SynchronizeWaterFeatureClipBounds(
-                                series[draggedSeries.value()].timeline,
-                                movedClipId);
-                    }
-                    if (timings.waterRunKeySelection.has_value() &&
-                        matchesSeries(
-                            timings.waterRunKeySelection.value(),
-                            draggedSeries.value()) &&
-                        std::abs(
-                            timings.waterRunKeySelection->position -
-                            drag.currentPosition) <= kKeyTolerance) {
-                        timings.waterRunKeySelection->position = destination;
-                    }
+        if (!drag.originalKeys.empty() &&
+            drag.originalKeys.size() == drag.currentKeys.size() &&
+            drag.primaryIndex < drag.originalKeys.size()) {
+            const float pointerX = mouse.x - drag.grabOffsetX;
+            float offset = timelineCoordinates.linkedCyclic
+                ? timelineCoordinates.AuthoredDeltaBetweenDisplayPositions(
+                      drag.unwrappedDisplayPositionAtStart,
+                      timelineCoordinates.ViewFractionToUnwrappedDisplay(
+                          (pointerX - minimum.x) / width))
+                : positionForX(pointerX) -
+                      drag.originalKeys[drag.primaryIndex].position;
+            if (!timelineCoordinates.linkedCyclic) {
+                float first = 1.0F;
+                float last = 0.0F;
+                for (const auto& handle : drag.originalKeys) {
+                    first = std::min(first, handle.position);
+                    last = std::max(last, handle.position);
+                }
+                offset = std::clamp(offset, -first, 1.0F - last);
+            }
+
+            std::vector<WaterRunKeyHandle> destinations =
+                drag.originalKeys;
+            for (auto& destination : destinations) {
+                destination.position = timelineCoordinates.linkedCyclic
+                    ? invisible_places::water::WrapWaterClipPhase(
+                          destination.position + offset)
+                    : std::clamp(
+                          destination.position + offset,
+                          0.0F,
+                          1.0F);
+            }
+            bool timeChanged = false;
+            for (std::size_t index = 0U;
+                 index < destinations.size();
+                 ++index) {
+                timeChanged = timeChanged ||
+                    std::abs(
+                        destinations[index].position -
+                        drag.currentKeys[index].position) >
+                        kKeyTolerance;
+            }
+            if (timeChanged) {
+                std::vector<WaterRunKeyMove> moves;
+                moves.reserve(destinations.size());
+                for (std::size_t index = 0U;
+                     index < destinations.size();
+                     ++index) {
+                    moves.push_back({
+                        .source = drag.currentKeys[index],
+                        .destination = destinations[index],
+                    });
+                }
+                if (MoveWaterRunKeysAtomically(
+                        run,
+                        moves,
+                        timelineCoordinates.linkedCyclic)) {
+                    drag.currentKeys = std::move(destinations);
+                    drag.currentPosition =
+                        drag.currentKeys[drag.primaryIndex].position;
                     if (selectionMatchesRun()) {
-                        const auto moved = keyHandle(
-                            draggedSeries.value(),
-                            drag.currentPosition);
-                        for (auto& selected :
-                             timings.waterRunKeySelection->keys) {
-                            if (WaterRunKeyHandleMatches(selected, moved)) {
-                                selected.position = destination;
+                        timings.waterRunKeySelection->keys =
+                            drag.currentKeys;
+                        SetWaterRunKeySelectionPrimary(
+                            &timings.waterRunKeySelection.value(),
+                            drag.currentKeys[drag.primaryIndex]);
+                        if (drag.rangeAnchor.has_value()) {
+                            const auto anchor = std::find_if(
+                                drag.originalKeys.begin(),
+                                drag.originalKeys.end(),
+                                [&](const WaterRunKeyHandle& handle) {
+                                    return WaterRunKeyHandleMatches(
+                                        handle,
+                                        drag.rangeAnchor.value());
+                                });
+                            if (anchor != drag.originalKeys.end()) {
+                                timings.waterRunKeySelection->rangeAnchor =
+                                    drag.currentKeys[static_cast<
+                                        std::size_t>(std::distance(
+                                        drag.originalKeys.begin(),
+                                        anchor))];
+                            } else {
+                                timings.waterRunKeySelection->rangeAnchor =
+                                    drag.rangeAnchor;
                             }
                         }
-                        if (timings.waterRunKeySelection->rangeAnchor
-                                .has_value() &&
-                            WaterRunKeyHandleMatches(
-                                timings.waterRunKeySelection->rangeAnchor
-                                    .value(),
-                                moved)) {
-                            timings.waterRunKeySelection->rangeAnchor
-                                ->position = destination;
-                        }
+                        timings.waterRunKeySelection->clipDriven = false;
                     }
-                    drag.currentPosition = destination;
-                    scrubTo(destination);
+                    scrubTo(drag.currentPosition);
                     mutated = true;
                     MarkWaterKeyEditTransactionChanged(runtimeState);
                 }
             }
-            if (drag.valueDrag) {
+            if (drag.valueDrag &&
+                drag.primaryIndex < drag.currentKeys.size()) {
                 const float value = std::clamp(
                     valueForY(
                         series[draggedSeries.value()],
                         mouse.y - drag.grabOffsetY),
                     drag.rangeMinimum,
                     drag.rangeMaximum);
-                AddOrUpdateWaterTimelineSettingKeyFromUi(
-                    series[draggedSeries.value()].timeline,
-                    track,
-                    drag.currentPosition,
-                    value,
-                    draggedInterpolation);
-                mutated = true;
-                MarkWaterKeyEditTransactionChanged(runtimeState);
+                const auto resolved = ResolveWaterRunKey(
+                    run,
+                    drag.currentKeys[drag.primaryIndex]);
+                if (resolved.key != nullptr &&
+                    std::abs(resolved.key->value - value) >
+                        std::numeric_limits<float>::epsilon()) {
+                    resolved.key->value = value;
+                    mutated = true;
+                    MarkWaterKeyEditTransactionChanged(runtimeState);
+                    ApplyFeatureTimelineScrub(runtimeState);
+                    runtimeState->previewRenderStateSignatureValid = false;
+                }
             }
         }
     }
@@ -89301,19 +90843,42 @@ void DrawWaterRunTimingGraph(
             }
         }
     }
+    if (marqueeMatches() &&
+        ImGui::IsMouseDragging(ImGuiMouseButton_Left, 2.0F)) {
+        const auto& marquee = timings.waterRunKeyMarquee.value();
+        const ImVec2 selectionMinimum{
+            std::min(marquee.startX, marquee.currentX),
+            std::min(marquee.startY, marquee.currentY)};
+        const ImVec2 selectionMaximum{
+            std::max(marquee.startX, marquee.currentX),
+            std::max(marquee.startY, marquee.currentY)};
+        const ImU32 selectionColour =
+            ImGui::GetColorU32(ImGuiCol_SliderGrabActive);
+        drawList->AddRectFilled(
+            selectionMinimum,
+            selectionMaximum,
+            colourWithOpacity(selectionColour, 0.10F));
+        drawList->AddRect(
+            selectionMinimum,
+            selectionMaximum,
+            colourWithOpacity(selectionColour, 0.85F),
+            0.0F,
+            0,
+            1.25F);
+    }
     if (!keyHelpHovered && itemHovered &&
         !hoveredSplineHandle.has_value() &&
         !hoveredDotSeries.has_value() && !markerHovered) {
         if (hoveredCurveSeries.has_value()) {
             ImGui::SetTooltip(
-                "%s = %.3g\nPosition %.4f (%.2f s)",
+                "%s = %.3g\nPosition %.4f (%.2f s)\nRight-click or right-drag to scrub. Left-drag empty space to select keys.",
                 series[hoveredCurveSeries.value()].label.c_str(),
                 hoveredCurveValue,
                 hoveredCurvePosition,
                 hoveredCurvePosition * durationSeconds);
         } else {
             ImGui::SetTooltip(
-                "Animation position %.4f (%.2f s)",
+                "Animation position %.4f (%.2f s)\nRight-click or right-drag to scrub. Left-drag to select keys.",
                 positionForX(mouse.x),
                 positionForX(mouse.x) * durationSeconds);
         }
@@ -93457,6 +95022,7 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                     "Split Graphs",
                     &timings.waterRunGraphSplit)) {
                 timings.waterRunKeyDrag.reset();
+                timings.waterRunKeyMarquee.reset();
                 timings.waterRunSplineHandleDrag.reset();
             }
             DrawWaterSeepageParameterTooltip(
@@ -108204,6 +109770,7 @@ bool DrawAnimationCyclicTimelineViewRangeSelector(
     ImGui::PopID();
     if (changed) {
         runtimeState->timingsPanel.waterRunKeyDrag.reset();
+        runtimeState->timingsPanel.waterRunKeyMarquee.reset();
         runtimeState->timingsPanel.waterRunSplineHandleDrag.reset();
     }
     return changed;
@@ -108439,6 +110006,7 @@ bool DrawAnimationTimelineViewRangeSelector(
 
     if (changed) {
         runtimeState->timingsPanel.waterRunKeyDrag.reset();
+        runtimeState->timingsPanel.waterRunKeyMarquee.reset();
         runtimeState->timingsPanel.waterRunSplineHandleDrag.reset();
     }
     return changed;
@@ -126478,6 +128046,12 @@ int Application::Run(ApplicationRunOptions options) const {
     if (options.backgroundRenderStatusMonitor.has_value()) {
         return RunBackgroundRenderStatusMonitor(
             options.backgroundRenderStatusMonitor.value());
+    }
+    if (options.backgroundRenderWorker.has_value() &&
+        WaitForBackgroundRenderDependencies(
+            options.backgroundRenderWorker.value()) ==
+            BackgroundRenderDependencyWaitResult::Cancelled) {
+        return 0;
     }
     if (options.guiSmoke.has_value() &&
         options.guiSmoke->scenario == "scene3-density-parity") {
