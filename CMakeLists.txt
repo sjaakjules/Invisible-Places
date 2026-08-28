@@ -152,6 +152,7 @@ add_library(
     src/app/Application.cpp
     src/app/LinkedHighQualityPreview.cpp
     src/app/BackgroundRenderPreparation.cpp
+    src/app/BackgroundRenderQueue.cpp
     src/app/PointDensityParity.cpp
     src/app/PointVisualSelection.cpp
     src/app/ProcessMemoryTelemetry.cpp
@@ -331,7 +332,9 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
             tests/AssetDiscoveryTests.cpp
             tests/CompositionGuideTests.cpp
             tests/LinkedHighQualityPreviewTests.cpp
+            tests/LinkedAnimationExportSelectionTests.cpp
             tests/BackgroundRenderPreparationTests.cpp
+            tests/BackgroundRenderQueueTests.cpp
             tests/PointCloudDensityCompensationTests.cpp
             tests/PointDensityParityTests.cpp
             tests/PointCloudFieldCacheTests.cpp

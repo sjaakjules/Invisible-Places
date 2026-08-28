@@ -928,6 +928,8 @@ TEST_CASE(
     status.renderedFrames = 18U;
     status.totalFrames = 120U;
     status.progress = 0.15F;
+    status.currentFrameProgress = 0.4F;
+    status.frameRenderSeconds = {0.125F, 0.091F, 0.104F};
     status.updatedUtc = "2026-08-12T01:02:03Z";
 
     std::string error;
@@ -953,6 +955,9 @@ TEST_CASE(
     CHECK(loaded->renderedFrames == status.renderedFrames);
     CHECK(loaded->totalFrames == status.totalFrames);
     CHECK(loaded->progress == Approx(status.progress));
+    CHECK(loaded->currentFrameProgress ==
+          Approx(status.currentFrameProgress));
+    CHECK(loaded->frameRenderSeconds == status.frameRenderSeconds);
     CHECK(loaded->updatedUtc == status.updatedUtc);
 
     status.progress = 2.0F;
@@ -999,6 +1004,8 @@ TEST_CASE(
         legacyStatus = nlohmann::json::parse(input);
     }
     legacyStatus.erase("cancellation_supported");
+    legacyStatus.erase("current_frame_progress");
+    legacyStatus.erase("frame_render_seconds");
     {
         std::ofstream output{statusPath};
         REQUIRE(output.is_open());
@@ -1011,4 +1018,6 @@ TEST_CASE(
                 &error);
     REQUIRE(legacy.has_value());
     CHECK_FALSE(legacy->cancellationSupported);
+    CHECK(legacy->currentFrameProgress == Approx(0.0F));
+    CHECK(legacy->frameRenderSeconds.empty());
 }

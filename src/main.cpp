@@ -81,6 +81,16 @@ int main(int argc, char** argv) {
                 options.backgroundRenderWorker.emplace();
             }
             options.backgroundRenderWorker->statusPath = argv[++index];
+        } else if (argument == "--background-render-wait-for-status") {
+            if (index + 1 >= argc || argv[index + 1] == nullptr) {
+                std::cerr << "--background-render-wait-for-status requires a status path.\n";
+                return 2;
+            }
+            if (!options.backgroundRenderWorker.has_value()) {
+                options.backgroundRenderWorker.emplace();
+            }
+            options.backgroundRenderWorker->waitForStatusPaths.emplace_back(
+                argv[++index]);
         } else if (argument == "--background-render-throttle-ms") {
             if (index + 1 >= argc || argv[index + 1] == nullptr) {
                 std::cerr << "--background-render-throttle-ms requires a non-negative integer.\n";

@@ -138,6 +138,11 @@ struct BackgroundRenderStatusDocument {
     std::uint32_t renderedFrames = 0U;
     std::uint32_t totalFrames = 0U;
     float progress = 0.0F;
+    // Optional live telemetry. Keeping it in the small status sidecar lets a
+    // detached/reattached monitor draw the same duration-column progress bar
+    // as a foreground export without sharing worker memory.
+    float currentFrameProgress = 0.0F;
+    std::vector<float> frameRenderSeconds;
     std::string updatedUtc;
 };
 

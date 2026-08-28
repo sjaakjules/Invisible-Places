@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cctype>
+#include <cmath>
 #include <ctime>
 #include <fstream>
 #include <iomanip>
@@ -589,6 +590,12 @@ bool SaveBackgroundRenderStatusDocument(
     const std::filesystem::path& outputPath,
     std::string* errorMessage) {
     try {
+        json frameRenderSeconds = json::array();
+        for (const float seconds : document.frameRenderSeconds) {
+            if (std::isfinite(seconds) && seconds >= 0.0F) {
+                frameRenderSeconds.push_back(seconds);
+            }
+        }
         const json value{
             {"schema_version", kBackgroundRenderStatusSchemaVersion},
             {"state", document.state},
@@ -601,6 +608,9 @@ bool SaveBackgroundRenderStatusDocument(
             {"rendered_frames", document.renderedFrames},
             {"total_frames", document.totalFrames},
             {"progress", std::clamp(document.progress, 0.0F, 1.0F)},
+            {"current_frame_progress",
+             std::clamp(document.currentFrameProgress, 0.0F, 1.0F)},
+            {"frame_render_seconds", std::move(frameRenderSeconds)},
             {"updated_utc",
              document.updatedUtc.empty() ? CurrentUtcTimestamp()
                                          : document.updatedUtc},
@@ -650,6 +660,36 @@ LoadBackgroundRenderStatusDocument(
         document.totalFrames = root->value("total_frames", 0U);
         document.progress = std::clamp(
             root->value("progress", 0.0F), 0.0F, 1.0F);
+        document.currentFrameProgress = std::clamp(
+            root->value("current_frame_progress", 0.0F),
+            0.0F,
+            1.0F);
+        if (const auto durationsIt = root->find("frame_render_seconds");
+            durationsIt != root->end()) {
+            if (!durationsIt->is_array()) {
+                SetError(
+                    errorMessage,
+                    "Background-render frame timings are not an array.");
+                return std::nullopt;
+            }
+            document.frameRenderSeconds.reserve(durationsIt->size());
+            for (const auto& duration : *durationsIt) {
+                if (!duration.is_number()) {
+                    SetError(
+                        errorMessage,
+                        "Background-render frame timing is not numeric.");
+                    return std::nullopt;
+                }
+                const float seconds = duration.get<float>();
+                if (!std::isfinite(seconds) || seconds < 0.0F) {
+                    SetError(
+                        errorMessage,
+                        "Background-render frame timing is invalid.");
+                    return std::nullopt;
+                }
+                document.frameRenderSeconds.push_back(seconds);
+            }
+        }
         document.updatedUtc = root->value("updated_utc", std::string{});
         if (document.state.empty()) {
             SetError(errorMessage, "Background-render status state is empty.");

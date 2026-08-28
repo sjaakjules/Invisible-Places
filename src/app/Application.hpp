@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace invisible_places::app {
 
@@ -21,6 +22,10 @@ struct ExportBenchmarkOptions {
 struct BackgroundRenderWorkerOptions {
     std::filesystem::path setupPath;
     std::filesystem::path statusPath;
+    // A queued detached worker stays CPU/GPU-light until every predecessor
+    // reaches a terminal status. Repeated paths form a durable queue that
+    // survives the editor closing.
+    std::vector<std::filesystem::path> waitForStatusPaths;
     std::uint32_t throttleMilliseconds = 24U;
 };
 
