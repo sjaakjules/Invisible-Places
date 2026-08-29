@@ -1991,6 +1991,21 @@ TEST_CASE("Frustum union point mask keeps full-density visible points", "[budget
         cloud.bounds,
         std::span<const glm::mat4>{centerView.data(), centerView.size()},
         32U);
+    const auto pointGridLookup =
+        invisible_places::renderer::pointcloud::BuildFrustumPointGridLookup(
+            cloud.positions,
+            cloud.bounds,
+            32U);
+    REQUIRE(pointGridLookup.Matches(cloud.positions, 32U));
+    const auto cachedCenterMask =
+        invisible_places::renderer::pointcloud::GenerateFrustumUnionPointIndices(
+            cloud.positions,
+            cloud.bounds,
+            std::span<const glm::mat4>{centerView.data(), centerView.size()},
+            32U,
+            {},
+            &pointGridLookup);
+    CHECK(cachedCenterMask == centerMask);
 
     CHECK(std::is_sorted(centerMask.begin(), centerMask.end()));
     CHECK(std::find(centerMask.begin(), centerMask.end(), 1U) != centerMask.end());

@@ -1233,12 +1233,116 @@ std::vector<std::uint32_t> GenerateSpatialSampleIndices(
     return SelectStratifiedCandidateIndices(bestCandidates, clampedRequested);
 }
 
+bool FrustumPointGridLookup::Matches(
+    const std::vector<invisible_places::io::Float3>& positions,
+    std::uint32_t requestedDimension) const {
+    return positionsIdentity == positions.data() &&
+        pointCount == positions.size() &&
+        dimension == std::clamp(requestedDimension, 1U, 128U) &&
+        pointCellIndices.size() == positions.size();
+}
+
+FrustumPointGridLookup BuildFrustumPointGridLookup(
+    const std::vector<invisible_places::io::Float3>& positions,
+    const invisible_places::io::Bounds3f& bounds,
+    std::uint32_t gridDimension,
+    std::stop_token stopToken) {
+    FrustumPointGridLookup lookup;
+    if (positions.empty() || !bounds.valid ||
+        positions.size() > std::numeric_limits<std::uint32_t>::max() ||
+        stopToken.stop_requested()) {
+        return lookup;
+    }
+    lookup.dimension = std::clamp(gridDimension, 1U, 128U);
+    lookup.bounds = bounds;
+    lookup.pointCount = positions.size();
+    lookup.pointCellIndices.resize(positions.size());
+    const float safeXExtent = std::max(
+        bounds.maximum.x - bounds.minimum.x,
+        1.0e-6F);
+    const float safeYExtent = std::max(
+        bounds.maximum.y - bounds.minimum.y,
+        1.0e-6F);
+    const float safeZExtent = std::max(
+        bounds.maximum.z - bounds.minimum.z,
+        1.0e-6F);
+    const auto pointCount = static_cast<std::uint32_t>(positions.size());
+    constexpr std::uint32_t kMinimumPointsPerWorker = 1'000'000U;
+    const auto hardwareThreads =
+        std::max(1U, std::thread::hardware_concurrency());
+    const auto workerCount = static_cast<std::size_t>(
+        std::clamp<std::uint32_t>(
+            pointCount / kMinimumPointsPerWorker,
+            1U,
+            std::min(hardwareThreads, 8U)));
+    const auto pointsPerWorker = static_cast<std::uint32_t>(
+        (pointCount + workerCount - 1U) / workerCount);
+    const auto buildRange = [&](std::uint32_t begin, std::uint32_t end) {
+        for (std::uint32_t pointIndex = begin;
+             pointIndex < end;
+             ++pointIndex) {
+            if ((pointIndex & 4095U) == 0U &&
+                stopToken.stop_requested()) {
+                return;
+            }
+            const auto& point = positions[pointIndex];
+            const auto x = VoxelCoordinate(
+                point.x,
+                bounds.minimum.x,
+                safeXExtent,
+                lookup.dimension);
+            const auto y = VoxelCoordinate(
+                point.y,
+                bounds.minimum.y,
+                safeYExtent,
+                lookup.dimension);
+            const auto z = VoxelCoordinate(
+                point.z,
+                bounds.minimum.z,
+                safeZExtent,
+                lookup.dimension);
+            lookup.pointCellIndices[pointIndex] =
+                static_cast<std::uint32_t>(FrustumCellIndex(
+                    x,
+                    y,
+                    z,
+                    lookup.dimension));
+        }
+    };
+    {
+        std::vector<std::jthread> workers;
+        workers.reserve(workerCount - 1U);
+        for (std::size_t worker = 1U; worker < workerCount; ++worker) {
+            const auto begin = static_cast<std::uint32_t>(
+                std::min<std::uint64_t>(
+                    pointCount,
+                    static_cast<std::uint64_t>(worker) *
+                        pointsPerWorker));
+            const auto end = static_cast<std::uint32_t>(
+                std::min<std::uint64_t>(
+                    pointCount,
+                    static_cast<std::uint64_t>(begin) +
+                        pointsPerWorker));
+            workers.emplace_back([&, begin, end]() {
+                buildRange(begin, end);
+            });
+        }
+        buildRange(0U, std::min(pointCount, pointsPerWorker));
+    }
+    if (stopToken.stop_requested()) {
+        return {};
+    }
+    lookup.positionsIdentity = positions.data();
+    return lookup;
+}
+
 std::vector<std::uint32_t> GenerateFrustumUnionPointIndices(
     const std::vector<invisible_places::io::Float3>& positions,
     const invisible_places::io::Bounds3f& bounds,
     std::span<const glm::mat4> viewProjections,
     std::uint32_t gridDimension,
-    std::stop_token stopToken) {
+    std::stop_token stopToken,
+    const FrustumPointGridLookup* pointGridLookup) {
     if (positions.empty() ||
         !bounds.valid ||
         viewProjections.empty() ||
@@ -1456,6 +1560,9 @@ std::vector<std::uint32_t> GenerateFrustumUnionPointIndices(
         pointCount / kMinimumPointsPerClassifyThread,
         1U,
         std::min(hardwareThreads, 8U)));
+    const bool usePointGridLookup =
+        pointGridLookup != nullptr &&
+        pointGridLookup->Matches(positions, dimension);
     std::vector<std::vector<std::uint32_t>> workerIndices(classifyWorkerCount);
     const auto classifyRange = [&](std::uint32_t rangeBegin,
                                    std::uint32_t rangeEnd,
@@ -1470,11 +1577,30 @@ std::vector<std::uint32_t> GenerateFrustumUnionPointIndices(
                 stopToken.stop_requested()) {
                 return;
             }
-            const auto& point = positions[pointIndex];
-            const std::uint32_t x = VoxelCoordinate(point.x, bounds.minimum.x, safeXExtent, dimension);
-            const std::uint32_t y = VoxelCoordinate(point.y, bounds.minimum.y, safeYExtent, dimension);
-            const std::uint32_t z = VoxelCoordinate(point.z, bounds.minimum.z, safeZExtent, dimension);
-            if (visibleCells[FrustumCellIndex(x, y, z, dimension)] != 0U) {
+            std::size_t cellIndex = 0U;
+            if (usePointGridLookup) {
+                cellIndex = pointGridLookup->pointCellIndices[pointIndex];
+            } else {
+                const auto& point = positions[pointIndex];
+                const std::uint32_t x = VoxelCoordinate(
+                    point.x,
+                    bounds.minimum.x,
+                    safeXExtent,
+                    dimension);
+                const std::uint32_t y = VoxelCoordinate(
+                    point.y,
+                    bounds.minimum.y,
+                    safeYExtent,
+                    dimension);
+                const std::uint32_t z = VoxelCoordinate(
+                    point.z,
+                    bounds.minimum.z,
+                    safeZExtent,
+                    dimension);
+                cellIndex = FrustumCellIndex(x, y, z, dimension);
+            }
+            if (cellIndex < visibleCells.size() &&
+                visibleCells[cellIndex] != 0U) {
                 out->push_back(pointIndex);
             }
         }

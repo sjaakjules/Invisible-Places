@@ -647,12 +647,33 @@ std::vector<std::uint32_t> GenerateSpatialSampleIndices(
     const std::vector<invisible_places::io::Float3>& positions,
     const invisible_places::io::Bounds3f& bounds,
     std::uint64_t requestedPoints);
+struct FrustumPointGridLookup {
+    const invisible_places::io::Float3* positionsIdentity = nullptr;
+    std::size_t pointCount = 0U;
+    std::uint32_t dimension = 0U;
+    invisible_places::io::Bounds3f bounds{};
+    // One precomputed 3-D cell id per source point, retained in source order.
+    // Reusing it turns later guard refreshes into a compact integer scan and
+    // preserves the sorted-unique point-index contract without redoing voxel
+    // coordinates from float positions.
+    std::vector<std::uint32_t> pointCellIndices;
+
+    [[nodiscard]] bool Matches(
+        const std::vector<invisible_places::io::Float3>& positions,
+        std::uint32_t requestedDimension) const;
+};
+[[nodiscard]] FrustumPointGridLookup BuildFrustumPointGridLookup(
+    const std::vector<invisible_places::io::Float3>& positions,
+    const invisible_places::io::Bounds3f& bounds,
+    std::uint32_t gridDimension = 64U,
+    std::stop_token stopToken = {});
 std::vector<std::uint32_t> GenerateFrustumUnionPointIndices(
     const std::vector<invisible_places::io::Float3>& positions,
     const invisible_places::io::Bounds3f& bounds,
     std::span<const glm::mat4> viewProjections,
     std::uint32_t gridDimension = 64U,
-    std::stop_token stopToken = {});
+    std::stop_token stopToken = {},
+    const FrustumPointGridLookup* pointGridLookup = nullptr);
 std::vector<std::uint32_t> GenerateSurfelEncodedSampleIndices(
     const std::vector<std::uint32_t>& sampledPointIndices);
 

@@ -578,7 +578,8 @@ class VulkanViewportShell {
     void UpdatePointBudget(
         std::size_t layerId,
         const std::vector<std::uint32_t>& sampledIndices,
-        bool indicesAlreadySortedUnique = false);
+        bool indicesAlreadySortedUnique = false,
+        bool retainBufferCapacity = false);
     void UpdateInteractivePointSampleBuffer(
         std::size_t layerId,
         const std::vector<std::uint32_t>& sampledIndices,

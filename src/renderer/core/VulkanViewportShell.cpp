@@ -5263,7 +5263,8 @@ VulkanViewportShell::WaterSeepageParamsPublicationState(std::size_t layerId) con
 void VulkanViewportShell::UpdatePointBudget(
     std::size_t layerId,
     const std::vector<std::uint32_t>& sampledIndices,
-    bool indicesAlreadySortedUnique) {
+    bool indicesAlreadySortedUnique,
+    bool retainBufferCapacity) {
     SettlePointCloudMutation();
 
     auto* resources = FindPointCloudResources(layerId);
@@ -5271,8 +5272,10 @@ void VulkanViewportShell::UpdatePointBudget(
         return;
     }
 
-    DestroyBuffer(&resources->sampledIndexBuffer);
-    DestroyBuffer(&resources->sampledSurfelIndexBuffer);
+    if (!retainBufferCapacity) {
+        DestroyBuffer(&resources->sampledIndexBuffer);
+        DestroyBuffer(&resources->sampledSurfelIndexBuffer);
+    }
     DestroyBuffer(&resources->interactiveSampledIndexBuffer);
     DestroyBuffer(&resources->interactiveSurfelIndexBuffer);
     resources->usingSampledIndices = false;
@@ -5300,30 +5303,77 @@ void VulkanViewportShell::UpdatePointBudget(
     if (validPointCount == 0 ||
         sanitized->empty() ||
         sanitized->size() >= validPointCount) {
+        if (!retainBufferCapacity) {
+            DestroyBuffer(&resources->sampledIndexBuffer);
+            DestroyBuffer(&resources->sampledSurfelIndexBuffer);
+        }
         return;
     }
 
-    resources->sampledIndexBuffer = CreateHostVisibleBuffer(
-        static_cast<VkDeviceSize>(sanitized->size() * sizeof(std::uint32_t)),
-        VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+    const auto ensureCapacity = [&] (
+        BufferAllocation* buffer,
+        VkDeviceSize requiredBytes,
+        VkDeviceSize maximumUsefulBytes) {
+        if (buffer->buffer != VK_NULL_HANDLE &&
+            buffer->size >= requiredBytes) {
+            return;
+        }
+        DestroyBuffer(buffer);
+        VkDeviceSize capacityBytes = requiredBytes;
+        if (retainBufferCapacity &&
+            requiredBytes <=
+                std::numeric_limits<VkDeviceSize>::max() -
+                    requiredBytes / 2U) {
+            capacityBytes = std::min(
+                maximumUsefulBytes,
+                requiredBytes + requiredBytes / 2U);
+        }
+        *buffer = CreateHostVisibleBuffer(
+            std::max(requiredBytes, capacityBytes),
+            VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+    };
+    const auto pointIndexBytes = static_cast<VkDeviceSize>(
+        sanitized->size() * sizeof(std::uint32_t));
+    ensureCapacity(
+        &resources->sampledIndexBuffer,
+        pointIndexBytes,
+        static_cast<VkDeviceSize>(validPointCount) *
+            sizeof(std::uint32_t));
     UploadBufferData(
         resources->sampledIndexBuffer,
         sanitized->data(),
-        resources->sampledIndexBuffer.size);
+        pointIndexBytes);
     resources->usingSampledIndices = true;
     resources->activePointCount = static_cast<std::uint32_t>(sanitized->size());
 
-    const auto surfelIndices =
-        invisible_places::renderer::pointcloud::GenerateSurfelEncodedSampleIndices(*sanitized);
-    if (!surfelIndices.empty()) {
-        resources->sampledSurfelIndexBuffer = CreateHostVisibleBuffer(
-            static_cast<VkDeviceSize>(surfelIndices.size() * sizeof(std::uint32_t)),
-            VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
-        UploadBufferData(
-            resources->sampledSurfelIndexBuffer,
-            surfelIndices.data(),
-            resources->sampledSurfelIndexBuffer.size);
+    if (sanitized->back() <= kMaxSurfelEncodedPointCount) {
+        const auto surfelIndexCount =
+            sanitized->size() * kSurfelVerticesPerPoint;
+        const auto surfelIndexBytes = static_cast<VkDeviceSize>(
+            surfelIndexCount * sizeof(std::uint32_t));
+        ensureCapacity(
+            &resources->sampledSurfelIndexBuffer,
+            surfelIndexBytes,
+            static_cast<VkDeviceSize>(validPointCount) *
+                kSurfelVerticesPerPoint * sizeof(std::uint32_t));
+        auto* destination = static_cast<std::uint32_t*>(
+            resources->sampledSurfelIndexBuffer.mapped);
+        if (destination == nullptr) {
+            throw std::runtime_error{
+                "Point-budget surfel index storage is not host visible."};
+        }
+        for (const auto pointIndex : *sanitized) {
+            const auto encodedBase = pointIndex * kSurfelVerticesPerPoint;
+            for (std::uint32_t corner = 0U;
+                 corner < kSurfelVerticesPerPoint;
+                 ++corner) {
+                *destination++ = encodedBase + corner;
+            }
+        }
+    } else {
+        DestroyBuffer(&resources->sampledSurfelIndexBuffer);
     }
+    TrackPointCloudResidentPeak();
 }
 
 void VulkanViewportShell::UpdateInteractivePointSampleBuffer(
