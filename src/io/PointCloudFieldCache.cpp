@@ -1,5 +1,6 @@
 #include "io/PointCloudFieldCache.hpp"
 
+#include "io/AdaptiveHqCache.hpp"
 #include "io/SceneDisplayDensityCache.hpp"
 
 #include <nlohmann/json.hpp>
@@ -55,10 +56,17 @@ std::filesystem::path FieldFilePath(
 struct SourceIdentity {
     std::uint64_t sizeBytes = 0;
     std::int64_t mtimeNanoseconds = 0;
+    std::uint32_t recordSize = 0;
+    std::string schemaFingerprint;
+    std::string contentFingerprint;
 };
 
 std::optional<SourceIdentity> StatSourceIdentity(
     const std::filesystem::path& sourcePath) {
+    const auto inspected = InspectAdaptiveHqSource(sourcePath);
+    if (!inspected.success) {
+        return std::nullopt;
+    }
     std::error_code error;
     const auto size = std::filesystem::file_size(sourcePath, error);
     if (error) {
@@ -74,6 +82,9 @@ std::optional<SourceIdentity> StatSourceIdentity(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 mtime.time_since_epoch())
                 .count(),
+        .recordSize = inspected.identity.recordSize,
+        .schemaFingerprint = inspected.identity.schemaFingerprint,
+        .contentFingerprint = inspected.identity.contentFingerprint,
     };
 }
 
@@ -157,6 +168,9 @@ bool WriteManifest(
         {"schema", manifest.schemaVersion},
         {"source_size_bytes", manifest.sourceSizeBytes},
         {"source_mtime_ns", manifest.sourceMtimeNanoseconds},
+        {"source_record_size", manifest.sourceRecordSize},
+        {"source_schema_fingerprint", manifest.sourceSchemaFingerprint},
+        {"source_content_fingerprint", manifest.sourceContentFingerprint},
         {"point_count", manifest.pointCount},
         {"has_source_rgb", manifest.hasSourceRgb},
         {"has_normals", manifest.hasNormals},
@@ -200,6 +214,12 @@ std::optional<PointCloudFieldCacheManifest> ReadManifest(
             manifestJson.value("source_size_bytes", std::uint64_t{0});
         manifest.sourceMtimeNanoseconds =
             manifestJson.value("source_mtime_ns", std::int64_t{0});
+        manifest.sourceRecordSize =
+            manifestJson.value("source_record_size", 0U);
+        manifest.sourceSchemaFingerprint =
+            manifestJson.value("source_schema_fingerprint", std::string{});
+        manifest.sourceContentFingerprint =
+            manifestJson.value("source_content_fingerprint", std::string{});
         manifest.pointCount = manifestJson.value("point_count", std::uint64_t{0});
         manifest.hasSourceRgb = manifestJson.value("has_source_rgb", false);
         manifest.hasNormals = manifestJson.value("has_normals", false);
@@ -246,6 +266,11 @@ std::optional<PointCloudFieldCacheManifest> ReadManifest(
             }
         }
     } catch (const json::exception&) {
+        return std::nullopt;
+    }
+    if (manifest.sourceRecordSize == 0U ||
+        manifest.sourceSchemaFingerprint.empty() ||
+        manifest.sourceContentFingerprint.empty()) {
         return std::nullopt;
     }
     return manifest;
@@ -352,6 +377,9 @@ void WriteCacheFromLoadedCloud(
         existing.has_value() &&
         existing->sourceSizeBytes == identity->sizeBytes &&
         existing->sourceMtimeNanoseconds == identity->mtimeNanoseconds &&
+        existing->sourceRecordSize == identity->recordSize &&
+        existing->sourceSchemaFingerprint == identity->schemaFingerprint &&
+        existing->sourceContentFingerprint == identity->contentFingerprint &&
         existing->pointCount == cloud.PointCount();
     if (!existingMatches) {
         ClearCacheDirectory(cacheDirectory);
@@ -361,6 +389,9 @@ void WriteCacheFromLoadedCloud(
     manifest.schemaVersion = kPointCloudFieldCacheSchemaVersion;
     manifest.sourceSizeBytes = identity->sizeBytes;
     manifest.sourceMtimeNanoseconds = identity->mtimeNanoseconds;
+    manifest.sourceRecordSize = identity->recordSize;
+    manifest.sourceSchemaFingerprint = identity->schemaFingerprint;
+    manifest.sourceContentFingerprint = identity->contentFingerprint;
     manifest.pointCount = cloud.PointCount();
     manifest.hasSourceRgb = cloud.hasSourceRgb;
     manifest.hasNormals = cloud.hasNormals;
@@ -477,7 +508,10 @@ LoadValidPointCloudFieldCacheManifest(
     auto manifest = ReadManifest(PointCloudFieldCacheDirectory(sourcePath));
     if (!manifest.has_value() ||
         manifest->sourceSizeBytes != identity->sizeBytes ||
-        manifest->sourceMtimeNanoseconds != identity->mtimeNanoseconds) {
+        manifest->sourceMtimeNanoseconds != identity->mtimeNanoseconds ||
+        manifest->sourceRecordSize != identity->recordSize ||
+        manifest->sourceSchemaFingerprint != identity->schemaFingerprint ||
+        manifest->sourceContentFingerprint != identity->contentFingerprint) {
         return std::nullopt;
     }
     return manifest;
@@ -623,6 +657,23 @@ PointCloudLoadResult LoadPointCloudWithFieldCache(
     return {.cloud = std::move(cloud), .success = true};
 }
 
+PointCloudLoadResult RebuildPointCloudFieldCache(
+    const std::filesystem::path& sourcePath,
+    const PointCloudScalarFieldFilter& fieldFilter) {
+    const auto payloadPath =
+        ResolveSceneDisplayDensityPayloadPath(sourcePath);
+    auto result = LoadPointCloud(payloadPath, fieldFilter);
+    if (!result.success) {
+        return result;
+    }
+
+    ClearCacheDirectory(PointCloudFieldCacheDirectory(payloadPath));
+    WriteCacheFromLoadedCloud(payloadPath, result.cloud);
+    result.cloud.sourcePath = sourcePath;
+    result.cloud.layerName = sourcePath.stem().string();
+    return result;
+}
+
 bool ReadPointCloudCachedField(
     const std::filesystem::path& sourcePath,
     std::string_view fieldName,
@@ -683,12 +734,18 @@ bool WritePointCloudCachedField(
         manifest.has_value() &&
         manifest->sourceSizeBytes == identity->sizeBytes &&
         manifest->sourceMtimeNanoseconds == identity->mtimeNanoseconds &&
+        manifest->sourceRecordSize == identity->recordSize &&
+        manifest->sourceSchemaFingerprint == identity->schemaFingerprint &&
+        manifest->sourceContentFingerprint == identity->contentFingerprint &&
         manifest->pointCount == values.size();
     if (!manifestMatches) {
         ClearCacheDirectory(cacheDirectory);
         manifest = PointCloudFieldCacheManifest{};
         manifest->sourceSizeBytes = identity->sizeBytes;
         manifest->sourceMtimeNanoseconds = identity->mtimeNanoseconds;
+        manifest->sourceRecordSize = identity->recordSize;
+        manifest->sourceSchemaFingerprint = identity->schemaFingerprint;
+        manifest->sourceContentFingerprint = identity->contentFingerprint;
         manifest->pointCount = values.size();
     }
     if (!WriteFileAtomically(

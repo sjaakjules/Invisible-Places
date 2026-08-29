@@ -4,12 +4,10 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
-#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <string>
-#include <thread>
 #include <vector>
 
 namespace {
@@ -18,6 +16,7 @@ using invisible_places::io::LoadPointCloud;
 using invisible_places::io::LoadPointCloudWithFieldCache;
 using invisible_places::io::PointCloudFieldCacheDirectory;
 using invisible_places::io::PointCloudScalarFieldFilter;
+using invisible_places::io::RebuildPointCloudFieldCache;
 
 template <typename T>
 void WriteBinaryValue(std::ofstream* output, const T& value) {
@@ -163,10 +162,12 @@ TEST_CASE("A rewritten source invalidates the cache and prunes stale fields",
     REQUIRE(LoadPointCloudWithFieldCache(plyPath).success);
     TamperCachedField(plyPath, 0U, "height", 999.0F);
 
-    // Rewrite with different content; ensure the mtime moves even on
-    // filesystems with coarse timestamps.
-    std::this_thread::sleep_for(std::chrono::milliseconds{1100});
+    // Rewrite with different content but deliberately restore the exact old
+    // timestamp. Size and mtime alone cannot catch this replacement; schema
+    // plus sampled content fingerprints must invalidate the cache.
+    const auto originalWriteTime = std::filesystem::last_write_time(plyPath);
     WriteCacheFixturePly(plyPath, 50.0F);
+    std::filesystem::last_write_time(plyPath, originalWriteTime);
 
     const auto reloaded = LoadPointCloudWithFieldCache(plyPath);
     REQUIRE(reloaded.success);
@@ -219,6 +220,43 @@ TEST_CASE("Filtered cache loads stream missing fields and write them through",
     const auto third = LoadPointCloudWithFieldCache(plyPath, flowOnly);
     REQUIRE(third.success);
     CHECK(FieldColumn(third.cloud, "Flow_Rate")[0] == Catch::Approx(-5.0F));
+}
+
+TEST_CASE("Explicit field-cache rebuild materializes all cold columns in one pass",
+          "[pointcloud][fieldcache]") {
+    const auto directory = FixtureDirectory("explicit-rebuild");
+    const auto plyPath = directory / "cloud.ply";
+    WriteCacheFixturePly(plyPath, 10.0F);
+
+    PointCloudScalarFieldFilter geometryOnly;
+    geometryOnly.mode = PointCloudScalarFieldFilter::Mode::Selected;
+    REQUIRE(LoadPointCloudWithFieldCache(plyPath, geometryOnly).success);
+    const auto cacheDirectory = PointCloudFieldCacheDirectory(plyPath);
+    CHECK(std::filesystem::exists(cacheDirectory / "geometry.bin"));
+    CHECK_FALSE(std::filesystem::exists(
+        cacheDirectory / "field_0_height.bin"));
+    CHECK_FALSE(std::filesystem::exists(
+        cacheDirectory / "field_1_flow-rate.bin"));
+
+    const auto rebuilt = RebuildPointCloudFieldCache(plyPath);
+    REQUIRE(rebuilt.success);
+    REQUIRE(rebuilt.cloud.scalarFields.size() == 2U);
+    CHECK(std::filesystem::exists(
+        cacheDirectory / "field_0_height.bin"));
+    CHECK(std::filesystem::exists(
+        cacheDirectory / "field_1_flow-rate.bin"));
+
+    // Rebuild is source-authoritative, not an incremental reuse of a
+    // previously tampered cold column.
+    TamperCachedField(plyPath, 0U, "height", 444.0F);
+    const auto refreshed = RebuildPointCloudFieldCache(plyPath);
+    REQUIRE(refreshed.success);
+    CHECK(FieldColumn(refreshed.cloud, "Height")[0] ==
+          Catch::Approx(10.0F));
+    const auto cached = LoadPointCloudWithFieldCache(plyPath);
+    REQUIRE(cached.success);
+    CHECK(FieldColumn(cached.cloud, "Height")[0] ==
+          Catch::Approx(10.0F));
 }
 
 TEST_CASE("Single cached fields read and write through the manifest",

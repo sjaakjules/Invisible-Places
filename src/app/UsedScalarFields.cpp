@@ -37,7 +37,8 @@ void UsedScalarFieldSet::AddFieldName(std::string_view name) {
 
 void UsedScalarFieldSet::AddBinding(
     const style::RenderParameterBinding& binding) {
-    if (binding.mode != style::ParameterSourceMode::FieldMapped) {
+    if (!binding.active ||
+        binding.mode != style::ParameterSourceMode::FieldMapped) {
         return;
     }
     AddFieldName(binding.fieldMap.fieldName);

@@ -17,10 +17,10 @@ namespace invisible_places::app {
 // combination of styles, effects, and constant name lists, and the tests
 // can drive it directly.
 //
-// A binding contributes its field only while mapped. Switching a dormant
-// binding back to FieldMapped may therefore trigger the on-demand loader,
-// but does not keep a full point-count column resident while the binding is
-// constant. A Visual Feature still contributes its field while disabled
+// A binding contributes its field only while active and mapped. Enabling a
+// dormant binding or switching it back to FieldMapped may therefore trigger
+// the on-demand loader, but does not keep a full point-count column resident
+// while the binding is inactive or constant. A Visual Feature still contributes its field while disabled
 // because animation can activate it at another position. Names the source
 // file does not contain are harmless — the load filter and the on-demand
 // loader both ignore unknown names.

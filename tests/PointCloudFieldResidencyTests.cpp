@@ -254,6 +254,12 @@ TEST_CASE("Used scalar field sets aggregate bindings and Visual Features",
     constant.fieldMap.fieldName = "A_Slope_deg";
     used.AddBinding(constant);
 
+    invisible_places::style::RenderParameterBinding inactive;
+    inactive.active = false;
+    inactive.mode = invisible_places::style::ParameterSourceMode::FieldMapped;
+    inactive.fieldMap.fieldName = "Composite";
+    used.AddBinding(inactive);
+
     invisible_places::style::RenderParameterBinding unnamed;
     used.AddBinding(unnamed);
 
@@ -275,6 +281,7 @@ TEST_CASE("Used scalar field sets aggregate bindings and Visual Features",
     CHECK(used.Names()[1] == "Intensity");
     CHECK(used.Contains("height"));
     CHECK_FALSE(used.Contains("a_slope_deg"));
+    CHECK_FALSE(used.Contains("Composite"));
     CHECK_FALSE(used.Contains("IgnoredForNormals"));
     CHECK_FALSE(used.Contains("Roughness"));
 

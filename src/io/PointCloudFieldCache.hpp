@@ -11,24 +11,27 @@
 
 namespace invisible_places::io {
 
-inline constexpr std::uint32_t kPointCloudFieldCacheSchemaVersion = 1U;
+inline constexpr std::uint32_t kPointCloudFieldCacheSchemaVersion = 2U;
 
 // A field-major on-disk mirror of one source point cloud, so restarts and
 // on-demand field loads read compact contiguous arrays instead of
-// re-scanning the interleaved PLY record stream. Layout, beside the source
-// file under <dir>/.invisible_places/cache/fields/<stem>-<hash>/:
+// re-scanning the interleaved PLY record stream. The desktop app stores it
+// under Saved/.invisible_places/cache/fields/<stem>-<hash>/ (standalone
+// callers may retain the historical source-adjacent root):
 //
-//   manifest.json      source identity (size + mtime), point count, flags,
-//                      bounds/focus, and per-field stats for every field
-//                      that has ever been materialised
-//   geometry.bin       positions, packed colours, then normals (if any)
+//   manifest.json      source identity (size, mtime, schema and sampled
+//                      content fingerprints), point count, flags,
+//                      bounds/focus, and per-field stats
+//   geometry.bin       positions, packed colours, then normals (if any).
+//                      Point IDs are implicit file-order indices because this
+//                      complete coarse cache is not spatially reordered.
 //   field_<idx>_<name>.bin   one float per point, file-order index idx
 //
 // Everything is best-effort: a missing, stale, or partial cache falls back
 // to the PLY loader, and all writes go through a temp file + rename so a
 // crash never leaves a truncated artefact behind. The cache is only
-// trusted while the manifest's recorded source size and mtime match the
-// file on disk.
+// trusted while size, mtime, record schema, and sampled-content fingerprints
+// all match the source on disk.
 struct PointCloudFieldCacheFieldEntry {
     std::string name;
     std::uint32_t sourceIndex = 0;
@@ -39,6 +42,9 @@ struct PointCloudFieldCacheManifest {
     std::uint32_t schemaVersion = kPointCloudFieldCacheSchemaVersion;
     std::uint64_t sourceSizeBytes = 0;
     std::int64_t sourceMtimeNanoseconds = 0;
+    std::uint32_t sourceRecordSize = 0;
+    std::string sourceSchemaFingerprint;
+    std::string sourceContentFingerprint;
     std::uint64_t pointCount = 0;
     bool hasSourceRgb = false;
     bool hasNormals = false;
@@ -69,6 +75,15 @@ LoadValidPointCloudFieldCacheManifest(const std::filesystem::path& sourcePath);
 // stats, availableScalarFields) is identical to LoadPointCloud with the
 // same filter.
 [[nodiscard]] PointCloudLoadResult LoadPointCloudWithFieldCache(
+    const std::filesystem::path& sourcePath,
+    const PointCloudScalarFieldFilter& fieldFilter = {});
+
+// Explicit one-pass builder used by the headless cache command. It reads the
+// interleaved source once with fieldFilter, replaces the derived cache, and
+// returns the same loaded cloud. With the default all-fields filter this
+// materialises hot geometry and every independent cold scalar column without
+// the repeated source scans that an incremental cache miss would require.
+[[nodiscard]] PointCloudLoadResult RebuildPointCloudFieldCache(
     const std::filesystem::path& sourcePath,
     const PointCloudScalarFieldFilter& fieldFilter = {});
 
