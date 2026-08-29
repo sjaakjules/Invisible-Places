@@ -515,6 +515,25 @@ PointCloudShorelineWaveSettings CalmPointCloudShorelineWaveSettings() {
     return settings;
 }
 
+const PointCloudShorelineWaveProfile* FindPointCloudShorelineWaveProfile(
+    std::span<const PointCloudShorelineWaveProfile> profiles,
+    std::uint32_t shorelineInstanceId,
+    std::string_view profileName) {
+    const std::string normalized = TrimShorelineProfileName(profileName);
+    if (normalized.empty()) {
+        return nullptr;
+    }
+    const auto found = std::find_if(
+        profiles.begin(),
+        profiles.end(),
+        [&](const PointCloudShorelineWaveProfile& profile) {
+            return TrimShorelineProfileName(profile.name) == normalized &&
+                   (!profile.objectOverride ||
+                    profile.shorelineInstanceId == shorelineInstanceId);
+        });
+    return found != profiles.end() ? &*found : nullptr;
+}
+
 std::string UniquePointCloudShorelineObjectProfileName(
     std::span<const PointCloudShorelineWaveProfile> profiles,
     std::string_view baseProfileName,

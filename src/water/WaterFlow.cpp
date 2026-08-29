@@ -8313,6 +8313,7 @@ constexpr WaterFeatureFixedSettingDescriptor kWaterFlowPathFixedSettings[]{
 };
 
 constexpr WaterFeatureFixedSettingDescriptor kWaterShorelineFixedSettings[]{
+    {kWaterShorelineProfileFixedSettingId, WaterFeatureFixedSettingInvalidation::LiveUpdate},
     {"enabled", WaterFeatureFixedSettingInvalidation::LiveUpdate},
     {"algorithm", WaterFeatureFixedSettingInvalidation::LiveUpdate},
     {"foam_fronts.boundary_z", WaterFeatureFixedSettingInvalidation::LiveUpdate},

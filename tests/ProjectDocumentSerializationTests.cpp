@@ -359,6 +359,12 @@ TEST_CASE("Water Feature Run variants and remembered values round-trip",
            .settingId = "foam_fronts.colour",
            .value = std::array<float, 3U>{0.2F, 0.4F, 0.8F},
            .detached = true},
+          {.feature = run.features.front().feature,
+           .settingId = std::string{
+               invisible_places::water::
+                   kWaterShorelineProfileFixedSettingId},
+           .value = std::string{"Shoreline A"},
+           .detached = true},
       },
   }};
 
@@ -384,7 +390,7 @@ TEST_CASE("Water Feature Run variants and remembered values round-trip",
   REQUIRE(loadedRun.variants.size() == 1U);
   CHECK(loadedRun.nextVariantId == 8U);
   CHECK(loadedRun.variants.front().name == "Animation A low sand");
-  REQUIRE(loadedRun.variants.front().overrides.size() == 3U);
+  REQUIRE(loadedRun.variants.front().overrides.size() == 4U);
   CHECK(std::get<double>(
             loadedRun.variants.front().overrides[0].value) ==
         Catch::Approx(1.275));
@@ -394,6 +400,9 @@ TEST_CASE("Water Feature Run variants and remembered values round-trip",
   CHECK(std::get<std::array<float, 3U>>(
             loadedRun.variants.front().overrides[2].value)[2] ==
         Catch::Approx(0.8F));
+  CHECK(std::get<std::string>(
+            loadedRun.variants.front().overrides[3].value) ==
+        "Shoreline A");
 }
 
 TEST_CASE("Palette stop-property animation and provenance round-trip",

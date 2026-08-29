@@ -1409,6 +1409,47 @@ TEST_CASE("Shoreline object profile names avoid bases and other object copies",
     }
 }
 
+TEST_CASE("Shoreline saved profile lookup respects object ownership",
+          "[water][shoreline][profiles][lookup]") {
+    using invisible_places::renderer::pointcloud::
+        FindPointCloudShorelineWaveProfile;
+    using invisible_places::renderer::pointcloud::
+        PointCloudShorelineWaveProfile;
+
+    const std::vector<PointCloudShorelineWaveProfile> profiles{
+        {.name = "Shoreline A"},
+        {.name = "Shoreline A - North",
+         .objectOverride = true,
+         .shorelineInstanceId = 7U,
+         .baseProfileName = "Shoreline A"},
+        {.name = "Shoreline B - South",
+         .objectOverride = true,
+         .shorelineInstanceId = 8U,
+         .baseProfileName = "Shoreline B"},
+    };
+
+    REQUIRE(FindPointCloudShorelineWaveProfile(
+                profiles,
+                99U,
+                "  Shoreline A  ") != nullptr);
+    REQUIRE(FindPointCloudShorelineWaveProfile(
+                profiles,
+                7U,
+                "Shoreline A - North") != nullptr);
+    CHECK(FindPointCloudShorelineWaveProfile(
+              profiles,
+              8U,
+              "Shoreline A - North") == nullptr);
+    CHECK(FindPointCloudShorelineWaveProfile(
+              profiles,
+              7U,
+              "Shoreline B - South") == nullptr);
+    CHECK(FindPointCloudShorelineWaveProfile(
+              profiles,
+              7U,
+              "Missing") == nullptr);
+}
+
 TEST_CASE("Sand-cloud shoreline waves use dedicated foam helpers", "[water][shoreline][shader]") {
     const auto shaderPath = DataRoot().parent_path() / "shaders" / "pointcloud_sparse_ripple.glsl";
     std::ifstream input{shaderPath};

@@ -2527,8 +2527,12 @@ struct OfflineRenderJobState {
         frozenFixedSettingOverlay;
     bool frozenOnlyShowWaterFeaturesInRuns = false;
     // Additional shoreline instances frozen with the job; their keyed
-    // visual settings evaluate per exported frame from the frozen runs.
+    // visual settings evaluate per exported frame from the frozen runs. The
+    // profile library is frozen alongside them because a run variant may
+    // select a different complete named profile before its individual fixed
+    // overrides are applied.
     std::vector<PointCloudShorelineInstance> frozenShorelineInstances;
+    std::vector<PointCloudShorelineWaveProfile> frozenShorelineProfiles;
     std::string frozenTimingTakeId{
         invisible_places::timing::kAuthoredTimingTakeId};
     std::string frozenTimingSceneGroupName = "Default";
@@ -2584,6 +2588,7 @@ struct QueuedQuickMp4WaterSnapshot {
         timingTakeSceneStates;
     std::vector<WaterSeepageNode> seepageNodes;
     std::vector<PointCloudShorelineInstance> shorelineInstances;
+    std::vector<PointCloudShorelineWaveProfile> shorelineProfiles;
     std::optional<invisible_places::water::WaterScenarioState>
         authoredFrameControlState;
     WaterDynamicMeshFlowSettings dynamicMeshFlowSettings{};
@@ -6188,6 +6193,40 @@ void ApplyWaterShorelineFixedSettingOverlay(
     applyUint("height_foam.seed", &height.seed);
 }
 
+PointCloudShorelineWaveSettings ResolveWaterShorelineFixedSettings(
+    const PointCloudShorelineInstance& instance,
+    std::span<const PointCloudShorelineWaveProfile> profiles,
+    const invisible_places::water::WaterKeyedFeatureId& feature,
+    const invisible_places::water::WaterFeatureFixedSettingOverlay* overlay) {
+    auto settings = instance.settings;
+    if (overlay != nullptr) {
+        const auto* selection = overlay->Find(
+            feature,
+            invisible_places::water::
+                kWaterShorelineProfileFixedSettingId);
+        if (selection != nullptr) {
+            if (const auto* profileName =
+                    std::get_if<std::string>(selection)) {
+                if (const auto* profile = invisible_places::renderer::
+                        pointcloud::FindPointCloudShorelineWaveProfile(
+                            profiles,
+                            instance.id,
+                            *profileName);
+                    profile != nullptr) {
+                    settings = profile->settings;
+                }
+            }
+        }
+    }
+    // The selected profile is the variant's baseline. More precise detached
+    // settings remain useful and therefore layer on top of it.
+    ApplyWaterShorelineFixedSettingOverlay(
+        feature,
+        overlay,
+        &settings);
+    return settings;
+}
+
 // Resolves the frame's complete project-owned Shoreline list. Disabled
 // effects drop, keyed setting tracks replace authored visual scalars, and the
 // global Shoreline level scales every effect uniformly. Authored Water state
@@ -6195,6 +6234,7 @@ void ApplyWaterShorelineFixedSettingOverlay(
 std::vector<PointCloudShorelineWaveSettings>
 ResolveShorelinesForFrame(
     const std::vector<PointCloudShorelineInstance>& instances,
+    std::span<const PointCloudShorelineWaveProfile> profiles,
     const invisible_places::water::WaterFeatureTimingOverlay* overlay,
     const std::optional<invisible_places::water::WaterScenarioState>&
         scenarioState = std::nullopt,
@@ -6217,11 +6257,11 @@ ResolveShorelinesForFrame(
         if (overlay != nullptr && !overlay->Allows(feature)) {
             continue;
         }
-        auto settings = instance.settings;
-        ApplyWaterShorelineFixedSettingOverlay(
+        auto settings = ResolveWaterShorelineFixedSettings(
+            instance,
+            profiles,
             feature,
-            fixedSettingOverlay,
-            &settings);
+            fixedSettingOverlay);
         if (!settings.enabled) {
             continue;
         }
@@ -15745,6 +15785,47 @@ std::optional<std::size_t> FindWaterShorelineObjectProfileIndex(
         }
     }
     return std::nullopt;
+}
+
+void RewriteWaterShorelineVariantProfileReferences(
+    WaterWorkflowState* water,
+    std::uint32_t shorelineInstanceId,
+    std::string_view previousName,
+    std::string_view nextName) {
+    if (water == nullptr) {
+        return;
+    }
+    const auto previous = NormalizeWaterShorelineProfileName(previousName);
+    const auto next = NormalizeWaterShorelineProfileName(nextName);
+    if (previous.empty() || next.empty() || previous == next) {
+        return;
+    }
+    const invisible_places::water::WaterKeyedFeatureId feature{
+        .kind = invisible_places::water::WaterKeyedFeatureKind::
+            ShorelineInstance,
+        .objectId = shorelineInstanceId};
+    for (auto& sceneState : water->timingTakeSceneStates) {
+        for (auto& run : sceneState.waterFeatureTimingRuns) {
+            for (auto& variant : run.variants) {
+                auto* overrideValue = invisible_places::water::
+                    FindWaterFeatureRunVariantOverride(
+                        &variant,
+                        feature,
+                        invisible_places::water::
+                            kWaterShorelineProfileFixedSettingId);
+                if (overrideValue == nullptr) {
+                    continue;
+                }
+                auto* profileName =
+                    std::get_if<std::string>(&overrideValue->value);
+                if (profileName != nullptr &&
+                    NormalizeWaterShorelineProfileName(*profileName) ==
+                        previous) {
+                    *profileName = next;
+                }
+            }
+        }
+    }
 }
 
 std::string UniqueWaterShorelineProfileName(
@@ -33646,6 +33727,7 @@ std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
     const auto& activeWaterScenario = activeWater.rawScenarioState;
     const auto resolvedShorelines = ResolveShorelinesForFrame(
         runtimeState.water.shorelineInstances,
+        runtimeState.water.shorelineProfiles,
         &activeWater.featureOverlay,
         activeWaterScenario,
         &activeWater.fixedSettingOverlay);
@@ -35705,6 +35787,7 @@ invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState
     }
     const auto resolvedShorelines = ResolveShorelinesForFrame(
         job.frozenShorelineInstances,
+        job.frozenShorelineProfiles,
         &waterFrame.featureOverlay,
         waterFrame.rawScenarioState,
         &waterFrame.fixedSettingOverlay);
@@ -41291,6 +41374,7 @@ void FreezeAuthoredTimingState(
     job->frozenFixedSettingOverlay.samples.clear();
     job->frozenOnlyShowWaterFeaturesInRuns = false;
     job->frozenShorelineInstances = runtimeState.water.shorelineInstances;
+    job->frozenShorelineProfiles = runtimeState.water.shorelineProfiles;
     job->frozenTimingColouriseEffects.clear();
     if (timingSnapshot != nullptr) {
         job->frozenFeatureTimingRuns =
@@ -41461,6 +41545,7 @@ void FreezeQueuedQuickMp4AuthoredTimingState(
     job->frozenFixedSettingOverlay.samples.clear();
     job->frozenOnlyShowWaterFeaturesInRuns = false;
     job->frozenShorelineInstances = snapshot.shorelineInstances;
+    job->frozenShorelineProfiles = snapshot.shorelineProfiles;
     job->frozenTimingColouriseEffects.clear();
     if (timingSnapshot != nullptr) {
         job->frozenFeatureTimingRuns =
@@ -42631,6 +42716,8 @@ void StartSelectedQuickMp4Batch(
         runtimeState->water.seepageNodes;
     waterSnapshot->shorelineInstances =
         runtimeState->water.shorelineInstances;
+    waterSnapshot->shorelineProfiles =
+        runtimeState->water.shorelineProfiles;
     waterSnapshot->authoredFrameControlState =
         ResolveActiveWaterScenarioState(*runtimeState, false);
     waterSnapshot->dynamicMeshFlowSettings =
@@ -43189,6 +43276,7 @@ void StartStillCameraExportJob(
         .frozenFeatureTimingRuns =
             SnapshotActiveWaterFeatureTimingRuns(*runtimeState),
         .frozenShorelineInstances = runtimeState->water.shorelineInstances,
+        .frozenShorelineProfiles = runtimeState->water.shorelineProfiles,
         .frozenNormalizedTime =
             CurrentAuthoredTrackPosition(*runtimeState),
         .exportVisualName = "Current View",
@@ -43622,6 +43710,7 @@ void StartAnimationExportJob(
         .frozenFeatureTimingRuns =
             SnapshotActiveWaterFeatureTimingRuns(*runtimeState),
         .frozenShorelineInstances = runtimeState->water.shorelineInstances,
+        .frozenShorelineProfiles = runtimeState->water.shorelineProfiles,
         .frozenNormalizedTime = renderSnapshot.normalizedPosition,
         .effectiveSeepageInvocations = effectiveSeepageInvocations,
         .frozenSeepageLayers = std::move(frozenSeepageLayers),
@@ -82973,9 +83062,15 @@ void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState) {
                         instance.name,
                         instance.id);
                 if (!renamed.empty()) {
+                    const std::string previousName = profile.name;
                     const bool wasApplied =
                         instance.profileName == profile.name;
                     profile.name = renamed;
+                    RewriteWaterShorelineVariantProfileReferences(
+                        &water,
+                        instance.id,
+                        previousName,
+                        renamed);
                     if (wasApplied) {
                         instance.profileName = renamed;
                     }
@@ -83001,87 +83096,6 @@ void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState) {
             return;
         }
 
-        const std::string profilePreview =
-            instance.profileName.empty()
-                ? std::string{"Select saved profile"}
-                : instance.profileName;
-        if (ImGui::BeginCombo(
-                "Saved Profile",
-                profilePreview.c_str())) {
-            for (const auto& profile : water.shorelineProfiles) {
-                if (profile.objectOverride &&
-                    profile.shorelineInstanceId != instance.id) {
-                    continue;
-                }
-                const bool selected =
-                    instance.profileName == profile.name;
-                const std::string label =
-                    profile.objectOverride
-                        ? profile.name + " (Object Copy)"
-                        : profile.name;
-                if (ImGui::Selectable(label.c_str(), selected)) {
-                    instance.profileName = profile.name;
-                    instance.baseProfileName =
-                        profile.objectOverride
-                            ? profile.baseProfileName
-                            : profile.name;
-                    instance.settings = profile.settings;
-                    water.shorelineProfileNameBuffer =
-                        instance.baseProfileName;
-                }
-                if (selected) {
-                    ImGui::SetItemDefaultFocus();
-                }
-            }
-            ImGui::EndCombo();
-        }
-        const bool usingObjectCopy =
-            FindWaterShorelineObjectProfileIndex(
-                water,
-                instance.id,
-                instance.baseProfileName)
-                .has_value() &&
-            instance.profileName != instance.baseProfileName;
-        if (usingObjectCopy) {
-            ImGui::TextColored(
-                ImVec4{0.55F, 0.78F, 0.98F, 1.0F},
-                "Object copy of %s",
-                instance.baseProfileName.c_str());
-            if (ImGui::Button("Use Saved Base")) {
-                if (const auto base =
-                        FindWaterShorelineProfileIndex(
-                            water,
-                            instance.baseProfileName);
-                    base.has_value()) {
-                    instance.profileName =
-                        water.shorelineProfiles[base.value()].name;
-                    instance.settings =
-                        water.shorelineProfiles[base.value()].settings;
-                }
-            }
-            DrawWaterSeepageParameterTooltip(
-                "Selects the saved named base without deleting this object's "
-                "copy. The next edit rebuilds and overwrites that same copy "
-                "from the base plus the new change.");
-        }
-
-        std::optional<PointCloudShorelineWaveSettings> savedBaseSettings;
-        const std::string normalizedBaseName =
-            NormalizeWaterShorelineProfileName(instance.baseProfileName);
-        const auto savedBaseProfile = std::find_if(
-            water.shorelineProfiles.begin(),
-            water.shorelineProfiles.end(),
-            [&](const PointCloudShorelineWaveProfile& profile) {
-                return !profile.objectOverride &&
-                       NormalizeWaterShorelineProfileName(profile.name) ==
-                           normalizedBaseName;
-            });
-        if (savedBaseProfile != water.shorelineProfiles.end()) {
-            savedBaseSettings = savedBaseProfile->settings;
-        }
-
-        bool instanceSettingsChanged = false;
-
         const invisible_places::water::WaterKeyedFeatureId feature{
             .kind = invisible_places::water::WaterKeyedFeatureKind::
                 ShorelineInstance,
@@ -83104,7 +83118,7 @@ void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState) {
         }
         const auto variantAuthority =
             ResolveWaterVariantAnimationAuthority(*runtimeState);
-        auto resolvedRunSelection = featureRun != nullptr &&
+        const auto resolvedRunSelection = featureRun != nullptr &&
                 variantAuthority.path != nullptr
             ? invisible_places::water::ResolveWaterFeatureRunSelection(
                   *featureRun,
@@ -83116,17 +83130,250 @@ void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState) {
                   featureRun,
                   resolvedRunSelection.variantId)
             : nullptr;
-        auto effectiveFixedSettings = instance.settings;
+
+        const auto variantProfileOverride = [&]() {
+            return invisible_places::water::
+                FindWaterFeatureRunVariantOverride(
+                    activeVariant,
+                    feature,
+                    invisible_places::water::
+                        kWaterShorelineProfileFixedSettingId);
+        };
+        const auto detachedVariantProfileName = [&]()
+            -> std::optional<std::string> {
+            const auto* overrideValue = variantProfileOverride();
+            if (overrideValue == nullptr || !overrideValue->detached) {
+                return std::nullopt;
+            }
+            if (const auto* name =
+                    std::get_if<std::string>(&overrideValue->value)) {
+                return *name;
+            }
+            return std::string{};
+        };
+
+        bool variantProfileChanged = false;
+        const auto selectedVariantProfile = detachedVariantProfileName();
+        const std::string effectiveProfilePreview =
+            selectedVariantProfile.has_value()
+                ? selectedVariantProfile->empty()
+                      ? std::string{"Invalid saved profile override"}
+                      : *selectedVariantProfile
+                : instance.profileName.empty()
+                      ? std::string{"Select saved profile"}
+                      : instance.profileName;
+        std::vector<std::string> divergentProfileVariants;
+        if (featureRun != nullptr) {
+            for (const auto& variant : featureRun->variants) {
+                const auto* overrideValue = invisible_places::water::
+                    FindWaterFeatureRunVariantOverride(
+                        &variant,
+                        feature,
+                        invisible_places::water::
+                            kWaterShorelineProfileFixedSettingId);
+                if (overrideValue != nullptr && overrideValue->detached) {
+                    divergentProfileVariants.push_back(variant.name);
+                }
+            }
+        }
+        const bool profileDetached = selectedVariantProfile.has_value();
+        if (profileDetached || !divergentProfileVariants.empty()) {
+            ImGui::PushStyleColor(
+                ImGuiCol_Text,
+                profileDetached
+                    ? ImVec4{0.95F, 0.25F, 0.22F, 1.0F}
+                    : ImVec4{1.0F, 0.58F, 0.16F, 1.0F});
+        }
+        const bool profileEditingLocked =
+            variantAuthority.variantEditingLocked ||
+            RenderSetupAuthoringLocked(runtimeState);
+        if (profileEditingLocked) {
+            ImGui::BeginDisabled();
+        }
+        if (ImGui::BeginCombo(
+                activeVariant != nullptr
+                    ? "Variant Profile"
+                    : "Saved Profile",
+                effectiveProfilePreview.c_str())) {
+            if (activeVariant != nullptr) {
+                const std::string inheritLabel =
+                    "Inherit Base Run — " +
+                    (instance.profileName.empty()
+                         ? std::string{"no profile"}
+                         : instance.profileName);
+                if (ImGui::Selectable(
+                        inheritLabel.c_str(),
+                        !selectedVariantProfile.has_value())) {
+                    if (invisible_places::water::
+                            ReattachWaterFeatureRunVariantSetting(
+                                activeVariant,
+                                feature,
+                                invisible_places::water::
+                                    kWaterShorelineProfileFixedSettingId)) {
+                        variantProfileChanged = true;
+                        runtimeState->statusMessage =
+                            "Variant " + activeVariant->name +
+                            " now inherits the Base Run profile for " +
+                            instance.name + ".";
+                        runtimeState->errorMessage.clear();
+                    }
+                }
+                ImGui::Separator();
+            }
+            for (const auto& profile : water.shorelineProfiles) {
+                if (profile.objectOverride &&
+                    profile.shorelineInstanceId != instance.id) {
+                    continue;
+                }
+                const bool selected = activeVariant != nullptr
+                    ? selectedVariantProfile.has_value() &&
+                          *selectedVariantProfile == profile.name
+                    : instance.profileName == profile.name;
+                const std::string label =
+                    profile.objectOverride
+                        ? profile.name + " (Object Copy)"
+                        : profile.name;
+                if (ImGui::Selectable(label.c_str(), selected)) {
+                    if (activeVariant != nullptr) {
+                        (void)invisible_places::water::
+                            DetachWaterFeatureRunVariantSetting(
+                                activeVariant,
+                                feature,
+                                invisible_places::water::
+                                    kWaterShorelineProfileFixedSettingId,
+                                std::string{profile.name});
+                        variantProfileChanged = true;
+                        runtimeState->statusMessage =
+                            "Variant " + activeVariant->name + " uses " +
+                            profile.name + " for " + instance.name + ".";
+                        runtimeState->errorMessage.clear();
+                    } else {
+                        instance.profileName = profile.name;
+                        instance.baseProfileName =
+                            profile.objectOverride
+                                ? profile.baseProfileName
+                                : profile.name;
+                        instance.settings = profile.settings;
+                        water.shorelineProfileNameBuffer =
+                            instance.baseProfileName;
+                    }
+                }
+                if (selected) {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+            ImGui::EndCombo();
+        }
+        if (profileEditingLocked) {
+            ImGui::EndDisabled();
+        }
+        if (profileDetached || !divergentProfileVariants.empty()) {
+            ImGui::PopStyleColor();
+        }
+        if (activeVariant != nullptr) {
+            ImGui::TextDisabled(
+                "Run variant: %s%s",
+                activeVariant->name.c_str(),
+                detachedVariantProfileName().has_value()
+                    ? " — named profile detached"
+                    : " — inherits Base Run profile");
+        }
+        DrawWaterSeepageParameterTooltip(
+            activeVariant != nullptr
+                ? "Select a complete saved Shoreline profile for the active "
+                  "run variant. Inherit Base Run follows the object's normal "
+                  "profile. Individual detached settings are applied after "
+                  "the selected profile, and timeline keys are applied last."
+                : "Select the normal saved profile inherited by Base Run and "
+                  "every variant that has no named-profile override.");
+
+        const bool usingObjectCopy =
+            FindWaterShorelineObjectProfileIndex(
+                water,
+                instance.id,
+                instance.baseProfileName)
+                .has_value() &&
+            instance.profileName != instance.baseProfileName;
+        if (usingObjectCopy && activeVariant == nullptr) {
+            ImGui::TextColored(
+                ImVec4{0.55F, 0.78F, 0.98F, 1.0F},
+                "Object copy of %s",
+                instance.baseProfileName.c_str());
+            if (ImGui::Button("Use Saved Base")) {
+                if (const auto base =
+                        FindWaterShorelineProfileIndex(
+                            water,
+                            instance.baseProfileName);
+                    base.has_value()) {
+                    instance.profileName =
+                        water.shorelineProfiles[base.value()].name;
+                    instance.settings =
+                        water.shorelineProfiles[base.value()].settings;
+                }
+            }
+            DrawWaterSeepageParameterTooltip(
+                "Selects the saved named base without deleting this object's "
+                "copy. The next edit rebuilds and overwrites that same copy "
+                "from the base plus the new change.");
+        }
+
+        invisible_places::water::WaterFeatureFixedSettingOverlay fixedOverlay;
+        const invisible_places::water::WaterFeatureFixedSettingOverlay*
+            fixedOverlayPtr = nullptr;
         if (timingEntry != nullptr && variantAuthority.path != nullptr) {
-            const auto fixedOverlay = invisible_places::water::
+            fixedOverlay = invisible_places::water::
                 BuildWaterFeatureFixedSettingOverlay(
                     timingEntry->waterFeatureTimingRuns,
                     variantAuthority.path->waterFeatureRunSelections);
-            ApplyWaterShorelineFixedSettingOverlay(
-                feature,
-                &fixedOverlay,
-                &effectiveFixedSettings);
+            fixedOverlayPtr = &fixedOverlay;
         }
+        auto effectiveFixedSettings = ResolveWaterShorelineFixedSettings(
+            instance,
+            water.shorelineProfiles,
+            feature,
+            fixedOverlayPtr);
+        const auto currentVariantProfile = detachedVariantProfileName();
+        const std::string effectiveProfileName =
+            currentVariantProfile.has_value() &&
+                    !currentVariantProfile->empty()
+                ? *currentVariantProfile
+                : instance.profileName;
+        const auto* effectiveProfile = invisible_places::renderer::pointcloud::
+            FindPointCloudShorelineWaveProfile(
+                water.shorelineProfiles,
+                instance.id,
+                effectiveProfileName);
+        if (currentVariantProfile.has_value() &&
+            (currentVariantProfile->empty() || effectiveProfile == nullptr)) {
+            ImGui::TextColored(
+                ImVec4{0.95F, 0.42F, 0.22F, 1.0F},
+                "Missing variant profile: %s (using Base Run until restored)",
+                currentVariantProfile->empty()
+                    ? "invalid value"
+                    : currentVariantProfile->c_str());
+        }
+
+        std::optional<PointCloudShorelineWaveSettings> savedBaseSettings;
+        const std::string normalizedBaseName =
+            NormalizeWaterShorelineProfileName(
+                effectiveProfile != nullptr
+                    ? effectiveProfile->objectOverride
+                          ? effectiveProfile->baseProfileName
+                          : effectiveProfile->name
+                    : instance.baseProfileName);
+        const auto savedBaseProfile = std::find_if(
+            water.shorelineProfiles.begin(),
+            water.shorelineProfiles.end(),
+            [&](const PointCloudShorelineWaveProfile& profile) {
+                return !profile.objectOverride &&
+                       NormalizeWaterShorelineProfileName(profile.name) ==
+                           normalizedBaseName;
+            });
+        if (savedBaseProfile != water.shorelineProfiles.end()) {
+            savedBaseSettings = savedBaseProfile->settings;
+        }
+
+        bool instanceSettingsChanged = false;
         DrawEmbeddedWaterFeatureTimeline(runtimeState, feature);
         const std::array<invisible_places::water::WaterKeyedFeatureId, 1>
             keyedFeatures{feature};
@@ -83180,8 +83427,8 @@ void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState) {
         keyedScalarRow(
             "intensity",
             "Intensity",
-            instance.settings.foamFronts.intensity,
-            instance.settings.heightFoam.intensity,
+            effectiveFixedSettings.foamFronts.intensity,
+            effectiveFixedSettings.heightFoam.intensity,
             savedBaseSettings.has_value()
                 ? savedBaseSettings->foamFronts.intensity
                 : 0.0F,
@@ -83198,8 +83445,8 @@ void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState) {
         keyedScalarRow(
             "emission_add",
             "Emission Add",
-            instance.settings.foamFronts.emissionAdd,
-            instance.settings.heightFoam.emissionAdd,
+            effectiveFixedSettings.foamFronts.emissionAdd,
+            effectiveFixedSettings.heightFoam.emissionAdd,
             savedBaseSettings.has_value()
                 ? savedBaseSettings->foamFronts.emissionAdd
                 : 0.0F,
@@ -83216,8 +83463,8 @@ void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState) {
         keyedScalarRow(
             "opacity_add",
             "Opacity Add",
-            instance.settings.foamFronts.opacityAdd,
-            instance.settings.heightFoam.opacityAdd,
+            effectiveFixedSettings.foamFronts.opacityAdd,
+            effectiveFixedSettings.heightFoam.opacityAdd,
             savedBaseSettings.has_value()
                 ? savedBaseSettings->foamFronts.opacityAdd
                 : 0.0F,
@@ -83234,8 +83481,8 @@ void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState) {
         keyedScalarRow(
             "point_size_multiply",
             "Point Size Multiply",
-            instance.settings.foamFronts.pointSizeMultiply,
-            instance.settings.heightFoam.pointSizeMultiply,
+            effectiveFixedSettings.foamFronts.pointSizeMultiply,
+            effectiveFixedSettings.heightFoam.pointSizeMultiply,
             savedBaseSettings.has_value()
                 ? savedBaseSettings->foamFronts.pointSizeMultiply
                 : 0.0F,
@@ -83253,8 +83500,8 @@ void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState) {
         keyedScalarRow(
             "colour_mix",
             "Colour Mix",
-            instance.settings.foamFronts.colourMix,
-            instance.settings.heightFoam.colourMix,
+            effectiveFixedSettings.foamFronts.colourMix,
+            effectiveFixedSettings.heightFoam.colourMix,
             savedBaseSettings.has_value()
                 ? savedBaseSettings->foamFronts.colourMix
                 : 0.0F,
@@ -83316,6 +83563,7 @@ void DrawAdditionalShorelinesSection(PreviewRuntimeState* runtimeState) {
             .activeVariant = activeVariant,
             .feature = feature,
             .editingLocked = variantAuthority.variantEditingLocked,
+            .stateChanged = variantProfileChanged,
         };
         ImGui::BeginDisabled(
             variantAuthority.variantEditingLocked ||
@@ -98008,6 +98256,142 @@ void DrawWaterFeatureRunsSection(PreviewRuntimeState* runtimeState) {
                     ImGui::SameLine();
                     ImGui::TextDisabled(
                         "Its remembered detached values will be removed.");
+                }
+
+                bool drewShorelineProfiles = false;
+                for (const auto& timeline : run.features) {
+                    if (timeline.feature.kind !=
+                        invisible_places::water::WaterKeyedFeatureKind::
+                            ShorelineInstance) {
+                        continue;
+                    }
+                    if (!drewShorelineProfiles) {
+                        ImGui::Spacing();
+                        ImGui::TextDisabled("Named Shoreline Profiles");
+                        drewShorelineProfiles = true;
+                    }
+                    const auto instanceIt = std::find_if(
+                        water.shorelineInstances.begin(),
+                        water.shorelineInstances.end(),
+                        [&](const PointCloudShorelineInstance& instance) {
+                            return instance.id == timeline.feature.objectId;
+                        });
+                    const std::string featureLabel =
+                        WaterKeyedFeatureDisplayLabel(
+                            *runtimeState,
+                            timeline.feature);
+                    const auto* overrideValue = invisible_places::water::
+                        FindWaterFeatureRunVariantOverride(
+                            selectedVariant,
+                            timeline.feature,
+                            invisible_places::water::
+                                kWaterShorelineProfileFixedSettingId);
+                    std::optional<std::string> assignedProfile;
+                    if (overrideValue != nullptr &&
+                        overrideValue->detached) {
+                        if (const auto* name = std::get_if<std::string>(
+                                &overrideValue->value)) {
+                            assignedProfile = *name;
+                        } else {
+                            assignedProfile = std::string{};
+                        }
+                    }
+                    const std::string inheritedProfile =
+                        instanceIt != water.shorelineInstances.end() &&
+                                !instanceIt->profileName.empty()
+                            ? instanceIt->profileName
+                            : std::string{"no saved profile"};
+                    const auto* resolvedProfile =
+                        assignedProfile.has_value() &&
+                                !assignedProfile->empty() &&
+                                instanceIt != water.shorelineInstances.end()
+                            ? invisible_places::renderer::pointcloud::
+                                  FindPointCloudShorelineWaveProfile(
+                                      water.shorelineProfiles,
+                                      instanceIt->id,
+                                      *assignedProfile)
+                            : nullptr;
+                    const std::string preview = assignedProfile.has_value()
+                        ? assignedProfile->empty()
+                              ? std::string{"Invalid profile override"}
+                              : resolvedProfile == nullptr
+                                    ? *assignedProfile + " (missing)"
+                                    : *assignedProfile
+                        : "Inherit Base Run — " + inheritedProfile;
+                    ImGui::PushID(
+                        static_cast<int>(timeline.feature.objectId));
+                    if (RenderSetupAuthoringLocked(runtimeState)) {
+                        ImGui::BeginDisabled();
+                    }
+                    const std::string comboLabel =
+                        featureLabel + " Profile";
+                    if (ImGui::BeginCombo(
+                            comboLabel.c_str(),
+                            preview.c_str())) {
+                        const std::string inheritLabel =
+                            "Inherit Base Run — " + inheritedProfile;
+                        if (ImGui::Selectable(
+                                inheritLabel.c_str(),
+                                !assignedProfile.has_value())) {
+                            if (invisible_places::water::
+                                    ReattachWaterFeatureRunVariantSetting(
+                                        selectedVariant,
+                                        timeline.feature,
+                                        invisible_places::water::
+                                            kWaterShorelineProfileFixedSettingId)) {
+                                runtimeState->statusMessage =
+                                    "Variant " + selectedVariant->name +
+                                    " now inherits Base Run for " +
+                                    featureLabel + ".";
+                                runtimeState->errorMessage.clear();
+                                invalidateFeatureRunEvaluation();
+                            }
+                        }
+                        ImGui::Separator();
+                        for (const auto& profile :
+                             water.shorelineProfiles) {
+                            if (profile.objectOverride &&
+                                (instanceIt ==
+                                     water.shorelineInstances.end() ||
+                                 profile.shorelineInstanceId !=
+                                     instanceIt->id)) {
+                                continue;
+                            }
+                            const bool selected =
+                                assignedProfile.has_value() &&
+                                *assignedProfile == profile.name;
+                            const std::string label =
+                                profile.objectOverride
+                                    ? profile.name + " (Object Copy)"
+                                    : profile.name;
+                            if (ImGui::Selectable(
+                                    label.c_str(),
+                                    selected)) {
+                                (void)invisible_places::water::
+                                    DetachWaterFeatureRunVariantSetting(
+                                        selectedVariant,
+                                        timeline.feature,
+                                        invisible_places::water::
+                                            kWaterShorelineProfileFixedSettingId,
+                                        std::string{profile.name});
+                                runtimeState->statusMessage =
+                                    "Variant " + selectedVariant->name +
+                                    " uses " + profile.name + " for " +
+                                    featureLabel + ".";
+                                runtimeState->errorMessage.clear();
+                                invalidateFeatureRunEvaluation();
+                            }
+                        }
+                        ImGui::EndCombo();
+                    }
+                    if (RenderSetupAuthoringLocked(runtimeState)) {
+                        ImGui::EndDisabled();
+                    }
+                    DrawWaterSeepageParameterTooltip(
+                        "The named profile supplies this variant's complete "
+                        "Shoreline baseline. Individual detached settings "
+                        "layer over it; the run's timeline keys stay shared.");
+                    ImGui::PopID();
                 }
             }
 
@@ -118180,6 +118564,7 @@ bool PreviewLiveVisualEffectsRequireSceneRedraw(
     const auto resolvedShorelines =
         ResolveShorelinesForFrame(
             runtimeState.water.shorelineInstances,
+            runtimeState.water.shorelineProfiles,
             overlayPtr,
             scenario,
             &fixedOverlay);
@@ -118314,6 +118699,7 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
     renderState.rainSpawnCentre = renderCamera->OrbitCenter();
     const auto resolvedShorelines = ResolveShorelinesForFrame(
         runtimeState.water.shorelineInstances,
+        runtimeState.water.shorelineProfiles,
         &waterFrame.featureOverlay,
         activeWaterScenario,
         &waterFrame.fixedSettingOverlay);

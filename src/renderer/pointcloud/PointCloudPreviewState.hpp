@@ -540,6 +540,14 @@ void ApplyPointCloudShorelineWaveSettings(
     PointCloudStyleState* style,
     const PointCloudShorelineWaveSettings& settings);
 [[nodiscard]] PointCloudShorelineWaveSettings CalmPointCloudShorelineWaveSettings();
+// Resolves a saved profile name for one Shoreline object. Shared named bases
+// are available to every object; an object-specific copy is available only to
+// its owner. Whitespace around authored names is ignored.
+[[nodiscard]] const PointCloudShorelineWaveProfile*
+FindPointCloudShorelineWaveProfile(
+    std::span<const PointCloudShorelineWaveProfile> profiles,
+    std::uint32_t shorelineInstanceId,
+    std::string_view profileName);
 // Returns the stable human-facing name for one Shoreline object's derived
 // profile without colliding with a saved base or another object's copy. An
 // existing copy owned by the same object and base is ignored so ordinary

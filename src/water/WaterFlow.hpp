@@ -580,6 +580,13 @@ struct WaterFeatureFixedSettingDescriptor {
         WaterFeatureFixedSettingInvalidation::LiveUpdate;
 };
 
+// A Shoreline run variant may select a complete saved profile before its
+// individual detached fixed settings are layered on top. This remains an
+// ordinary typed variant override, so existing project/animation
+// serialization can round-trip it without a parallel variant schema.
+inline constexpr std::string_view kWaterShorelineProfileFixedSettingId =
+    "profile_name";
+
 // Canonical registry for fixed settings that may be detached by a run
 // variant. IDs are serialization/runtime identities and therefore must never
 // be repurposed. Keyable settings are intentionally absent: their per-frame

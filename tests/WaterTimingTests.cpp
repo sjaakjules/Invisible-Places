@@ -174,6 +174,64 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Shoreline run variants carry a named profile beside individual overrides",
+    "[water][timing][variants][shoreline][profiles]") {
+    using namespace invisible_places::water;
+
+    const WaterKeyedFeatureId shoreline{
+        .kind = WaterKeyedFeatureKind::ShorelineInstance,
+        .objectId = 17U};
+    WaterFeatureTimingRun run;
+    run.id = 9U;
+    run.features.push_back({.feature = shoreline});
+    run.variants.push_back({.id = 2U, .name = "A"});
+    REQUIRE(DetachWaterFeatureRunVariantSetting(
+                &run.variants.front(),
+                shoreline,
+                kWaterShorelineProfileFixedSettingId,
+                std::string{"Foam Jiggle 01 - Far A"}) != nullptr);
+    REQUIRE(DetachWaterFeatureRunVariantSetting(
+                &run.variants.front(),
+                shoreline,
+                "foam_fronts.boundary_z",
+                1.42) != nullptr);
+
+    const std::array selections{WaterFeatureRunSelection{
+        .runId = run.id,
+        .enabled = true,
+        .variantId = 2U,
+    }};
+    const auto overlay = BuildWaterFeatureFixedSettingOverlay(
+        std::span{&run, 1U},
+        selections);
+    const auto* profile = overlay.Find(
+        shoreline,
+        kWaterShorelineProfileFixedSettingId);
+    REQUIRE(profile != nullptr);
+    REQUIRE(std::holds_alternative<std::string>(*profile));
+    CHECK(std::get<std::string>(*profile) ==
+          "Foam Jiggle 01 - Far A");
+    CHECK(std::get<double>(
+              *overlay.Find(shoreline, "foam_fronts.boundary_z")) ==
+          Approx(1.42));
+    CHECK(FindWaterFeatureFixedSetting(
+              WaterKeyedFeatureKind::ShorelineInstance,
+              kWaterShorelineProfileFixedSettingId) != nullptr);
+
+    CHECK(ReattachWaterFeatureRunVariantSetting(
+        &run.variants.front(),
+        shoreline,
+        kWaterShorelineProfileFixedSettingId));
+    const auto inherited = BuildWaterFeatureFixedSettingOverlay(
+        std::span{&run, 1U},
+        selections);
+    CHECK(inherited.Find(
+              shoreline,
+              kWaterShorelineProfileFixedSettingId) == nullptr);
+    CHECK(inherited.Find(shoreline, "foam_fronts.boundary_z") != nullptr);
+}
+
+TEST_CASE(
     "Fixed variant descriptors stay disjoint from keyed settings and Rain resolves in layer order",
     "[water][timing][variants][fixed]") {
     using namespace invisible_places::water;
