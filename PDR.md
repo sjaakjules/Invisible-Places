@@ -82,6 +82,28 @@ Point-cloud layers shall support static and dynamic motion modes.
 #### FR-SCENE-5
 Point-cloud layers shall preserve rest position for non-destructive procedural motion.
 
+#### FR-SCENE-6
+Only one available grouped LiDAR scene shall own interactive point-cloud
+residency. Making another scene authoritative shall release every CPU/GPU
+point-cloud session and queued load stored directly in the outgoing scene
+folder; an in-flight whole-file result that finishes after ownership changes
+shall be discarded before publication. Project restoration shall replay loaded
+state for at most one resolved active scene.
+
+#### FR-SCENE-7
+Delimiter-bounded `WATER` point clouds in a grouped scene folder shall form one
+density-aware auxiliary family. Live display shall load only an exact spacing
+match to the committed base bundle, or the nearest available spacing when no
+exact source exists. Recovery copies identified by `old`, `backup`, `archive`,
+or equivalent recovery tokens shall remain undiscovered.
+
+#### FR-SCENE-8
+Final output shall resolve the finest complete ROCK/SAND/VEG bundle plus the
+WATER variant nearest that density. WATER footprint shall follow nominal point
+spacing and its opacity and emission shall use measured point-count coverage
+relative to the finest installed WATER source, so live and output densities
+retain equivalent visual weight.
+
 ### 5.3 Navigation and Camera
 #### FR-CAM-1
 The application shall support orbit, pan, dolly, and free-fly navigation.
@@ -387,51 +409,91 @@ are required for that pair. The optional wizard 4:00 fit in FR-CAM-20 remains
 available for other pairs whose unique duration is not already 7,200 frames.
 
 #### FR-CAM-24
-Every valid reciprocal pair with a common grouped 1 mm/5 mm scene shall expose
-an independent session-only **HQ** control beside Seam/A/B. Preparation shall
-begin automatically after the complete 5 mm baseline and higher-priority
-display/shared-cache work are ready. Until both role patches are ready, the
-disabled control shall show monotonic progress and its Waiting, Scanning,
-Organising, or Uploading stage; a failure shall retain the pure 5 mm view and
-offer retry details.
+Every animation with a grouped scene containing complete 1 mm/5 mm bundles
+shall expose an independent session-only **HQ** control. A reciprocal pair
+shall show it beside Seam/A/B; an unlinked animation shall show it in its local
+animation view. Preparation shall begin automatically after the complete 5 mm
+baseline and higher-priority display/shared-cache work are ready. Until every
+requested role patch is ready, the disabled control shall show monotonic
+progress and its Waiting, Scanning, Organising, or Uploading stage; a failure
+shall retain the pure 5 mm view and offer retry details.
 
-HQ off shall render the complete 5 mm ROCK/SAND/VEG bundle. HQ on shall retain
-complete 5 mm SAND, render 1 mm ROCK and VEG point centres inside the
-union of the two member cameras evaluated at normalized `0.5`, and render 5 mm
-ROCK and VEG outside that union. A project-saved patch spacing of 1, 2 or 3 mm
+HQ off shall render the complete 5 mm ROCK/SAND/VEG bundle. For a reciprocal
+pair, HQ on shall render 1 mm ROCK and VEG point centres inside the union of
+the two member cameras evaluated at normalized
+`0.5`, and render 5 mm ROCK and VEG outside that union. For an unlinked
+animation, the union shall instead contain nine evenly spaced camera views
+including normalized `0`, `0.5`, and `1`, plus every authored camera-key time,
+so the higher-density patch spans the complete finite path. A project-saved
+patch spacing of 1, 2 or 3 mm
 selects the inside density: 1 mm keeps every point, while 2 mm and 3 mm thin
 the scanned 1 mm points with the density-preserving cell stratification of the
 display-density cache (cells of the chosen spacing keep a hash-dithered quota
 of one in four or one in nine of their parents, a single output being the real
 parent nearest the cell's parent centroid) and declare that nominal spacing
 with the exact kept/scanned counts so the existing density compensation
-restores the 1 mm reference coverage. Changing the spacing shall re-prepare the patches and
-restore an enabled HQ view once they publish. Each camera shall use its authored live-view
-aspect ratio, falling back to the current live aspect only when absent. The
+restores the 1 mm reference coverage. Changing the spacing shall re-prepare the
+patches and restore an enabled HQ view once they publish. Each camera shall use
+its authored live-view aspect ratio, falling back to the current live aspect
+only when absent. The
 viewport shall extend by 5% of its full width/height beyond every X/Y side;
 authored near/far clipping shall not be extended. The same exact centre test
 shall construct the 1 mm selection and complementary 5 mm mask, leaving no
-overlap or gap. The application shall never open or allocate 1 mm SAND for HQ.
+overlap or gap. A project-saved **Sand** toggle shall be off by default. While
+off, HQ shall retain complete 5 mm SAND and never fingerprint, open, or allocate
+1 mm SAND. While on, it shall apply the same view union, spacing, 1 mm selection,
+and complementary 5 mm mask to SAND.
 
-Both 1 mm patches and both 5 mm masks shall publish as one live-resource
-transaction. Enabling or disabling HQ shall preserve Seam/A/B mode, canonical
+All requested ROCK/VEG or ROCK/VEG/SAND patches and masks shall publish as one
+live-resource transaction. Enabling or disabling HQ shall preserve Seam/A/B mode, canonical
 and local playheads, camera, and playback, while resetting only temporal and
 compositor history. Internal layers shall reuse the corresponding role's
 resolved Visual, field names and full-role mapping ranges, Timing Colourise,
 Rain, Seepage, Flow/roughness motion, renderer mode, depth of field, and EDL.
+An included SAND patch shall also retain ordinary Shoreline eligibility and
+resolved wave settings.
 The 5 mm remainder shall retain normal density compensation and the 1 mm patch
 shall use identity compensation. Retained source indices shall support later
 indexed field gathering without retaining or rescanning a complete in-memory
 1 mm cloud.
 
-The cache shall remain memory/GPU-only for the current active pair and shall be
-cancelled/rebuilt when the pair, midpoint camera/aspect, project identity, or a
-relevant source fingerprint changes. A hidden 5 mm override may be loaded for
-this purpose without changing the saved Visible Point Cloud selection.
+The patch cache shall remain memory/GPU-only for the current active animation
+or pair and shall be cancelled/rebuilt when that selection, any contributing
+sampled camera/aspect, project identity, saved Sand mode, or a relevant source
+fingerprint changes. A hidden 5 mm override may be loaded for this purpose
+without changing the saved Visible Point Cloud selection.
 Internal layer ids, masks, and that override shall never enter serialization or
 export snapshots. Every still, frame preview, video, and EXR export shall keep
-the existing complete canonical 1 mm ROCK/SAND/VEG path. No schema increment is
-required.
+the existing complete canonical 1 mm ROCK/SAND/VEG path. The spacing and Sand
+preferences may be serialized without a schema-version increment.
+
+#### FR-CAM-25
+The application shall expose a mutually exclusive experimental **aHQ** live
+mode while retaining fixed HQ. aHQ shall work without a loaded animation and
+shall resolve the selected compatible grouped scene, or the only visible
+compatible grouped scene when unambiguous. Its fine-data union shall always
+include a guarded current-camera view. Any loaded animation associated with
+that scene may add path prefetch coverage but shall not constrain where aHQ
+can operate.
+
+aHQ shall retain the complete 5 mm baseline and select fine/coarse points with
+a camera-stable GPU transition derived from projected 5 mm spacing. Fine source
+preparation shall be depth-bounded beyond that transition. Leaving a published
+camera guard shall hide the stale fine patch, preserve the complete 5 mm view,
+and request a background replacement without repeatedly cancelling one active
+block request. On first use, each fine source shall produce one machine-local,
+Morton-ordered cache PLY and a sidecar block index under
+`Saved/.invisible_places/cache/adaptive_hq/`. Blocks shall be approximately
+1--8 MiB and expose bounds, file offset, and point count so guarded camera
+requests can seek only intersecting ranges. Recently used blocks shall be
+retained so camera movement normally loads only its new fringe.
+
+The spatial cache shall never be written to OneDrive, beside a source, or over
+an export-quality PLY. It shall be rebuilt automatically whenever the source
+path, size, timestamp, property schema, point layout, or content fingerprint no
+longer matches its sidecar. aHQ shall share HQ's 1/2/3 mm and Sand preferences
+and remain serialization-free and excluded from every frozen export path; only
+its validated derived disk cache may persist between sessions.
 
 ### 5.4 Side Panel Behaviour
 #### FR-UI-1
@@ -712,16 +774,22 @@ through draggable nodes: each node skews left/right and spreads or pinches
 up/down its surrounding area, snapping onto neutral spread and its unskewed
 home; double-click adds a node anchoring the coordinate that lands there,
 or removes one. The centre node's coordinates stay keyable as Skew Centre
-and Skew Spread. Bounds edge fades shall be independent per edge, each
-keyable and reaching a whole span in either direction; they stay linked
-through one recoloured "Ends Fade" control until a fade handle is
+and Skew Spread. Bounds edge fades shall be independent per edge and keyable.
+An inward fade shall stop at 100% of the selected spacing, while an outward
+fade may exceed 100% so a narrow selected interval can feather through the
+rest of a scalar field; they stay linked through one recoloured "Ends Fade"
+control until a fade handle is
 double-clicked apart, splitting into per-edge tinted columns. Every
 geometric bounds coordinate shall remain text-editable in any Bounds Keying
-mode, writing through the keyed pair. Keyed palette-stop properties shall
-join the shared value graph as one auto-ranged curve per track with the
-full curve-style set (Linear and Hold are honoured stored styles, keys are
-authoritative at their exact instant, and new keys default to Monotone
-Spline); keyed stop colours shall interpolate in an authored sRGB,
+mode, writing through the keyed pair. Palette marker Positions shall key as
+one complete group through a vertical `+ / < / > / X` rail beside the palette;
+Colour and Colourise Amount shall remain independent stop tracks. Every marker
+Position curve shall share the min/max of only the marker tracks whose authored
+values vary, excluding invariant group-keyed markers from that axis. Other
+keyed palette-stop properties shall join the shared value graph as one
+auto-ranged curve per track with the full curve-style set (Linear and Hold are
+honoured stored styles, keys are authoritative at their exact instant, and new
+keys default to Monotone Spline); keyed stop colours shall interpolate in an authored sRGB,
 linear-light, or OkLab space and tint their curve. Emissive output shall
 support a falloff profile over the bounds: level-multiplier nodes joined by
 a Monotone Spline, each node keyable over time, shaped by the falloff's own
@@ -729,7 +797,26 @@ skew warp, and previewed as a mid-grey response strip atop the histogram.
 Value-graph time markers shall hang below the axis, select every key at
 their time (or a pre-selected subset), and drags shall snap onto other
 keys' times unless a dragged key would stack on its own setting, with a
-mouse shake toggling snapping. Colourise and Emissive settings shall follow
+mouse shake toggling snapping. The selected feature's interactive controls
+shall be ordered as Bounds/profile controls, histogram, enabled Colourise
+palette, enabled Emissive falloff curve, and one unified keyframe timeline;
+scalar numeric settings shall occupy a separate block below. When Colourise is
+enabled, its preset and saved-palette selectors shall sit directly below
+Bounds Profile and above Histogram Axis. Position, Fade, Skew, Palette, and
+Intensity key groups shall be independently showable for the session without
+deleting keys; Palette and Intensity visibility controls shall appear only
+for their enabled output aspects. Each group shall snap only to its own kind
+on the shared graph. Disabling Colourise or Emissive shall hide that aspect's
+interactive editor and timeline group while retaining its dormant authored
+data. Double-clicking open
+value-graph space shall add a key to the only or nearest visible curve, and
+double-clicking an existing key shall open exact normalized-position editing.
+Colourise Amount, the
+palette/emissive centre-skew pair, and colour-stop Position/Amount shall show
+their value on a draggable ranged bar whose double-click mode accepts an exact
+numeric value. Colourise Phase may retain its specialised relative-turn rail
+because its stored keys are deltas and its graph is accumulated. Colourise and
+Emissive settings shall follow
 the selected scalar field through a per-field visual memory unless the user
 opts a feature into one global set. Each feature's colourise output shall
 carry an authored Blend Mode against the colour beneath it - Normal (the
@@ -737,8 +824,10 @@ historical mix), Multiply, Screen, Add, Divide, and Vivid Light, the
 vocabulary of the 2024 After Effects exhibition grade - applied identically
 in the live viewport and offline renders with Colourise Amount acting as
 the layer opacity, and slot order remaining the compositing order. Project
-schema 85 introduces the per-edge fades; the remaining state serializes
-additively with omitted defaults.
+schema 85 introduces the per-edge fades, and schema 87 widens their existing
+negative span-relative values without changing any schema-86 base value,
+bounds snapshot, parameter key, or per-field memory; the remaining state
+serializes additively with omitted defaults.
 
 #### FR-STYLE-19
 Each Water Feature Run shall support project-owned named variants that share

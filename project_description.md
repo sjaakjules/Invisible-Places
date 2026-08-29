@@ -129,6 +129,16 @@ They support:
 - AOV export,
 - optional subtle procedural motion evaluated from rest position.
 
+Grouped LiDAR scene folders have exclusive interactive residency: activating
+another scene releases the outgoing folder's CPU/GPU point clouds and queued
+loads, and project restoration loads only one available active scene. A
+delimiter-bounded `WATER` family follows the grouped scene density without
+joining the primary ROCK/SAND/VEG bundle. Live view loads one exact/nearest
+WATER sibling, while final output combines the finest complete terrain bundle
+with its nearest WATER sibling and applies measured point-size, opacity, and
+emission compensation across WATER densities. Recovery copies remain on disk
+but are excluded from discovery.
+
 ### 2. Dynamic Point Cloud Layers
 These are smaller or selectively animated subsets.
 
@@ -429,21 +439,38 @@ unavailable member to an unrelated endpoint. These modes do not replace the
 separate compiled-linked-animation **Live Camera** Overlay/A/B control described
 above, and none of this header state is serialized.
 
-An independent **HQ** button beside those modes prepares a linked live-view
-density override without moving the canonical frame, camera, or playback. Its
-off state is complete 5 mm ROCK/SAND/VEG. Its on state keeps complete 5 mm SAND
-and combines compact 1 mm ROCK/VEG inside the union of the two authored
-midpoint camera views (with a 5% border on each viewport side) with 5 mm points
-outside. A spacing selector beside the button keeps every 1 mm point or thins them
+An independent **HQ** button prepares an animation live-view density override
+without moving the frame, camera, or playback. It is available both beside the
+linked modes and in an unlinked animation's local view. Its off state is
+complete 5 mm ROCK/SAND/VEG. For a linked pair its on state combines compact
+1 mm ROCK/VEG inside the union of the two authored midpoint camera views with
+5 mm points outside. For an unlinked animation the
+union instead contains nine evenly spaced camera views from the path's start
+through end plus every authored camera-key view, extending higher density over
+the complete shot. Every view has a 5% border on each viewport side. A spacing
+selector beside the button keeps every 1 mm point or thins them
 to one centred point per 2 mm or 3 mm cell (density-preserving, like the 5 mm
 display cache) with matching density compensation when the full 1 mm patch is
-too slow. Preparation is cancellable and lower priority than normal display and
-shared-cache startup, publishes both patches and masks atomically, and retains
-them only for the current session. The 1 mm SAND file is never read for this
-preview. Internal layers share the role Visual and effects but remain excluded
+too slow. A saved **Sand** toggle beside it is off by default; on adds 1 mm SAND
+to the same union and spacing, masks only the matching 5 mm SAND region, and
+preserves its Shoreline and other role effects. Preparation is cancellable and
+lower priority than normal display and shared-cache startup, publishes all
+requested two or three patches and masks atomically, and retains them only for
+the current session. While Sand is off, the 1 mm SAND file is not fingerprinted
+or read. Internal layers share the role Visual and effects but remain excluded
 from project/animation documents and all frozen render snapshots; still,
 frame-preview, video, and EXR output continue to use complete canonical 1 mm
 ROCK/SAND/VEG.
+
+An optional session-only **aHQ** mode extends this live override beyond
+animation coverage. It can operate with no animation loaded, choosing the
+selected or uniquely visible compatible grouped scene and preparing a guarded
+fine cache around the current camera. An associated animation path is only
+prefetched coverage; navigation outside it requests a new cache. A stable GPU
+transition uses the compact 1/2/3 mm patch nearby and the complete 5 mm scene
+at distance. While a replacement scans, or whenever the published guard no
+longer covers the current camera, the complete 5 mm scene is the safe fallback.
+The original fixed HQ mode remains separately selectable.
 
 Seam uses the same signed `-1..1` transport as the wizard's final preview, but
 without invoking the wizard or retiming either path. Zero is the midpoint of
@@ -613,10 +640,15 @@ the animation overview.
   one green "Ends Fade" control until a fade handle is double-clicked
   apart, recolouring each edge. Every geometric bounds coordinate stays
   text-editable in any Bounds Keying mode by writing through the keyed
-  pair. Keyed palette-stop properties draw as auto-ranged curves on the
-  shared value graph with every curve style (new keys default to Monotone
-  Spline; Linear and Hold are honoured), keyed colours blend in a chosen
-  sRGB, linear-light, or OkLab space while tinting their curve, and each
+  pair. Palette marker Positions key as one group from the vertical
+  `+ / < / > / X` rail beside the palette: every marker receives a Position
+  key at that animation moment, while stop Colour and Colourise Amount remain
+  independent tracks. Their Position curves share one vertical axis derived
+  only from marker tracks whose authored values change, so fixed group-keyed
+  markers do not widen the view. Other keyed palette-stop properties draw as
+  auto-ranged curves on the shared value graph with every curve style (new
+  keys default to Monotone Spline; Linear and Hold are honoured), keyed colours
+  blend in a chosen sRGB, linear-light, or OkLab space while tinting their curve, and each
   scalar field remembers its own Colourise/Emissive settings unless the
   feature opts into one global set.
 - Emissive output gains a falloff profile over the bounds: level-multiplier
@@ -628,6 +660,25 @@ the animation overview.
   key at their time (or a pre-selected subset), and drags snap onto other
   keys' times unless that would stack keys of one setting; shaking the
   mouse mid-drag toggles snapping.
+- A selected Visual Feature groups interactive editors before its numeric
+  settings: Bounds/profile controls (with Colourise preset and saved-palette
+  selectors directly below Bounds Profile), the histogram, an enabled
+  Colourise palette, an enabled Emissive falloff curve, then one unified
+  keyframe timeline. Its session-only visibility controls expose Position,
+  Fade, Skew, Palette, and Intensity groups, with the last two present only
+  for enabled output aspects. Every group snaps only to its own kind even
+  though all visible curves share the graph. Disabling an aspect hides only
+  that aspect's editor and timeline group while keeping its authored settings
+  and keys dormant.
+- Colourise Amount, palette/emissive Skew Centre and Skew Spread, and colour
+  stop Position/Amount use the same visible-value slider as other ranged
+  controls: drag for a live change and double-click the bar for exact numeric
+  entry. Every Colourise/Emissive value graph uses one shared interaction
+  renderer; double-clicking open graph space inserts a key on the only or
+  nearest visible curve, while double-clicking an existing node opens its
+  exact normalized time editor. Colour Phase remains the one specialised
+  signed-turn control because stored phase keys are relative deltas while its
+  graph displays their accumulated wrapped result.
 - Emissive effects have no palette UI. They apply a non-negative, smoothly
   keyable emissive level through a scalar-field bounds/fade mask; bounds and
   fade use the same keyable histogram controls as Colourise effects.
@@ -847,6 +898,8 @@ Prioritise:
 - fast style iteration,
 - smooth navigation,
 - practical 1080p preview.
+
+Live preview keeps the committed point density fixed: it does not swap between density bundles as the camera moves. For an unlinked animation with a focused Feature Run View, a background job may scan the resident source once and upload a conservative union-of-frusta index mask for that section. The camera path and every 30 fps section frame are known ahead of playback, so off-section points can be skipped before vertex shading without changing point spacing. Visual colour/emission edits reuse that mask; camera geometry, range, aspect, or source changes invalidate it.
 
 ### On stronger Windows GPUs
 Prioritise:
