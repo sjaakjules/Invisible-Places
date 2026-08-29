@@ -1973,6 +1973,33 @@ PointCloudSubsetLoadResult LoadAdaptiveHqCacheBlock(
     return loaded;
 }
 
+std::vector<AdaptiveHqResidentBlock::MicroBlock>
+BuildAdaptiveHqMicroBlocks(
+    std::span<const Float3> positions,
+    std::uint32_t targetPointCount) {
+    std::vector<AdaptiveHqResidentBlock::MicroBlock> blocks;
+    if (positions.empty()) {
+        return blocks;
+    }
+    const auto pointsPerBlock = std::max(1U, targetPointCount);
+    blocks.reserve(
+        (positions.size() + pointsPerBlock - 1U) / pointsPerBlock);
+    for (std::size_t first = 0U; first < positions.size();) {
+        const auto count = std::min<std::size_t>(
+            pointsPerBlock,
+            positions.size() - first);
+        AdaptiveHqResidentBlock::MicroBlock block;
+        block.firstPoint = static_cast<std::uint32_t>(first);
+        block.pointCount = static_cast<std::uint32_t>(count);
+        for (std::size_t local = 0U; local < count; ++local) {
+            block.bounds.Expand(positions[first + local]);
+        }
+        blocks.push_back(block);
+        first += count;
+    }
+    return blocks;
+}
+
 namespace {
 
 template <typename Value>
@@ -2029,7 +2056,8 @@ PointCloudSubsetLoadResult AssembleAdaptiveHqCacheSubset(
     const PointCloudSubsetPredicate& includePoint,
     const PointCloudGridDecimation& gridDecimation,
     std::stop_token stopToken,
-    bool restoreSourceOrder) {
+    bool restoreSourceOrder,
+    const AdaptiveHqBoundsPredicate& includeMicroBlockBounds) {
     PointCloudSubsetLoadResult result;
     result.sourcePointCount = index.source.pointCount;
     result.cloud.sourcePath = index.source.path;
@@ -2079,12 +2107,16 @@ PointCloudSubsetLoadResult AssembleAdaptiveHqCacheSubset(
         }
     }
 
-    // Exact point classification dominated live aHQ refreshes on full Site3
-    // data (several seconds for a single camera guard). Blocks are immutable
-    // and independent, so classify them concurrently, retain their local
-    // point order, then copy into deterministic active-block order. The
-    // published cloud is therefore byte-for-byte ordered like the former
-    // serial path while using the available CPU cores.
+    // The on-disk blocks are intentionally large enough for efficient seeks.
+    // Their retained in-memory micro-block bounds let live aHQ accept small,
+    // contiguous Morton ranges conservatively instead of evaluating the
+    // frustum predicate for millions of individual points. Exact per-point
+    // classification remains the compatibility fallback for callers without
+    // micro-blocks (and for fixed-HQ tests).
+    struct IncludedRange {
+        std::uint32_t firstPoint = 0U;
+        std::uint32_t pointCount = 0U;
+    };
     const auto hardwareThreads = std::max(1U, std::thread::hardware_concurrency());
     const auto workerCount = static_cast<std::size_t>(std::clamp<std::uint64_t>(
         maximumPoints / 250'000U,
@@ -2094,7 +2126,7 @@ PointCloudSubsetLoadResult AssembleAdaptiveHqCacheSubset(
             std::min<std::uint64_t>(
                 hardwareThreads,
                 activeBlockIndices.size()))));
-    std::vector<std::vector<std::uint32_t>> includedByBlock(
+    std::vector<std::vector<IncludedRange>> includedByBlock(
         activeBlockIndices.size());
     std::atomic<std::size_t> nextBlock{0U};
     std::atomic_bool cancelled{false};
@@ -2115,7 +2147,58 @@ PointCloudSubsetLoadResult AssembleAdaptiveHqCacheSubset(
                 const auto& blockCloud =
                     residentByIndex[blockIndex]->points->cloud;
                 auto& included = includedByBlock[slot];
-                included.reserve(blockCloud.PointCount());
+                const auto appendRange = [&](std::uint32_t first,
+                                             std::uint32_t count) {
+                    if (count == 0U) {
+                        return;
+                    }
+                    if (!included.empty() &&
+                        included.back().firstPoint +
+                                included.back().pointCount == first) {
+                        included.back().pointCount += count;
+                    } else {
+                        included.push_back({first, count});
+                    }
+                };
+                const auto& microBlocks =
+                    residentByIndex[blockIndex]->microBlocks;
+                bool validMicroBlocks = includeMicroBlockBounds &&
+                    microBlocks != nullptr && !microBlocks->empty();
+                std::uint32_t expectedFirst = 0U;
+                if (validMicroBlocks) {
+                    for (const auto& micro : *microBlocks) {
+                        if (micro.pointCount == 0U ||
+                            micro.firstPoint != expectedFirst ||
+                            static_cast<std::uint64_t>(micro.firstPoint) +
+                                    micro.pointCount >
+                                blockCloud.PointCount() ||
+                            !micro.bounds.valid) {
+                            validMicroBlocks = false;
+                            break;
+                        }
+                        expectedFirst += micro.pointCount;
+                    }
+                    validMicroBlocks = validMicroBlocks &&
+                        expectedFirst == blockCloud.PointCount();
+                }
+                if (validMicroBlocks) {
+                    included.reserve(microBlocks->size());
+                    for (std::size_t microIndex = 0U;
+                         microIndex < microBlocks->size();
+                         ++microIndex) {
+                        if ((microIndex & 63U) == 0U &&
+                            stopToken.stop_requested()) {
+                            cancelled.store(true, std::memory_order_release);
+                            return;
+                        }
+                        const auto& micro = (*microBlocks)[microIndex];
+                        if (includeMicroBlockBounds(micro.bounds)) {
+                            appendRange(micro.firstPoint, micro.pointCount);
+                        }
+                    }
+                    continue;
+                }
+                included.reserve(blockCloud.PointCount() / 32U + 1U);
                 for (std::uint32_t pointIndex = 0U;
                      pointIndex < blockCloud.PointCount();
                      ++pointIndex) {
@@ -2126,7 +2209,7 @@ PointCloudSubsetLoadResult AssembleAdaptiveHqCacheSubset(
                     }
                     if (!includePoint ||
                         includePoint(blockCloud.positions[pointIndex])) {
-                        included.push_back(pointIndex);
+                        appendRange(pointIndex, 1U);
                     }
                 }
             }
@@ -2171,8 +2254,11 @@ PointCloudSubsetLoadResult AssembleAdaptiveHqCacheSubset(
 
     std::vector<std::size_t> blockOffsets(activeBlockIndices.size() + 1U, 0U);
     for (std::size_t slot = 0U; slot < includedByBlock.size(); ++slot) {
-        blockOffsets[slot + 1U] =
-            blockOffsets[slot] + includedByBlock[slot].size();
+        std::size_t blockPointCount = 0U;
+        for (const auto& range : includedByBlock[slot]) {
+            blockPointCount += range.pointCount;
+        }
+        blockOffsets[slot + 1U] = blockOffsets[slot] + blockPointCount;
     }
     const auto includedCount = blockOffsets.back();
     try {
@@ -2204,35 +2290,49 @@ PointCloudSubsetLoadResult AssembleAdaptiveHqCacheSubset(
             const auto& blockResult = *residentByIndex[blockIndex]->points;
             const auto& blockCloud = blockResult.cloud;
             const auto& included = includedByBlock[slot];
-            const auto destinationBegin = blockOffsets[slot];
-            for (std::size_t local = 0U; local < included.size(); ++local) {
-                if ((local & 4095U) == 0U &&
-                    stopToken.stop_requested()) {
+            std::size_t destination = blockOffsets[slot];
+            for (const auto& range : included) {
+                if (stopToken.stop_requested()) {
                     cancelled.store(true, std::memory_order_release);
                     return;
                 }
-                const auto source = included[local];
-                const auto destination = destinationBegin + local;
-                result.cloud.positions[destination] =
-                    blockCloud.positions[source];
-                result.cloud.packedColors[destination] =
-                    blockCloud.packedColors[source];
-                result.sourcePointIndices[destination] =
-                    blockResult.sourcePointIndices[source];
+                const auto source = static_cast<std::size_t>(
+                    range.firstPoint);
+                const auto count = static_cast<std::size_t>(
+                    range.pointCount);
+                std::copy_n(
+                    blockCloud.positions.begin() + source,
+                    count,
+                    result.cloud.positions.begin() + destination);
+                std::copy_n(
+                    blockCloud.packedColors.begin() + source,
+                    count,
+                    result.cloud.packedColors.begin() + destination);
+                std::copy_n(
+                    blockResult.sourcePointIndices.begin() + source,
+                    count,
+                    result.sourcePointIndices.begin() + destination);
                 if (result.cloud.hasNormals) {
-                    result.cloud.normals[destination] =
-                        blockCloud.normals[source];
+                    std::copy_n(
+                        blockCloud.normals.begin() + source,
+                        count,
+                        result.cloud.normals.begin() + destination);
                 }
                 for (std::size_t field = 0U;
                      field < reference.scalarFields.size();
                      ++field) {
-                    result.cloud.scalarFieldValues[
-                        field * includedCount + destination] =
-                        blockCloud.scalarFieldValues[
-                            blockCloud.ScalarFieldValueIndex(
-                                field,
-                                source)];
+                    std::copy_n(
+                        blockCloud.scalarFieldValues.begin() +
+                            static_cast<std::ptrdiff_t>(
+                                blockCloud.ScalarFieldValueIndex(
+                                    field,
+                                    source)),
+                        count,
+                        result.cloud.scalarFieldValues.begin() +
+                            static_cast<std::ptrdiff_t>(
+                                field * includedCount + destination));
                 }
+                destination += count;
             }
         }
     };

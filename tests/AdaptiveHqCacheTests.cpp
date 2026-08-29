@@ -7,6 +7,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -319,6 +320,57 @@ TEST_CASE(
          ++point) {
         CHECK(mortonHeat[point] == Catch::Approx(
             static_cast<float>(expectedMortonOrder[point]) * 0.5F));
+    }
+
+    for (auto& block : resident) {
+        block.microBlocks = std::make_shared<const std::vector<
+            invisible_places::io::AdaptiveHqResidentBlock::MicroBlock>>(
+            invisible_places::io::BuildAdaptiveHqMicroBlocks(
+                block.points->cloud.positions,
+                1024U));
+        REQUIRE_FALSE(block.microBlocks->empty());
+    }
+    std::atomic<std::size_t> pointPredicateCalls{0U};
+    const auto microBlockAssembled =
+        invisible_places::io::AssembleAdaptiveHqCacheSubset(
+            opened.index,
+            activeBlocks,
+            resident,
+            [&](const invisible_places::io::Float3&) {
+                pointPredicateCalls.fetch_add(1U);
+                return false;
+            },
+            {},
+            {},
+            false,
+            [](const invisible_places::io::Bounds3f& bounds) {
+                return bounds.minimum.y < 5.0F;
+            });
+    REQUIRE(microBlockAssembled.success);
+    CHECK(pointPredicateCalls.load() == 0U);
+    CHECK(microBlockAssembled.cloud.PointCount() >=
+          mortonAssembled.cloud.PointCount());
+    std::set<std::uint32_t> microBlockSourceIndices{
+        microBlockAssembled.sourcePointIndices.begin(),
+        microBlockAssembled.sourcePointIndices.end()};
+    CHECK(std::all_of(
+        expectedMortonOrder.begin(),
+        expectedMortonOrder.end(),
+        [&](std::uint32_t sourceIndex) {
+            return microBlockSourceIndices.contains(sourceIndex);
+        }));
+    const auto microBlockHeat = FieldValues(
+        microBlockAssembled.cloud,
+        "Heat");
+    REQUIRE(microBlockHeat.size() ==
+            microBlockAssembled.sourcePointIndices.size());
+    for (std::size_t point = 0U;
+         point < microBlockHeat.size();
+         ++point) {
+        CHECK(microBlockHeat[point] == Catch::Approx(
+            static_cast<float>(
+                microBlockAssembled.sourcePointIndices[point]) *
+            0.5F));
     }
 
     const auto& firstBounds = opened.index.blocks.front().bounds;

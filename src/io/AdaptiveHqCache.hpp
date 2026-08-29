@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <span>
 #include <stop_token>
@@ -23,6 +24,12 @@ inline constexpr std::uint64_t kAdaptiveHqCacheMinimumBlockBytes =
     1U * 1024U * 1024U;
 inline constexpr std::uint64_t kAdaptiveHqCacheMaximumBlockBytes =
     8U * 1024U * 1024U;
+// Disk blocks stay large enough for efficient sequential reads. Once a block
+// is decoded, this smaller logical subdivision lets a camera request accept
+// contiguous Morton ranges by bounds instead of testing every point. The
+// subdivision is session-only, so existing schema-v2 Site3 caches remain
+// valid and do not need to be rebuilt.
+inline constexpr std::uint32_t kAdaptiveHqMicroBlockPointCount = 128U;
 
 struct AdaptiveHqSourceIdentity {
     std::filesystem::path path;
@@ -129,9 +136,24 @@ AdaptiveHqCacheBlockRanges(
 struct AdaptiveHqResidentBlock {
     std::uint32_t blockIndex = 0U;
     std::shared_ptr<const PointCloudSubsetLoadResult> points;
+    struct MicroBlock {
+        std::uint32_t firstPoint = 0U;
+        std::uint32_t pointCount = 0U;
+        Bounds3f bounds{};
+    };
+    std::shared_ptr<const std::vector<MicroBlock>> microBlocks;
     // Monotonic request serial used by the app's small LRU fringe cache.
     std::uint64_t lastUsedSerial = 0U;
+    // Squared distance from the latest request camera to the parent cache
+    // block. Navigation retention uses this before age; animation/scrubbing
+    // uses age before distance so a repeatedly visited path remains warm.
+    float requestDistanceSquared = std::numeric_limits<float>::infinity();
 };
+
+[[nodiscard]] std::vector<AdaptiveHqResidentBlock::MicroBlock>
+BuildAdaptiveHqMicroBlocks(
+    std::span<const Float3> positions,
+    std::uint32_t targetPointCount = kAdaptiveHqMicroBlockPointCount);
 
 [[nodiscard]] std::uint64_t AdaptiveHqFieldFilterFingerprint(
     const PointCloudScalarFieldFilter& filter);
@@ -146,12 +168,14 @@ struct AdaptiveHqResidentBlock {
     std::stop_token stopToken = {},
     const PointCloudLoadProgress& progress = {});
 
-// Assembles active resident blocks and applies the exact guarded-frustum
-// test, then the same deterministic grid decimation as fixed HQ. Restoring
-// original source order is available for callers that need monotonic source
-// indices; the live aHQ renderer disables it because Morton order is stable,
-// valid for GPU drawing, and avoids an O(n log n) sort of millions of points.
-// Every selected block must be resident.
+// Assembles active resident blocks, then applies the same deterministic grid
+// decimation as fixed HQ. When micro-block bounds are supplied, intersecting
+// contiguous Morton ranges are accepted conservatively and the expensive
+// per-point frustum predicate is skipped; without them the exact predicate is
+// retained as a compatibility fallback. Restoring original source order is
+// available for callers that need monotonic source indices; live aHQ keeps
+// stable Morton order and avoids an O(n log n) sort of millions of points.
+// Every selected disk block must be resident.
 [[nodiscard]] PointCloudSubsetLoadResult AssembleAdaptiveHqCacheSubset(
     const AdaptiveHqCacheIndex& index,
     std::span<const std::uint32_t> activeBlockIndices,
@@ -159,6 +183,7 @@ struct AdaptiveHqResidentBlock {
     const PointCloudSubsetPredicate& includePoint,
     const PointCloudGridDecimation& gridDecimation = {},
     std::stop_token stopToken = {},
-    bool restoreSourceOrder = true);
+    bool restoreSourceOrder = true,
+    const AdaptiveHqBoundsPredicate& includeMicroBlockBounds = {});
 
 }  // namespace invisible_places::io
