@@ -604,6 +604,28 @@ bool PointCloudStyleHasActiveShorelineWaves(const PointCloudStyleState& style) {
     return style.shorelineSpeed > kMaterialEpsilon;
 }
 
+bool PointCloudShorelineWaveSettingsHasActiveMotion(
+    const PointCloudShorelineWaveSettings& settings) {
+    if (!settings.enabled) {
+        return false;
+    }
+    if (settings.algorithm ==
+        PointCloudShorelineWaveAlgorithm::HeightFoam) {
+        return settings.heightFoam.speed > kMaterialEpsilon &&
+               settings.heightFoam.offshoreReachMeters >
+                   kMaterialEpsilon &&
+               settings.heightFoam.wavelengthMeters >
+                   kMaterialEpsilon &&
+               settings.heightFoam.intensity > kMaterialEpsilon;
+    }
+    return settings.foamFronts.speed > kMaterialEpsilon &&
+           settings.foamFronts.heightReachMeters >
+               kMaterialEpsilon &&
+           settings.foamFronts.wavelengthMeters >
+               kMaterialEpsilon &&
+           settings.foamFronts.intensity > kMaterialEpsilon;
+}
+
 bool PointCloudStyleHasShorelineWaveRegion(const PointCloudStyleState& style) {
     if (!style.shorelineWaveEnabled) {
         return false;
@@ -888,6 +910,77 @@ PointCloudDensityCompensation SanitizePointCloudDensityCompensation(
     return compensation;
 }
 
+PointCloudAdaptiveDensityTransition
+ResolvePointCloudAdaptiveDensityTransition(
+    float projectionScaleY,
+    float viewportHeightPixels,
+    float coarseSpacingMeters,
+    float targetCoarsePixels) {
+    PointCloudAdaptiveDensityTransition result;
+    if (!std::isfinite(projectionScaleY) || projectionScaleY <= 0.0F ||
+        !std::isfinite(viewportHeightPixels) || viewportHeightPixels <= 0.0F ||
+        !std::isfinite(coarseSpacingMeters) || coarseSpacingMeters <= 0.0F ||
+        !std::isfinite(targetCoarsePixels) || targetCoarsePixels <= 0.0F) {
+        return result;
+    }
+
+    // Perspective projection: projected diameter in pixels is
+    // spacing * projectionY * viewportHeight / (2 * depth).
+    const float switchDepth =
+        coarseSpacingMeters * projectionScaleY * viewportHeightPixels /
+        (2.0F * targetCoarsePixels);
+    if (!std::isfinite(switchDepth) || switchDepth <= 0.0F) {
+        return result;
+    }
+    result.startDepthMeters = std::max(0.01F, switchDepth * 0.65F);
+    result.switchDepthMeters = std::max(
+        result.startDepthMeters,
+        switchDepth);
+    result.endDepthMeters = std::max(
+        result.switchDepthMeters + 0.01F,
+        switchDepth * 1.35F);
+    result.preparedFineDepthMeters = result.endDepthMeters * 1.30F;
+    return result;
+}
+
+float PointCloudAdaptiveDensityCoarseWeight(
+    float viewDepthMeters,
+    const PointCloudAdaptiveDensityTransition& transition) {
+    if (!transition.Valid() || !std::isfinite(viewDepthMeters)) {
+        return 1.0F;
+    }
+    const float width = std::max(
+        1.0e-6F,
+        transition.endDepthMeters - transition.startDepthMeters);
+    const float linear = std::clamp(
+        (viewDepthMeters - transition.startDepthMeters) / width,
+        0.0F,
+        1.0F);
+    return linear * linear * (3.0F - 2.0F * linear);
+}
+
+float PointCloudAdaptiveDensityKeepProbability(
+    PointCloudAdaptiveDensityRole role,
+    float viewDepthMeters,
+    const PointCloudAdaptiveDensityTransition& transition) {
+    if (role == PointCloudAdaptiveDensityRole::Disabled ||
+        !transition.Valid()) {
+        return 1.0F;
+    }
+    const float coarseWeight = PointCloudAdaptiveDensityCoarseWeight(
+        viewDepthMeters,
+        transition);
+    if (role == PointCloudAdaptiveDensityRole::Coarse) {
+        return coarseWeight;
+    }
+    // Squaring the remaining fine weight reduces vertex work through the
+    // middle band more quickly than a linear cross-fade. The coarse points
+    // ramp in concurrently, so the visual transition stays covered without
+    // carrying roughly half of a 1 mm cloud at the switch depth.
+    const float fineWeight = 1.0F - coarseWeight;
+    return fineWeight * fineWeight;
+}
+
 float ResolvePointCloudDensityAdjustedFootprint(
     float authoredFootprint,
     float antialiasFootprint,
@@ -1019,6 +1112,15 @@ PointCloudMaterialVariant ResolvePointCloudMaterialVariant(
     return PointCloudMaterialVariant::Unified;
 }
 
+bool PointCloudStyleSupportsPreviewDepthCulling(
+    const PointCloudStyleState& style) {
+    return ResolvePointCloudMaterialVariant(
+               style,
+               {},
+               false) ==
+           PointCloudMaterialVariant::OpaqueHardDisc;
+}
+
 const char* PointCloudMaterialVariantName(PointCloudMaterialVariant variant) {
     switch (variant) {
         case PointCloudMaterialVariant::OpaqueHardDisc:
@@ -1135,11 +1237,13 @@ std::vector<std::uint32_t> GenerateFrustumUnionPointIndices(
     const std::vector<invisible_places::io::Float3>& positions,
     const invisible_places::io::Bounds3f& bounds,
     std::span<const glm::mat4> viewProjections,
-    std::uint32_t gridDimension) {
+    std::uint32_t gridDimension,
+    std::stop_token stopToken) {
     if (positions.empty() ||
         !bounds.valid ||
         viewProjections.empty() ||
-        positions.size() > std::numeric_limits<std::uint32_t>::max()) {
+        positions.size() > std::numeric_limits<std::uint32_t>::max() ||
+        stopToken.stop_requested()) {
         return {};
     }
 
@@ -1199,6 +1303,9 @@ std::vector<std::uint32_t> GenerateFrustumUnionPointIndices(
     std::vector<RangedFrustum> frustums;
     frustums.reserve(viewProjections.size());
     for (const auto& viewProjection : viewProjections) {
+        if (stopToken.stop_requested()) {
+            return {};
+        }
         RangedFrustum frustum;
         frustum.planes = FrustumPlanes(viewProjection);
         frustum.end = {dimension - 1U, dimension - 1U, dimension - 1U};
@@ -1266,8 +1373,14 @@ std::vector<std::uint32_t> GenerateFrustumUnionPointIndices(
         for (std::size_t frustumIndex = frustumBegin;
              frustumIndex < frustumEnd;
              ++frustumIndex) {
+            if (stopToken.stop_requested()) {
+                return;
+            }
             const auto& frustum = frustums[frustumIndex];
             for (std::uint32_t z = frustum.begin[2]; z <= frustum.end[2]; ++z) {
+                if (stopToken.stop_requested()) {
+                    return;
+                }
                 for (std::uint32_t y = frustum.begin[1]; y <= frustum.end[1]; ++y) {
                     for (std::uint32_t x = frustum.begin[0]; x <= frustum.end[0]; ++x) {
                         auto& cell = (*cells)[FrustumCellIndex(x, y, z, dimension)];
@@ -1314,6 +1427,9 @@ std::vector<std::uint32_t> GenerateFrustumUnionPointIndices(
             std::min(frustums.size(), frustaPerWorker),
             &workerCells[0]);
     }
+    if (stopToken.stop_requested()) {
+        return {};
+    }
     auto visibleCells = std::move(workerCells.front());
     for (std::size_t workerIndex = 1U; workerIndex < maskWorkerCount; ++workerIndex) {
         const auto& cells = workerCells[workerIndex];
@@ -1350,6 +1466,10 @@ std::vector<std::uint32_t> GenerateFrustumUnionPointIndices(
                 1024.0,
                 static_cast<double>(rangeEnd - rangeBegin) * visibleFraction * 1.5))));
         for (std::uint32_t pointIndex = rangeBegin; pointIndex < rangeEnd; ++pointIndex) {
+            if ((pointIndex & 4095U) == 0U &&
+                stopToken.stop_requested()) {
+                return;
+            }
             const auto& point = positions[pointIndex];
             const std::uint32_t x = VoxelCoordinate(point.x, bounds.minimum.x, safeXExtent, dimension);
             const std::uint32_t y = VoxelCoordinate(point.y, bounds.minimum.y, safeYExtent, dimension);
@@ -1380,6 +1500,9 @@ std::vector<std::uint32_t> GenerateFrustumUnionPointIndices(
             0U,
             std::min(pointCount, pointsPerWorker),
             &workerIndices[0]);
+    }
+    if (stopToken.stop_requested()) {
+        return {};
     }
 
     std::size_t totalIndexCount = 0;

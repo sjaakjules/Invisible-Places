@@ -4447,6 +4447,46 @@ TEST_CASE("Project live-view window size and lock round-trip",
   CHECK_FALSE(legacy->lockLiveViewWindowSize);
 }
 
+TEST_CASE("Animation HQ Sand inclusion round-trips and defaults off",
+          "[project][serialization][linked-hq]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+
+  ProjectDocument document;
+  document.projectName = "linked-hq-sand";
+  document.linkedHqPatchSpacingMicrometres = 2'000U;
+  document.linkedHqIncludeSand = true;
+
+  TemporaryProjectFile file{"invisible_places_linked_hq_sand.json"};
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(document, file.path, &errorMessage));
+
+  std::ifstream savedInput{file.path};
+  REQUIRE(savedInput.is_open());
+  auto savedJson = nlohmann::json::parse(savedInput);
+  savedInput.close();
+  CHECK(savedJson["linked_hq_patch_spacing_um"] == 2'000U);
+  CHECK(savedJson["linked_hq_include_sand"] == true);
+
+  const auto loaded = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loaded.has_value());
+  CHECK(loaded->linkedHqPatchSpacingMicrometres == 2'000U);
+  CHECK(loaded->linkedHqIncludeSand);
+
+  savedJson.erase("linked_hq_include_sand");
+  {
+    std::ofstream legacyOutput{file.path, std::ios::trunc};
+    REQUIRE(legacyOutput.is_open());
+    legacyOutput << savedJson.dump(2);
+  }
+  const auto legacy = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(legacy.has_value());
+  CHECK_FALSE(legacy->linkedHqIncludeSand);
+}
+
 TEST_CASE("Animation default live-view window size round-trips and remains unset for legacy JSON",
           "[animation][serialization][window]") {
   using invisible_places::serialization::AnimationPathFromJson;
@@ -5042,6 +5082,8 @@ TEST_CASE("Per-edge fades round-trip and legacy shared fades split",
   using invisible_places::serialization::SaveProjectDocument;
   using invisible_places::timing::TimingColouriseBoundsParameter;
   using invisible_places::timing::TimingColouriseEffect;
+  using invisible_places::timing::TimingColouriseFieldBoundsMemory;
+  using invisible_places::timing::TimingColouriseFieldSource;
   using invisible_places::timing::TimingTakeSceneState;
 
   ProjectDocument document;
@@ -5054,15 +5096,39 @@ TEST_CASE("Per-edge fades round-trip and legacy shared fades split",
       .lower = -1.0F,
       .upper = 3.0F,
       .edgeFadeLower = 0.8F,
-      .edgeFadeUpper = -0.6F,
+      .edgeFadeUpper = -9.0F,
   };
-  effect.edgeFadesLinked = false;
+  effect.edgeFadeMode = invisible_places::timing::
+      TimingColouriseEdgeFadeMode::RelativeSeparate;
   REQUIRE(invisible_places::timing::
               AddOrUpdateTimingColouriseBoundsParameterKey(
                   &effect,
                   TimingColouriseBoundsParameter::EdgeFadeLower,
                   0.5F,
-                  0.9F));
+                  -4.0F));
+  effect.fieldBoundsMemory.push_back(TimingColouriseFieldBoundsMemory{
+      .selector = {.source = TimingColouriseFieldSource::Scalar,
+                   .scalarFieldName = "Heat"},
+      .bounds = {.lower = 0.0F,
+                 .upper = 0.1F,
+                 .edgeFadeLower = 0.0F,
+                 .edgeFadeUpper = -9.0F},
+      .boundsParameterKeys = {{
+          .parameter = TimingColouriseBoundsParameter::EdgeFadeUpper,
+          .position = 0.25F,
+          .value = -8.0F,
+      }},
+      .boundsKeys = {{
+          .position = 0.75F,
+          .bounds = {.lower = 0.0F,
+                     .upper = 0.1F,
+                     .edgeFadeLower = -7.0F,
+                     .edgeFadeUpper = -6.0F},
+      }},
+      .edited = true,
+      .edgeFadeMode = invisible_places::timing::
+          TimingColouriseEdgeFadeMode::RelativeSeparate,
+  });
   state.colouriseEffects = {effect};
   document.timingTakeStates = {state};
 
@@ -5076,12 +5142,42 @@ TEST_CASE("Per-edge fades round-trip and legacy shared fades split",
   const auto& loadedEffect =
       loaded->timingTakeStates[0].colouriseEffects.at(0);
   CHECK(loadedEffect.baseBounds.edgeFadeLower == Catch::Approx(0.8F));
-  CHECK(loadedEffect.baseBounds.edgeFadeUpper == Catch::Approx(-0.6F));
-  CHECK_FALSE(loadedEffect.edgeFadesLinked);
+  CHECK(loadedEffect.baseBounds.edgeFadeUpper == Catch::Approx(-9.0F));
+  CHECK(loadedEffect.edgeFadeMode == invisible_places::timing::
+      TimingColouriseEdgeFadeMode::RelativeSeparate);
   REQUIRE(loadedEffect.boundsParameterKeys.size() == 1U);
   CHECK(loadedEffect.boundsParameterKeys[0].parameter ==
         TimingColouriseBoundsParameter::EdgeFadeLower);
-  CHECK(loadedEffect.boundsParameterKeys[0].value == Catch::Approx(0.9F));
+  CHECK(loadedEffect.boundsParameterKeys[0].value == Catch::Approx(-4.0F));
+  REQUIRE(loadedEffect.fieldBoundsMemory.size() == 1U);
+  const auto& loadedMemory = loadedEffect.fieldBoundsMemory.front();
+  CHECK(loadedMemory.bounds.edgeFadeUpper == Catch::Approx(-9.0F));
+  REQUIRE(loadedMemory.boundsParameterKeys.size() == 2U);
+  const auto loadedLowerFade = std::find_if(
+      loadedMemory.boundsParameterKeys.begin(),
+      loadedMemory.boundsParameterKeys.end(),
+      [](const auto& key) {
+        return key.parameter ==
+            TimingColouriseBoundsParameter::EdgeFadeLower;
+      });
+  const auto loadedUpperFade = std::find_if(
+      loadedMemory.boundsParameterKeys.begin(),
+      loadedMemory.boundsParameterKeys.end(),
+      [](const auto& key) {
+        return key.parameter ==
+            TimingColouriseBoundsParameter::EdgeFadeUpper;
+      });
+  REQUIRE(loadedLowerFade != loadedMemory.boundsParameterKeys.end());
+  REQUIRE(loadedUpperFade != loadedMemory.boundsParameterKeys.end());
+  CHECK(loadedLowerFade->value == Catch::Approx(-7.0F));
+  CHECK(loadedUpperFade->value == Catch::Approx(-8.0F));
+  REQUIRE(loadedMemory.boundsKeys.size() == 1U);
+  CHECK(loadedMemory.boundsKeys[0].bounds.edgeFadeLower ==
+        Catch::Approx(-7.0F));
+  CHECK(loadedMemory.boundsKeys[0].bounds.edgeFadeUpper ==
+        Catch::Approx(-6.0F));
+  CHECK(loadedMemory.edgeFadeMode == invisible_places::timing::
+      TimingColouriseEdgeFadeMode::RelativeSeparate);
 
   // The document carries the split values plus a clamped legacy mean for
   // pre-85 readers.
@@ -5093,14 +5189,51 @@ TEST_CASE("Per-edge fades round-trip and legacy shared fades split",
       savedJson["timing_take_states"][0]["timing_effects"][0]
                ["base_bounds"];
   CHECK(boundsJson["edge_fade_lower"] == Catch::Approx(0.8));
-  CHECK(boundsJson["edge_fade_upper"] == Catch::Approx(-0.6));
-  CHECK(boundsJson["edge_fade"] == Catch::Approx(0.1));
+  CHECK(boundsJson["edge_fade_upper"] == Catch::Approx(-9.0));
+  CHECK(boundsJson["edge_fade"] == Catch::Approx(-0.5));
+
+  // Schema 86 already used the same signed, span-relative units. Loading it
+  // into the current schema is deliberately an identity migration across every
+  // storage location rather than a percentage conversion.
+  auto schema86Json = savedJson;
+  schema86Json["schema_version"] = 86U;
+  {
+    std::ofstream schema86Output{file.path};
+    REQUIRE(schema86Output.is_open());
+    schema86Output << schema86Json.dump(2);
+  }
+  const auto schema86Loaded = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(schema86Loaded.has_value());
+  CHECK(schema86Loaded->sourceSchemaVersion == 86U);
+  CHECK(schema86Loaded->schemaVersion ==
+        invisible_places::serialization::kProjectDocumentSchemaVersion);
+  const auto& schema86Effect =
+      schema86Loaded->timingTakeStates[0].colouriseEffects.at(0);
+  CHECK(schema86Effect.baseBounds.edgeFadeUpper == Catch::Approx(-9.0F));
+  CHECK(schema86Effect.boundsParameterKeys[0].value == Catch::Approx(-4.0F));
+  CHECK(schema86Effect.fieldBoundsMemory[0].bounds.edgeFadeUpper ==
+        Catch::Approx(-9.0F));
+  const auto schema86UpperFade = std::find_if(
+      schema86Effect.fieldBoundsMemory[0].boundsParameterKeys.begin(),
+      schema86Effect.fieldBoundsMemory[0].boundsParameterKeys.end(),
+      [](const auto& key) {
+        return key.parameter ==
+            TimingColouriseBoundsParameter::EdgeFadeUpper;
+      });
+  REQUIRE(schema86UpperFade !=
+          schema86Effect.fieldBoundsMemory[0].boundsParameterKeys.end());
+  CHECK(schema86UpperFade->value == Catch::Approx(-8.0F));
+  CHECK(schema86Effect.fieldBoundsMemory[0]
+            .boundsKeys[0]
+            .bounds.edgeFadeLower == Catch::Approx(-7.0F));
 
   // A pre-85 document with only the shared fade loads it into both edges,
   // and a shared-fade parameter key splits into the two per-edge tracks.
   auto legacyJson = savedJson;
   auto& legacyEffect =
       legacyJson["timing_take_states"][0]["timing_effects"][0];
+  legacyEffect.erase("edge_fade_mode");
   legacyEffect["base_bounds"] = {
       {"lower", -1.0F},
       {"upper", 3.0F},
@@ -5109,7 +5242,7 @@ TEST_CASE("Per-edge fades round-trip and legacy shared fades split",
   legacyEffect["bounds_parameter_keys"] = nlohmann::json::array({
       {{"parameter", "edge_fade"},
        {"position", 0.5F},
-       {"value", 0.2F},
+       {"value", -9.0F},
        {"interpolation", "linear"}},
   });
   legacyEffect.erase("edge_fades_linked");
@@ -5126,14 +5259,209 @@ TEST_CASE("Per-edge fades round-trip and legacy shared fades split",
       legacyLoaded->timingTakeStates[0].colouriseEffects.at(0);
   CHECK(migrated.baseBounds.edgeFadeLower == Catch::Approx(0.25F));
   CHECK(migrated.baseBounds.edgeFadeUpper == Catch::Approx(0.25F));
-  CHECK(migrated.edgeFadesLinked);
+  CHECK(migrated.edgeFadeMode == invisible_places::timing::
+      TimingColouriseEdgeFadeMode::RelativeLinked);
   REQUIRE(migrated.boundsParameterKeys.size() == 2U);
   CHECK(migrated.boundsParameterKeys[0].parameter ==
         TimingColouriseBoundsParameter::EdgeFadeLower);
   CHECK(migrated.boundsParameterKeys[1].parameter ==
         TimingColouriseBoundsParameter::EdgeFadeUpper);
-  CHECK(migrated.boundsParameterKeys[0].value == Catch::Approx(0.2F));
-  CHECK(migrated.boundsParameterKeys[1].value == Catch::Approx(0.2F));
+  CHECK(migrated.boundsParameterKeys[0].value == Catch::Approx(-9.0F));
+  CHECK(migrated.boundsParameterKeys[1].value == Catch::Approx(-9.0F));
+}
+
+TEST_CASE("Absolute fade endpoints round-trip without relative clamping",
+          "[project][serialization][timing][colourise][bounds]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::timing::TimingColouriseBoundsParameter;
+  using invisible_places::timing::TimingColouriseEdgeFadeMode;
+  using invisible_places::timing::TimingColouriseEffect;
+  using invisible_places::timing::TimingTakeSceneState;
+
+  ProjectDocument document;
+  document.projectName = "absolute-fade-ends";
+  TimingColouriseEffect effect;
+  effect.id = "absolute-fade";
+  effect.edgeFadeMode = TimingColouriseEdgeFadeMode::Absolute;
+  effect.baseBounds = {
+      .lower = -10.0F,
+      .upper = 20.0F,
+      .edgeFadeLower = -3.5F,
+      .edgeFadeUpper = 12.25F,
+  };
+  REQUIRE(invisible_places::timing::
+              AddOrUpdateTimingColouriseBoundsParameterKey(
+                  &effect,
+                  TimingColouriseBoundsParameter::EdgeFadeLower,
+                  0.5F,
+                  -4.25F));
+  TimingTakeSceneState state;
+  state.colouriseEffects.push_back(effect);
+  document.timingTakeStates.push_back(state);
+
+  TemporaryProjectFile file{"invisible_places_absolute_fades.json"};
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(document, file.path, &errorMessage));
+
+  std::ifstream savedInput{file.path};
+  REQUIRE(savedInput.is_open());
+  const auto savedJson = nlohmann::json::parse(savedInput);
+  const auto& savedEffect =
+      savedJson["timing_take_states"][0]["timing_effects"][0];
+  CHECK(savedEffect["edge_fade_mode"] == "absolute");
+  CHECK(savedEffect["base_bounds"]["edge_fade_lower"] ==
+        Catch::Approx(-3.5));
+  CHECK(savedEffect["base_bounds"]["edge_fade_upper"] ==
+        Catch::Approx(12.25));
+
+  const auto loaded = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loaded.has_value());
+  const auto& loadedEffect =
+      loaded->timingTakeStates.at(0).colouriseEffects.at(0);
+  CHECK(loadedEffect.edgeFadeMode == TimingColouriseEdgeFadeMode::Absolute);
+  CHECK(loadedEffect.baseBounds.edgeFadeLower == Catch::Approx(-3.5F));
+  CHECK(loadedEffect.baseBounds.edgeFadeUpper == Catch::Approx(12.25F));
+  REQUIRE(loadedEffect.boundsParameterKeys.size() == 1U);
+  CHECK(loadedEffect.boundsParameterKeys[0].value == Catch::Approx(-4.25F));
+
+  const auto renderBounds = invisible_places::timing::
+      EvaluateTimingColouriseBounds(loadedEffect, 0.0F);
+  CHECK(renderBounds.edgeFadeLower == Catch::Approx(5.75F / 30.0F));
+  CHECK(renderBounds.edgeFadeUpper == Catch::Approx(7.75F / 30.0F));
+}
+
+TEST_CASE("Fade mode memories round-trip as independent tracks",
+          "[project][serialization][timing][colourise][bounds][fade-mode][mode-memory]") {
+  using invisible_places::serialization::LoadProjectDocument;
+  using invisible_places::serialization::ProjectDocument;
+  using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::timing::TimingColouriseBoundsParameter;
+  using invisible_places::timing::TimingColouriseEdgeFadeMode;
+  using invisible_places::timing::TimingColouriseEdgeFadeModeMemory;
+  using invisible_places::timing::TimingColouriseEffect;
+  using invisible_places::timing::TimingColouriseFieldBoundsMemory;
+  using invisible_places::timing::TimingColouriseFieldSource;
+  using invisible_places::timing::TimingTakeSceneState;
+
+  ProjectDocument document;
+  document.projectName = "fade-mode-memories";
+  TimingColouriseEffect effect;
+  effect.id = "fade-memories";
+  effect.edgeFadeMode = TimingColouriseEdgeFadeMode::RelativeSeparate;
+  effect.baseBounds = {
+      .lower = 0.0F,
+      .upper = 10.0F,
+      .edgeFadeLower = 0.2F,
+      .edgeFadeUpper = 0.3F,
+  };
+  effect.boundsParameterKeys = {{
+      .parameter = TimingColouriseBoundsParameter::EdgeFadeLower,
+      .position = 0.4F,
+      .value = 0.45F,
+  }};
+  effect.edgeFadeModeMemories = {
+      TimingColouriseEdgeFadeModeMemory{
+          .mode = TimingColouriseEdgeFadeMode::RelativeLinked,
+          .edgeFadeLower = 0.1F,
+          .edgeFadeUpper = 0.1F,
+          .keys = {{
+              .parameter = TimingColouriseBoundsParameter::EdgeFadeLower,
+              .position = 0.2F,
+              .value = 0.15F,
+          }, {
+              .parameter = TimingColouriseBoundsParameter::EdgeFadeUpper,
+              .position = 0.2F,
+              .value = 0.15F,
+          }},
+      },
+      TimingColouriseEdgeFadeModeMemory{
+          .mode = TimingColouriseEdgeFadeMode::Absolute,
+          .edgeFadeLower = 2.0F,
+          .edgeFadeUpper = 8.0F,
+          .keys = {{
+              .parameter = TimingColouriseBoundsParameter::EdgeFadeUpper,
+              .position = 0.8F,
+              .value = 7.25F,
+          }},
+      },
+  };
+  effect.fieldBoundsMemory.push_back(TimingColouriseFieldBoundsMemory{
+      .selector = {.source = TimingColouriseFieldSource::Scalar,
+                   .scalarFieldName = "Heat"},
+      .bounds = {.lower = -2.0F,
+                 .upper = 2.0F,
+                 .edgeFadeLower = -1.0F,
+                 .edgeFadeUpper = 1.0F},
+      .edited = true,
+      .edgeFadeMode = TimingColouriseEdgeFadeMode::Absolute,
+      .edgeFadeModeMemories = {
+          TimingColouriseEdgeFadeModeMemory{
+              .mode = TimingColouriseEdgeFadeMode::RelativeSeparate,
+              .edgeFadeLower = 0.25F,
+              .edgeFadeUpper = -0.5F,
+              .keys = {{
+                  .parameter =
+                      TimingColouriseBoundsParameter::EdgeFadeLower,
+                  .position = 0.6F,
+                  .value = 0.4F,
+              }},
+          },
+      },
+  });
+  TimingTakeSceneState state;
+  state.colouriseEffects.push_back(effect);
+  document.timingTakeStates.push_back(state);
+
+  TemporaryProjectFile file{"invisible_places_fade_mode_memories.json"};
+  std::string errorMessage;
+  REQUIRE(SaveProjectDocument(document, file.path, &errorMessage));
+
+  std::ifstream savedInput{file.path};
+  REQUIRE(savedInput.is_open());
+  const auto savedJson = nlohmann::json::parse(savedInput);
+  const auto& savedEffect =
+      savedJson["timing_take_states"][0]["timing_effects"][0];
+  CHECK(savedJson["schema_version"] == 89U);
+  REQUIRE(savedEffect["edge_fade_mode_memories"].size() == 2U);
+  CHECK(savedEffect["edge_fade_mode_memories"][0]["mode"] ==
+        "relative_linked");
+  CHECK(savedEffect["edge_fade_mode_memories"][1]["mode"] ==
+        "absolute");
+  REQUIRE(savedEffect["field_bounds_memory"][0]
+                     ["edge_fade_mode_memories"]
+                         .size() == 1U);
+
+  const auto loaded = LoadProjectDocument(file.path, &errorMessage);
+  INFO(errorMessage);
+  REQUIRE(loaded.has_value());
+  const auto& loadedEffect =
+      loaded->timingTakeStates.at(0).colouriseEffects.at(0);
+  CHECK(loadedEffect.edgeFadeMode ==
+        TimingColouriseEdgeFadeMode::RelativeSeparate);
+  REQUIRE(loadedEffect.boundsParameterKeys.size() == 1U);
+  CHECK(loadedEffect.boundsParameterKeys[0].value ==
+        Catch::Approx(0.45F));
+  REQUIRE(loadedEffect.edgeFadeModeMemories.size() == 2U);
+  CHECK(loadedEffect.edgeFadeModeMemories[0].mode ==
+        TimingColouriseEdgeFadeMode::RelativeLinked);
+  REQUIRE(loadedEffect.edgeFadeModeMemories[0].keys.size() == 2U);
+  CHECK(loadedEffect.edgeFadeModeMemories[1].mode ==
+        TimingColouriseEdgeFadeMode::Absolute);
+  CHECK(loadedEffect.edgeFadeModeMemories[1].edgeFadeLower ==
+        Catch::Approx(2.0F));
+  REQUIRE(loadedEffect.edgeFadeModeMemories[1].keys.size() == 1U);
+  CHECK(loadedEffect.edgeFadeModeMemories[1].keys[0].value ==
+        Catch::Approx(7.25F));
+  REQUIRE(loadedEffect.fieldBoundsMemory.size() == 1U);
+  REQUIRE(loadedEffect.fieldBoundsMemory[0]
+              .edgeFadeModeMemories.size() == 1U);
+  CHECK(loadedEffect.fieldBoundsMemory[0]
+            .edgeFadeModeMemories[0]
+            .keys[0]
+            .value == Catch::Approx(0.4F));
 }
 
 TEST_CASE("Legacy takes backfill their scene from single-scene states",

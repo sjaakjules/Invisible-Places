@@ -19,6 +19,7 @@
 #include "camera/CameraShot.hpp"
 #include "InvisiblePlacesBuildConfig.hpp"
 #include "camera/OrbitCamera.hpp"
+#include "io/AdaptiveHqCache.hpp"
 #include "io/AssetDiscovery.hpp"
 #include "io/GaussianSplatData.hpp"
 #include "io/PointCloudData.hpp"
@@ -56,6 +57,7 @@
 #include "timing/TimingColourisePresets.hpp"
 #include "ui/CompositionGuide.hpp"
 #include "ui/SidePanelState.hpp"
+#include "ui/VisualFeatureTimeline.hpp"
 #include "water/RainSimulation.hpp"
 #include "water/WaterSurfaceCache.hpp"
 #include "water/WaterFlow.hpp"
@@ -104,6 +106,7 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <tuple>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -270,6 +273,20 @@ constexpr std::size_t kLinkedHqRockPatchLayerId =
     std::numeric_limits<std::size_t>::max() - 62U;
 constexpr std::size_t kLinkedHqVegetationPatchLayerId =
     std::numeric_limits<std::size_t>::max() - 61U;
+constexpr std::size_t kLinkedHqSandPatchLayerId =
+    std::numeric_limits<std::size_t>::max() - 60U;
+constexpr std::array<std::size_t, 3U> kLinkedHqPatchLayerIds{
+    kLinkedHqRockPatchLayerId,
+    kLinkedHqVegetationPatchLayerId,
+    kLinkedHqSandPatchLayerId,
+};
+
+[[nodiscard]] constexpr bool IsLinkedHqPatchLayerId(
+    std::size_t layerId) {
+    return layerId == kLinkedHqRockPatchLayerId ||
+           layerId == kLinkedHqVegetationPatchLayerId ||
+           layerId == kLinkedHqSandPatchLayerId;
+}
 constexpr invisible_places::scene::PointSpacingMicrometres
     kAnimationMatchingFrameGhostSpacingMicrometres = 5'000U;
 constexpr std::size_t kAnimationMatchingFrameGhostSourceSampleLimit =
@@ -289,6 +306,10 @@ constexpr std::uint64_t kDefaultInteractivePointCap = 10'000'000ULL;
 constexpr std::uint64_t kPointCloudPreviewLodTarget = 10'000'000ULL;
 constexpr std::uint32_t kAnimationExportFrustumMaskGridDimension = 48U;
 constexpr double kAnimationExportFrustumMaskUsefulFraction = 0.85;
+constexpr std::uint32_t kLiveAnimationSectionMaskGridDimension = 48U;
+constexpr double kLiveAnimationSectionMaskUsefulFraction = 0.85;
+constexpr auto kLiveAnimationSectionMaskDebounce =
+    std::chrono::milliseconds{350};
 constexpr std::size_t kDefaultQueuedExportFrames = 2U;
 constexpr std::size_t kMaxAdaptiveQueuedExportFrames = 6U;
 constexpr std::uint64_t kAdaptiveExportQueueMemoryPercent = 85ULL;
@@ -361,6 +382,9 @@ struct ProjectSettings {
     // declares the nominal spacing so the density compensation matches the
     // 1 mm reference coverage.
     std::uint32_t linkedHqPatchSpacingMicrometres = 1000U;
+    // The 1 mm SAND source can be substantially larger than ROCK/VEG, so HQ
+    // leaves it on the complete 5 mm baseline unless the user opts in.
+    bool linkedHqIncludeSand = false;
     // Escape hatch for scalar-field residency: when set, point-cloud loads
     // materialise every on-disk scalar field exactly as before field
     // filtering existed. Takes effect on the next load of each cloud.
@@ -879,6 +903,24 @@ struct TimingColouriseBoundsValueEditState {
     std::string draft;
 };
 
+struct TimingColouriseHistogramValueEditState {
+    std::string effectId;
+    TimingColouriseHistogramHandle handle =
+        TimingColouriseHistogramHandle::None;
+    float draftValue = 0.0F;
+    bool percentage = false;
+    bool requestKeyboardFocus = true;
+};
+
+struct TimingColouriseHistogramWarpValueEditState {
+    std::string effectId;
+    bool emissiveAspect = false;
+    std::string nodeId;
+    float fieldPosition = 0.5F;
+    float spread = 0.0F;
+    bool requestKeyboardFocus = true;
+};
+
 struct TimingColouriseKeyHandle {
     TimingColouriseKeyTrack track = TimingColouriseKeyTrack::Palette;
     std::optional<
@@ -963,6 +1005,11 @@ struct TimingColouriseGraphKeyDragState {
     float mouseStartX = 0.0F;
     float mouseStartY = 0.0F;
     invisible_places::timing::TimingColouriseEffect originalEffect{};
+    // Keys explicitly selected by the user. `handles` may additionally
+    // contain an invisible or unselected semantic partner (the other Bounds
+    // coordinate/fade at the same time), but moving that partner must not
+    // turn a single-dot selection into a destructive multi-selection.
+    std::vector<TimingColouriseKeyHandle> selectedHandles;
     std::vector<TimingColouriseKeyHandle> handles;
     std::optional<TimingColouriseKeyHandle> rangeAnchor;
     std::vector<TimingColouriseGraphKeyDragValue> values;
@@ -2113,6 +2160,10 @@ struct TimingsPanelState {
         colouriseLocalKeyPositionEdit;
     std::optional<TimingColouriseBoundsValueEditState>
         colouriseBoundsValueEdit;
+    std::optional<TimingColouriseHistogramValueEditState>
+        colouriseHistogramValueEdit;
+    std::optional<TimingColouriseHistogramWarpValueEditState>
+        colouriseHistogramWarpValueEdit;
     std::optional<TimingColouriseKeySelectionState>
         colouriseKeySelection;
     std::optional<TimingColouriseGraphKeyDragState>
@@ -2130,10 +2181,23 @@ struct TimingsPanelState {
         colouriseOverviewHelpHover;
     TimingColouriseTimelineView colouriseTimelineView =
         TimingColouriseTimelineView::FullAnimation;
+    // Session-only visibility for the key families shown together on the
+    // Visual Feature timeline. Hiding a family never removes or rewrites its
+    // authored keys.
+    bool colourisePositionTimelineVisible = true;
+    bool colouriseFadeTimelineVisible = true;
+    bool colouriseSkewTimelineVisible = true;
+    bool colourisePaletteTimelineVisible = true;
+    bool colouriseIntensityTimelineVisible = true;
     // Remembered variant choice per scalar family so switching families
     // returns to the variant the user last authored with.
     std::unordered_map<std::string, std::string>
         lastColouriseVariantByFamily;
+    // Session-only association between an effect and the named Bounds
+    // profile it was loaded from. This keeps the compact Save/Delete buttons
+    // unambiguous without changing the serialized Bounds schema.
+    std::unordered_map<std::string, std::string>
+        selectedBoundsProfileByEffectId;
     std::string boundsProfileNameBuffer;
 };
 
@@ -2984,6 +3048,10 @@ struct PreviewLayerSession {
     std::vector<std::uint32_t> previewLodSampledIndices;
     std::uint32_t previewLodRequestedDrawCount = 0;
     std::uint32_t previewLodSampledDrawCount = 0;
+    // Full-density animation-section culling is independent from preview LOD:
+    // it changes only which source indices are submitted, never point spacing.
+    std::uint64_t liveAnimationSectionMaskFingerprint = 0U;
+    std::uint32_t liveAnimationSectionMaskDrawCount = 0U;
     PointBudgetState pointBudget{};
     PointCloudStyleState pointStyle{};
     std::vector<SavedPointVisualState> pointVisuals;
@@ -3723,19 +3791,34 @@ struct AnimationReciprocalPanSmoothingJobRuntime {
 // Runtime-only animation-view density assembly. Neither the synthetic layer ids
 // nor the hidden 5 mm baseline sessions are serialized or included by the
 // canonical export-source resolver.
+enum class LinkedHqPreviewMode : std::uint8_t {
+    Off = 0U,
+    Fixed,
+    Adaptive,
+};
+
 struct LinkedHqSelectionRequest {
     std::uint64_t fingerprint = 0U;
     std::string pairSessionId;
     std::string sceneGroupName;
     std::uint32_t patchSpacingMicrometres = 1000U;
-    LinkedHqFrustumUnion midpointFrustums{};
+    LinkedHqFrustumUnion patchFrustums{};
+    bool usesFullAnimationPath = false;
+    bool includeSand = false;
+    LinkedHqPreviewMode mode = LinkedHqPreviewMode::Fixed;
+    std::uint64_t animationPrefetchFingerprint = 0U;
+    invisible_places::renderer::pointcloud::
+        PointCloudAdaptiveDensityTransition adaptiveTransition{};
     std::array<std::size_t, invisible_places::scene::kScenePointCloudRoleCount>
         fiveMillimeterSessionIndices{};
     std::array<std::size_t, invisible_places::scene::kScenePointCloudRoleCount>
         oneMillimeterSessionIndices{};
-    std::array<LinkedHqSourceFingerprint, 5U> sourceFingerprints{};
-    std::array<invisible_places::io::PointCloudScalarFieldFilter, 2U>
-        patchFieldFilters{};
+    std::vector<std::size_t> patchRoles;
+    std::vector<std::size_t> patchLayerIds;
+    std::vector<LinkedHqSourceFingerprint> sourceFingerprints;
+    std::vector<invisible_places::io::PointCloudScalarFieldFilter>
+        patchFieldFilters;
+    std::filesystem::path adaptiveCacheRoot;
 };
 
 struct LinkedHqPatchJobOutput {
@@ -3744,11 +3827,32 @@ struct LinkedHqPatchJobOutput {
     std::size_t sourceSessionIndex = 0U;
     invisible_places::io::PointCloudSubsetLoadResult subset;
     std::vector<std::uint32_t> fiveMillimeterOutsideIndices;
+    std::optional<invisible_places::io::AdaptiveHqCacheIndex>
+        adaptiveCacheIndex;
+    std::uint64_t adaptiveFieldFilterFingerprint = 0U;
+    std::vector<std::uint32_t> adaptiveActiveBlockIndices;
+    std::vector<invisible_places::io::AdaptiveHqResidentBlock>
+        adaptiveResidentBlocks;
+    bool adaptiveCacheBuilt = false;
+    std::uint64_t adaptiveActiveBlockBytes = 0U;
+    std::uint64_t adaptiveMissingBlockBytes = 0U;
+    std::uint32_t adaptiveMissingBlockCount = 0U;
+    std::uint32_t adaptiveReusedBlockCount = 0U;
+    double adaptiveCacheOpenMilliseconds = 0.0;
+    double adaptiveBlockLoadMilliseconds = 0.0;
+    double adaptiveAssemblyMilliseconds = 0.0;
 };
 
 struct LinkedHqPreparationJobResult {
     std::uint64_t fingerprint = 0U;
-    std::array<LinkedHqPatchJobOutput, 2U> patches{};
+    std::vector<LinkedHqPatchJobOutput> patches;
+    std::array<std::vector<std::uint32_t>,
+               invisible_places::scene::kScenePointCloudRoleCount>
+        fiveMillimeterGuardIndices;
+    std::array<std::uint64_t,
+               invisible_places::scene::kScenePointCloudRoleCount>
+        fiveMillimeterFullPointCounts{};
+    double fiveMillimeterGuardPreparationMilliseconds = 0.0;
     std::string errorMessage;
     bool success = false;
     bool cancelled = false;
@@ -3775,7 +3879,29 @@ struct LinkedHqPatchRuntime {
     // 1 mm points inside the union before decimation; the reference count
     // for the patch's density compensation.
     std::uint64_t includedPointCount = 0U;
+    std::optional<invisible_places::io::AdaptiveHqCacheIndex>
+        adaptiveCacheIndex;
+    std::uint64_t adaptiveFieldFilterFingerprint = 0U;
+    std::vector<std::uint32_t> adaptiveActiveBlockIndices;
+    std::vector<invisible_places::io::AdaptiveHqResidentBlock>
+        adaptiveResidentBlocks;
+    bool adaptiveCacheBuilt = false;
+    std::uint64_t adaptiveActiveBlockBytes = 0U;
+    std::uint64_t adaptiveMissingBlockBytes = 0U;
+    std::uint32_t adaptiveMissingBlockCount = 0U;
+    std::uint32_t adaptiveReusedBlockCount = 0U;
+    double adaptiveCacheOpenMilliseconds = 0.0;
+    double adaptiveBlockLoadMilliseconds = 0.0;
+    double adaptiveAssemblyMilliseconds = 0.0;
     bool uploaded = false;
+};
+
+struct LinkedHqAdaptiveCacheSnapshot {
+    std::size_t layerId = std::numeric_limits<std::size_t>::max();
+    std::string cacheFingerprint;
+    std::uint64_t fieldFilterFingerprint = 0U;
+    std::vector<invisible_places::io::AdaptiveHqResidentBlock>
+        residentBlocks;
 };
 
 struct LinkedHqIndexedFieldJobResult {
@@ -3793,7 +3919,7 @@ struct LinkedHqIndexedFieldJobShared {
 
 struct LinkedHqPreviewRuntime {
     std::optional<LinkedHqSelectionRequest> request;
-    std::array<LinkedHqPatchRuntime, 2U> patches{};
+    std::vector<LinkedHqPatchRuntime> patches;
     std::jthread preparationWorker;
     std::shared_ptr<LinkedHqPreparationJobShared> preparationShared;
     std::optional<LinkedHqPreparationJobResult> uploadPending;
@@ -3808,16 +3934,93 @@ struct LinkedHqPreviewRuntime {
     bool baselineReady = false;
     bool ready = false;
     bool enabled = false;
+    bool adaptiveEnabled = false;
     bool retryRequested = false;
+    // User intent is retained while aHQ prepares. Off may still keep a
+    // published patch resident for an immediate later re-enable.
+    LinkedHqPreviewMode requestedMode = LinkedHqPreviewMode::Off;
+    std::uint64_t publishedFingerprint = 0U;
+    LinkedHqFrustumUnion publishedPatchFrustums{};
+    invisible_places::renderer::pointcloud::
+        PointCloudAdaptiveDensityTransition publishedAdaptiveTransition{};
+    std::array<std::vector<std::uint32_t>,
+               invisible_places::scene::kScenePointCloudRoleCount>
+        fiveMillimeterGuardIndices;
+    std::array<std::uint64_t,
+               invisible_places::scene::kScenePointCloudRoleCount>
+        fiveMillimeterFullPointCounts{};
+    double fiveMillimeterGuardPreparationMilliseconds = 0.0;
+    bool adaptiveBaseGuardApplied = false;
     // Set when a selection change (spacing, cameras, sources) replaced a
     // live HQ view; the next publish re-enables HQ so the user keeps the
     // density they were looking at.
     bool reenableAfterPublish = false;
-    // Re-resolving the selection stats five source files (symlinks into
-    // cloud storage) and re-evaluates both midpoint cameras, so it runs on
-    // a short cadence rather than every frame.
+    bool reenableAdaptiveAfterPublish = false;
+    // Re-resolving the selection stats five sources (or six when SAND is
+    // included) and re-evaluates the linked midpoint or unlinked full-path
+    // cameras, so it runs on a short cadence rather than every frame.
     bool resolveTimestampValid = false;
     std::chrono::steady_clock::time_point lastResolveAt{};
+    std::string failureMessage;
+    std::uint64_t nextAdaptiveBlockUseSerial = 1U;
+};
+
+struct LiveAnimationSectionMaskSource {
+    std::size_t sessionIndex = 0U;
+    std::uint64_t contentGeneration = 0U;
+    std::shared_ptr<const invisible_places::io::LoadedPointCloud> cloud;
+    bool includeSurfelIndices = false;
+};
+
+struct LiveAnimationSectionMaskRequest {
+    std::uint64_t fingerprint = 0U;
+    AnimationPath path{};
+    float normalizedStart = 0.0F;
+    float normalizedEnd = 1.0F;
+    float aspectRatio = 16.0F / 9.0F;
+    std::vector<LiveAnimationSectionMaskSource> sources;
+};
+
+struct LiveAnimationSectionMaskLayerResult {
+    LiveAnimationSectionMaskSource source{};
+    std::vector<std::uint32_t> indices;
+    std::uint64_t effectiveDrawCount = 0U;
+    bool useful = false;
+};
+
+struct LiveAnimationSectionMaskJobResult {
+    std::uint64_t fingerprint = 0U;
+    std::vector<LiveAnimationSectionMaskLayerResult> layers;
+    std::uint64_t fullPointCount = 0U;
+    std::uint64_t effectiveDrawPointCount = 0U;
+    double preparationMilliseconds = 0.0;
+    bool cancelled = false;
+    std::string errorMessage;
+};
+
+struct LiveAnimationSectionMaskJobShared {
+    std::mutex mutex;
+    std::optional<LiveAnimationSectionMaskJobResult> result;
+    std::atomic<float> progress{0.0F};
+    std::atomic_bool finished{false};
+};
+
+struct LiveAnimationSectionMaskRuntime {
+    std::uint64_t desiredFingerprint = 0U;
+    std::chrono::steady_clock::time_point desiredSince{};
+    std::optional<LiveAnimationSectionMaskRequest> request;
+    std::jthread worker;
+    std::shared_ptr<LiveAnimationSectionMaskJobShared> shared;
+    std::optional<LiveAnimationSectionMaskJobResult> prepared;
+    std::vector<std::size_t> installedSessionIndices;
+    std::uint64_t appliedFingerprint = 0U;
+    std::uint64_t fullPointCount = 0U;
+    std::uint64_t effectiveDrawPointCount = 0U;
+    double preparationMilliseconds = 0.0;
+    float progress = 0.0F;
+    bool uploaded = false;
+    bool applied = false;
+    bool releaseInstalledBuffers = false;
     std::string failureMessage;
 };
 
@@ -3866,6 +4069,7 @@ struct PreviewRuntimeState {
     AnimationReciprocalPanSmoothingJobRuntime
         animationReciprocalPanSmoothingJob{};
     LinkedHqPreviewRuntime linkedHqPreview{};
+    LiveAnimationSectionMaskRuntime liveAnimationSectionMask{};
     AnimationPlaybackState animationPlayback{};
     TimingsPanelState timingsPanel{};
     TimingColouriseHistogramRuntime timingColouriseHistogram{};
@@ -4772,6 +4976,9 @@ ResolveCurrentTimingTakeExportSnapshot(
 }
 
 bool IsWaterFillPointCloudSession(const PreviewLayerSession& session);
+std::optional<std::size_t> FindWaterFillReferenceSessionIndex(
+    const PreviewRuntimeState& runtimeState,
+    const PreviewLayerSession& waterSession);
 
 bool IsAuthoredTimingColouriseLayer(
     const PreviewLayerSession& session) {
@@ -6263,7 +6470,19 @@ bool FastBasicPointRendererActive(const ProjectSettings& settings) {
 std::uint64_t EffectivePointDrawCount(
     const PreviewRuntimeState& runtimeState,
     const PreviewLayerSession& session) {
-    (void)runtimeState;
+    const auto& sectionMask = runtimeState.liveAnimationSectionMask;
+    const bool linkedHqOwnsPointMasks =
+        runtimeState.linkedHqPreview.ready &&
+        runtimeState.linkedHqPreview.enabled;
+    if (!runtimeState.offlineRenderJob.active &&
+        !linkedHqOwnsPointMasks &&
+        sectionMask.applied &&
+        sectionMask.appliedFingerprint != 0U &&
+        session.liveAnimationSectionMaskFingerprint ==
+            sectionMask.appliedFingerprint &&
+        session.liveAnimationSectionMaskDrawCount > 0U) {
+        return session.liveAnimationSectionMaskDrawCount;
+    }
     if (session.totalPrimitives > 0U) {
         return session.totalPrimitives;
     }
@@ -7090,6 +7309,18 @@ std::uint64_t RenderStateSignature(
         HashShorelineWaveSettings(&seed, shoreline);
     }
     HashCombine(&seed, static_cast<std::uint64_t>(renderState.pointCloudRendererMode));
+    HashFloat(
+        &seed,
+        renderState.adaptiveDensityTransition.startDepthMeters);
+    HashFloat(
+        &seed,
+        renderState.adaptiveDensityTransition.switchDepthMeters);
+    HashFloat(
+        &seed,
+        renderState.adaptiveDensityTransition.endDepthMeters);
+    HashFloat(
+        &seed,
+        renderState.adaptiveDensityTransition.preparedFineDepthMeters);
     HashCombine(&seed, renderState.pointCloudLayers.size());
     for (const auto& layer : renderState.pointCloudLayers) {
         HashCombine(&seed, layer.layerId);
@@ -7107,6 +7338,9 @@ std::uint64_t RenderStateSignature(
         HashCombine(&seed, layer.drawPointCount);
         HashFloat(&seed, layer.densityCompensation.footprintScale);
         HashFloat(&seed, layer.densityCompensation.coverageCorrection);
+        HashCombine(
+            &seed,
+            static_cast<std::uint64_t>(layer.adaptiveDensityRole));
         HashCombine(&seed, static_cast<std::uint64_t>(layer.rainCollisionRole));
     }
     HashCombine(&seed, renderState.gaussianSplatLayers.size());
@@ -7505,13 +7739,17 @@ void SanitizePointCloudStyle(PreviewLayerSession* session) {
         return;
     }
 
-    if (!session->hasSourceRgb && session->pointStyle.colorMode == PointCloudColorMode::SourceRgb) {
-        session->pointStyle.colorMode = session->scalarFields.empty()
-                                            ? PointCloudColorMode::SolidColor
-                                            : PointCloudColorMode::ScalarColormap;
+    const bool sourceOffersScalarFields =
+        !session->availableScalarFields.empty();
+    if (!session->hasSourceRgb &&
+        session->pointStyle.colorMode == PointCloudColorMode::SourceRgb) {
+        session->pointStyle.colorMode =
+            !session->scalarFields.empty() || sourceOffersScalarFields
+                ? PointCloudColorMode::ScalarColormap
+                : PointCloudColorMode::SolidColor;
     }
 
-    if (session->scalarFields.empty() &&
+    if (session->scalarFields.empty() && !sourceOffersScalarFields &&
         session->pointStyle.colorMode == PointCloudColorMode::ScalarColormap) {
         session->pointStyle.colorMode =
             session->hasSourceRgb ? PointCloudColorMode::SourceRgb : PointCloudColorMode::SolidColor;
@@ -9725,7 +9963,10 @@ bool DrawScalarBindingBody(
         }
     }
 
-    if (binding->mode == ParameterSourceMode::Constant || scalarFields.empty()) {
+    const bool hasOnDemandFields =
+        session != nullptr && !session->availableScalarFields.empty();
+    if (binding->mode == ParameterSourceMode::Constant ||
+        (scalarFields.empty() && !hasOnDemandFields)) {
         const float displayScale = std::max(1.0e-6F, config.displayScale);
         float constantValue = invisible_places::style::ScalarConstant(*binding) * displayScale;
         const std::optional<float> hardMin =
@@ -9744,7 +9985,8 @@ bool DrawScalarBindingBody(
             invisible_places::style::SetScalarConstant(binding, constantValue / displayScale);
             changed = true;
         }
-        if (binding->mode == ParameterSourceMode::FieldMapped && scalarFields.empty()) {
+        if (binding->mode == ParameterSourceMode::FieldMapped &&
+            scalarFields.empty()) {
             ImGui::TextDisabled("No scalar fields are available for this layer.");
         }
         if (!binding->active) {
@@ -10291,17 +10533,43 @@ PointCloudDensityCompensation ResolveSessionDensityCompensationRaw(
     const PreviewRuntimeState& runtimeState,
     const PreviewLayerSession& session) {
     if (!IsSceneGroupedPointCloud(session)) {
-        // Standalone (role-less) spaced clouds -- e.g. the generated
-        // Site1-WATER-5mm gap fill -- belong to no display bundle, so density
-        // switching never swaps them for a finer variant: they render at
-        // their authored pitch beside the coarse live bundles and beside the
-        // fine full-density export sources alike. Whenever such a cloud
-        // declares a spacing token coarser than the canonical 1 mm baseline,
-        // give it the same spacing-only footprint compensation a bundled
-        // coarse layer would receive; there is no sibling cloud to derive a
-        // coverage correction from, so the ideal-lattice assumption applies.
-        // Generated water overlays keep identity compensation: their sprite
-        // sizing carries water-content semantics of its own.
+        // Standing-water fills form their own density family. The finest
+        // installed WATER source (currently Site1 2 mm) is the measured
+        // reference: live 5 mm and final-render 2 mm variants therefore share
+        // coverage even when their downsample counts are not an ideal ratio.
+        // The resolver's footprint scale affects point size, while coverage
+        // correction multiplies both opacity and emission in the live shaders
+        // and offline renderer.
+        if (IsWaterFillPointCloudSession(session)) {
+            const auto referenceIndex =
+                FindWaterFillReferenceSessionIndex(runtimeState, session);
+            const PreviewLayerSession* reference =
+                referenceIndex.has_value() &&
+                        referenceIndex.value() < runtimeState.sessions.size()
+                    ? &runtimeState.sessions[referenceIndex.value()]
+                    : nullptr;
+            const float displaySpacing =
+                session.inferredPointSpacingMeters > 0.0F
+                    ? session.inferredPointSpacingMeters
+                    : EffectivePointSpacingMeters(session);
+            const float referenceSpacing =
+                reference != nullptr
+                    ? (reference->inferredPointSpacingMeters > 0.0F
+                           ? reference->inferredPointSpacingMeters
+                           : EffectivePointSpacingMeters(*reference))
+                    : 0.0F;
+            return invisible_places::renderer::pointcloud::
+                ResolvePointCloudDensityCompensation(
+                    displaySpacing,
+                    session.totalPrimitives,
+                    referenceSpacing,
+                    reference != nullptr ? reference->totalPrimitives : 0U);
+        }
+
+        // Other standalone spaced clouds have no sibling reference. They
+        // retain spacing-only compensation under the ideal-lattice
+        // assumption. Generated water overlays keep identity compensation:
+        // their sprite sizing carries water-content semantics of its own.
         if (session.kind != LayerKind::PointCloud ||
             IsGeneratedWaterOverlaySession(session)) {
             return {};
@@ -10434,24 +10702,9 @@ PointCloudDensityCompensation ResolveSessionDensityCompensation(
     if (IsSceneGroupedPointCloud(session)) {
         return HarmonizeSceneCoverageCorrection(runtimeState, session, compensation);
     }
-    // The water gap fill is a SAND peer: it adopts the committed SAND role's
-    // (harmonized) coverage correction so both draw with the same
-    // per-fragment alpha in the live view. Export snapshots override this to
-    // identity because exports render the finest bundle at identity coverage.
-    if (IsWaterFillPointCloudSession(session) &&
-        compensation.footprintScale > 1.0F + 1.0e-4F) {
-        if (const auto sandIndex = FindWaterFillSceneSandSessionIndex(runtimeState, session);
-            sandIndex.has_value()) {
-            const auto& sandSession = runtimeState.sessions[sandIndex.value()];
-            const auto sandCompensation = HarmonizeSceneCoverageCorrection(
-                runtimeState,
-                sandSession,
-                ResolveSessionDensityCompensationRaw(runtimeState, sandSession));
-            if (sandCompensation.coverageCorrection < 1.0F) {
-                compensation.coverageCorrection = sandCompensation.coverageCorrection;
-            }
-        }
-    }
+    // WATER has its own measured 2/5 mm family reference above. Borrowing the
+    // committed SAND correction would couple a 2 mm final-render source to the
+    // viewport's 5 mm terrain choice and visibly dim its opacity/emission.
     return compensation;
 }
 
@@ -10804,6 +11057,10 @@ std::vector<PreviewLayerSession> BuildSessions(const invisible_places::io::Asset
     sessions.reserve(assetCatalog.pointClouds.size() + assetCatalog.gaussianSplats.size());
 
     for (const auto& asset : assetCatalog.pointClouds) {
+        if (invisible_places::io::IsArchivedWaterFillPointCloudName(
+                asset.filePath.stem().string())) {
+            continue;
+        }
         PreviewLayerSession session;
         session.kind = LayerKind::PointCloud;
         session.sourcePath = asset.filePath;
@@ -10825,8 +11082,7 @@ std::vector<PreviewLayerSession> BuildSessions(const invisible_places::io::Asset
         if (IsWaterFillPointCloudSession(session)) {
             // A standing-water gap fill follows its scene group: default to
             // visible so the companion auto-load in CommitSceneDisplaySwitch
-            // shows it with the scene until the user or a project layer
-            // record says otherwise.
+            // can select exactly one density sibling when the scene commits.
             session.visible = true;
         }
         sessions.push_back(std::move(session));
@@ -11022,35 +11278,140 @@ bool IsWaterFillPointCloudSession(const PreviewLayerSession& session) {
         IsGeneratedWaterOverlaySession(session)) {
         return false;
     }
-    // A standing-water gap fill (for example Site1-WATER-5mm.ply) carries a
-    // delimiter-bounded WATER token in its stem, mirroring the discovery
-    // role tokens. Scene-grouped and generated water overlay sessions never
-    // qualify, and camel-case overlay stems such as "-WaterPreview" have no
-    // delimiter after "Water" so they cannot match here.
-    const auto stem = session.sourcePath.stem().string();
-    std::string lowered;
-    lowered.reserve(stem.size());
-    for (const char character : stem) {
-        lowered.push_back(
-            static_cast<char>(std::tolower(static_cast<unsigned char>(character))));
+    // Asset discovery already removes rollback copies (old/backup/archive),
+    // and the shared filename classifier rejects camel-case generated
+    // overlays such as WaterPreview.
+    return invisible_places::io::IsWaterFillPointCloudName(
+        session.sourcePath.stem().string());
+}
+
+const ScenePointCloudRuntime* FindSceneForWaterFillSession(
+    const PreviewRuntimeState& runtimeState,
+    const PreviewLayerSession& waterSession) {
+    if (!IsWaterFillPointCloudSession(waterSession)) {
+        return nullptr;
     }
-    const auto isBoundary = [](char character) {
-        return character == '-' || character == '_' || character == ' ' ||
-               character == '.';
-    };
-    std::size_t searchStart = 0U;
-    while (true) {
-        const auto found = lowered.find("water", searchStart);
-        if (found == std::string::npos) {
-            return false;
+    const auto folderKey =
+        NormalizePathKey(waterSession.sourcePath.parent_path());
+    const auto scene = std::find_if(
+        runtimeState.pointCloudScenes.begin(),
+        runtimeState.pointCloudScenes.end(),
+        [&](const ScenePointCloudRuntime& candidate) {
+            return NormalizePathKey(candidate.sourceFolder) == folderKey;
+        });
+    return scene == runtimeState.pointCloudScenes.end() ? nullptr : &*scene;
+}
+
+std::vector<invisible_places::scene::AuxiliaryDensityVariantCandidate>
+WaterFillVariantCandidates(
+    const PreviewRuntimeState& runtimeState,
+    const ScenePointCloudRuntime& scene) {
+    std::vector<invisible_places::scene::AuxiliaryDensityVariantCandidate>
+        candidates;
+    const auto folderKey = NormalizePathKey(scene.sourceFolder);
+    for (std::size_t index = 0U; index < runtimeState.sessions.size(); ++index) {
+        const auto& session = runtimeState.sessions[index];
+        if (!IsWaterFillPointCloudSession(session) ||
+            NormalizePathKey(session.sourcePath.parent_path()) != folderKey) {
+            continue;
         }
-        const auto end = found + 5U;
-        if ((found == 0U || isBoundary(lowered[found - 1U])) &&
-            (end == lowered.size() || isBoundary(lowered[end]))) {
-            return true;
+        const auto spacing =
+            invisible_places::scene::QuantizePointSpacingMicrometres(
+                session.inferredPointSpacingMeters > 0.0F
+                    ? session.inferredPointSpacingMeters
+                    : EffectivePointSpacingMeters(session));
+        if (spacing.has_value()) {
+            candidates.push_back({
+                .spacingMicrometres = spacing.value(),
+                .sourceIndex = index,
+            });
         }
-        searchStart = found + 1U;
     }
+    return candidates;
+}
+
+std::optional<std::size_t> FindWaterFillVariantSessionIndex(
+    const PreviewRuntimeState& runtimeState,
+    const ScenePointCloudRuntime& scene,
+    invisible_places::scene::PointSpacingMicrometres targetSpacingMicrometres) {
+    const auto candidates = WaterFillVariantCandidates(runtimeState, scene);
+    return invisible_places::scene::SelectAuxiliaryDensityVariant(
+        candidates,
+        targetSpacingMicrometres);
+}
+
+std::optional<std::size_t> FindWaterFillReferenceSessionIndex(
+    const PreviewRuntimeState& runtimeState,
+    const PreviewLayerSession& waterSession) {
+    const auto* scene = FindSceneForWaterFillSession(runtimeState, waterSession);
+    return scene == nullptr
+               ? std::nullopt
+               : FindWaterFillVariantSessionIndex(runtimeState, *scene, 0U);
+}
+
+std::optional<invisible_places::scene::PointSpacingMicrometres>
+SceneLiveWaterTargetSpacing(
+    const PreviewRuntimeState& runtimeState,
+    const ScenePointCloudRuntime& scene) {
+    if (scene.committedDisplaySpacingMicrometres.has_value()) {
+        return scene.committedDisplaySpacingMicrometres;
+    }
+    const auto sandRole = invisible_places::scene::ScenePointCloudRoleIndex(
+        invisible_places::scene::ScenePointCloudRole::Sand);
+    const auto sandIndex = scene.committedDisplaySessionIndices[sandRole];
+    if (!sandIndex.has_value() || sandIndex.value() >= runtimeState.sessions.size()) {
+        return std::nullopt;
+    }
+    const auto& sand = runtimeState.sessions[sandIndex.value()];
+    return invisible_places::scene::QuantizePointSpacingMicrometres(
+        sand.inferredPointSpacingMeters > 0.0F
+            ? sand.inferredPointSpacingMeters
+            : EffectivePointSpacingMeters(sand));
+}
+
+std::optional<std::size_t> FindLiveWaterFillSessionIndex(
+    const PreviewRuntimeState& runtimeState,
+    const ScenePointCloudRuntime& scene) {
+    const auto targetSpacing = SceneLiveWaterTargetSpacing(runtimeState, scene);
+    return targetSpacing.has_value()
+               ? FindWaterFillVariantSessionIndex(
+                     runtimeState,
+                     scene,
+                     targetSpacing.value())
+               : std::nullopt;
+}
+
+std::optional<std::size_t> FindExportWaterFillSessionIndex(
+    const PreviewRuntimeState& runtimeState,
+    const ScenePointCloudRuntime& scene) {
+    if (scene.displayBundles.empty()) {
+        return std::nullopt;
+    }
+    const auto finest = std::min_element(
+        scene.displayBundles.begin(),
+        scene.displayBundles.end(),
+        [](const SceneDisplayBundleRuntime& left,
+           const SceneDisplayBundleRuntime& right) {
+            return left.spacingMicrometres < right.spacingMicrometres;
+        });
+    return FindWaterFillVariantSessionIndex(
+        runtimeState,
+        scene,
+        finest->spacingMicrometres);
+}
+
+bool IsLiveWaterFillSession(
+    const PreviewRuntimeState& runtimeState,
+    std::size_t sessionIndex) {
+    if (sessionIndex >= runtimeState.sessions.size()) {
+        return false;
+    }
+    const auto* scene =
+        FindSceneForWaterFillSession(runtimeState, runtimeState.sessions[sessionIndex]);
+    if (scene == nullptr || !scene->displayLoaded || !scene->displayVisible) {
+        return false;
+    }
+    return FindLiveWaterFillSessionIndex(runtimeState, *scene) == sessionIndex;
 }
 
 // Shoreline waves ride the SAND role and any standing-water gap fill: the
@@ -11318,29 +11679,69 @@ void QueueLayerLoad(
     std::size_t sessionIndex,
     PointCloudLoadPurpose purpose,
     std::uint64_t generation);
+void UnloadLayerByIndex(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    std::size_t sessionIndex,
+    bool releaseCpuResources);
 
-// Queues the companion load for every water-fill session whose scene display
-// is loaded while the fill itself is still unloaded but meant to be visible.
-// Deduped by QueueLayerLoad, so calling this from the display-commit tail and
-// after project applies is safe.
-void QueueWaterFillCompanionLoads(PreviewRuntimeState* runtimeState) {
-    if (runtimeState == nullptr) {
+// Reconciles each scene to exactly one WATER companion. The active live base
+// density selects an exact WATER sibling when present (5 mm -> 5 mm); the
+// nearest finer/coarser sibling is the deterministic fallback (1 mm -> 2 mm).
+// Every other WATER density is retired before the selected one is queued.
+void QueueWaterFillCompanionLoads(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr || viewport == nullptr) {
         return;
     }
-    for (std::size_t index = 0; index < runtimeState->sessions.size(); ++index) {
-        const auto& session = runtimeState->sessions[index];
-        if (!IsWaterFillPointCloudSession(session) ||
-            !session.visible ||
-            session.loaded) {
+    const auto activeSceneName =
+        ActiveWaterTimingSceneGroupName(runtimeState->water);
+    std::vector<std::size_t> selectedIndices;
+    for (const auto& scene : runtimeState->pointCloudScenes) {
+        if (!scene.displayLoaded || !scene.displayVisible ||
+            (!activeSceneName.empty() && activeSceneName != "Default" &&
+             scene.sceneGroupName != activeSceneName)) {
             continue;
         }
-        for (const auto& scene : runtimeState->pointCloudScenes) {
-            if (scene.displayLoaded &&
-                NormalizePathKey(session.sourcePath.parent_path()) ==
-                    NormalizePathKey(scene.sourceFolder)) {
-                QueueLayerLoad(runtimeState, index, PointCloudLoadPurpose::Interactive, 0U);
-                break;
-            }
+        if (const auto selected =
+                FindLiveWaterFillSessionIndex(*runtimeState, scene);
+            selected.has_value()) {
+            selectedIndices.push_back(selected.value());
+        }
+    }
+
+    for (std::size_t index = 0U; index < runtimeState->sessions.size(); ++index) {
+        auto& session = runtimeState->sessions[index];
+        if (!IsWaterFillPointCloudSession(session)) {
+            continue;
+        }
+        const bool selected =
+            std::find(selectedIndices.begin(), selectedIndices.end(), index) !=
+            selectedIndices.end();
+        session.visible = selected;
+        if (selected) {
+            continue;
+        }
+        std::erase_if(
+            runtimeState->persistence.queuedLoads,
+            [&](const QueuedLayerLoad& load) {
+                return load.sessionIndex == index;
+            });
+        if (session.gpuResident || session.cpuResident) {
+            UnloadLayerByIndex(runtimeState, viewport, index, true);
+        }
+    }
+
+    for (const auto index : selectedIndices) {
+        auto& session = runtimeState->sessions[index];
+        session.visible = true;
+        if (!session.gpuResident) {
+            QueueLayerLoad(
+                runtimeState,
+                index,
+                PointCloudLoadPurpose::Interactive,
+                0U);
         }
     }
 }
@@ -13091,6 +13492,34 @@ void HandleScenePurposeLoadCompleted(
     PointCloudLoadPurpose purpose,
     std::uint64_t sceneSwitchGeneration);
 
+bool IsScenePurposeLoadObsolete(
+    const PreviewRuntimeState& runtimeState,
+    std::size_t sessionIndex,
+    PointCloudLoadPurpose purpose) {
+    if (sessionIndex >= runtimeState.sessions.size()) {
+        return true;
+    }
+    const auto& session = runtimeState.sessions[sessionIndex];
+    const auto folderKey = NormalizePathKey(session.sourcePath.parent_path());
+    const auto ownerScene = std::find_if(
+        runtimeState.pointCloudScenes.begin(),
+        runtimeState.pointCloudScenes.end(),
+        [&](const ScenePointCloudRuntime& scene) {
+            return NormalizePathKey(scene.sourceFolder) == folderKey;
+        });
+    const auto activeSceneName =
+        ActiveWaterTimingSceneGroupName(runtimeState.water);
+    const bool inactiveScene =
+        !activeSceneName.empty() && activeSceneName != "Default" &&
+        ownerScene != runtimeState.pointCloudScenes.end() &&
+        ownerScene->sceneGroupName != activeSceneName;
+    const bool supersededWaterDensity =
+        purpose == PointCloudLoadPurpose::Interactive &&
+        IsWaterFillPointCloudSession(session) &&
+        !IsLiveWaterFillSession(runtimeState, sessionIndex);
+    return inactiveScene || supersededWaterDensity;
+}
+
 void PollTimingColouriseHistogram(
     PreviewRuntimeState* runtimeState);
 
@@ -13106,11 +13535,21 @@ void HandleScenePurposeLoadFailed(
     std::uint64_t sceneSwitchGeneration,
     std::string_view errorMessage);
 
-// All potentially exportable visuals/takes contribute their genuinely mapped
-// scalar fields. This keeps queued/batch export snapshots self-contained
-// without retaining remembered mappings from Constant bindings.
+enum class ScalarFieldRequirementScope : std::uint8_t {
+    // Only the style currently applied to this layer and the active Timing
+    // Take. Switching a Visual or Timing Take is cheap: the residency sweep
+    // notices its new durable field names and streams those columns in.
+    Live,
+    // Used only while preparing full-density export sources. Batch exports
+    // can select a saved Visual/Take after the source cloud has loaded, so
+    // keep the conservative authored superset for that explicit operation.
+    AllAuthored,
+};
+
 bool SessionPotentiallyNeedsRoughnessMotionFields(
-    const PreviewLayerSession& session) {
+    const PreviewLayerSession& session,
+    ScalarFieldRequirementScope scope =
+        ScalarFieldRequirementScope::Live) {
     const auto needsFields = [&session](PointCloudStyleState style) {
         style = invisible_places::renderer::pointcloud::
             MakePointCloudStyleForSceneRole(style, session.sceneRole);
@@ -13120,6 +13559,9 @@ bool SessionPotentiallyNeedsRoughnessMotionFields(
     };
     if (needsFields(session.pointStyle)) {
         return true;
+    }
+    if (scope == ScalarFieldRequirementScope::Live) {
+        return false;
     }
     return std::any_of(
         session.pointVisuals.begin(),
@@ -13131,7 +13573,9 @@ bool SessionPotentiallyNeedsRoughnessMotionFields(
 
 invisible_places::app::UsedScalarFieldSet CollectRequiredScalarFieldNames(
     const PreviewRuntimeState& runtimeState,
-    const PreviewLayerSession& session) {
+    const PreviewLayerSession& session,
+    ScalarFieldRequirementScope scope =
+        ScalarFieldRequirementScope::Live) {
     invisible_places::app::UsedScalarFieldSet used;
     const auto addStyle = [&used](const PointCloudStyleState& style) {
         used.AddBinding(style.pointSize);
@@ -13142,10 +13586,12 @@ invisible_places::app::UsedScalarFieldSet CollectRequiredScalarFieldNames(
         used.AddBinding(style.colormapPosition);
     };
     addStyle(session.pointStyle);
-    for (const auto& visual : session.pointVisuals) {
-        addStyle(visual.style);
+    if (scope == ScalarFieldRequirementScope::AllAuthored) {
+        for (const auto& visual : session.pointVisuals) {
+            addStyle(visual.style);
+        }
     }
-    if (SessionPotentiallyNeedsRoughnessMotionFields(session)) {
+    if (SessionPotentiallyNeedsRoughnessMotionFields(session, scope)) {
         for (const auto& available : session.availableScalarFields) {
             const auto normalized =
                 NormalizeMotionScalarFieldName(available.name);
@@ -13155,12 +13601,25 @@ invisible_places::app::UsedScalarFieldSet CollectRequiredScalarFieldNames(
             }
         }
     }
-    // Colourise selectors carry no per-role scoping, and the same field set
-    // ships in every density variant and role of a scene, so every effect
-    // in every exportable take contributes to every session rather than
-    // risking a miss when batch export selects a take not currently open.
-    for (const auto& takeState : runtimeState.water.timingTakeSceneStates) {
-        for (const auto& effect : takeState.colouriseEffects) {
+    // Visual Feature selectors carry no per-role scoping, and the same field
+    // set ships in every density variant and role. Interactive rendering only
+    // needs the currently selected Take/scene; dormant effects inside that
+    // Take still contribute so toggling one has no extra wait. Explicit batch
+    // export preparation retains the authored superset.
+    if (scope == ScalarFieldRequirementScope::AllAuthored) {
+        for (const auto& takeState :
+             runtimeState.water.timingTakeSceneStates) {
+            for (const auto& effect : takeState.colouriseEffects) {
+                used.AddColouriseEffect(effect);
+            }
+        }
+    } else if (const auto* activeTake =
+                   invisible_places::timing::FindTimingTakeSceneState(
+                       runtimeState.water.timingTakeSceneStates,
+                       ActiveWaterTimingScenarioId(runtimeState),
+                       ActiveWaterTimingSceneGroupName(runtimeState.water));
+               activeTake != nullptr) {
+        for (const auto& effect : activeTake->colouriseEffects) {
             used.AddColouriseEffect(effect);
         }
     }
@@ -13170,17 +13629,20 @@ invisible_places::app::UsedScalarFieldSet CollectRequiredScalarFieldNames(
 invisible_places::io::PointCloudScalarFieldFilter
 CollectScalarFieldLoadFilter(
     const PreviewRuntimeState& runtimeState,
-    const PreviewLayerSession& session) {
+    const PreviewLayerSession& session,
+    ScalarFieldRequirementScope scope =
+        ScalarFieldRequirementScope::Live) {
     invisible_places::io::PointCloudScalarFieldFilter filter;
     if (runtimeState.projectSettings.loadAllScalarFields) {
         return filter;
     }
     filter.mode =
         invisible_places::io::PointCloudScalarFieldFilter::Mode::Selected;
-    filter.names = CollectRequiredScalarFieldNames(runtimeState, session).Names();
+    filter.names =
+        CollectRequiredScalarFieldNames(runtimeState, session, scope).Names();
     filter.containsPatterns =
         invisible_places::app::AlwaysResidentScalarFieldPatterns();
-    if (SessionPotentiallyNeedsRoughnessMotionFields(session)) {
+    if (SessionPotentiallyNeedsRoughnessMotionFields(session, scope)) {
         filter.containsPatterns.push_back("roughness");
         filter.containsPatterns.push_back("groundid");
     }
@@ -13191,13 +13653,16 @@ CollectScalarFieldLoadFilter(
 // nullopt when the session is fully satisfied.
 std::optional<std::string> SessionMissingRequiredScalarFieldName(
     const PreviewRuntimeState& runtimeState,
-    const PreviewLayerSession& session) {
+    const PreviewLayerSession& session,
+    ScalarFieldRequirementScope scope =
+        ScalarFieldRequirementScope::Live) {
     if (session.kind != LayerKind::PointCloud || !session.cpuResident ||
         session.offlinePointCloud == nullptr ||
         session.availableScalarFields.empty()) {
         return std::nullopt;
     }
-    const auto required = CollectRequiredScalarFieldNames(runtimeState, session);
+    const auto required =
+        CollectRequiredScalarFieldNames(runtimeState, session, scope);
     if (required.Empty()) {
         return std::nullopt;
     }
@@ -13583,12 +14048,25 @@ void BeginLayerLoad(
     const auto layerKind = session.kind;
     const auto filePath = session.sourcePath;
     const auto transformPath = session.transformPath;
-    // Resolved on the main thread against the session's authored state at
-    // spawn time; fields referenced by later edits stream in on demand.
-    const auto scalarFieldFilter =
-        layerKind == LayerKind::PointCloud
-            ? CollectScalarFieldLoadFilter(*runtimeState, session)
-            : invisible_places::io::PointCloudScalarFieldFilter{};
+    // Interactive/coarse/HQ-baseline loads publish hot geometry first.
+    // Required scalar columns live in separate cache files and are appended
+    // by the residency sweep after the complete fallback cloud is visible.
+    // The explicit Load All setting and export preparation retain synchronous
+    // comprehensive loading because those operations promise completeness at
+    // their activation boundary.
+    invisible_places::io::PointCloudScalarFieldFilter scalarFieldFilter;
+    if (layerKind == LayerKind::PointCloud) {
+        if (runtimeState->projectSettings.loadAllScalarFields ||
+            purpose == PointCloudLoadPurpose::ExportGpu) {
+            scalarFieldFilter = CollectScalarFieldLoadFilter(
+                *runtimeState,
+                session,
+                ScalarFieldRequirementScope::AllAuthored);
+        } else {
+            scalarFieldFilter.mode = invisible_places::io::
+                PointCloudScalarFieldFilter::Mode::Selected;
+        }
+    }
     runtimeState->statusMessage = "Loading " + session.displayName + " in the background...";
     runtimeState->errorMessage.clear();
     std::cout << "Loading " << LayerKindLabel(layerKind) << ": " << filePath.filename().string() << std::endl;
@@ -13720,6 +14198,10 @@ void PollPendingScalarFieldLoad(
     }
     cloud.scalarFields.push_back(result->stats);
     session.scalarFields = cloud.scalarFields;
+    // Durable field names were deliberately kept while geometry rendered
+    // with constant fallbacks. Resolve their slots as each cold column
+    // arrives without disturbing the authored mapping or Visual selection.
+    SanitizePointCloudStyle(&session);
 
     if (session.gpuResident) {
         try {
@@ -13738,6 +14220,7 @@ void PollPendingScalarFieldLoad(
     runtimeState->statusMessage = "Loaded scalar field '" + fieldName +
                                   "' for " + session.displayName + ".";
     runtimeState->errorMessage.clear();
+    runtimeState->previewRenderStateSignatureValid = false;
 }
 
 void PollPendingLayerLoad(
@@ -13763,7 +14246,7 @@ void PollPendingLayerLoad(
     auto& pendingLoad = runtimeState->pendingLoad.value();
 
     if (pendingLoad.phase == PendingLoadPhase::CpuLoading) {
-        const auto completedResult = TakeCompletedBackgroundResult(pendingLoad.backgroundState);
+        auto completedResult = TakeCompletedBackgroundResult(pendingLoad.backgroundState);
         if (!completedResult.has_value()) {
             return;
         }
@@ -13783,6 +14266,24 @@ void PollPendingLayerLoad(
             return;
         }
 
+        if (IsScenePurposeLoadObsolete(
+                *runtimeState,
+                pendingLoad.sessionIndex,
+                pendingLoad.purpose)) {
+            // The read itself is not interruptible, but its large CPU payload
+            // can be destroyed here without ever copying or uploading it.
+            // Incoming scene work remains serialized behind this read, so the
+            // two full scene payloads cannot overlap during loading.
+            const auto displayName =
+                runtimeState->sessions[pendingLoad.sessionIndex].displayName;
+            runtimeState->pendingLoad.reset();
+            runtimeState->previewRenderStateSignatureValid = false;
+            runtimeState->statusMessage =
+                "Discarded stale layer load for " + displayName + ".";
+            runtimeState->errorMessage.clear();
+            return;
+        }
+
         pendingLoad.completedResult = std::move(completedResult);
         pendingLoad.phase = PendingLoadPhase::UploadPending;
         pendingLoad.showUploadOverlayFrame = true;
@@ -13796,6 +14297,24 @@ void PollPendingLayerLoad(
                                           : "Uploading " +
                                                 runtimeState->sessions[pendingLoad.sessionIndex].displayName +
                                                 " to the GPU...";
+        return;
+    }
+
+    if (IsScenePurposeLoadObsolete(
+            *runtimeState,
+            pendingLoad.sessionIndex,
+            pendingLoad.purpose)) {
+        // Ownership may change during the one-frame upload overlay. Drop a
+        // ready payload (or a resident-source upload request) before it can
+        // allocate any GPU resources for the outgoing scene.
+        const auto displayName =
+            runtimeState->sessions[pendingLoad.sessionIndex].displayName;
+        pendingLoad.completedResult.reset();
+        runtimeState->pendingLoad.reset();
+        runtimeState->previewRenderStateSignatureValid = false;
+        runtimeState->statusMessage =
+            "Discarded stale layer load for " + displayName + ".";
+        runtimeState->errorMessage.clear();
         return;
     }
 
@@ -14607,11 +15126,10 @@ bool CommitSceneDisplaySwitch(
     scene->mixedDisplay = committedMixedDisplay;
     scene->stagedReadyCount = 0U;
     scene->switchError.clear();
-    // A standing-water gap fill (Site1-WATER-5mm) behaves as part of its
-    // scene: whenever a scene display commits loaded, queue the companion
-    // load for any same-folder water fill that is still unloaded. An
-    // explicit in-session unload clears the visible flag and is respected.
-    QueueWaterFillCompanionLoads(runtimeState);
+    // Standing WATER behaves as a density-aware scene role: reconcile to the
+    // one variant matching this committed bundle, retiring every sibling
+    // before its replacement load is queued.
+    QueueWaterFillCompanionLoads(runtimeState, viewport);
     SyncWaterFillVisualsFromScene(runtimeState);
     if (runtimeState->water.authoritativeWaterSurfaceSceneGroupName.empty() ||
         runtimeState->water.authoritativeWaterSurfaceSceneGroupName ==
@@ -14817,6 +15335,18 @@ void HandleScenePurposeLoadCompleted(
     std::size_t sessionIndex,
     PointCloudLoadPurpose purpose,
     std::uint64_t sceneSwitchGeneration) {
+    if (runtimeState == nullptr || viewport == nullptr ||
+        sessionIndex >= runtimeState->sessions.size()) {
+        return;
+    }
+    if (IsScenePurposeLoadObsolete(*runtimeState, sessionIndex, purpose)) {
+        // Whole-cloud reads cannot be interrupted safely. If a scene switch
+        // happens at the final activation boundary, publish nothing and
+        // immediately retire the payload regardless of its original purpose.
+        UnloadLayerByIndex(runtimeState, viewport, sessionIndex, true);
+        runtimeState->previewRenderStateSignatureValid = false;
+        return;
+    }
     auto* scene = FindScenePointCloudRuntimeContainingSession(runtimeState, sessionIndex);
     if (scene == nullptr) {
         return;
@@ -14965,6 +15495,7 @@ void HandleScenePurposeLoadFailed(
         hq.baselineReady = false;
         hq.ready = false;
         hq.enabled = false;
+        hq.adaptiveEnabled = false;
     }
 }
 
@@ -25051,6 +25582,8 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
     document.previewPerformanceMode = runtimeState.projectSettings.previewPerformanceMode;
     document.linkedHqPatchSpacingMicrometres =
         runtimeState.projectSettings.linkedHqPatchSpacingMicrometres;
+    document.linkedHqIncludeSand =
+        runtimeState.projectSettings.linkedHqIncludeSand;
     document.loadAllScalarFields = runtimeState.projectSettings.loadAllScalarFields;
     document.scalarFieldBudgetGigabytes =
         runtimeState.projectSettings.scalarFieldBudgetGigabytes;
@@ -25200,6 +25733,10 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
         runtimeState.water.authoritativeWaterSurfaceSceneGroupName.empty()
             ? runtimeState.water.activeWaterSurfaceSceneGroupName
             : runtimeState.water.authoritativeWaterSurfaceSceneGroupName;
+    if (!document.activeWaterSceneGroupName.empty() &&
+        document.activeWaterSceneGroupName != "Default") {
+        document.activeSceneGroupName = document.activeWaterSceneGroupName;
+    }
     {
         invisible_places::serialization::WaterSceneStateDocument waterSceneState;
         waterSceneState.sceneGroupName =
@@ -25366,7 +25903,9 @@ ProjectDocument BuildProjectDocument(const PreviewRuntimeState& runtimeState) {
         const auto& selectedSession =
             runtimeState.sessions[runtimeState.selectedSessionIndex.value()];
         document.selectedLayerPath = selectedSession.sourcePath;
-        document.activeSceneGroupName = selectedSession.sceneGroupName;
+        if (!selectedSession.sceneGroupName.empty()) {
+            document.activeSceneGroupName = selectedSession.sceneGroupName;
+        }
     }
 
     document.scenePointCloudGroups.reserve(runtimeState.pointCloudScenes.size());
@@ -25579,6 +26118,28 @@ SceneFullDensityExportSessionIndices(const ScenePointCloudRuntime& scene) {
     return scene.analysisSessionIndices;
 }
 
+std::vector<std::size_t> SceneFullDensityExportSourceIndices(
+    const PreviewRuntimeState& runtimeState,
+    const ScenePointCloudRuntime& scene) {
+    std::vector<std::size_t> indices;
+    indices.reserve(invisible_places::scene::kScenePointCloudRoleCount + 1U);
+    for (const auto roleIndex : SceneFullDensityExportSessionIndices(scene)) {
+        if (roleIndex.has_value() &&
+            roleIndex.value() < runtimeState.sessions.size()) {
+            indices.push_back(roleIndex.value());
+        }
+    }
+    if (const auto waterIndex =
+            FindExportWaterFillSessionIndex(runtimeState, scene);
+        waterIndex.has_value() &&
+        waterIndex.value() < runtimeState.sessions.size() &&
+        std::find(indices.begin(), indices.end(), waterIndex.value()) ==
+            indices.end()) {
+        indices.push_back(waterIndex.value());
+    }
+    return indices;
+}
+
 bool SceneFullDensityExportUsesSession(
     const ScenePointCloudRuntime& scene,
     std::size_t sessionIndex) {
@@ -25602,6 +26163,13 @@ bool IsExportPointCloudSourceCandidate(
     if (session.kind != LayerKind::PointCloud ||
         IsInactiveLegacyWaterOverlaySession(session)) {
         return false;
+    }
+    if (IsWaterFillPointCloudSession(session)) {
+        const auto* scene = FindSceneForWaterFillSession(runtimeState, session);
+        return scene != nullptr && scene->displayLoaded &&
+               scene->displayVisible &&
+               FindExportWaterFillSessionIndex(runtimeState, *scene) ==
+                   sessionIndex;
     }
     if (!IsSceneGroupedPointCloud(session)) {
         return IsRenderablePointCloudSource(runtimeState, session);
@@ -25734,6 +26302,19 @@ bool EnsureFullDensityExportSourcesReady(
             QueueLayerLoad(runtimeState, index, PointCloudLoadPurpose::ExportGpu);
             queuedAny = true;
         }
+        if (const auto waterIndex =
+                FindExportWaterFillSessionIndex(*runtimeState, scene);
+            waterIndex.has_value()) {
+            auto& waterSession = runtimeState->sessions[waterIndex.value()];
+            if (!waterSession.loaded || !waterSession.gpuResident ||
+                waterSession.offlinePointCloud == nullptr) {
+                QueueLayerLoad(
+                    runtimeState,
+                    waterIndex.value(),
+                    PointCloudLoadPurpose::ExportGpu);
+                queuedAny = true;
+            }
+        }
     }
 
     if (missingSourceCount > 0U) {
@@ -25758,21 +26339,19 @@ bool EnsureFullDensityExportSourcesReady(
         if (!scene.displayLoaded || !scene.displayVisible) {
             continue;
         }
-        for (const auto sessionIndex : SceneFullDensityExportSessionIndices(scene)) {
-            if (!sessionIndex.has_value() ||
-                sessionIndex.value() >= runtimeState->sessions.size()) {
-                continue;
-            }
+        for (const auto sessionIndex :
+             SceneFullDensityExportSourceIndices(*runtimeState, scene)) {
             const auto missing = SessionMissingRequiredScalarFieldName(
                 *runtimeState,
-                runtimeState->sessions[sessionIndex.value()]);
+                runtimeState->sessions[sessionIndex],
+                ScalarFieldRequirementScope::AllAuthored);
             if (!missing.has_value()) {
                 continue;
             }
             if (!runtimeState->pendingScalarFieldLoad.has_value()) {
                 StartScalarFieldLoad(
                     runtimeState,
-                    sessionIndex.value(),
+                    sessionIndex,
                     missing.value());
             }
             runtimeState->statusMessage =
@@ -25810,17 +26389,16 @@ ExportSourceReleaseSummary ReleaseExportOnlyPointCloudSources(
     std::vector<std::size_t> releaseIndices;
     for (const auto& scene : runtimeState->pointCloudScenes) {
         for (const auto sessionIndex :
-             SceneFullDensityExportSessionIndices(scene)) {
-            if (!sessionIndex.has_value() ||
-                sessionIndex.value() >= runtimeState->sessions.size() ||
+             SceneFullDensityExportSourceIndices(*runtimeState, scene)) {
+            if (sessionIndex >= runtimeState->sessions.size() ||
                 std::find(
                     releaseIndices.begin(),
                     releaseIndices.end(),
-                    sessionIndex.value()) != releaseIndices.end()) {
+                    sessionIndex) != releaseIndices.end()) {
                 continue;
             }
             const auto& session =
-                runtimeState->sessions[sessionIndex.value()];
+                runtimeState->sessions[sessionIndex];
             const bool retainedByLinkedHq =
                 runtimeState->linkedHqPreview.request.has_value() &&
                 std::find(
@@ -25828,11 +26406,12 @@ ExportSourceReleaseSummary ReleaseExportOnlyPointCloudSources(
                         ->fiveMillimeterSessionIndices.begin(),
                     runtimeState->linkedHqPreview.request
                         ->fiveMillimeterSessionIndices.end(),
-                    sessionIndex.value()) !=
+                    sessionIndex) !=
                     runtimeState->linkedHqPreview.request
                         ->fiveMillimeterSessionIndices.end();
             if (session.committedDisplaySource ||
-                session.pendingDisplaySource || retainedByLinkedHq) {
+                session.pendingDisplaySource || retainedByLinkedHq ||
+                IsLiveWaterFillSession(*runtimeState, sessionIndex)) {
                 continue;
             }
             const bool hasExportOnlyGpuCopy =
@@ -25840,7 +26419,7 @@ ExportSourceReleaseSummary ReleaseExportOnlyPointCloudSources(
             const bool hasUnownedCpuCopy =
                 session.cpuResident && !session.analysisSource;
             if (hasExportOnlyGpuCopy || hasUnownedCpuCopy) {
-                releaseIndices.push_back(sessionIndex.value());
+                releaseIndices.push_back(sessionIndex);
             }
         }
     }
@@ -25921,6 +26500,11 @@ void StopBackgroundWorkForShutdown(PreviewRuntimeState* runtimeState) {
         runtimeState->linkedHqPreview.indexedFieldWorker = std::jthread{};
     }
     runtimeState->linkedHqPreview.indexedFieldShared.reset();
+    if (runtimeState->liveAnimationSectionMask.worker.joinable()) {
+        runtimeState->liveAnimationSectionMask.worker.request_stop();
+        runtimeState->liveAnimationSectionMask.worker = std::jthread{};
+    }
+    runtimeState->liveAnimationSectionMask.shared.reset();
     if (runtimeState->offlineRenderJob.active) {
         std::cout << "Requesting animation export shutdown..." << std::endl;
         runtimeState->offlineRenderJob.cancelRequested = true;
@@ -26003,8 +26587,11 @@ void ReleaseScenePointCloudResidency(
     const auto sceneFolderKey = NormalizePathKey(scene->sourceFolder);
     for (std::size_t index = 0; index < runtimeState->sessions.size(); ++index) {
         auto& session = runtimeState->sessions[index];
-        if (!IsSceneGroupedPointCloud(session) ||
-            NormalizePathKey(session.sourcePath.parent_path()) != sceneFolderKey) {
+        // A scene owns every layer stored directly in its source folder, not
+        // only the three primary roles. This includes WATER density siblings
+        // and any manually loaded reconstruction/helper cloud. Switching
+        // scenes must release their CPU payloads and GPU allocations too.
+        if (NormalizePathKey(session.sourcePath.parent_path()) != sceneFolderKey) {
             continue;
         }
         session.committedDisplaySource = false;
@@ -26017,7 +26604,6 @@ void ReleaseScenePointCloudResidency(
         runtimeState->persistence.queuedLoads,
         [&](const QueuedLayerLoad& load) {
             return load.sessionIndex < runtimeState->sessions.size() &&
-                   IsSceneGroupedPointCloud(runtimeState->sessions[load.sessionIndex]) &&
                    NormalizePathKey(
                        runtimeState->sessions[load.sessionIndex].sourcePath.parent_path()) == sceneFolderKey;
         });
@@ -26033,6 +26619,63 @@ void ReleaseScenePointCloudResidency(
     runtimeState->water.trailSurfaceIndex.reset();
     runtimeState->water.trailSurfaceIndexSupportSignature.clear();
     runtimeState->water.trailSurfaceIndexSupportPath.clear();
+}
+
+void ReleaseInactiveSceneResidency(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    std::string_view targetSceneGroupName) {
+    if (runtimeState == nullptr || viewport == nullptr) {
+        return;
+    }
+    for (auto& scene : runtimeState->pointCloudScenes) {
+        if (scene.sceneGroupName == targetSceneGroupName) {
+            continue;
+        }
+        const auto folderKey = NormalizePathKey(scene.sourceFolder);
+        const bool ownsResidency =
+            scene.displayLoaded ||
+            scene.pendingDisplaySpacingMicrometres.has_value() ||
+            scene.pendingMixedDisplay ||
+            std::any_of(
+                runtimeState->sessions.begin(),
+                runtimeState->sessions.end(),
+                [&](const PreviewLayerSession& session) {
+                    return NormalizePathKey(session.sourcePath.parent_path()) ==
+                               folderKey &&
+                           (session.cpuResident || session.gpuResident ||
+                            session.loaded);
+                }) ||
+            std::any_of(
+                runtimeState->persistence.queuedLoads.begin(),
+                runtimeState->persistence.queuedLoads.end(),
+                [&](const QueuedLayerLoad& load) {
+                    return load.sessionIndex < runtimeState->sessions.size() &&
+                           NormalizePathKey(runtimeState->sessions[load.sessionIndex]
+                                                .sourcePath.parent_path()) ==
+                               folderKey;
+                });
+        if (ownsResidency) {
+            ReleaseScenePointCloudResidency(runtimeState, viewport, &scene);
+        }
+        scene.displayVisible = false;
+    }
+    if (runtimeState->selectedSessionIndex.has_value() &&
+        runtimeState->selectedSessionIndex.value() < runtimeState->sessions.size()) {
+        const auto& selected = runtimeState->sessions[
+            runtimeState->selectedSessionIndex.value()];
+        const auto selectedScene = std::find_if(
+            runtimeState->pointCloudScenes.begin(),
+            runtimeState->pointCloudScenes.end(),
+            [&](const ScenePointCloudRuntime& scene) {
+                return scene.sceneGroupName != targetSceneGroupName &&
+                       NormalizePathKey(selected.sourcePath.parent_path()) ==
+                           NormalizePathKey(scene.sourceFolder);
+            });
+        if (selectedScene != runtimeState->pointCloudScenes.end()) {
+            runtimeState->selectedSessionIndex.reset();
+        }
+    }
 }
 
 // ---- Exclusive scene activation (the Project panel Scene selector) -------
@@ -26252,6 +26895,12 @@ void SetAuthoritativeWaterScene(
     SwitchActiveWaterSceneState(runtimeState, viewport, sceneGroupName);
     runtimeState->water.authoritativeWaterSurfaceSceneGroupName = sceneGroupName;
     runtimeState->water.activeWaterSurfaceSceneGroupName = sceneGroupName;
+    // Every path that can make a scene authoritative (the main selector,
+    // LiDAR visibility controls, or a density choice) enforces the same
+    // residency invariant. Previously only the main selector retired the
+    // outgoing scene, so another control could leave Pools and Fossils in
+    // memory together.
+    ReleaseInactiveSceneResidency(runtimeState, viewport, sceneGroupName);
     if (changingScene) {
         RestoreSceneWorkspaceMemento(runtimeState, sceneGroupName);
     }
@@ -26262,6 +26911,11 @@ void ActivateExclusiveScene(
     invisible_places::renderer::core::VulkanViewportShell* viewport,
     const std::string& targetSceneGroupName) {
     if (runtimeState == nullptr || viewport == nullptr) {
+        return;
+    }
+    if (runtimeState->offlineRenderJob.active) {
+        runtimeState->errorMessage =
+            "Scene switching is disabled while an export is active.";
         return;
     }
     ScenePointCloudRuntime* target = nullptr;
@@ -26279,30 +26933,6 @@ void ActivateExclusiveScene(
 
     SetAuthoritativeWaterScene(runtimeState, viewport, target->sceneGroupName);
     CancelWaterSurfaceCacheWarmup(&runtimeState->water);
-
-    for (auto& scene : runtimeState->pointCloudScenes) {
-        if (&scene == target) {
-            continue;
-        }
-        if (scene.displayLoaded ||
-            scene.pendingDisplaySpacingMicrometres.has_value() ||
-            scene.pendingMixedDisplay) {
-            ReleaseScenePointCloudResidency(runtimeState, viewport, &scene);
-        }
-        scene.displayVisible = false;
-        // the role-less water fill lives in the same folder but is not
-        // scene-grouped, so release it explicitly
-        for (std::size_t index = 0; index < runtimeState->sessions.size(); ++index) {
-            auto& session = runtimeState->sessions[index];
-            if (IsWaterFillPointCloudSession(session) &&
-                NormalizePathKey(session.sourcePath.parent_path()) ==
-                    NormalizePathKey(scene.sourceFolder) &&
-                (session.gpuResident || session.cpuResident)) {
-                UnloadLayerByIndex(runtimeState, viewport, index, true);
-                session.visible = true;  // keep the follow-the-scene default
-            }
-        }
-    }
 
     target->displayVisible = true;
     if (!target->displayLoaded) {
@@ -26334,7 +26964,7 @@ void ActivateExclusiveScene(
                 runtimeState->sessions[sessionIndex.value()].visible = true;
             }
         }
-        QueueWaterFillCompanionLoads(runtimeState);
+        QueueWaterFillCompanionLoads(runtimeState, viewport);
     }
     QueueWaterFlowTrailRefresh(
         runtimeState,
@@ -26350,7 +26980,8 @@ void ActivateExclusiveScene(
 bool ApplyScenePointCloudGroupDocuments(
     const ProjectDocument& document,
     PreviewRuntimeState* runtimeState,
-    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    std::string_view exclusiveActiveSceneGroupName) {
     if (runtimeState == nullptr || viewport == nullptr) {
         return false;
     }
@@ -26387,6 +27018,7 @@ bool ApplyScenePointCloudGroupDocuments(
             });
         if (groupIt == document.scenePointCloudGroups.end()) {
             ReleaseScenePointCloudResidency(runtimeState, viewport, &scene);
+            scene.displayVisible = false;
             // A scene the project has never recorded (a freshly added local
             // scan such as Scene1) starts at its coarsest complete bundle:
             // the first interactive load should cost the 5 mm set, not the
@@ -26460,7 +27092,9 @@ bool ApplyScenePointCloudGroupDocuments(
             }
         }
 
-        scene.displayVisible = groupIt->displayVisible;
+        const bool activeScene =
+            scene.sceneGroupName == exclusiveActiveSceneGroupName;
+        scene.displayVisible = activeScene && groupIt->displayVisible;
         if (!groupIt->displayName.empty()) {
             scene.displayName = groupIt->displayName;
         }
@@ -26475,7 +27109,10 @@ bool ApplyScenePointCloudGroupDocuments(
         scene.waterSurfaceCacheStatus = InitialWaterSurfaceCacheStatus(
             *runtimeState,
             scene);
-        const bool shouldLoadDisplay = groupIt->displayLoaded;
+        // Old projects could persist display_loaded=true on both Pools and
+        // Fossils. Project restoration is now exclusive: only the resolved
+        // active scene may replay that residency request.
+        const bool shouldLoadDisplay = activeScene && groupIt->displayLoaded;
 
         const SceneDisplayBundleRuntime* desiredBundle = nullptr;
         const auto savedSpacing = invisible_places::scene::QuantizePointSpacingMicrometres(
@@ -26597,6 +27234,79 @@ bool ApplyProjectDocumentToRuntime(
     invisible_places::app::workspace::ResolveProjectDocument(
         &document,
         WorkspaceRoots(*runtimeState));
+    // Archived WATER copies are recovery artifacts, not project layers. Drop
+    // stale records from older documents so unresolved-entry preservation
+    // cannot reintroduce them on the next save.
+    std::erase_if(
+        document.layers,
+        [](const ProjectLayerDocument& layer) {
+            return invisible_places::io::IsArchivedWaterFillPointCloudName(
+                layer.sourcePath.stem().string());
+        });
+
+    const auto availableScene = [&](std::string_view sceneGroupName) {
+        return !sceneGroupName.empty() &&
+               std::any_of(
+                   runtimeState->pointCloudScenes.begin(),
+                   runtimeState->pointCloudScenes.end(),
+                   [&](const ScenePointCloudRuntime& scene) {
+                       return scene.sceneGroupName == sceneGroupName;
+                   });
+    };
+    std::string exclusiveActiveSceneGroupName;
+    // The Water scene is the UI's authoritative scene identity. Fall back to
+    // the selected scene for older documents, then to one saved loaded scene.
+    // At most one local scene is ever restored resident.
+    for (const auto& candidate : {
+             document.activeWaterSceneGroupName,
+             document.activeSceneGroupName}) {
+        if (availableScene(candidate)) {
+            exclusiveActiveSceneGroupName = candidate;
+            break;
+        }
+    }
+    if (exclusiveActiveSceneGroupName.empty() &&
+        !document.selectedLayerPath.empty()) {
+        const auto selected = FindSessionIndexBySourcePath(
+            *runtimeState,
+            document.selectedLayerPath);
+        if (selected.has_value()) {
+            const auto selectedFolder = NormalizePathKey(
+                runtimeState->sessions[selected.value()].sourcePath.parent_path());
+            const auto selectedScene = std::find_if(
+                runtimeState->pointCloudScenes.begin(),
+                runtimeState->pointCloudScenes.end(),
+                [&](const ScenePointCloudRuntime& scene) {
+                    return NormalizePathKey(scene.sourceFolder) == selectedFolder;
+                });
+            if (selectedScene != runtimeState->pointCloudScenes.end()) {
+                exclusiveActiveSceneGroupName = selectedScene->sceneGroupName;
+            }
+        }
+    }
+    if (exclusiveActiveSceneGroupName.empty()) {
+        const auto savedActive = std::find_if(
+            document.scenePointCloudGroups.begin(),
+            document.scenePointCloudGroups.end(),
+            [&](const invisible_places::serialization::ScenePointCloudGroupDocument& group) {
+                return availableScene(group.sceneGroupName) &&
+                       group.displayLoaded && group.displayVisible;
+            });
+        if (savedActive != document.scenePointCloudGroups.end()) {
+            exclusiveActiveSceneGroupName = savedActive->sceneGroupName;
+        }
+    }
+    if (exclusiveActiveSceneGroupName.empty()) {
+        const auto savedLoaded = std::find_if(
+            document.scenePointCloudGroups.begin(),
+            document.scenePointCloudGroups.end(),
+            [&](const invisible_places::serialization::ScenePointCloudGroupDocument& group) {
+                return availableScene(group.sceneGroupName) && group.displayLoaded;
+            });
+        if (savedLoaded != document.scenePointCloudGroups.end()) {
+            exclusiveActiveSceneGroupName = savedLoaded->sceneGroupName;
+        }
+    }
 
     // Project application is a full context switch. Clear the previous
     // animation before water/profile state is synchronized, then restore the
@@ -26672,6 +27382,8 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->projectSettings.previewPerformanceMode = document.previewPerformanceMode;
     runtimeState->projectSettings.linkedHqPatchSpacingMicrometres =
         SanitizeLinkedHqPatchSpacing(document.linkedHqPatchSpacingMicrometres);
+    runtimeState->projectSettings.linkedHqIncludeSand =
+        document.linkedHqIncludeSand;
     runtimeState->projectSettings.loadAllScalarFields = document.loadAllScalarFields;
     runtimeState->projectSettings.scalarFieldBudgetGigabytes =
         std::max(0.0F, document.scalarFieldBudgetGigabytes);
@@ -26731,7 +27443,7 @@ bool ApplyProjectDocumentToRuntime(
     ApplyActiveExportPresetToRenderSettings(runtimeState);
     runtimeState->persistence.inactiveWaterSceneStates.clear();
     for (const auto& state : document.waterSceneStates) {
-        if (state.sceneGroupName != document.activeWaterSceneGroupName) {
+        if (state.sceneGroupName != exclusiveActiveSceneGroupName) {
             runtimeState->persistence.inactiveWaterSceneStates.push_back(state);
         }
     }
@@ -26845,9 +27557,9 @@ bool ApplyProjectDocumentToRuntime(
     runtimeState->water.movingDynamicMeshAttractorIndex.reset();
     runtimeState->water.dynamicMeshAttractorPlacementArmed = false;
     runtimeState->water.activeWaterSurfaceSceneGroupName =
-        document.activeWaterSceneGroupName;
+        exclusiveActiveSceneGroupName;
     runtimeState->water.authoritativeWaterSurfaceSceneGroupName =
-        document.activeWaterSceneGroupName;
+        exclusiveActiveSceneGroupName;
     runtimeState->water.dynamicMeshFlowGpuSessionIndex.reset();
     runtimeState->water.dynamicMeshFlowLastUpdateSeconds = 0.0F;
     runtimeState->water.dynamicMeshFlowResetRequested = true;
@@ -27259,8 +27971,9 @@ bool ApplyProjectDocumentToRuntime(
     requestedLoadedLayer |= ApplyScenePointCloudGroupDocuments(
         document,
         runtimeState,
-        viewport);
-    QueueWaterFillCompanionLoads(runtimeState);
+        viewport,
+        exclusiveActiveSceneGroupName);
+    QueueWaterFillCompanionLoads(runtimeState, viewport);
 
     const auto selectedLayerIndex =
         document.selectedLayerPath.empty()
@@ -27272,15 +27985,15 @@ bool ApplyProjectDocumentToRuntime(
     // Prefer the precise saved layer when it still belongs to the active
     // scene. The stable group identity repairs selection after a density or
     // source-file replacement makes that path obsolete.
-    if (!document.activeSceneGroupName.empty() &&
+    if (!exclusiveActiveSceneGroupName.empty() &&
         (!runtimeState->selectedSessionIndex.has_value() ||
          runtimeState->sessions[
              runtimeState->selectedSessionIndex.value()]
-                 .sceneGroupName != document.activeSceneGroupName)) {
+                 .sceneGroupName != exclusiveActiveSceneGroupName)) {
         if (const auto activeSceneIndex =
                 FindSessionIndexForSceneGroup(
                     *runtimeState,
-                    document.activeSceneGroupName);
+                    exclusiveActiveSceneGroupName);
             activeSceneIndex.has_value()) {
             runtimeState->selectedSessionIndex = activeSceneIndex;
         }
@@ -30409,9 +31122,12 @@ void ApplyAnimationEvaluation(
         return;
     }
 
-    auto evaluation = invisible_places::camera::EvaluateAnimationPath(
-        path,
-        AnimationDurationSeconds(path) *
+    const auto& prepared = CachedPreparedAnimationPath(
+        &runtimeState->animationPanel,
+        path);
+    auto evaluation = invisible_places::camera::EvaluatePreparedAnimationPath(
+        prepared,
+        prepared.durationSeconds *
             std::clamp(amount, 0.0F, 1.0F));
     ApplyAnimationEvaluationResult(
         runtimeState,
@@ -31599,11 +32315,14 @@ void StartAnimationPlayback(PreviewRuntimeState* runtimeState) {
     // it).
     const bool linkedPairActive =
         ResolveActiveAnimationLinkedPair(*runtimeState).has_value();
+    const auto& preparedPath = CachedPreparedAnimationPath(
+        &runtimeState->animationPanel,
+        path);
     const bool followCamera = linkedPairActive
         ? runtimeState->animationPanel.linkedViewCameraAttached
-        : invisible_places::camera::AnimationPlaybackShouldFollowCamera(
+        : invisible_places::camera::PreparedAnimationPlaybackShouldFollowCamera(
               runtimeState->camera.CaptureState(),
-              path,
+              preparedPath,
               currentPosition,
               true);
     const float startPosition =
@@ -31993,10 +32712,13 @@ void UpdateAnimationPlayback(PreviewRuntimeState* runtimeState) {
         // which the loaded-path test cannot recognise.
         if (playback.followCamera &&
             !ResolveActiveAnimationLinkedPair(*runtimeState).has_value()) {
+            const auto& preparedPath = CachedPreparedAnimationPath(
+                &runtimeState->animationPanel,
+                playback.path);
             playback.followCamera = invisible_places::camera::
-                AnimationPlaybackShouldFollowCamera(
+                PreparedAnimationPlaybackShouldFollowCamera(
                     runtimeState->camera.CaptureState(),
-                    playback.path,
+                    preparedPath,
                     runtimeState->animationPanel.scrubAmount,
                     playback.followCamera);
         }
@@ -32074,6 +32796,509 @@ void HandleAnimationPlaybackShortcut(PreviewRuntimeState* runtimeState) {
     }
     if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
         ToggleGlobalAnimationPlayback(runtimeState);
+    }
+}
+
+std::optional<LiveAnimationSectionMaskRequest>
+ResolveLiveAnimationSectionMaskRequest(
+    PreviewRuntimeState& runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport) {
+    if (runtimeState.offlineRenderJob.active ||
+        !runtimeState.animationPanel.currentPath.has_value() ||
+        runtimeState.animationPanel.currentPath->keys.size() < 2U ||
+        ResolveActiveAnimationLinkedPair(runtimeState).has_value() ||
+        (runtimeState.linkedHqPreview.ready &&
+         runtimeState.linkedHqPreview.enabled)) {
+        return std::nullopt;
+    }
+
+    const auto range = invisible_places::timing::SanitizeTimelineViewRange(
+        runtimeState.animationPanel.timelineViewRange);
+    if (invisible_places::timing::TimelineViewRangeIsFull(range)) {
+        return std::nullopt;
+    }
+
+    const auto& path =
+        runtimeState.animationPanel.currentPath.value();
+    LiveAnimationSectionMaskRequest request;
+    request.normalizedStart = range.start;
+    request.normalizedEnd = range.end;
+    request.aspectRatio = CurrentAspectRatio(viewport);
+    for (std::size_t sessionIndex = 0U;
+         sessionIndex < runtimeState.sessions.size();
+         ++sessionIndex) {
+        const auto& session = runtimeState.sessions[sessionIndex];
+        if (!IsCanonicalRenderablePointCloudSource(
+                runtimeState,
+                session) ||
+            session.offlinePointCloud == nullptr ||
+            session.offlinePointCloud->positions.empty() ||
+            IsGeneratedWaterOverlaySession(session) ||
+            session.waterFlowGpuPreview ||
+            session.dynamicMeshFlowGpuPreview) {
+            continue;
+        }
+        request.sources.push_back(
+            {.sessionIndex = sessionIndex,
+             .contentGeneration =
+                 session.pointCloudContentGeneration,
+             .cloud = session.offlinePointCloud,
+             .includeSurfelIndices =
+                 session.pointStyle.geometryMode !=
+                 PointCloudGeometryMode::ScreenSprites});
+    }
+    if (request.sources.empty()) {
+        return std::nullopt;
+    }
+
+    std::uint64_t fingerprint = AnimationPathMotionFingerprint(path);
+    HashFloat(&fingerprint, request.normalizedStart);
+    HashFloat(&fingerprint, request.normalizedEnd);
+    HashFloat(&fingerprint, request.aspectRatio);
+    for (const auto& source : request.sources) {
+        HashCombine(&fingerprint, source.sessionIndex);
+        HashCombine(&fingerprint, source.contentGeneration);
+        HashCombine(
+            &fingerprint,
+            source.cloud != nullptr
+                ? source.cloud->PointCount()
+                : 0U);
+        HashBool(&fingerprint, source.includeSurfelIndices);
+    }
+    request.fingerprint = fingerprint == 0U ? 1U : fingerprint;
+    return request;
+}
+
+void StopLiveAnimationSectionMaskWorker(
+    LiveAnimationSectionMaskRuntime* runtime) {
+    if (runtime == nullptr) {
+        return;
+    }
+    if (runtime->worker.joinable()) {
+        runtime->worker.request_stop();
+        runtime->worker = std::jthread{};
+    }
+    runtime->shared.reset();
+}
+
+void ClearLiveAnimationSectionMaskSessionState(
+    PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr) {
+        return;
+    }
+    for (auto& session : runtimeState->sessions) {
+        session.liveAnimationSectionMaskFingerprint = 0U;
+        session.liveAnimationSectionMaskDrawCount = 0U;
+    }
+    runtimeState->liveAnimationSectionMask.applied = false;
+    runtimeState->liveAnimationSectionMask.appliedFingerprint = 0U;
+}
+
+void ReleaseLiveAnimationSectionMaskBuffers(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr || viewport == nullptr ||
+        runtimeState->offlineRenderJob.active) {
+        return;
+    }
+    auto& mask = runtimeState->liveAnimationSectionMask;
+    if (runtimeState->linkedHqPreview.ready &&
+        runtimeState->linkedHqPreview.enabled) {
+        // HQ publishes its complementary base masks atomically on the same
+        // renderer slots. Once it owns those slots, discarding our tracking
+        // is enough; clearing them here would erase the freshly enabled HQ
+        // view.
+        mask.installedSessionIndices.clear();
+        mask.releaseInstalledBuffers = false;
+        return;
+    }
+    if (!mask.releaseInstalledBuffers ||
+        mask.installedSessionIndices.empty()) {
+        mask.releaseInstalledBuffers = false;
+        return;
+    }
+    try {
+        PointCloudMutationBatchScope mutationBatch{viewport};
+        for (const auto sessionIndex : mask.installedSessionIndices) {
+            if (sessionIndex < runtimeState->sessions.size() &&
+                viewport->HasPointCloudResources(sessionIndex)) {
+                viewport->UpdateInteractivePointSampleBuffer(
+                    sessionIndex,
+                    {},
+                    false);
+            }
+        }
+        mutationBatch.Finish();
+    } catch (const std::exception& error) {
+        mask.failureMessage =
+            "Could not release the prior animation-section mask: " +
+            std::string{error.what()};
+    }
+    mask.installedSessionIndices.clear();
+    mask.releaseInstalledBuffers = false;
+    runtimeState->previewRenderStateSignatureValid = false;
+}
+
+void StartLiveAnimationSectionMaskPreparation(
+    LiveAnimationSectionMaskRuntime* runtime) {
+    if (runtime == nullptr || !runtime->request.has_value() ||
+        runtime->worker.joinable()) {
+        return;
+    }
+    const auto request = runtime->request.value();
+    auto shared = std::make_shared<
+        LiveAnimationSectionMaskJobShared>();
+    runtime->shared = shared;
+    runtime->progress = 0.0F;
+    runtime->failureMessage.clear();
+    runtime->worker = std::jthread{
+        [shared, request](std::stop_token stopToken) mutable {
+#ifdef __APPLE__
+            (void)pthread_set_qos_class_self_np(
+                QOS_CLASS_UTILITY,
+                0);
+#endif
+            LiveAnimationSectionMaskJobResult result;
+            result.fingerprint = request.fingerprint;
+            const auto startedAt = std::chrono::steady_clock::now();
+            const auto finish = [&]() {
+                result.preparationMilliseconds =
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - startedAt)
+                        .count();
+                std::scoped_lock lock(shared->mutex);
+                shared->result = std::move(result);
+                shared->finished.store(
+                    true,
+                    std::memory_order_release);
+            };
+            try {
+                const auto prepared = invisible_places::camera::
+                    PrepareAnimationPathEvaluation(request.path);
+                const auto sampleTimes =
+                    invisible_places::app::
+                        BuildAnimationSectionFrustumSampleTimes(
+                            prepared.durationSeconds,
+                            request.normalizedStart,
+                            request.normalizedEnd);
+                std::vector<glm::mat4> viewProjections;
+                viewProjections.reserve(sampleTimes.size());
+                invisible_places::camera::OrbitCamera camera;
+                for (const float sampleTime : sampleTimes) {
+                    if (stopToken.stop_requested()) {
+                        result.cancelled = true;
+                        finish();
+                        return;
+                    }
+                    const auto evaluation = invisible_places::camera::
+                        EvaluatePreparedAnimationPath(
+                            prepared,
+                            sampleTime);
+                    camera.ApplyState(evaluation.camera);
+                    viewProjections.push_back(
+                        camera.Matrices(request.aspectRatio)
+                            .viewProjection);
+                }
+                if (viewProjections.empty()) {
+                    result.errorMessage =
+                        "The focused animation section produced no camera samples.";
+                    finish();
+                    return;
+                }
+
+                result.layers.reserve(request.sources.size());
+                for (std::size_t sourceIndex = 0U;
+                     sourceIndex < request.sources.size();
+                     ++sourceIndex) {
+                    if (stopToken.stop_requested()) {
+                        result.cancelled = true;
+                        finish();
+                        return;
+                    }
+                    const auto& source = request.sources[sourceIndex];
+                    LiveAnimationSectionMaskLayerResult layer;
+                    layer.source = source;
+                    const std::uint64_t fullCount =
+                        source.cloud != nullptr
+                            ? source.cloud->PointCount()
+                            : 0U;
+                    result.fullPointCount += fullCount;
+                    if (source.cloud != nullptr && fullCount > 0U) {
+                        layer.indices = invisible_places::renderer::
+                            pointcloud::GenerateFrustumUnionPointIndices(
+                                source.cloud->positions,
+                                source.cloud->bounds,
+                                viewProjections,
+                                kLiveAnimationSectionMaskGridDimension,
+                                stopToken);
+                    }
+                    if (stopToken.stop_requested()) {
+                        result.cancelled = true;
+                        finish();
+                        return;
+                    }
+                    const double retainedFraction = fullCount > 0U
+                        ? static_cast<double>(layer.indices.size()) /
+                              static_cast<double>(fullCount)
+                        : 1.0;
+                    layer.useful =
+                        !layer.indices.empty() &&
+                        retainedFraction <
+                            kLiveAnimationSectionMaskUsefulFraction;
+                    layer.effectiveDrawCount = layer.useful
+                        ? layer.indices.size()
+                        : fullCount;
+                    if (!layer.useful) {
+                        layer.indices.clear();
+                        layer.indices.shrink_to_fit();
+                    }
+                    result.effectiveDrawPointCount +=
+                        layer.effectiveDrawCount;
+                    result.layers.push_back(std::move(layer));
+                    shared->progress.store(
+                        static_cast<float>(sourceIndex + 1U) /
+                            static_cast<float>(request.sources.size()),
+                        std::memory_order_release);
+                }
+            } catch (const std::exception& error) {
+                result.errorMessage =
+                    "Animation-section mask preparation failed: " +
+                    std::string{error.what()};
+            }
+            finish();
+        }};
+}
+
+void PollLiveAnimationSectionMaskPreparation(
+    LiveAnimationSectionMaskRuntime* runtime) {
+    if (runtime == nullptr || runtime->shared == nullptr) {
+        return;
+    }
+    const auto shared = runtime->shared;
+    runtime->progress = shared->progress.load(
+        std::memory_order_acquire);
+    if (!shared->finished.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::optional<LiveAnimationSectionMaskJobResult> completed;
+    {
+        std::scoped_lock lock(shared->mutex);
+        if (shared->result.has_value()) {
+            completed = std::move(shared->result);
+            shared->result.reset();
+        }
+    }
+    runtime->worker = std::jthread{};
+    runtime->shared.reset();
+    if (!completed.has_value() ||
+        !runtime->request.has_value() ||
+        completed->fingerprint !=
+            runtime->request->fingerprint ||
+        completed->cancelled) {
+        return;
+    }
+    if (!completed->errorMessage.empty()) {
+        runtime->failureMessage = completed->errorMessage;
+        return;
+    }
+    runtime->fullPointCount = completed->fullPointCount;
+    runtime->effectiveDrawPointCount =
+        completed->effectiveDrawPointCount;
+    runtime->preparationMilliseconds =
+        completed->preparationMilliseconds;
+    runtime->prepared = std::move(completed);
+    runtime->uploaded = false;
+    runtime->progress = 1.0F;
+}
+
+bool PublishLiveAnimationSectionMask(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr || viewport == nullptr) {
+        return false;
+    }
+    auto& runtime = runtimeState->liveAnimationSectionMask;
+    if (!runtime.prepared.has_value() ||
+        !runtime.request.has_value() ||
+        runtime.prepared->fingerprint !=
+            runtime.request->fingerprint) {
+        return false;
+    }
+    for (const auto& layer : runtime.prepared->layers) {
+        if (layer.source.sessionIndex >=
+                runtimeState->sessions.size() ||
+            runtimeState->sessions[layer.source.sessionIndex]
+                    .pointCloudContentGeneration !=
+                layer.source.contentGeneration ||
+            runtimeState->sessions[layer.source.sessionIndex]
+                    .offlinePointCloud != layer.source.cloud ||
+            !viewport->HasPointCloudResources(
+                layer.source.sessionIndex)) {
+            runtime.failureMessage =
+                "The point-cloud source changed before its animation-section mask could be published.";
+            return false;
+        }
+    }
+
+    try {
+        PointCloudMutationBatchScope mutationBatch{viewport};
+        for (const auto sessionIndex :
+             runtime.installedSessionIndices) {
+            if (sessionIndex < runtimeState->sessions.size() &&
+                viewport->HasPointCloudResources(sessionIndex)) {
+                viewport->UpdateInteractivePointSampleBuffer(
+                    sessionIndex,
+                    {},
+                    false);
+            }
+        }
+        runtime.installedSessionIndices.clear();
+        for (const auto& layer : runtime.prepared->layers) {
+            auto& session = runtimeState->sessions[
+                layer.source.sessionIndex];
+            session.liveAnimationSectionMaskFingerprint =
+                runtime.prepared->fingerprint;
+            session.liveAnimationSectionMaskDrawCount =
+                layer.useful
+                    ? static_cast<std::uint32_t>(
+                          layer.effectiveDrawCount)
+                    : 0U;
+            if (!layer.useful) {
+                continue;
+            }
+            viewport->UpdateInteractivePointSampleBuffer(
+                layer.source.sessionIndex,
+                layer.indices,
+                layer.source.includeSurfelIndices,
+                true);
+            runtime.installedSessionIndices.push_back(
+                layer.source.sessionIndex);
+        }
+        mutationBatch.Finish();
+    } catch (const std::exception& error) {
+        runtime.failureMessage =
+            "Animation-section mask upload failed: " +
+            std::string{error.what()};
+        ClearLiveAnimationSectionMaskSessionState(runtimeState);
+        runtime.releaseInstalledBuffers = true;
+        return false;
+    }
+    runtime.appliedFingerprint = runtime.prepared->fingerprint;
+    runtime.uploaded = true;
+    runtime.releaseInstalledBuffers = false;
+    runtimeState->previewRenderStateSignatureValid = false;
+    return true;
+}
+
+bool LiveAnimationSectionMaskCameraIsSafe(
+    PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr ||
+        !runtimeState->animationPanel.currentPath.has_value()) {
+        return false;
+    }
+    const auto& runtime = runtimeState->liveAnimationSectionMask;
+    if (!runtime.request.has_value()) {
+        return false;
+    }
+    const float playhead = std::clamp(
+        runtimeState->animationPanel.scrubAmount,
+        0.0F,
+        1.0F);
+    constexpr float kRangeTolerance = 1.0e-5F;
+    if (playhead < runtime.request->normalizedStart -
+                       kRangeTolerance ||
+        playhead > runtime.request->normalizedEnd +
+                       kRangeTolerance) {
+        return false;
+    }
+    if (runtimeState->animationPlayback.active) {
+        return runtimeState->animationPlayback.followCamera;
+    }
+    const auto& prepared = CachedPreparedAnimationPath(
+        &runtimeState->animationPanel,
+        runtimeState->animationPanel.currentPath.value());
+    return invisible_places::camera::PreparedAnimationCameraMatchesFrame(
+        runtimeState->camera.CaptureState(),
+        prepared,
+        playhead);
+}
+
+void EnsureLiveAnimationSectionMask(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr || viewport == nullptr) {
+        return;
+    }
+    auto& runtime = runtimeState->liveAnimationSectionMask;
+    const auto desired = ResolveLiveAnimationSectionMaskRequest(
+        *runtimeState,
+        *viewport);
+    const std::uint64_t desiredFingerprint =
+        desired.has_value() ? desired->fingerprint : 0U;
+    const auto now = std::chrono::steady_clock::now();
+    if (desiredFingerprint != runtime.desiredFingerprint) {
+        StopLiveAnimationSectionMaskWorker(&runtime);
+        ClearLiveAnimationSectionMaskSessionState(runtimeState);
+        runtime.releaseInstalledBuffers =
+            !runtime.installedSessionIndices.empty();
+        runtime.prepared.reset();
+        runtime.uploaded = false;
+        runtime.fullPointCount = 0U;
+        runtime.effectiveDrawPointCount = 0U;
+        runtime.progress = 0.0F;
+        runtime.failureMessage.clear();
+        runtime.desiredFingerprint = desiredFingerprint;
+        runtime.desiredSince = now;
+        runtime.request = desired;
+        runtimeState->previewRenderStateSignatureValid = false;
+    }
+
+    ReleaseLiveAnimationSectionMaskBuffers(
+        runtimeState,
+        viewport);
+    if (!runtime.request.has_value()) {
+        runtime.applied = false;
+        return;
+    }
+
+    PollLiveAnimationSectionMaskPreparation(&runtime);
+    if (!runtime.worker.joinable() &&
+        runtime.shared == nullptr &&
+        !runtime.prepared.has_value() &&
+        runtime.failureMessage.empty() &&
+        now - runtime.desiredSince >=
+            kLiveAnimationSectionMaskDebounce) {
+        runtime.request->path =
+            runtimeState->animationPanel.currentPath.value();
+        StartLiveAnimationSectionMaskPreparation(&runtime);
+    }
+
+    // Installing a multi-million-index buffer requires one GPU mutation
+    // barrier. Publish only while transport/navigation is idle so a mask
+    // becoming ready cannot introduce a hitch in the middle of playback.
+    if (runtime.prepared.has_value() &&
+        !runtime.uploaded &&
+        !runtimeState->animationPlayback.active &&
+        !runtimeState->cameraInteraction.navigationActive &&
+        !runtimeState->offlineRenderJob.active &&
+        !(runtimeState->linkedHqPreview.ready &&
+          runtimeState->linkedHqPreview.enabled)) {
+        (void)PublishLiveAnimationSectionMask(
+            runtimeState,
+            viewport);
+    }
+
+    const bool shouldApply =
+        runtime.uploaded &&
+        runtime.appliedFingerprint ==
+            runtime.desiredFingerprint &&
+        !runtimeState->offlineRenderJob.active &&
+        !(runtimeState->linkedHqPreview.ready &&
+          runtimeState->linkedHqPreview.enabled) &&
+        LiveAnimationSectionMaskCameraIsSafe(runtimeState);
+    if (runtime.applied != shouldApply) {
+        runtime.applied = shouldApply;
+        runtimeState->previewRenderStateSignatureValid = false;
     }
 }
 
@@ -36739,16 +37964,13 @@ CaptureRenderSetupSourceFingerprints(
         return fingerprints;
     }
     for (const auto sessionIndex :
-         SceneFullDensityExportSessionIndices(*scene)) {
-        if (!sessionIndex.has_value() ||
-            sessionIndex.value() >= runtimeState.sessions.size()) {
-            continue;
-        }
-        const auto& session =
-            runtimeState.sessions[sessionIndex.value()];
+         SceneFullDensityExportSourceIndices(runtimeState, *scene)) {
+        const auto& session = runtimeState.sessions[sessionIndex];
         invisible_places::serialization::RenderSetupSourceFingerprint
             fingerprint;
-        fingerprint.sceneRole = session.sceneRole;
+        fingerprint.sceneRole = IsWaterFillPointCloudSession(session)
+                                    ? std::string{"WATER"}
+                                    : session.sceneRole;
         fingerprint.sourcePath = session.sourcePath;
         std::error_code metadataError;
         fingerprint.fileSize = std::filesystem::file_size(
@@ -37572,17 +38794,31 @@ bool InstallBackgroundWorkerRenderSetup(
         }
         return false;
     }
+    const auto setupScene = std::find_if(
+        runtimeState->pointCloudScenes.begin(),
+        runtimeState->pointCloudScenes.end(),
+        [&](const ScenePointCloudRuntime& candidate) {
+            return candidate.sceneGroupName == setup.sceneGroupName;
+        });
     for (const auto& fingerprint : setup.sourceFingerprints) {
+        const bool waterFingerprint =
+            NormalizeSceneRoleName(fingerprint.sceneRole) == "WATER";
         const auto session = std::find_if(
             runtimeState->sessions.begin(),
             runtimeState->sessions.end(),
             [&](const PreviewLayerSession& candidate) {
-                return candidate.sceneGroupName == setup.sceneGroupName &&
-                       NormalizeSceneRoleName(candidate.sceneRole) ==
-                           NormalizeSceneRoleName(fingerprint.sceneRole) &&
-                       PathsReferToSameLocation(
-                           candidate.sourcePath,
-                           fingerprint.sourcePath);
+                const bool sceneMatches = waterFingerprint
+                    ? setupScene != runtimeState->pointCloudScenes.end() &&
+                          IsWaterFillPointCloudSession(candidate) &&
+                          PathsReferToSameLocation(
+                              candidate.sourcePath.parent_path(),
+                              setupScene->sourceFolder)
+                    : candidate.sceneGroupName == setup.sceneGroupName &&
+                          NormalizeSceneRoleName(candidate.sceneRole) ==
+                              NormalizeSceneRoleName(fingerprint.sceneRole);
+                return sceneMatches && PathsReferToSameLocation(
+                                           candidate.sourcePath,
+                                           fingerprint.sourcePath);
             });
         if (session == runtimeState->sessions.end()) {
             if (errorMessage != nullptr) {
@@ -56395,9 +57631,9 @@ void PublishLinkedHqStageProgress(
 
 // waitingForScene distinguishes the common scene still loading (Waiting in
 // the UI, resolved again next frame) from an animation selection that can
-// never prepare. A reciprocal pair contributes its two midpoint views; an
-// ordinary animation contributes one midpoint view twice so the same compact
-// ROCK/VEG patch pipeline remains available without inventing a link.
+// never prepare. A reciprocal pair retains its compact two-midpoint policy;
+// an ordinary animation contributes uniformly spaced views plus every
+// authored key across its complete finite path.
 std::optional<LinkedHqSelectionRequest> ResolveLinkedHqSelectionRequest(
     const PreviewRuntimeState& runtimeState,
     const invisible_places::renderer::core::VulkanViewportShell& viewport,
@@ -56406,11 +57642,14 @@ std::optional<LinkedHqSelectionRequest> ResolveLinkedHqSelectionRequest(
     if (waitingForScene != nullptr) {
         *waitingForScene = false;
     }
+    const bool adaptiveRequested =
+        runtimeState.linkedHqPreview.requestedMode ==
+        LinkedHqPreviewMode::Adaptive;
     const auto pair = ResolveActiveAnimationLinkedPair(runtimeState);
     const auto& panel = runtimeState.animationPanel;
     const AnimationPath* localAnimation =
         panel.currentPath.has_value() ? &panel.currentPath.value() : nullptr;
-    if (!pair.has_value() && localAnimation == nullptr) {
+    if (!adaptiveRequested && !pair.has_value() && localAnimation == nullptr) {
         if (errorMessage != nullptr) {
             errorMessage->clear();
         }
@@ -56423,10 +57662,12 @@ std::optional<LinkedHqSelectionRequest> ResolveLinkedHqSelectionRequest(
     const AnimationPath* secondAnimation = pair.has_value()
         ? pair->members[1U]
         : nullptr;
-    if (firstAnimation == nullptr) {
+    if (!adaptiveRequested && firstAnimation == nullptr) {
         return std::nullopt;
     }
-    auto firstAssociations = firstAnimation->associatedLayerPaths;
+    auto firstAssociations = firstAnimation != nullptr
+        ? firstAnimation->associatedLayerPaths
+        : std::vector<std::filesystem::path>{};
     auto secondAssociations = secondAnimation != nullptr
         ? secondAnimation->associatedLayerPaths
         : firstAssociations;
@@ -56440,44 +57681,118 @@ std::optional<LinkedHqSelectionRequest> ResolveLinkedHqSelectionRequest(
     const ScenePointCloudRuntime* selectedScene = nullptr;
     const SceneDisplayBundleRuntime* fiveMillimeterBundle = nullptr;
     const SceneDisplayBundleRuntime* oneMillimeterBundle = nullptr;
-    for (const auto& association : firstAssociations) {
-        if (secondAnimation != nullptr &&
-            !AssociatedLayerPathsContain(secondAssociations, association)) {
-            continue;
-        }
-        const auto sceneGroup =
-            SceneGroupNameFromAssociationPath(association);
-        if (!sceneGroup.has_value()) {
-            continue;
-        }
-        const auto sceneIt = std::find_if(
-            runtimeState.pointCloudScenes.begin(),
-            runtimeState.pointCloudScenes.end(),
-            [&](const ScenePointCloudRuntime& scene) {
-                return scene.sceneGroupName == sceneGroup.value();
-            });
-        if (sceneIt == runtimeState.pointCloudScenes.end()) {
-            continue;
+    bool associatedSceneWaiting = false;
+    const auto acceptScene = [&](const ScenePointCloudRuntime* scene) {
+        if (scene == nullptr || !scene->displayLoaded ||
+            !scene->displayVisible) {
+            return false;
         }
         const auto* candidateFive = FindSceneDisplayBundle(
-            *sceneIt,
+            *scene,
             invisible_places::scene::PointSpacingMicrometres{5'000U});
         const auto* candidateOne = FindSceneDisplayBundle(
-            *sceneIt,
+            *scene,
             invisible_places::scene::PointSpacingMicrometres{1'000U});
         if (candidateFive == nullptr || candidateOne == nullptr) {
-            continue;
+            return false;
         }
-        selectedScene = &*sceneIt;
+        selectedScene = scene;
         fiveMillimeterBundle = candidateFive;
         oneMillimeterBundle = candidateOne;
-        break;
+        return true;
+    };
+    const auto findAssociatedScene = [&]() {
+        for (const auto& association : firstAssociations) {
+            if (!adaptiveRequested && secondAnimation != nullptr &&
+                !AssociatedLayerPathsContain(
+                    secondAssociations,
+                    association)) {
+                continue;
+            }
+            const auto sceneGroup =
+                SceneGroupNameFromAssociationPath(association);
+            if (!sceneGroup.has_value()) {
+                continue;
+            }
+            const auto sceneIt = std::find_if(
+                runtimeState.pointCloudScenes.begin(),
+                runtimeState.pointCloudScenes.end(),
+                [&](const ScenePointCloudRuntime& scene) {
+                    return scene.sceneGroupName == sceneGroup.value();
+                });
+            if (sceneIt != runtimeState.pointCloudScenes.end() &&
+                acceptScene(&*sceneIt)) {
+                return true;
+            }
+            if (sceneIt != runtimeState.pointCloudScenes.end() &&
+                FindSceneDisplayBundle(
+                    *sceneIt,
+                    invisible_places::scene::
+                        PointSpacingMicrometres{5'000U}) != nullptr &&
+                FindSceneDisplayBundle(
+                    *sceneIt,
+                    invisible_places::scene::
+                        PointSpacingMicrometres{1'000U}) != nullptr &&
+                (!sceneIt->displayLoaded ||
+                 !sceneIt->displayVisible)) {
+                associatedSceneWaiting = true;
+            }
+        }
+        return false;
+    };
+    if (adaptiveRequested &&
+        runtimeState.selectedSessionIndex.has_value() &&
+        runtimeState.selectedSessionIndex.value() <
+            runtimeState.sessions.size()) {
+        (void)acceptScene(FindScenePointCloudRuntime(
+            runtimeState,
+            runtimeState.sessions[
+                runtimeState.selectedSessionIndex.value()]));
+    }
+    if (selectedScene == nullptr) {
+        (void)findAssociatedScene();
+    }
+    if (selectedScene == nullptr && associatedSceneWaiting) {
+        if (waitingForScene != nullptr) {
+            *waitingForScene = true;
+        }
+        if (errorMessage != nullptr) {
+            *errorMessage = adaptiveRequested
+                ? "aHQ is waiting for the associated scene's complete 5 mm display bundle."
+                : "HQ is waiting for the associated scene's complete 5 mm display bundle.";
+        }
+        return std::nullopt;
+    }
+    if (adaptiveRequested && selectedScene == nullptr) {
+        // With no animation (and no selected owning layer), infer only a
+        // unique visible scene. Silently choosing the first of several would
+        // make aHQ refine the wrong world.
+        const ScenePointCloudRuntime* unique = nullptr;
+        for (const auto& scene : runtimeState.pointCloudScenes) {
+            const auto* candidateFive = FindSceneDisplayBundle(
+                scene,
+                invisible_places::scene::PointSpacingMicrometres{5'000U});
+            const auto* candidateOne = FindSceneDisplayBundle(
+                scene,
+                invisible_places::scene::PointSpacingMicrometres{1'000U});
+            if (!scene.displayLoaded || !scene.displayVisible ||
+                candidateFive == nullptr || candidateOne == nullptr) {
+                continue;
+            }
+            if (unique != nullptr) {
+                unique = nullptr;
+                break;
+            }
+            unique = &scene;
+        }
+        (void)acceptScene(unique);
     }
     if (selectedScene == nullptr || fiveMillimeterBundle == nullptr ||
         oneMillimeterBundle == nullptr) {
         if (errorMessage != nullptr) {
-            *errorMessage =
-                secondAnimation != nullptr
+            *errorMessage = adaptiveRequested
+                ? "aHQ needs one selected (or uniquely visible) grouped scene with complete 1 mm and 5 mm ROCK/SAND/VEG bundles. It does not require an animation."
+                : secondAnimation != nullptr
                     ? "HQ requires the linked animations to share one grouped "
                       "scene with complete 1 mm and 5 mm ROCK/SAND/VEG bundles."
                     : "HQ requires the animation to use a grouped scene with "
@@ -56499,61 +57814,160 @@ std::optional<LinkedHqSelectionRequest> ResolveLinkedHqSelectionRequest(
     }
 
     LinkedHqSelectionRequest request;
-    request.pairSessionId = pair.has_value()
-        ? pair->sessionPairId
-        : "local:" + NormalizePathKey(
-              std::filesystem::path{panel.currentFilePath});
+    request.mode = adaptiveRequested
+        ? LinkedHqPreviewMode::Adaptive
+        : LinkedHqPreviewMode::Fixed;
+    request.adaptiveCacheRoot = runtimeState.localSavedRoot /
+        ".invisible_places" / "cache" / "adaptive_hq";
+    request.pairSessionId = adaptiveRequested
+        ? "adaptive:" + selectedScene->sceneGroupName
+        : pair.has_value()
+              ? pair->sessionPairId
+              : "local:" + NormalizePathKey(
+                    std::filesystem::path{panel.currentFilePath});
     request.sceneGroupName = selectedScene->sceneGroupName;
     request.patchSpacingMicrometres = SanitizeLinkedHqPatchSpacing(
         runtimeState.projectSettings.linkedHqPatchSpacingMicrometres);
+    request.includeSand =
+        runtimeState.projectSettings.linkedHqIncludeSand;
     request.fiveMillimeterSessionIndices =
         fiveMillimeterBundle->sessionIndices;
     request.oneMillimeterSessionIndices =
         oneMillimeterBundle->sessionIndices;
 
     const float fallbackAspect = CurrentAspectRatio(viewport);
-    std::array<glm::mat4, 2U> midpointViewProjections{};
-    const std::size_t midpointCount = pair.has_value() ? 2U : 1U;
-    for (std::size_t member = 0U; member < midpointCount; ++member) {
-        const auto* animation = pair.has_value()
-            ? pair->members[member]
-            : firstAnimation;
-        if (animation == nullptr) {
-            return std::nullopt;
-        }
+    std::vector<glm::mat4> patchViewProjections;
+    const auto authoredAspectFor = [&](const AnimationPath& animation) {
         const auto defaultSize =
-            AnimationDefaultLiveViewWindowSize(*animation);
-        const float authoredAspect = defaultSize.has_value()
+            AnimationDefaultLiveViewWindowSize(animation);
+        return defaultSize.has_value()
             ? static_cast<float>(defaultSize->width) /
                   static_cast<float>(std::max(1, defaultSize->height))
             : fallbackAspect;
-        const auto evaluation = invisible_places::camera::EvaluateAnimationPath(
-            *animation,
-            invisible_places::camera::AnimationPathDurationSeconds(
-                *animation) *
-                0.5F);
-        invisible_places::camera::OrbitCamera midpointCamera;
-        midpointCamera.ApplyState(evaluation.camera);
-        midpointViewProjections[member] =
-            midpointCamera.Matrices(authoredAspect).viewProjection;
+    };
+    const auto appendViewProjection = [&](
+        const invisible_places::camera::AnimationPathEvaluation& evaluation,
+        float authoredAspect) {
+        invisible_places::camera::OrbitCamera camera;
+        camera.ApplyState(evaluation.camera);
+        patchViewProjections.push_back(
+            camera.Matrices(authoredAspect).viewProjection);
+    };
+    if (adaptiveRequested) {
+        const auto currentMatrices =
+            runtimeState.camera.Matrices(fallbackAspect);
+        patchViewProjections.push_back(currentMatrices.viewProjection);
+        // The earlier implementation appended sampled cameras from the
+        // complete loaded animation. On Surface_05 that selected 18.9M
+        // block-level points (2.98 GB) before aHQ could publish, even when
+        // the user was only working in one section. The persistent cache and
+        // guarded current camera are now the authority; animation playback
+        // naturally advances that same guard without inflating it to the
+        // complete 120-second path.
+        request.animationPrefetchFingerprint = 0U;
+        request.adaptiveTransition = invisible_places::renderer::pointcloud::
+            ResolvePointCloudAdaptiveDensityTransition(
+                std::abs(currentMatrices.projection[1][1]),
+                static_cast<float>(
+                    std::max<std::uint32_t>(1U, viewport.Height())));
+        if (!request.adaptiveTransition.Valid()) {
+            if (errorMessage != nullptr) {
+                *errorMessage =
+                    "aHQ could not derive a safe camera-density transition.";
+            }
+            return std::nullopt;
+        }
+        const auto& prior = runtimeState.linkedHqPreview.request;
+        const bool priorGuardReusable =
+            prior.has_value() &&
+            prior->mode == LinkedHqPreviewMode::Adaptive &&
+            prior->sceneGroupName == request.sceneGroupName &&
+            prior->patchSpacingMicrometres ==
+                request.patchSpacingMicrometres &&
+            prior->includeSand == request.includeSand &&
+            prior->animationPrefetchFingerprint ==
+                request.animationPrefetchFingerprint &&
+            prior->patchFrustums.maximumViewDepthMeters >=
+                request.adaptiveTransition.preparedFineDepthMeters &&
+            LinkedHqFrustumUnionCoversView(
+                prior->patchFrustums,
+                currentMatrices.view,
+                currentMatrices.projection,
+                request.adaptiveTransition.endDepthMeters,
+                kAdaptiveHqRefreshBorderFraction);
+        if (priorGuardReusable) {
+            request.patchFrustums = prior->patchFrustums;
+        } else {
+            request.patchFrustums = BuildAnimationHqFrustumUnion(
+                patchViewProjections,
+                kAdaptiveHqViewportGuardFraction);
+            request.patchFrustums.maximumViewDepthMeters =
+                request.adaptiveTransition.preparedFineDepthMeters;
+        }
+        request.usesFullAnimationPath = false;
+    } else if (pair.has_value()) {
+        patchViewProjections.reserve(2U);
+        for (const auto* animation : pair->members) {
+            if (animation == nullptr) {
+                return std::nullopt;
+            }
+            appendViewProjection(
+                invisible_places::camera::EvaluateAnimationPath(
+                    *animation,
+                    invisible_places::camera::AnimationPathDurationSeconds(
+                        *animation) *
+                        0.5F),
+                authoredAspectFor(*animation));
+        }
+        request.patchFrustums = BuildAnimationHqFrustumUnion(
+            patchViewProjections);
+        request.usesFullAnimationPath = false;
+    } else {
+        const auto prepared = invisible_places::camera::
+            PrepareAnimationPathEvaluation(*firstAnimation);
+        const auto sampleTimes = BuildUnlinkedAnimationHqSampleTimes(
+            prepared.knots,
+            prepared.durationSeconds);
+        patchViewProjections.reserve(sampleTimes.size());
+        const float authoredAspect = authoredAspectFor(*firstAnimation);
+        for (const float sampleTime : sampleTimes) {
+            appendViewProjection(
+                invisible_places::camera::EvaluatePreparedAnimationPath(
+                    prepared,
+                    sampleTime),
+                authoredAspect);
+        }
+        request.patchFrustums = BuildAnimationHqFrustumUnion(
+            patchViewProjections);
+        request.usesFullAnimationPath = true;
     }
-    request.midpointFrustums = BuildAnimationHqFrustumUnion(
-        std::span<const glm::mat4>{
-            midpointViewProjections.data(),
-            midpointCount});
 
     const auto rockRole = invisible_places::scene::ScenePointCloudRoleIndex(
         invisible_places::scene::ScenePointCloudRole::Rock);
     const auto vegetationRole =
         invisible_places::scene::ScenePointCloudRoleIndex(
             invisible_places::scene::ScenePointCloudRole::Vegetation);
-    const std::array<std::size_t, 2U> patchRoles{
+    const auto sandRole = invisible_places::scene::ScenePointCloudRoleIndex(
+        invisible_places::scene::ScenePointCloudRole::Sand);
+    request.patchRoles = {
         rockRole,
         vegetationRole,
     };
-    for (std::size_t patch = 0U; patch < patchRoles.size(); ++patch) {
+    request.patchLayerIds = {
+        kLinkedHqRockPatchLayerId,
+        kLinkedHqVegetationPatchLayerId,
+    };
+    if (request.includeSand) {
+        request.patchRoles.push_back(sandRole);
+        request.patchLayerIds.push_back(kLinkedHqSandPatchLayerId);
+    }
+    request.patchFieldFilters.resize(request.patchRoles.size());
+    for (std::size_t patch = 0U;
+         patch < request.patchRoles.size();
+         ++patch) {
         const auto baseIndex =
-            request.fiveMillimeterSessionIndices[patchRoles[patch]];
+            request.fiveMillimeterSessionIndices[
+                request.patchRoles[patch]];
         if (baseIndex >= runtimeState.sessions.size()) {
             if (errorMessage != nullptr) {
                 *errorMessage = "HQ 5 mm role source is no longer registered.";
@@ -56565,16 +57979,23 @@ std::optional<LinkedHqSelectionRequest> ResolveLinkedHqSelectionRequest(
             runtimeState.sessions[baseIndex]);
     }
 
-    // Fingerprint every source HQ reads except 1 mm SAND. Merely preparing
-    // HQ must never open that large file; export retains sole ownership of it.
-    std::array<LinkedHqSourceFingerprint, 5U> sources{};
-    const std::array<std::size_t, 5U> sourceSessionIndices{
-        request.fiveMillimeterSessionIndices[0U],
-        request.fiveMillimeterSessionIndices[1U],
-        request.fiveMillimeterSessionIndices[2U],
-        request.oneMillimeterSessionIndices[rockRole],
-        request.oneMillimeterSessionIndices[vegetationRole],
-    };
+    // The complete 5 mm baseline is always fingerprinted. Only the active
+    // 1 mm patch roles are touched, so SAND remains entirely unopened while
+    // its opt-in toggle is off.
+    std::vector<std::size_t> sourceSessionIndices;
+    sourceSessionIndices.reserve(
+        request.fiveMillimeterSessionIndices.size() +
+        request.patchRoles.size());
+    sourceSessionIndices.insert(
+        sourceSessionIndices.end(),
+        request.fiveMillimeterSessionIndices.begin(),
+        request.fiveMillimeterSessionIndices.end());
+    for (const auto role : request.patchRoles) {
+        sourceSessionIndices.push_back(
+            request.oneMillimeterSessionIndices[role]);
+    }
+    std::vector<LinkedHqSourceFingerprint> sources(
+        sourceSessionIndices.size());
     for (std::size_t source = 0U;
          source < sourceSessionIndices.size();
          ++source) {
@@ -56595,20 +58016,27 @@ std::optional<LinkedHqSelectionRequest> ResolveLinkedHqSelectionRequest(
             return std::nullopt;
         }
     }
-    request.sourceFingerprints = sources;
     const std::string projectPairKey = request.pairSessionId + "\n" +
         runtimeState.persistence.projectFilePath + "\n" +
         request.sceneGroupName + "\n" +
-        std::to_string(request.patchSpacingMicrometres);
+        std::to_string(request.patchSpacingMicrometres) + "\n" +
+        (request.includeSand ? "sand" : "no-sand") + "\n" +
+        (adaptiveRequested ? "adaptive" : "fixed");
     request.fingerprint = BuildLinkedHqSelectionFingerprint(
         projectPairKey,
-        request.midpointFrustums,
+        request.patchFrustums,
         sources);
+    request.sourceFingerprints = std::move(sources);
     if (errorMessage != nullptr) {
         errorMessage->clear();
     }
     return request;
 }
+
+void ApplyLinkedHqFiveMillimeterMasks(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    LinkedHqPreviewMode mode);
 
 void ResetLinkedHqPreview(
     PreviewRuntimeState* runtimeState,
@@ -56625,6 +58053,7 @@ void ResetLinkedHqPreview(
     }
 
     const auto priorRequest = hq.request;
+    const auto requestedMode = hq.requestedMode;
     const auto ownedBaseline = hq.baselineLoadedForHq;
     if (priorRequest.has_value()) {
         std::cout << "Linked HQ: releasing prepared preview for "
@@ -56636,25 +58065,22 @@ void ResetLinkedHqPreview(
         try {
             PointCloudMutationBatchScope mutationBatch{viewport};
             for (const auto& patch : hq.patches) {
-                if (patch.baseSessionIndex < runtimeState->sessions.size() &&
-                    viewport->HasPointCloudResources(patch.baseSessionIndex)) {
-                    viewport->UpdatePointBudget(
-                        patch.baseSessionIndex,
-                        {});
-                }
                 const bool internalPatchLayer =
-                    patch.layerId == kLinkedHqRockPatchLayerId ||
-                    patch.layerId == kLinkedHqVegetationPatchLayerId;
+                    IsLinkedHqPatchLayerId(patch.layerId);
                 if (internalPatchLayer &&
                     viewport->HasPointCloudResources(patch.layerId)) {
                     viewport->RemovePointCloud(patch.layerId);
                 }
                 if (internalPatchLayer) {
                     ForgetWaterSeepageLayerAttachment(
-                        &runtimeState->water,
-                        patch.layerId);
+                    &runtimeState->water,
+                    patch.layerId);
                 }
             }
+            ApplyLinkedHqFiveMillimeterMasks(
+                runtimeState,
+                viewport,
+                LinkedHqPreviewMode::Off);
             if (priorRequest.has_value() &&
                 !runtimeState->offlineRenderJob.active) {
                 for (std::size_t role = 0U;
@@ -56696,9 +58122,7 @@ void ResetLinkedHqPreview(
                     }
                 }
             }
-            for (const auto layerId : {
-                     kLinkedHqRockPatchLayerId,
-                     kLinkedHqVegetationPatchLayerId}) {
+            for (const auto layerId : kLinkedHqPatchLayerIds) {
                 if (!viewport->HasPointCloudResources(layerId)) {
                     continue;
                 }
@@ -56715,6 +58139,7 @@ void ResetLinkedHqPreview(
     // Moving an empty replacement in joins the cancellable workers after
     // their current chunk and drops every session-only source index/cache.
     hq = LinkedHqPreviewRuntime{};
+    hq.requestedMode = requestedMode;
     runtimeState->previewRenderStateSignatureValid = false;
 }
 
@@ -56726,18 +58151,51 @@ void StartLinkedHqPreparation(
     }
     auto& hq = runtimeState->linkedHqPreview;
     const auto request = hq.request.value();
-    const auto rockRole = invisible_places::scene::ScenePointCloudRoleIndex(
-        invisible_places::scene::ScenePointCloudRole::Rock);
-    const auto vegetationRole =
-        invisible_places::scene::ScenePointCloudRoleIndex(
-            invisible_places::scene::ScenePointCloudRole::Vegetation);
-    const std::array<std::size_t, 2U> patchRoles{
-        rockRole,
-        vegetationRole,
-    };
-    std::array<std::shared_ptr<const invisible_places::io::LoadedPointCloud>, 2U>
-        baseClouds{};
-    std::array<std::filesystem::path, 2U> sourcePaths{};
+    if (request.patchRoles.empty() ||
+        request.patchRoles.size() != request.patchLayerIds.size() ||
+        request.patchRoles.size() != request.patchFieldFilters.size()) {
+        return;
+    }
+    const auto patchRoles = request.patchRoles;
+    const auto patchLayerIds = request.patchLayerIds;
+    const auto adaptiveUseSerial =
+        request.mode == LinkedHqPreviewMode::Adaptive
+            ? hq.nextAdaptiveBlockUseSerial++
+            : 0U;
+    std::vector<LinkedHqAdaptiveCacheSnapshot> priorAdaptiveCaches;
+    if (request.mode == LinkedHqPreviewMode::Adaptive) {
+        priorAdaptiveCaches.reserve(hq.patches.size());
+        for (const auto& patch : hq.patches) {
+            if (!patch.adaptiveCacheIndex.has_value()) {
+                continue;
+            }
+            priorAdaptiveCaches.push_back({
+                .layerId = patch.layerId,
+                .cacheFingerprint =
+                    patch.adaptiveCacheIndex->cacheFingerprint,
+                .fieldFilterFingerprint =
+                    patch.adaptiveFieldFilterFingerprint,
+                .residentBlocks = patch.adaptiveResidentBlocks,
+            });
+        }
+    }
+    std::vector<std::shared_ptr<const invisible_places::io::LoadedPointCloud>>
+        baseClouds(patchRoles.size());
+    std::array<std::shared_ptr<const invisible_places::io::LoadedPointCloud>,
+               invisible_places::scene::kScenePointCloudRoleCount>
+        fiveMillimeterClouds;
+    for (std::size_t role = 0U;
+         role < fiveMillimeterClouds.size();
+         ++role) {
+        const auto baseIndex = request.fiveMillimeterSessionIndices[role];
+        if (baseIndex >= runtimeState->sessions.size() ||
+            runtimeState->sessions[baseIndex].offlinePointCloud == nullptr) {
+            return;
+        }
+        fiveMillimeterClouds[role] =
+            runtimeState->sessions[baseIndex].offlinePointCloud;
+    }
+    std::vector<std::filesystem::path> sourcePaths(patchRoles.size());
     for (std::size_t patch = 0U; patch < patchRoles.size(); ++patch) {
         const auto baseIndex =
             request.fiveMillimeterSessionIndices[patchRoles[patch]];
@@ -56748,8 +58206,7 @@ void StartLinkedHqPreparation(
             runtimeState->sessions[baseIndex].offlinePointCloud == nullptr) {
             return;
         }
-        baseClouds[patch] =
-            runtimeState->sessions[baseIndex].offlinePointCloud;
+        baseClouds[patch] = fiveMillimeterClouds[patchRoles[patch]];
         sourcePaths[patch] =
             runtimeState->sessions[sourceIndex].sourcePath;
     }
@@ -56763,9 +58220,20 @@ void StartLinkedHqPreparation(
             LinkedHqPreparationStage::Scanning,
             0.0F));
     hq.failureMessage.clear();
-    std::cout << "Linked HQ: scanning 1 mm ROCK/VEG for "
-              << request.sceneGroupName << " (" << sourcePaths[0U].filename().string()
-              << ", " << sourcePaths[1U].filename().string() << ") at "
+    std::ostringstream sourceSummary;
+    for (std::size_t patch = 0U; patch < patchRoles.size(); ++patch) {
+        if (patch > 0U) {
+            sourceSummary << ", ";
+        }
+        sourceSummary << sourcePaths[patch].filename().string();
+    }
+    std::cout << "Linked HQ: "
+              << (request.mode == LinkedHqPreviewMode::Adaptive
+                      ? "opening spatial cache for "
+                      : "scanning ")
+              << patchRoles.size() << " selected 1 mm role sources for "
+              << request.sceneGroupName << " (" << sourceSummary.str()
+              << ") at "
               << (request.patchSpacingMicrometres / 1000U) << " mm patch spacing"
               << (request.patchSpacingMicrometres > 1000U
                       ? ", cell-stratified to " +
@@ -56780,16 +58248,23 @@ void StartLinkedHqPreparation(
         [shared,
          request,
          patchRoles,
+         patchLayerIds,
          baseClouds,
-         sourcePaths](std::stop_token stopToken) mutable {
+         fiveMillimeterClouds,
+         sourcePaths,
+         priorAdaptiveCaches = std::move(priorAdaptiveCaches),
+         adaptiveUseSerial](std::stop_token stopToken) mutable {
 #ifdef __APPLE__
             (void)pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
 #endif
             LinkedHqPreparationJobResult result;
             result.fingerprint = request.fingerprint;
-            result.patches[0U].layerId = kLinkedHqRockPatchLayerId;
-            result.patches[1U].layerId =
-                kLinkedHqVegetationPatchLayerId;
+            result.patches.resize(patchRoles.size());
+            for (std::size_t patch = 0U;
+                 patch < patchRoles.size();
+                 ++patch) {
+                result.patches[patch].layerId = patchLayerIds[patch];
+            }
             const auto finish = [&]() {
                 std::scoped_lock lock(shared->mutex);
                 shared->result = std::move(result);
@@ -56815,10 +58290,334 @@ void StartLinkedHqPreparation(
                     output.sourceSessionIndex =
                         request.oneMillimeterSessionIndices[
                             patchRoles[patch]];
+                    if (request.mode == LinkedHqPreviewMode::Adaptive) {
+                        const auto fingerprintIndex =
+                            request.fiveMillimeterSessionIndices.size() +
+                            patch;
+                        if (fingerprintIndex >=
+                            request.sourceFingerprints.size()) {
+                            result.errorMessage =
+                                "The aHQ source fingerprint is unavailable.";
+                            finish();
+                            return;
+                        }
+                        const auto& sourceFingerprint =
+                            request.sourceFingerprints[fingerprintIndex];
+                        const invisible_places::io::
+                            AdaptiveHqSourceIdentity sourceIdentity{
+                                .path = sourceFingerprint.path,
+                                .byteSize = sourceFingerprint.byteSize,
+                                .writeTimeTicks =
+                                    sourceFingerprint.writeTimeTicks,
+                                .schemaFingerprint =
+                                    sourceFingerprint.schemaFingerprint,
+                                .contentFingerprint =
+                                    sourceFingerprint.contentFingerprint,
+                                .pointCount = sourceFingerprint.pointCount,
+                                .recordSize = sourceFingerprint.recordSize,
+                            };
+                        const auto cacheOpenStarted =
+                            std::chrono::steady_clock::now();
+                        const auto opened = invisible_places::io::
+                            OpenOrBuildAdaptiveHqCache(
+                                request.adaptiveCacheRoot,
+                                sourceIdentity,
+                                stopToken,
+                                [shared,
+                                 patch,
+                                 patchCount = patchRoles.size()](
+                                    float cacheProgress) {
+                                    PublishLinkedHqStageProgress(
+                                        shared,
+                                        LinkedHqPreparationStage::Scanning,
+                                        (static_cast<float>(patch) +
+                                         0.55F * cacheProgress) /
+                                            static_cast<float>(patchCount));
+                                });
+                        output.adaptiveCacheOpenMilliseconds =
+                            std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() -
+                                cacheOpenStarted)
+                                .count();
+                        output.adaptiveCacheBuilt = opened.built;
+                        if (opened.cancelled ||
+                            stopToken.stop_requested()) {
+                            result.cancelled = true;
+                            finish();
+                            return;
+                        }
+                        if (!opened.success) {
+                            result.errorMessage =
+                                opened.errorMessage.empty()
+                                    ? "The aHQ spatial cache could not be opened."
+                                    : opened.errorMessage;
+                            finish();
+                            return;
+                        }
+
+                        const auto activeBlocks = invisible_places::io::
+                            SelectAdaptiveHqCacheBlocks(
+                                opened.index,
+                                [frustums = request.patchFrustums](
+                                    const invisible_places::io::Bounds3f&
+                                        bounds) {
+                                    return frustums.IntersectsBounds(bounds);
+                                });
+                        for (const auto blockIndex : activeBlocks) {
+                            output.adaptiveActiveBlockBytes +=
+                                opened.index.blocks[blockIndex].byteSize;
+                        }
+                        const auto filterFingerprint =
+                            invisible_places::io::
+                                AdaptiveHqFieldFilterFingerprint(
+                                    request.patchFieldFilters[patch]);
+                        std::vector<invisible_places::io::
+                                        AdaptiveHqResidentBlock>
+                            residentBlocks;
+                        const auto prior = std::find_if(
+                            priorAdaptiveCaches.begin(),
+                            priorAdaptiveCaches.end(),
+                            [&](const LinkedHqAdaptiveCacheSnapshot& cache) {
+                                return cache.layerId == patchLayerIds[patch] &&
+                                       cache.cacheFingerprint ==
+                                           opened.index.cacheFingerprint &&
+                                       cache.fieldFilterFingerprint ==
+                                           filterFingerprint;
+                            });
+                        if (prior != priorAdaptiveCaches.end()) {
+                            residentBlocks = prior->residentBlocks;
+                        }
+
+                        std::vector<std::uint32_t> missingBlocks;
+                        missingBlocks.reserve(activeBlocks.size());
+                        for (const auto blockIndex : activeBlocks) {
+                            const bool resident = std::any_of(
+                                residentBlocks.begin(),
+                                residentBlocks.end(),
+                                [&](const auto& block) {
+                                    return block.blockIndex == blockIndex &&
+                                           block.points != nullptr;
+                                });
+                            if (!resident) {
+                                missingBlocks.push_back(blockIndex);
+                                output.adaptiveMissingBlockBytes +=
+                                    opened.index.blocks[blockIndex].byteSize;
+                            } else {
+                                ++output.adaptiveReusedBlockCount;
+                            }
+                        }
+                        output.adaptiveMissingBlockCount =
+                            static_cast<std::uint32_t>(
+                                missingBlocks.size());
+                        const auto blockLoadStarted =
+                            std::chrono::steady_clock::now();
+                        // A single 4 MiB block is intentionally small for
+                        // camera seeking, but opening/parsing hundreds of
+                        // blocks serially left most CPU cores and the SSD
+                        // idle. Read independent ranges concurrently;
+                        // results are committed below in deterministic block
+                        // order so rendering and later field gathers remain
+                        // reproducible.
+                        std::vector<invisible_places::io::
+                                        PointCloudSubsetLoadResult>
+                            missingResults(missingBlocks.size());
+                        std::atomic<std::size_t> nextMissing{0U};
+                        std::atomic<std::size_t> completedMissing{0U};
+                        std::atomic_bool missingFailed{false};
+                        const auto loadMissingBlocks = [&]() {
+#ifdef __APPLE__
+                            (void)pthread_set_qos_class_self_np(
+                                QOS_CLASS_UTILITY,
+                                0);
+#endif
+                            while (!stopToken.stop_requested() &&
+                                   !missingFailed.load(
+                                       std::memory_order_acquire)) {
+                                const auto missing = nextMissing.fetch_add(
+                                    1U,
+                                    std::memory_order_relaxed);
+                                if (missing >= missingBlocks.size()) {
+                                    return;
+                                }
+                                const auto blockIndex =
+                                    missingBlocks[missing];
+                                auto loaded = invisible_places::io::
+                                    LoadAdaptiveHqCacheBlock(
+                                        opened.index,
+                                        blockIndex,
+                                        request.patchFieldFilters[patch],
+                                        stopToken,
+                                        [shared,
+                                         patch,
+                                         patchCount = patchRoles.size(),
+                                         missingCount = missingBlocks.size(),
+                                         &completedMissing](
+                                            std::uint64_t completed,
+                                            std::uint64_t total) {
+                                            const float blockProgress =
+                                                total > 0U
+                                                ? static_cast<float>(
+                                                      static_cast<double>(
+                                                          completed) /
+                                                      static_cast<double>(
+                                                          total))
+                                                : 1.0F;
+                                            const float fringeProgress =
+                                                missingCount > 0U
+                                                ? (static_cast<float>(
+                                                       completedMissing.load(
+                                                           std::memory_order_relaxed)) +
+                                                   blockProgress) /
+                                                      static_cast<float>(
+                                                          missingCount)
+                                                : 1.0F;
+                                            PublishLinkedHqStageProgress(
+                                                shared,
+                                                LinkedHqPreparationStage::Scanning,
+                                                (static_cast<float>(patch) +
+                                                 0.55F +
+                                                 0.35F * fringeProgress) /
+                                                    static_cast<float>(
+                                                        patchCount));
+                                        });
+                                if (!loaded.success && !loaded.cancelled) {
+                                    missingFailed.store(
+                                        true,
+                                        std::memory_order_release);
+                                }
+                                missingResults[missing] =
+                                    std::move(loaded);
+                                completedMissing.fetch_add(
+                                    1U,
+                                    std::memory_order_relaxed);
+                            }
+                        };
+                        const auto workerCount = std::min<std::size_t>(
+                            kAdaptiveHqBlockReadWorkerCount,
+                            missingBlocks.size());
+                        std::vector<std::jthread> blockWorkers;
+                        if (workerCount > 1U) {
+                            blockWorkers.reserve(workerCount - 1U);
+                            for (std::size_t worker = 1U;
+                                 worker < workerCount;
+                                 ++worker) {
+                                blockWorkers.emplace_back(
+                                    [&loadMissingBlocks]() {
+                                        loadMissingBlocks();
+                                    });
+                            }
+                        }
+                        loadMissingBlocks();
+                        for (auto& worker : blockWorkers) {
+                            worker.join();
+                        }
+                        for (std::size_t missing = 0U;
+                             missing < missingResults.size();
+                             ++missing) {
+                            auto& loaded = missingResults[missing];
+                            if (loaded.cancelled ||
+                                stopToken.stop_requested()) {
+                                result.cancelled = true;
+                                finish();
+                                return;
+                            }
+                            if (!loaded.success) {
+                                result.errorMessage =
+                                    loaded.errorMessage.empty()
+                                        ? "An aHQ cache block could not be read."
+                                        : loaded.errorMessage;
+                                finish();
+                                return;
+                            }
+                            residentBlocks.push_back({
+                                .blockIndex = missingBlocks[missing],
+                                .points = std::make_shared<const
+                                    invisible_places::io::
+                                        PointCloudSubsetLoadResult>(
+                                            std::move(loaded)),
+                                .lastUsedSerial = adaptiveUseSerial,
+                            });
+                        }
+                        output.adaptiveBlockLoadMilliseconds =
+                            std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() -
+                                blockLoadStarted)
+                                .count();
+
+                        std::unordered_set<std::uint32_t> activeSet{
+                            activeBlocks.begin(), activeBlocks.end()};
+                        for (auto& resident : residentBlocks) {
+                            if (activeSet.contains(resident.blockIndex)) {
+                                resident.lastUsedSerial = adaptiveUseSerial;
+                            }
+                        }
+                        auto retained = RetainAdaptiveHqResidentBlocks(
+                            residentBlocks,
+                            activeBlocks,
+                            kAdaptiveHqRetainedFringeByteBudgetPerRole);
+
+                        invisible_places::io::PointCloudGridDecimation
+                            decimation;
+                        if (request.patchSpacingMicrometres > 1000U) {
+                            decimation = {
+                                .cellSizeMeters =
+                                    static_cast<float>(
+                                        request.patchSpacingMicrometres) *
+                                    1.0e-6F,
+                                .keepFraction = LinkedHqPatchKeepFraction(
+                                    request.patchSpacingMicrometres),
+                            };
+                        }
+                        const auto assemblyStarted =
+                            std::chrono::steady_clock::now();
+                        output.subset = invisible_places::io::
+                            AssembleAdaptiveHqCacheSubset(
+                                opened.index,
+                                activeBlocks,
+                                retained.blocks,
+                                [frustums = request.patchFrustums](
+                                    const invisible_places::io::Float3& point) {
+                                    return frustums.Contains(point);
+                                },
+                                decimation,
+                                stopToken,
+                                false);
+                        output.adaptiveAssemblyMilliseconds =
+                            std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() -
+                                assemblyStarted)
+                                .count();
+                        if (output.subset.cancelled ||
+                            stopToken.stop_requested()) {
+                            result.cancelled = true;
+                            finish();
+                            return;
+                        }
+                        if (!output.subset.success) {
+                            result.errorMessage =
+                                output.subset.errorMessage.empty()
+                                    ? "The aHQ cache blocks could not be assembled."
+                                    : output.subset.errorMessage;
+                            finish();
+                            return;
+                        }
+                        output.adaptiveCacheIndex = opened.index;
+                        output.adaptiveFieldFilterFingerprint =
+                            filterFingerprint;
+                        output.adaptiveActiveBlockIndices = activeBlocks;
+                        output.adaptiveResidentBlocks =
+                            std::move(retained.blocks);
+                        PublishLinkedHqStageProgress(
+                            shared,
+                            LinkedHqPreparationStage::Scanning,
+                            static_cast<float>(patch + 1U) /
+                                static_cast<float>(patchRoles.size()));
+                        continue;
+                    }
                     invisible_places::io::PointCloudSubsetLoadOptions options;
                     options.fieldFilter = request.patchFieldFilters[patch];
                     options.includePoint =
-                        [frustums = request.midpointFrustums](
+                        [frustums = request.patchFrustums](
                             const invisible_places::io::Float3& point) {
                             return frustums.Contains(point);
                         };
@@ -56834,8 +58633,11 @@ void StartLinkedHqPreparation(
                     }
                     options.stopToken = stopToken;
                     options.progress =
-                        [shared, patch](std::uint64_t completed,
-                                        std::uint64_t total) {
+                        [shared,
+                         patch,
+                         patchCount = patchRoles.size()](
+                            std::uint64_t completed,
+                            std::uint64_t total) {
                             const float local = total > 0U
                                 ? static_cast<float>(
                                       static_cast<double>(completed) /
@@ -56845,7 +58647,7 @@ void StartLinkedHqPreparation(
                                 shared,
                                 LinkedHqPreparationStage::Scanning,
                                 (static_cast<float>(patch) + local) /
-                                    2.0F);
+                                    static_cast<float>(patchCount));
                         };
                     output.subset =
                         invisible_places::io::LoadPointCloudSubset(
@@ -56871,6 +58673,79 @@ void StartLinkedHqPreparation(
                     shared,
                     LinkedHqPreparationStage::Organising,
                     0.0F);
+                if (request.mode == LinkedHqPreviewMode::Adaptive) {
+                    // Keep the complete 5 mm payload resident, but submit
+                    // only conservative grid cells intersecting the guarded
+                    // current view. Leaving the guard clears these indices
+                    // synchronously, so the complete base remains the safe
+                    // fallback while a replacement fine patch is prepared.
+                    const auto guardStarted =
+                        std::chrono::steady_clock::now();
+                    std::vector<glm::mat4> guardedViewProjections;
+                    guardedViewProjections.reserve(
+                        request.patchFrustums.viewProjections.size());
+                    const float lateralLimit = 1.0F + 2.0F *
+                        std::max(0.0F,
+                                 request.patchFrustums.borderFraction);
+                    glm::mat4 clipScale{1.0F};
+                    clipScale[0][0] = 1.0F / lateralLimit;
+                    clipScale[1][1] = 1.0F / lateralLimit;
+                    for (const auto& viewProjection :
+                         request.patchFrustums.viewProjections) {
+                        guardedViewProjections.push_back(
+                            clipScale * viewProjection);
+                    }
+                    for (std::size_t role = 0U;
+                         role < fiveMillimeterClouds.size();
+                         ++role) {
+                        if (stopToken.stop_requested()) {
+                            result.cancelled = true;
+                            finish();
+                            return;
+                        }
+                        const auto& cloud = fiveMillimeterClouds[role];
+                        const auto fullPointCount = cloud != nullptr
+                            ? cloud->PointCount()
+                            : 0U;
+                        result.fiveMillimeterFullPointCounts[role] =
+                            fullPointCount;
+                        if (cloud != nullptr && fullPointCount > 0U) {
+                            auto indices = invisible_places::renderer::
+                                pointcloud::GenerateFrustumUnionPointIndices(
+                                    cloud->positions,
+                                    cloud->bounds,
+                                    guardedViewProjections,
+                                    kAdaptiveHqFiveMillimeterGuardGridDimension,
+                                    stopToken);
+                            const double retainedFraction =
+                                static_cast<double>(indices.size()) /
+                                static_cast<double>(fullPointCount);
+                            if (!indices.empty() &&
+                                retainedFraction <
+                                    kAdaptiveHqFiveMillimeterGuardUsefulFraction) {
+                                result.fiveMillimeterGuardIndices[role] =
+                                    std::move(indices);
+                            }
+                        }
+                        PublishLinkedHqStageProgress(
+                            shared,
+                            LinkedHqPreparationStage::Organising,
+                            static_cast<float>(role + 1U) /
+                                static_cast<float>(
+                                    fiveMillimeterClouds.size()));
+                    }
+                    result.fiveMillimeterGuardPreparationMilliseconds =
+                        std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - guardStarted)
+                            .count();
+                    PublishLinkedHqStageProgress(
+                        shared,
+                        LinkedHqPreparationStage::Organising,
+                        1.0F);
+                    result.success = true;
+                    finish();
+                    return;
+                }
                 for (std::size_t patch = 0U;
                      patch < patchRoles.size();
                      ++patch) {
@@ -56881,10 +58756,13 @@ void StartLinkedHqPreparation(
                     }
                     auto partition = PartitionLinkedHqIndices(
                         baseClouds[patch]->positions,
-                        request.midpointFrustums,
+                        request.patchFrustums,
                         stopToken,
-                        [shared, patch](std::uint64_t completed,
-                                        std::uint64_t total) {
+                        [shared,
+                         patch,
+                         patchCount = patchRoles.size()](
+                            std::uint64_t completed,
+                            std::uint64_t total) {
                             const float local = total > 0U
                                 ? static_cast<float>(
                                       static_cast<double>(completed) /
@@ -56894,7 +58772,7 @@ void StartLinkedHqPreparation(
                                 shared,
                                 LinkedHqPreparationStage::Organising,
                                 (static_cast<float>(patch) + local) /
-                                    2.0F);
+                                    static_cast<float>(patchCount));
                         });
                     if (partition.cancelled ||
                         stopToken.stop_requested()) {
@@ -56916,10 +58794,87 @@ void StartLinkedHqPreparation(
         }};
 }
 
+bool LinkedHqAdaptiveGuardCoversCurrentView(
+    const PreviewRuntimeState& runtimeState,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport) {
+    const auto& hq = runtimeState.linkedHqPreview;
+    if (!hq.publishedAdaptiveTransition.Valid() ||
+        hq.publishedPatchFrustums.viewProjections.empty()) {
+        return false;
+    }
+    const auto matrices = runtimeState.camera.Matrices(
+        CurrentAspectRatio(viewport));
+    return LinkedHqFrustumUnionCoversView(
+        hq.publishedPatchFrustums,
+        matrices.view,
+        matrices.projection,
+        hq.publishedAdaptiveTransition.endDepthMeters);
+}
+
+void ApplyLinkedHqFiveMillimeterMasks(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    LinkedHqPreviewMode mode) {
+    if (runtimeState == nullptr || viewport == nullptr ||
+        !runtimeState->linkedHqPreview.request.has_value()) {
+        return;
+    }
+    auto& hq = runtimeState->linkedHqPreview;
+    const bool adaptiveGuardValid =
+        mode == LinkedHqPreviewMode::Adaptive &&
+        LinkedHqAdaptiveGuardCoversCurrentView(*runtimeState, *viewport);
+    bool appliedAnyAdaptiveGuard = false;
+    const std::vector<std::uint32_t> completeBase;
+    for (std::size_t role = 0U;
+         role < hq.request->fiveMillimeterSessionIndices.size();
+         ++role) {
+        const auto sessionIndex =
+            hq.request->fiveMillimeterSessionIndices[role];
+        if (!viewport->HasPointCloudResources(sessionIndex)) {
+            if (mode != LinkedHqPreviewMode::Off) {
+                throw std::runtime_error{
+                    "the 5 mm baseline is no longer resident"};
+            }
+            continue;
+        }
+        const std::vector<std::uint32_t>* indices = &completeBase;
+        if (mode == LinkedHqPreviewMode::Fixed) {
+            const auto patch = std::find_if(
+                hq.patches.begin(),
+                hq.patches.end(),
+                [&](const LinkedHqPatchRuntime& value) {
+                    return value.baseSessionIndex == sessionIndex;
+                });
+            if (patch != hq.patches.end()) {
+                indices = &patch->fiveMillimeterOutsideIndices;
+            }
+        } else if (adaptiveGuardValid &&
+                   !hq.fiveMillimeterGuardIndices[role].empty()) {
+            indices = &hq.fiveMillimeterGuardIndices[role];
+            appliedAnyAdaptiveGuard = true;
+        }
+        viewport->UpdatePointBudget(sessionIndex, *indices, true);
+    }
+    hq.adaptiveBaseGuardApplied =
+        mode == LinkedHqPreviewMode::Adaptive &&
+        adaptiveGuardValid && appliedAnyAdaptiveGuard;
+}
+
+bool SetLinkedHqPreviewMode(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    LinkedHqPreviewMode mode);
+
 bool SetLinkedHqPreviewEnabled(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport,
-    bool enabled);
+    bool enabled) {
+    return SetLinkedHqPreviewMode(
+        runtimeState,
+        viewport,
+        enabled ? LinkedHqPreviewMode::Fixed
+                : LinkedHqPreviewMode::Off);
+}
 
 bool PollLinkedHqPreparation(
     PreviewRuntimeState* runtimeState,
@@ -56991,7 +58946,9 @@ bool PollLinkedHqPreparation(
     // the 5 mm masks were live so the new outside sets replace them instead
     // of leaving the old masks installed with no patch to fill them.
     const bool wasEnabled = hq.ready && hq.enabled;
-    std::array<LinkedHqPatchRuntime, 2U> published{};
+    const bool wasAdaptive = wasEnabled && hq.adaptiveEnabled;
+    std::vector<LinkedHqPatchRuntime> published(
+        completed->patches.size());
     try {
         PointCloudMutationBatchScope mutationBatch{viewport};
         for (std::size_t patch = 0U;
@@ -57009,6 +58966,29 @@ bool PollLinkedHqPreparation(
                 std::move(source.fiveMillimeterOutsideIndices);
             destination.includedPointCount =
                 source.subset.includedPointCount;
+            destination.adaptiveCacheIndex =
+                std::move(source.adaptiveCacheIndex);
+            destination.adaptiveFieldFilterFingerprint =
+                source.adaptiveFieldFilterFingerprint;
+            destination.adaptiveActiveBlockIndices =
+                std::move(source.adaptiveActiveBlockIndices);
+            destination.adaptiveResidentBlocks =
+                std::move(source.adaptiveResidentBlocks);
+            destination.adaptiveCacheBuilt = source.adaptiveCacheBuilt;
+            destination.adaptiveActiveBlockBytes =
+                source.adaptiveActiveBlockBytes;
+            destination.adaptiveMissingBlockBytes =
+                source.adaptiveMissingBlockBytes;
+            destination.adaptiveMissingBlockCount =
+                source.adaptiveMissingBlockCount;
+            destination.adaptiveReusedBlockCount =
+                source.adaptiveReusedBlockCount;
+            destination.adaptiveCacheOpenMilliseconds =
+                source.adaptiveCacheOpenMilliseconds;
+            destination.adaptiveBlockLoadMilliseconds =
+                source.adaptiveBlockLoadMilliseconds;
+            destination.adaptiveAssemblyMilliseconds =
+                source.adaptiveAssemblyMilliseconds;
             destination.cloud = std::make_shared<
                 invisible_places::io::LoadedPointCloud>(
                     std::move(source.subset.cloud));
@@ -57023,13 +59003,21 @@ bool PollLinkedHqPreparation(
                 hq.displayedProgress,
                 LinkedHqOverallProgress(
                     hq.stage,
-                    static_cast<float>(patch + 1U) / 2.0F));
+                    static_cast<float>(patch + 1U) /
+                        static_cast<float>(completed->patches.size())));
         }
         mutationBatch.Finish();
     } catch (const std::exception& error) {
-        for (const auto layerId : {
-                 kLinkedHqRockPatchLayerId,
-                 kLinkedHqVegetationPatchLayerId}) {
+        try {
+            PointCloudMutationBatchScope rollback{viewport};
+            ApplyLinkedHqFiveMillimeterMasks(
+                runtimeState,
+                viewport,
+                LinkedHqPreviewMode::Off);
+            rollback.Finish();
+        } catch (...) {
+        }
+        for (const auto layerId : kLinkedHqPatchLayerIds) {
             if (viewport->HasPointCloudResources(layerId)) {
                 try {
                     viewport->RemovePointCloud(layerId);
@@ -57043,86 +59031,165 @@ bool PollLinkedHqPreparation(
             std::string{error.what()};
         hq.ready = false;
         hq.enabled = false;
+        hq.adaptiveEnabled = false;
         runtimeState->previewRenderStateSignatureValid = false;
         return false;
     }
 
     hq.patches = std::move(published);
+    hq.fiveMillimeterGuardIndices =
+        std::move(completed->fiveMillimeterGuardIndices);
+    hq.fiveMillimeterFullPointCounts =
+        completed->fiveMillimeterFullPointCounts;
+    hq.fiveMillimeterGuardPreparationMilliseconds =
+        completed->fiveMillimeterGuardPreparationMilliseconds;
+    hq.adaptiveBaseGuardApplied = false;
     hq.ready = true;
     hq.enabled = false;
+    hq.adaptiveEnabled = false;
+    hq.publishedFingerprint = hq.request->fingerprint;
+    hq.publishedPatchFrustums = hq.request->patchFrustums;
+    hq.publishedAdaptiveTransition = hq.request->adaptiveTransition;
     hq.stage = LinkedHqPreparationStage::Ready;
     hq.displayedProgress = 1.0F;
     hq.failureMessage.clear();
     runtimeState->previewRenderStateSignatureValid = false;
-    runtimeState->statusMessage =
-        "HQ animation preview is ready (1 mm ROCK/VEG midpoint patches; "
-        "5 mm elsewhere).";
-    if (wasEnabled || hq.reenableAfterPublish) {
-        (void)SetLinkedHqPreviewEnabled(runtimeState, viewport, true);
+    const bool includesSand =
+        hq.request.has_value() && hq.request->includeSand;
+    const std::string patchedRoles =
+        includesSand ? "ROCK/VEG/SAND" : "ROCK/VEG";
+    runtimeState->statusMessage = hq.request->mode ==
+            LinkedHqPreviewMode::Adaptive
+        ? "aHQ camera cache is ready (fine " + patchedRoles +
+              " nearby; complete 5 mm at distance)."
+        : hq.request->usesFullAnimationPath
+              ? "HQ animation preview is ready (1 mm " + patchedRoles +
+                    " along the full animation path; 5 mm elsewhere)."
+              : "HQ animation preview is ready (1 mm " + patchedRoles +
+                    " midpoint patches; 5 mm elsewhere).";
+    const auto publishMode = hq.request->mode;
+    const bool requestedPublishedMode =
+        hq.requestedMode == publishMode;
+    if (requestedPublishedMode || wasEnabled || hq.reenableAfterPublish) {
+        const auto mode = requestedPublishedMode
+            ? hq.requestedMode
+            : (wasAdaptive || hq.reenableAdaptiveAfterPublish
+                   ? LinkedHqPreviewMode::Adaptive
+                   : LinkedHqPreviewMode::Fixed);
+        (void)SetLinkedHqPreviewMode(runtimeState, viewport, mode);
     }
     hq.reenableAfterPublish = false;
-    std::cout << "Linked HQ: patches ready ("
-              << FormatPointCount(
-                     hq.patches[0U].cloud != nullptr
-                         ? hq.patches[0U].cloud->PointCount()
-                         : 0U)
-              << " ROCK + "
-              << FormatPointCount(
-                     hq.patches[1U].cloud != nullptr
-                         ? hq.patches[1U].cloud->PointCount()
-                         : 0U)
-              << " VEG patch points at "
+    hq.reenableAdaptiveAfterPublish = false;
+    std::ostringstream patchSummary;
+    for (std::size_t patch = 0U; patch < hq.patches.size(); ++patch) {
+        if (patch > 0U) {
+            patchSummary << " + ";
+        }
+        const auto& publishedPatch = hq.patches[patch];
+        const std::string role =
+            publishedPatch.baseSessionIndex < runtimeState->sessions.size()
+            ? runtimeState->sessions[publishedPatch.baseSessionIndex].sceneRole
+            : "role";
+        patchSummary << FormatPointCount(
+                            publishedPatch.cloud != nullptr
+                                ? publishedPatch.cloud->PointCount()
+                                : 0U)
+                     << " " << role << " ("
+                     << FormatPointCount(
+                            publishedPatch.fiveMillimeterOutsideIndices.size())
+                     << " 5 mm outside)";
+    }
+    std::cout << "Linked HQ: patches ready (" << patchSummary.str()
+              << ") at "
               << (hq.request.has_value()
                       ? hq.request->patchSpacingMicrometres / 1000U
                       : 1U)
-              << " mm; 5 mm remainders "
-              << FormatPointCount(
-                     hq.patches[0U].fiveMillimeterOutsideIndices.size())
-              << " / "
-              << FormatPointCount(
-                     hq.patches[1U].fiveMillimeterOutsideIndices.size())
-              << ")." << std::endl;
+              << " mm";
+    if (hq.request.has_value() &&
+        hq.request->mode == LinkedHqPreviewMode::Adaptive) {
+        std::uint64_t guardedPoints = 0U;
+        std::uint64_t fullPoints = 0U;
+        for (std::size_t role = 0U;
+             role < hq.fiveMillimeterGuardIndices.size();
+             ++role) {
+            fullPoints += hq.fiveMillimeterFullPointCounts[role];
+            guardedPoints += hq.fiveMillimeterGuardIndices[role].empty()
+                ? hq.fiveMillimeterFullPointCounts[role]
+                : hq.fiveMillimeterGuardIndices[role].size();
+        }
+        std::cout << "; guarded 5 mm draw "
+                  << FormatPointCount(guardedPoints) << " / "
+                  << FormatPointCount(fullPoints) << " in "
+                  << FormatFixed(
+                         static_cast<float>(
+                             hq.fiveMillimeterGuardPreparationMilliseconds),
+                         1)
+                  << " ms";
+    }
+    std::cout << "." << std::endl;
     return true;
 }
 
-bool SetLinkedHqPreviewEnabled(
+bool SetLinkedHqPreviewMode(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport,
-    bool enabled) {
+    LinkedHqPreviewMode mode) {
     if (runtimeState == nullptr || viewport == nullptr) {
         return false;
     }
     auto& hq = runtimeState->linkedHqPreview;
-    if (!hq.ready || !hq.baselineReady ||
-        hq.enabled == enabled) {
-        return hq.ready && hq.baselineReady;
+    const bool enabled = mode != LinkedHqPreviewMode::Off;
+    const bool modeMatchesPublished =
+        hq.request.has_value() && hq.request->mode == mode &&
+        hq.publishedFingerprint == hq.request->fingerprint;
+    const bool alreadySelected =
+        hq.requestedMode == mode &&
+        hq.enabled == (enabled && modeMatchesPublished) &&
+        hq.adaptiveEnabled ==
+            (enabled && mode == LinkedHqPreviewMode::Adaptive &&
+             modeMatchesPublished);
+    hq.requestedMode = mode;
+    if (alreadySelected) {
+        return mode == LinkedHqPreviewMode::Off ||
+               (hq.ready && hq.baselineReady);
+    }
+    if (enabled &&
+        (!hq.ready || !hq.baselineReady || !modeMatchesPublished)) {
+        // Restore the complete coarse layer while the requested mode prepares.
+        try {
+            PointCloudMutationBatchScope mutationBatch{viewport};
+            ApplyLinkedHqFiveMillimeterMasks(
+                runtimeState,
+                viewport,
+                LinkedHqPreviewMode::Off);
+            mutationBatch.Finish();
+        } catch (...) {
+        }
+        hq.enabled = false;
+        hq.adaptiveEnabled = false;
+        hq.resolveTimestampValid = false;
+        hq.stage = LinkedHqPreparationStage::Waiting;
+        runtimeState->previewRenderStateSignatureValid = false;
+        runtimeState->statusMessage = mode == LinkedHqPreviewMode::Adaptive
+            ? "Preparing aHQ around the current camera. The complete 5 mm scene remains visible."
+            : "Preparing the fixed HQ animation view. The complete 5 mm scene remains visible.";
+        runtimeState->errorMessage.clear();
+        return true;
     }
     try {
         PointCloudMutationBatchScope mutationBatch{viewport};
-        for (const auto& patch : hq.patches) {
-            if (patch.baseSessionIndex >= runtimeState->sessions.size() ||
-                !viewport->HasPointCloudResources(
-                    patch.baseSessionIndex)) {
-                throw std::runtime_error{
-                    "the 5 mm baseline is no longer resident"};
-            }
-            viewport->UpdatePointBudget(
-                patch.baseSessionIndex,
-                enabled ? patch.fiveMillimeterOutsideIndices
-                        : std::vector<std::uint32_t>{});
-        }
+        ApplyLinkedHqFiveMillimeterMasks(
+            runtimeState,
+            viewport,
+            mode);
         mutationBatch.Finish();
     } catch (const std::exception& error) {
         try {
             PointCloudMutationBatchScope rollback{viewport};
-            for (const auto& patch : hq.patches) {
-                if (viewport->HasPointCloudResources(
-                        patch.baseSessionIndex)) {
-                    viewport->UpdatePointBudget(
-                        patch.baseSessionIndex,
-                        {});
-                }
-            }
+            ApplyLinkedHqFiveMillimeterMasks(
+                runtimeState,
+                viewport,
+                LinkedHqPreviewMode::Off);
             rollback.Finish();
         } catch (...) {
         }
@@ -57132,17 +59199,23 @@ bool SetLinkedHqPreviewEnabled(
         hq.stage = LinkedHqPreparationStage::Failed;
         hq.ready = false;
         hq.enabled = false;
+        hq.adaptiveEnabled = false;
         runtimeState->errorMessage = hq.failureMessage;
         return false;
     }
     hq.enabled = enabled;
+    hq.adaptiveEnabled =
+        enabled && mode == LinkedHqPreviewMode::Adaptive;
     viewport->SetTemporalCameraOverlay(false);
     runtimeState->animationPanel.linkedSeamedView
         .temporalHistoryResetRequested = true;
     runtimeState->previewRenderStateSignatureValid = false;
-    runtimeState->statusMessage = enabled
-        ? "HQ animation preview enabled."
-        : "HQ animation preview disabled; showing complete 5 mm points.";
+    runtimeState->statusMessage =
+        mode == LinkedHqPreviewMode::Adaptive
+            ? "Adaptive HQ enabled: fine nearby, stable transition, complete 5 mm at distance."
+            : mode == LinkedHqPreviewMode::Fixed
+                  ? "Fixed HQ animation preview enabled."
+                  : "HQ disabled; showing complete 5 mm points.";
     runtimeState->errorMessage.clear();
     return true;
 }
@@ -57164,6 +59237,7 @@ void PollLinkedHqIndexedFieldLoad(
         hq.stage = LinkedHqPreparationStage::Failed;
         hq.ready = false;
         hq.enabled = false;
+        hq.adaptiveEnabled = false;
         hq.failureMessage = std::move(message);
         runtimeState->errorMessage = hq.failureMessage;
         runtimeState->statusMessage.clear();
@@ -57289,6 +59363,12 @@ void EnsureLinkedHqIndexedFieldResidency(
                 ->sessions[patch.sourceSessionIndex]
                 .sourcePath;
             const auto sourceIndices = patch.sourcePointIndices;
+            const auto adaptiveCacheIndex = patch.adaptiveCacheIndex;
+            const auto adaptiveActiveBlockIndices =
+                patch.adaptiveActiveBlockIndices;
+            const auto adaptiveFrustums = hq.request->patchFrustums;
+            const auto adaptiveSpacingMicrometres =
+                hq.request->patchSpacingMicrometres;
             hq.indexedFieldShared = shared;
             std::cout << "Linked HQ: gathering field '" << fieldName
                       << "' for the "
@@ -57300,7 +59380,11 @@ void EnsureLinkedHqIndexedFieldResidency(
                  patchSlot,
                  fieldName,
                  sourcePath,
-                 sourceIndices](std::stop_token stopToken) {
+                 sourceIndices,
+                 adaptiveCacheIndex,
+                 adaptiveActiveBlockIndices,
+                 adaptiveFrustums,
+                 adaptiveSpacingMicrometres](std::stop_token stopToken) {
 #ifdef __APPLE__
                     (void)pthread_set_qos_class_self_np(
                         QOS_CLASS_UTILITY,
@@ -57311,18 +59395,136 @@ void EnsureLinkedHqIndexedFieldResidency(
                     result.patchSlot = patchSlot;
                     result.fieldName = fieldName;
                     try {
-                        result.load = invisible_places::io::
-                            LoadPointCloudSelectedValuesAtIndices(
-                                sourcePath,
-                                {
-                                    .source = invisible_places::io::
-                                        PointCloudSelectedValueSource::
-                                            ScalarField,
-                                    .scalarFieldName = fieldName,
-                                },
-                                *sourceIndices,
-                                {},
-                                stopToken);
+                        if (adaptiveCacheIndex.has_value()) {
+                            invisible_places::io::
+                                PointCloudScalarFieldFilter filter;
+                            filter.mode = invisible_places::io::
+                                PointCloudScalarFieldFilter::Mode::Selected;
+                            filter.names.push_back(fieldName);
+                            std::vector<invisible_places::io::
+                                            AdaptiveHqResidentBlock>
+                                fieldBlocks;
+                            fieldBlocks.reserve(
+                                adaptiveActiveBlockIndices.size());
+                            for (const auto blockIndex :
+                                 adaptiveActiveBlockIndices) {
+                                auto loaded = invisible_places::io::
+                                    LoadAdaptiveHqCacheBlock(
+                                        *adaptiveCacheIndex,
+                                        blockIndex,
+                                        filter,
+                                        stopToken);
+                                if (loaded.cancelled ||
+                                    stopToken.stop_requested()) {
+                                    result.load.cancelled = true;
+                                    break;
+                                }
+                                if (!loaded.success) {
+                                    result.load.errorMessage =
+                                        loaded.errorMessage;
+                                    break;
+                                }
+                                fieldBlocks.push_back({
+                                    .blockIndex = blockIndex,
+                                    .points = std::make_shared<const
+                                        invisible_places::io::
+                                            PointCloudSubsetLoadResult>(
+                                                std::move(loaded)),
+                                });
+                            }
+                            if (!result.load.cancelled &&
+                                result.load.errorMessage.empty()) {
+                                invisible_places::io::
+                                    PointCloudGridDecimation decimation;
+                                if (adaptiveSpacingMicrometres > 1000U) {
+                                    decimation = {
+                                        .cellSizeMeters =
+                                            static_cast<float>(
+                                                adaptiveSpacingMicrometres) *
+                                            1.0e-6F,
+                                        .keepFraction =
+                                            LinkedHqPatchKeepFraction(
+                                                adaptiveSpacingMicrometres),
+                                    };
+                                }
+                                auto subset = invisible_places::io::
+                                    AssembleAdaptiveHqCacheSubset(
+                                        *adaptiveCacheIndex,
+                                        adaptiveActiveBlockIndices,
+                                        fieldBlocks,
+                                        [adaptiveFrustums](
+                                            const invisible_places::io::
+                                                Float3& point) {
+                                            return adaptiveFrustums.Contains(
+                                                point);
+                                        },
+                                        decimation,
+                                        stopToken,
+                                        false);
+                                if (subset.cancelled ||
+                                    stopToken.stop_requested()) {
+                                    result.load.cancelled = true;
+                                } else if (!subset.success) {
+                                    result.load.errorMessage =
+                                        subset.errorMessage;
+                                } else if (subset.sourcePointIndices !=
+                                           *sourceIndices) {
+                                    result.load.errorMessage =
+                                        "The cached aHQ field selection no longer matches the published patch.";
+                                } else {
+                                    const auto field = std::find_if(
+                                        subset.cloud.scalarFields.begin(),
+                                        subset.cloud.scalarFields.end(),
+                                        [&](const auto& stats) {
+                                            return stats.name == fieldName;
+                                        });
+                                    if (field ==
+                                        subset.cloud.scalarFields.end()) {
+                                        result.load.errorMessage =
+                                            "The requested scalar field is not present in the aHQ cache source.";
+                                    } else {
+                                        const auto fieldSlot =
+                                            static_cast<std::size_t>(
+                                                std::distance(
+                                                    subset.cloud.scalarFields
+                                                        .begin(),
+                                                    field));
+                                        result.load.values.reserve(
+                                            subset.cloud.PointCount());
+                                        for (std::size_t point = 0U;
+                                             point <
+                                                 subset.cloud.PointCount();
+                                             ++point) {
+                                            result.load.values.push_back(
+                                                subset.cloud
+                                                    .scalarFieldValues[
+                                                        subset.cloud
+                                                            .ScalarFieldValueIndex(
+                                                                fieldSlot,
+                                                                point)]);
+                                        }
+                                        result.load.stats = *field;
+                                        result.load.sourcePointCount =
+                                            adaptiveCacheIndex->source
+                                                .pointCount;
+                                        result.load.success = true;
+                                    }
+                                }
+                            }
+                        } else {
+                            result.load = invisible_places::io::
+                                LoadPointCloudSelectedValuesAtIndices(
+                                    sourcePath,
+                                    {
+                                        .source = invisible_places::io::
+                                            PointCloudSelectedValueSource::
+                                                ScalarField,
+                                        .scalarFieldName = fieldName,
+                                    },
+                                    *sourceIndices,
+                                    {},
+                                    stopToken);
+                        }
                     } catch (const std::exception& error) {
                         result.load.errorMessage =
                             "Indexed HQ field scan failed unexpectedly: " +
@@ -57356,11 +59558,49 @@ void EnsureLinkedHqPreview(
     }
 
     auto& hq = runtimeState->linkedHqPreview;
+    const bool adaptiveBaseGuardExpired =
+        hq.adaptiveBaseGuardApplied && hq.enabled &&
+        hq.adaptiveEnabled &&
+        !LinkedHqAdaptiveGuardCoversCurrentView(
+            *runtimeState,
+            *viewport);
+    if (adaptiveBaseGuardExpired) {
+        // Restore the complete coarse layer for newly exposed pixels, but do
+        // not retire or hide the published fine patch. Render-state assembly
+        // keeps that patch as a depth-faded overlay until its replacement is
+        // ready, so crossing a guard no longer clears HQ points that remain
+        // visible.
+        try {
+            PointCloudMutationBatchScope mutationBatch{viewport};
+            ApplyLinkedHqFiveMillimeterMasks(
+                runtimeState,
+                viewport,
+                LinkedHqPreviewMode::Off);
+            mutationBatch.Finish();
+            runtimeState->previewRenderStateSignatureValid = false;
+        } catch (const std::exception& error) {
+            hq.failureMessage =
+                "aHQ could not restore its complete 5 mm fallback after "
+                "leaving the camera guard: " +
+                std::string{error.what()};
+            hq.stage = LinkedHqPreparationStage::Failed;
+            runtimeState->errorMessage = hq.failureMessage;
+            return;
+        }
+    }
     constexpr auto kLinkedHqResolveInterval = std::chrono::milliseconds{500};
     const auto now = std::chrono::steady_clock::now();
-    const bool resolveDue = !hq.request.has_value() ||
-        !hq.resolveTimestampValid ||
-        now - hq.lastResolveAt >= kLinkedHqResolveInterval;
+    // Let a running cache build/block request finish against one immutable guard.
+    // Re-targeting it every 500 ms while the user navigates would repeatedly
+    // throw away almost-complete work. A newly invalid view uses complete
+    // 5 mm until this request publishes, then a later resolve can refresh again.
+    const bool adaptivePreparationActive =
+        hq.request.has_value() &&
+        hq.request->mode == LinkedHqPreviewMode::Adaptive &&
+        (hq.preparationShared != nullptr || hq.uploadPending.has_value());
+    const bool resolveDue = !adaptivePreparationActive &&
+        (!hq.request.has_value() || !hq.resolveTimestampValid ||
+         now - hq.lastResolveAt >= kLinkedHqResolveInterval);
     if (resolveDue) {
         hq.resolveTimestampValid = true;
         hq.lastResolveAt = now;
@@ -57375,6 +59615,16 @@ void EnsureLinkedHqPreview(
               &waitingForScene)
         : hq.request;
     if (!resolved.has_value()) {
+        if (hq.request.has_value() &&
+            hq.request->mode == LinkedHqPreviewMode::Adaptive &&
+            hq.requestedMode == LinkedHqPreviewMode::Off &&
+            resolveError.empty()) {
+            // No animation is required for aHQ. When it is switched off in a
+            // scene without an animation, retain the completed camera cache;
+            // if a cache request was already finishing, publish it disabled.
+            (void)PollLinkedHqPreparation(runtimeState, viewport);
+            return;
+        }
         if (hq.request.has_value()) {
             ResetLinkedHqPreview(runtimeState, viewport);
         }
@@ -57389,8 +59639,25 @@ void EnsureLinkedHqPreview(
     if (!hq.request.has_value() ||
         hq.request->fingerprint != resolved->fingerprint) {
         const bool reenableAfterPublish = hq.ready && hq.enabled;
+        const bool reenableAdaptiveAfterPublish =
+            reenableAfterPublish && hq.adaptiveEnabled;
+        const bool adaptiveGuardRefresh =
+            hq.request.has_value() && hq.ready &&
+            hq.publishedFingerprint != 0U &&
+            hq.request->mode == LinkedHqPreviewMode::Adaptive &&
+            resolved->mode == LinkedHqPreviewMode::Adaptive &&
+            hq.request->sceneGroupName == resolved->sceneGroupName &&
+            hq.request->patchSpacingMicrometres ==
+                resolved->patchSpacingMicrometres &&
+            hq.request->includeSand == resolved->includeSand &&
+            hq.request->fiveMillimeterSessionIndices ==
+                resolved->fiveMillimeterSessionIndices &&
+            hq.request->oneMillimeterSessionIndices ==
+                resolved->oneMillimeterSessionIndices &&
+            hq.request->sourceFingerprints ==
+                resolved->sourceFingerprints;
         std::vector<std::pair<std::size_t, bool>> changedFiveMillimeterSources;
-        if (hq.request.has_value()) {
+        if (hq.request.has_value() && !adaptiveGuardRefresh) {
             for (std::size_t role = 0U;
                  role < hq.request->fiveMillimeterSessionIndices.size();
                  ++role) {
@@ -57414,6 +59681,16 @@ void EnsureLinkedHqPreview(
         hq.displayedProgress = 0.0F;
         hq.retryRequested = false;
         hq.reenableAfterPublish = reenableAfterPublish;
+        hq.reenableAdaptiveAfterPublish =
+            reenableAdaptiveAfterPublish;
+        if (adaptiveGuardRefresh) {
+            // Old fine data and the complete base remain resident. Once the
+            // camera leaves the old guard, rendering restores complete 5 mm
+            // for coverage and retains the old depth-faded fine patch while
+            // this replacement is loaded.
+            hq.resolveTimestampValid = true;
+            hq.lastResolveAt = now;
+        }
         for (const auto& [sessionIndex, wasVisible] :
              changedFiveMillimeterSources) {
             try {
@@ -57452,6 +59729,11 @@ void EnsureLinkedHqPreview(
         // Refresh field filters without invalidating already retained source
         // indices; newly referenced fields use the indexed gather path.
         hq.request->patchFieldFilters = resolved->patchFieldFilters;
+        hq.request->adaptiveTransition = resolved->adaptiveTransition;
+        if (hq.publishedFingerprint == hq.request->fingerprint) {
+            hq.publishedAdaptiveTransition =
+                resolved->adaptiveTransition;
+        }
     }
 
     // Resolve/invalidate before publishing worker results. This prevents a
@@ -57512,22 +59794,14 @@ void EnsureLinkedHqPreview(
     if (baselineBecameReady) {
         try {
             PointCloudMutationBatchScope mutationBatch{viewport};
-            for (const auto sessionIndex :
-                 hq.request->fiveMillimeterSessionIndices) {
-                if (viewport->HasPointCloudResources(sessionIndex)) {
-                    viewport->UpdatePointBudget(sessionIndex, {});
-                }
-            }
-            if (hq.ready && hq.enabled) {
-                for (const auto& patch : hq.patches) {
-                    if (viewport->HasPointCloudResources(
-                            patch.baseSessionIndex)) {
-                        viewport->UpdatePointBudget(
-                            patch.baseSessionIndex,
-                            patch.fiveMillimeterOutsideIndices);
-                    }
-                }
-            }
+            ApplyLinkedHqFiveMillimeterMasks(
+                runtimeState,
+                viewport,
+                hq.ready && hq.enabled
+                    ? (hq.adaptiveEnabled
+                           ? LinkedHqPreviewMode::Adaptive
+                           : LinkedHqPreviewMode::Fixed)
+                    : LinkedHqPreviewMode::Off);
             mutationBatch.Finish();
             viewport->SetTemporalCameraOverlay(false);
             runtimeState->animationPanel.linkedSeamedView
@@ -57548,7 +59822,9 @@ void EnsureLinkedHqPreview(
     // A finished scan waits one frame in uploadPending before it publishes;
     // starting another scan there would run the whole 1 mm read twice and
     // later re-publish over the live patches.
-    if (!hq.ready && hq.preparationShared == nullptr &&
+    const bool preparationRequired =
+        !hq.ready || hq.publishedFingerprint != hq.request->fingerprint;
+    if (preparationRequired && hq.preparationShared == nullptr &&
         !hq.uploadPending.has_value() &&
         !runtimeState->offlineRenderJob.active &&
         !runtimeState->pendingLoad.has_value() &&
@@ -57558,7 +59834,8 @@ void EnsureLinkedHqPreview(
         !runtimeState->water.waterSurfaceCachePreprocessPending) {
         StartLinkedHqPreparation(runtimeState);
     }
-    if (hq.ready) {
+    if (hq.ready &&
+        hq.publishedFingerprint == hq.request->fingerprint) {
         EnsureLinkedHqIndexedFieldResidency(runtimeState);
     }
 }
@@ -61487,22 +63764,26 @@ void DrawAnimationHqPreviewControls(
         return;
     }
     auto& hq = runtimeState->linkedHqPreview;
+    const bool includeSand =
+        runtimeState->projectSettings.linkedHqIncludeSand;
     ImGui::SameLine();
     if (hq.ready && hq.baselineReady) {
-        if (hq.enabled) {
+        const bool fixedActive = hq.enabled && !hq.adaptiveEnabled;
+        if (fixedActive) {
             ImGui::PushStyleColor(
                 ImGuiCol_Button,
                 ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
         }
         const bool pressed = ImGui::SmallButton("HQ");
-        if (hq.enabled) {
+        if (fixedActive) {
             ImGui::PopStyleColor();
         }
         if (pressed) {
-            (void)SetLinkedHqPreviewEnabled(
+            (void)SetLinkedHqPreviewMode(
                 runtimeState,
                 viewport,
-                !hq.enabled);
+                fixedActive ? LinkedHqPreviewMode::Off
+                            : LinkedHqPreviewMode::Fixed);
         }
     } else if (hq.stage == LinkedHqPreparationStage::Failed) {
         if (ImGui::SmallButton("HQ Retry")) {
@@ -61516,8 +63797,11 @@ void DrawAnimationHqPreviewControls(
             hq.displayedProgress,
             0.0F,
             0.99F);
+        const bool adaptivePreparing =
+            hq.requestedMode == LinkedHqPreviewMode::Adaptive;
         const std::string progressLabel =
-            "HQ " + std::to_string(static_cast<int>(std::floor(
+            std::string{adaptivePreparing ? "aHQ " : "HQ "} +
+            std::to_string(static_cast<int>(std::floor(
                           progress * 100.0F))) +
             "%";
         const ImVec2 size{
@@ -61572,22 +63856,81 @@ void DrawAnimationHqPreviewControls(
                 "HQ preparation failed. Click to retry.\n%s",
                 hq.failureMessage.c_str());
         } else if (hq.ready && hq.baselineReady) {
-            ImGui::SetTooltip(
-                linkedPair
-                    ? "HQ is independent of Seam/A/B. It uses 1 mm ROCK and "
-                      "VEG inside the two padded animation midpoint views, "
-                      "5 mm ROCK/VEG elsewhere, and complete 5 mm SAND. "
-                      "Exports remain complete 1 mm."
-                    : "HQ uses 1 mm ROCK and VEG inside the padded animation "
-                      "midpoint view, 5 mm ROCK/VEG elsewhere, and complete "
-                      "5 mm SAND. The animation does not need to be linked; "
-                      "exports remain complete 1 mm.");
+            if (linkedPair) {
+                ImGui::SetTooltip(
+                    includeSand
+                        ? "HQ is independent of Seam/A/B. It uses 1 mm "
+                          "ROCK, VEG, and SAND inside the two padded animation "
+                          "midpoint views, with complete 5 mm points elsewhere. "
+                          "Exports remain complete 1 mm."
+                        : "HQ is independent of Seam/A/B. It uses 1 mm ROCK "
+                          "and VEG inside the two padded animation midpoint "
+                          "views, 5 mm ROCK/VEG elsewhere, and complete 5 mm "
+                          "SAND. Exports remain complete 1 mm.");
+            } else {
+                ImGui::SetTooltip(
+                    includeSand
+                        ? "HQ uses 1 mm ROCK, VEG, and SAND across padded "
+                          "views spanning the complete animation path "
+                          "(including every camera key), with complete 5 mm "
+                          "points elsewhere. Exports remain complete 1 mm."
+                        : "HQ uses 1 mm ROCK and VEG across padded views "
+                          "spanning the complete animation path (including "
+                          "every camera key), 5 mm ROCK/VEG elsewhere, and "
+                          "complete 5 mm SAND. Exports remain complete 1 mm.");
+            }
         } else {
             ImGui::SetTooltip(
                 "HQ %s (%.0f%%). The complete 5 mm view remains visible "
-                "until both 1 mm ROCK/VEG patches are ready.%s%s",
+                "until all requested 1 mm %s patches are ready.%s%s",
                 LinkedHqPreparationStageName(hq.stage),
                 std::min(hq.displayedProgress, 0.99F) * 100.0F,
+                includeSand ? "ROCK/VEG/SAND" : "ROCK/VEG",
+                hq.failureMessage.empty() ? "" : "\n",
+                hq.failureMessage.c_str());
+        }
+    }
+
+    ImGui::SameLine();
+    const bool adaptiveActive = hq.enabled && hq.adaptiveEnabled;
+    const bool adaptiveRequested =
+        hq.requestedMode == LinkedHqPreviewMode::Adaptive;
+    if (adaptiveActive) {
+        ImGui::PushStyleColor(
+            ImGuiCol_Button,
+            ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+    }
+    const bool adaptivePressed = ImGui::SmallButton("aHQ");
+    if (adaptiveActive) {
+        ImGui::PopStyleColor();
+    }
+    if (adaptivePressed) {
+        (void)SetLinkedHqPreviewMode(
+            runtimeState,
+            viewport,
+            adaptiveRequested ? LinkedHqPreviewMode::Off
+                              : LinkedHqPreviewMode::Adaptive);
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+        if (adaptiveActive &&
+            hq.publishedAdaptiveTransition.Valid()) {
+            ImGui::SetTooltip(
+                "Adaptive HQ is active.\n"
+                "Fine points: near camera; complete 5 mm: distance.\n"
+                "Transition %.2f-%.2f m (5 mm reaches about one pixel at %.2f m).\n"
+                "The selection is stable on the GPU, so a stationary view does not shimmer.\n"
+                "Moving beyond the guard reads only newly intersecting Morton blocks; decoded regions stay in a 6 GiB-per-role LRU working set for fast return movement. Complete 5 mm stays visible until publication.\n"
+                "The local block cache persists under Saved; source and export PLYs are untouched.\n"
+                "Animations are optional; playback advances the same guarded camera cache without loading the complete path at once. Exports are unchanged.",
+                hq.publishedAdaptiveTransition.startDepthMeters,
+                hq.publishedAdaptiveTransition.endDepthMeters,
+                hq.publishedAdaptiveTransition.switchDepthMeters);
+        } else {
+            ImGui::SetTooltip(
+                "aHQ is an opt-in camera-adaptive alternative to fixed HQ.\n"
+                "It works with no animation and outside animation coverage. The current camera always owns a padded fine-data cache; a loaded animation does not inflate it to the complete path.\n"
+                "First use builds a machine-local Morton-block cache under Saved; later views seek only intersecting blocks and retain up to 6 GiB of recently used decoded blocks per role.\n"
+                "The complete 5 mm scene remains visible during preparation or cache refresh. Canonical PLYs and exports are unchanged.%s%s",
                 hq.failureMessage.empty() ? "" : "\n",
                 hq.failureMessage.c_str());
         }
@@ -61620,17 +63963,40 @@ void DrawAnimationHqPreviewControls(
                 static_cast<int>(
                     kLinkedHqPatchSpacingChoicesMicrometres.size()) -
                     1))];
+        hq.resolveTimestampValid = false;
     }
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
         ImGui::SetTooltip(
-            "HQ patch spacing inside the animation midpoint view%s.\n"
-            "1 mm keeps every 1 mm ROCK/VEG point (slowest, export-exact).\n"
+            "Fine patch spacing for HQ and aHQ.\n"
+            "1 mm keeps every point from each included 1 mm role (slowest).\n"
             "2 mm / 3 mm keep one centred point per 2 mm / 3 mm cell (a "
             "quarter / a ninth of the points, density preserving like the "
             "5 mm display cache); footprint compensation restores the 1 mm "
             "coverage. 2 mm reads like 1 mm; 3 mm thins fine vegetation.\n"
-            "Saved with the project; changing it rescans the 1 mm sources.",
-            linkedPair ? "s" : "");
+            "Saved with the project; changing it rebuilds the preview. Fixed HQ rescans its 1 mm sources; aHQ reuses its local spatial cache and reads only guarded blocks.");
+    }
+
+    ImGui::SameLine();
+    bool editedIncludeSand = includeSand;
+    if (ImGui::Checkbox(
+            "Sand##AnimationHqIncludeSand",
+            &editedIncludeSand)) {
+        runtimeState->projectSettings.linkedHqIncludeSand =
+            editedIncludeSand;
+        hq.resolveTimestampValid = false;
+        runtimeState->statusMessage = editedIncludeSand
+            ? "HQ will include a 1 mm SAND patch; rebuilding the selected preview."
+            : "HQ will keep complete 5 mm SAND; rebuilding without 1 mm SAND.";
+        runtimeState->errorMessage.clear();
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+        ImGui::SetTooltip(
+            "Include SAND in the HQ density replacement.\n"
+            "Off: scan and patch only 1 mm ROCK/VEG; SAND stays complete 5 mm.\n"
+            "On: scan and patch 1 mm SAND through the same animation-view "
+            "union and spacing, with complementary 5 mm SAND elsewhere.\n"
+            "The SAND source can be very large, so enabling this can add "
+            "substantial preparation time and memory. Saved with the project.");
     }
 }
 
@@ -75426,14 +77792,17 @@ void DrawLidarPanel(
                             runtimeState->sessions[sessionIndex.value()].visible = visible;
                         }
                     }
-                    // The scene checkbox also drives its companion water gap
-                    // fill; the layer's own Visible checkbox can still refine
-                    // it afterwards.
-                    for (auto& companion : runtimeState->sessions) {
-                        if (IsWaterFillPointCloudSession(companion) &&
-                            NormalizePathKey(companion.sourcePath.parent_path()) ==
-                                NormalizePathKey(scene.sourceFolder)) {
-                            companion.visible = visible;
+                    // The scene checkbox drives only the density-matched
+                    // WATER companion; sibling densities remain unloaded.
+                    if (visible) {
+                        QueueWaterFillCompanionLoads(runtimeState, viewport);
+                    } else {
+                        for (auto& companion : runtimeState->sessions) {
+                            if (IsWaterFillPointCloudSession(companion) &&
+                                NormalizePathKey(companion.sourcePath.parent_path()) ==
+                                    NormalizePathKey(scene.sourceFolder)) {
+                                companion.visible = false;
+                            }
                         }
                     }
                 }
@@ -75504,8 +77873,11 @@ void DrawLidarPanel(
     DrawLayerSection(runtimeState, viewport, LayerKind::PointCloud, "Lidar Layers");
 }
 
-void DrawPointRendererPanel(PreviewRuntimeState* runtimeState) {
-    if (runtimeState == nullptr || !BeginPanelSection("Point Renderer")) {
+void DrawPointRendererPanel(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (runtimeState == nullptr || viewport == nullptr ||
+        !BeginPanelSection("Point Renderer")) {
         return;
     }
 
@@ -75526,6 +77898,96 @@ void DrawPointRendererPanel(PreviewRuntimeState* runtimeState) {
     }
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Fast Basic renders opaque 1 px square points, with source RGB, solid colour, scalar colormaps, and colourise.");
+    }
+
+    ImGui::SeparatorText("Adaptive HQ");
+    auto& hq = runtimeState->linkedHqPreview;
+    bool adaptiveRequested =
+        hq.requestedMode == LinkedHqPreviewMode::Adaptive;
+    if (ImGui::Checkbox("aHQ (experimental)", &adaptiveRequested)) {
+        (void)SetLinkedHqPreviewMode(
+            runtimeState,
+            viewport,
+            adaptiveRequested ? LinkedHqPreviewMode::Adaptive
+                              : LinkedHqPreviewMode::Off);
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+        ImGui::SetTooltip(
+            "Camera-adaptive live density. No animation is required.\n"
+            "Fine data is cached near the current camera, transitions stably on the GPU, and the complete 5 mm scene covers distance and every cache refresh.\n"
+            "A loaded animation only prefetches its path; moving elsewhere causes a guarded background refresh. Current fixed HQ remains available in Animation View. Exports are unchanged.");
+    }
+    if (adaptiveRequested) {
+        if (hq.enabled && hq.adaptiveEnabled &&
+            hq.publishedAdaptiveTransition.Valid()) {
+            const bool retainingPriorPatch =
+                !LinkedHqAdaptiveGuardCoversCurrentView(
+                    *runtimeState,
+                    *viewport);
+            if (retainingPriorPatch) {
+                ImGui::TextDisabled(
+                    "%s %.0f%% — retaining previous fine points",
+                    LinkedHqPreparationStageName(hq.stage),
+                    std::min(hq.displayedProgress, 0.99F) * 100.0F);
+            } else {
+                ImGui::TextDisabled(
+                    "Active: %.2f-%.2f m transition",
+                    hq.publishedAdaptiveTransition.startDepthMeters,
+                    hq.publishedAdaptiveTransition.endDepthMeters);
+            }
+        } else if (hq.stage == LinkedHqPreparationStage::Failed) {
+            ImGui::TextColored(
+                ImVec4{0.75F, 0.20F, 0.18F, 1.0F},
+                "%s",
+                hq.failureMessage.c_str());
+            if (ImGui::SmallButton("Retry aHQ")) {
+                hq.retryRequested = true;
+                hq.resolveTimestampValid = false;
+            }
+        } else {
+            ImGui::TextDisabled(
+                "%s %.0f%% — complete 5 mm fallback",
+                LinkedHqPreparationStageName(hq.stage),
+                std::min(hq.displayedProgress, 0.99F) * 100.0F);
+        }
+    }
+
+    auto& spacing =
+        settings.linkedHqPatchSpacingMicrometres;
+    int spacingChoice = 0;
+    for (std::size_t choice = 0U;
+         choice < kLinkedHqPatchSpacingChoicesMicrometres.size();
+         ++choice) {
+        if (kLinkedHqPatchSpacingChoicesMicrometres[choice] ==
+            SanitizeLinkedHqPatchSpacing(spacing)) {
+            spacingChoice = static_cast<int>(choice);
+        }
+    }
+    if (ImGui::Combo(
+            "Fine spacing",
+            &spacingChoice,
+            "1 mm\0002 mm\0003 mm\000")) {
+        spacing = kLinkedHqPatchSpacingChoicesMicrometres[
+            static_cast<std::size_t>(std::clamp(
+                spacingChoice,
+                0,
+                static_cast<int>(
+                    kLinkedHqPatchSpacingChoicesMicrometres.size()) -
+                    1))];
+        hq.resolveTimestampValid = false;
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+        ImGui::SetTooltip(
+            "1 mm keeps all accepted fine points. 2 mm and 3 mm use density-preserving cell stratification, reducing fine-layer vertex work and cache memory. Saved with the project.");
+    }
+    bool includeSand = settings.linkedHqIncludeSand;
+    if (ImGui::Checkbox("Include fine SAND", &includeSand)) {
+        settings.linkedHqIncludeSand = includeSand;
+        hq.resolveTimestampValid = false;
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+        ImGui::SetTooltip(
+            "Off keeps SAND at complete 5 mm. On includes SAND in the fine camera cache; this can substantially increase scan time and memory. Saved with the project.");
     }
 
     EndPanelSection();
@@ -75592,7 +78054,7 @@ void DrawWaterFillVisualLinkBanner(
 void DrawVisualsPanel(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
-    DrawPointRendererPanel(runtimeState);
+    DrawPointRendererPanel(runtimeState, viewport);
 
     const auto visualIndex = runtimeState != nullptr ? ResolveLoadedPointCloudLookdevIndex(*runtimeState) : std::nullopt;
     PreviewLayerSession* session =
@@ -87123,6 +89585,19 @@ void DrawProjectPanel(
             " overlapping points blend in the preview only; animation exports are unaffected."
             " Off keeps the original (slower) preview appearance.");
     }
+    if (settings.previewPerformanceMode && viewport != nullptr) {
+        const auto eligible = viewport->Diagnostics()
+                                  .previewPerformanceEligibleLayerCount;
+        if (eligible > 0U) {
+            ImGui::TextDisabled(
+                "Performance depth culling: active on %u layer%s",
+                eligible,
+                eligible == 1U ? "" : "s");
+        } else {
+            ImGui::TextDisabled(
+                "Performance depth culling: no eligible layer in the last frame");
+        }
+    }
     ImGui::Checkbox("Load All Scalar Fields", &settings.loadAllScalarFields);
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip(
@@ -87131,7 +89606,51 @@ void DrawProjectPanel(
             " scenes). Off loads only the fields the project references and streams others in"
             " on demand. Takes effect on each cloud's next load.");
     }
-    ImGui::TextDisabled("Point preview: full cloud, no LOD/downsample.");
+    ImGui::TextDisabled(
+        "Point preview: fixed density, no adaptive LOD/downsample.");
+    const auto& sectionMask =
+        runtimeState->liveAnimationSectionMask;
+    if (!sectionMask.failureMessage.empty()) {
+        ImGui::TextDisabled(
+            "Animation section culling: unavailable (%s)",
+            sectionMask.failureMessage.c_str());
+    } else if (sectionMask.shared != nullptr ||
+               sectionMask.worker.joinable()) {
+        ImGui::TextDisabled(
+            "Animation section culling: preparing %.0f%%",
+            std::clamp(sectionMask.progress, 0.0F, 1.0F) *
+                100.0F);
+    } else if (sectionMask.prepared.has_value() &&
+               !sectionMask.uploaded) {
+        ImGui::TextDisabled(
+            "Animation section culling: ready; stop playback to publish");
+    } else if (sectionMask.uploaded &&
+               sectionMask.fullPointCount > 0U) {
+        if (sectionMask.effectiveDrawPointCount <
+            sectionMask.fullPointCount) {
+            ImGui::TextDisabled(
+                "Animation section culling: %s%s / %s points",
+                sectionMask.applied ? "active, " : "ready, ",
+                FormatPointCount(
+                    sectionMask.effectiveDrawPointCount)
+                    .c_str(),
+                FormatPointCount(sectionMask.fullPointCount)
+                    .c_str());
+        } else {
+            ImGui::TextDisabled(
+                "Animation section culling: range covers most points; using full cloud");
+        }
+    } else if (sectionMask.request.has_value()) {
+        ImGui::TextDisabled(
+            "Animation section culling: waiting for the focused range to settle");
+    } else {
+        ImGui::TextDisabled(
+            "Animation section culling: focus the Feature Run View to enable");
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+        ImGui::SetTooltip(
+            "Uses one conservative index mask for the focused animation range. Point spacing never changes, and the full cloud is restored outside the range or when the camera detaches.");
+    }
     EndPanelSection();
     }
     if (BeginPanelSection("Scalar Field Residency")) {
@@ -87214,7 +89733,7 @@ void DrawProjectPanel(
             if (scene.pendingDisplaySpacingMicrometres.has_value() ||
                 scene.pendingMixedDisplay) {
                 ImGui::TextDisabled(
-                    "Loading %s: %u/%u clouds staged...",
+                    "Loading %s: %zu/%u clouds staged...",
                     SceneDisplayLabel(*runtimeState, scene.sceneGroupName).c_str(),
                     scene.stagedReadyCount,
                     static_cast<unsigned>(
@@ -87539,6 +90058,13 @@ void DrawDebugVisualsSection(
         diagnostics.pointOpaqueHardDiscDrawCalls,
         diagnostics.pointConstantSimpleDrawCalls,
         diagnostics.pointUnifiedDrawCalls);
+    ImGui::Text(
+        "Preview performance: %s, %u eligible layer%s",
+        diagnostics.previewPerformanceModeEnabled ? "on" : "off",
+        diagnostics.previewPerformanceEligibleLayerCount,
+        diagnostics.previewPerformanceEligibleLayerCount == 1U
+            ? ""
+            : "s");
     if (diagnostics.pointFastBasicDrawCalls > 0) {
         ImGui::Text(
             "Fast Basic: %u draws, %s points",
@@ -96052,6 +98578,44 @@ void DrawTimingLabelTooltip(const char* text) {
     }
 }
 
+int TimingResponsiveColumnCount(
+    std::size_t itemCount,
+    float minimumColumnWidth,
+    int maximumColumns = std::numeric_limits<int>::max()) {
+    if (itemCount == 0U) {
+        return 1;
+    }
+    const float availableWidth =
+        std::max(1.0F, ImGui::GetContentRegionAvail().x);
+    const int widthLimited = std::max(
+        1,
+        static_cast<int>(
+            std::floor(availableWidth /
+                       std::max(1.0F, minimumColumnWidth))));
+    return std::clamp(
+        widthLimited,
+        1,
+        std::min(
+            maximumColumns,
+            static_cast<int>(itemCount)));
+}
+
+void SetNextTimingLabelledControlWidth(
+    const char* visibleLabel,
+    float reservedActionWidth = 0.0F,
+    float minimumControlWidth = 48.0F) {
+    const auto& style = ImGui::GetStyle();
+    const float labelWidth =
+        visibleLabel == nullptr || visibleLabel[0] == '\0'
+            ? 0.0F
+            : ImGui::CalcTextSize(visibleLabel).x +
+                  style.ItemInnerSpacing.x;
+    ImGui::SetNextItemWidth(std::max(
+        minimumControlWidth,
+        ImGui::GetContentRegionAvail().x - labelWidth -
+            std::max(0.0F, reservedActionWidth)));
+}
+
 // Draws the shared low-alpha '?' help watermark in a widget's top-right
 // corner and shows `tooltip` while the pointer rests within its radius.
 // Returns whether the mark is hovered so callers can suppress their own
@@ -96111,6 +98675,28 @@ const char* TimingInterpolationLabel(
             return "Smooth Step";
     }
     return "Smooth Step";
+}
+
+const char* TimingCompactInterpolationLabel(
+    invisible_places::water::WaterScenarioInterpolation interpolation) {
+    using invisible_places::water::WaterScenarioInterpolation;
+    switch (interpolation) {
+        case WaterScenarioInterpolation::Linear:
+            return "Linear";
+        case WaterScenarioInterpolation::Hold:
+            return "Hold";
+        case WaterScenarioInterpolation::SmoothVelocity:
+            return "Spline";
+        case WaterScenarioInterpolation::CentripetalCatmullRom:
+            return "Catmull";
+        case WaterScenarioInterpolation::SplineHandles:
+            return "Handles";
+        case WaterScenarioInterpolation::TrackDefault:
+            return "Default";
+        case WaterScenarioInterpolation::Smooth:
+            return "Smooth";
+    }
+    return "Smooth";
 }
 
 // includeSplineModes adds the automatic splines and manual Spline Handles —
@@ -96186,7 +98772,8 @@ template <typename Key, typename Matches>
 bool DrawTimingScalarTrackInterpolationCombo(
     const char* label,
     std::vector<Key>* keys,
-    Matches matches) {
+    Matches matches,
+    bool compactPreview = false) {
     if (keys == nullptr) {
         return false;
     }
@@ -96208,7 +98795,10 @@ bool DrawTimingScalarTrackInterpolationCombo(
     bool changed = false;
     if (ImGui::BeginCombo(
             label,
-            mixed ? "Mixed" : TimingInterpolationLabel(firstMode))) {
+            mixed ? "Mixed"
+                  : compactPreview
+                        ? TimingCompactInterpolationLabel(firstMode)
+                        : TimingInterpolationLabel(firstMode))) {
         constexpr std::array options{
             WaterScenarioInterpolation::Smooth,
             WaterScenarioInterpolation::SmoothVelocity,
@@ -96380,6 +98970,11 @@ float SnapTimingColourisePaletteStopPosition(
     return position;
 }
 
+constexpr float kTimingPaletteGradientHeight = 46.0F;
+constexpr float kTimingPaletteMarkerHeight = 17.0F;
+constexpr float kTimingPalettePreviewHeight =
+    kTimingPaletteGradientHeight + kTimingPaletteMarkerHeight;
+
 bool DrawTimingPalettePreview(
     const invisible_places::timing::TimingColouriseLut& lut,
     const invisible_places::timing::TimingColouriseLut& rawLut,
@@ -96394,16 +98989,20 @@ bool DrawTimingPalettePreview(
     std::optional<std::size_t>* requestedPickerStopIndex,
     bool allowEditing,
     bool allowTopologyEditing,
+    float requestedHeight,
     const char* id) {
     constexpr float kHorizontalInset = 8.0F;
-    constexpr float kGradientHeight = 56.0F;
-    constexpr float kMarkerHeight = 19.0F;
     constexpr float kAmountOverlayHeight = 16.0F;
     constexpr float kMarkerHitRadius = 8.0F;
     constexpr float kAmountHandleHitRadius = 6.0F;
+    const float previewHeight = std::max(
+        kTimingPalettePreviewHeight,
+        requestedHeight);
+    const float gradientHeight =
+        previewHeight - kTimingPaletteMarkerHeight;
     const ImVec2 size{
         std::max(120.0F, ImGui::GetContentRegionAvail().x),
-        kGradientHeight + kMarkerHeight};
+        previewHeight};
     ImGui::InvisibleButton(
         id,
         size,
@@ -96417,7 +99016,7 @@ bool DrawTimingPalettePreview(
         std::max(
             itemMinimum.x + kHorizontalInset + 1.0F,
             itemMaximum.x - kHorizontalInset),
-        itemMinimum.y + kGradientHeight};
+        itemMinimum.y + gradientHeight};
     const float width =
         std::max(1.0F, gradientMaximum.x - gradientMinimum.x);
     const float amountLaneTop = gradientMinimum.y;
@@ -96902,6 +99501,89 @@ struct TimingColouriseKeyLaneSeries {
     ImU32 colour = IM_COL32_WHITE;
 };
 
+float TimingColouriseGraphColourDistanceSquared(
+    ImU32 left,
+    ImU32 right) {
+    const ImVec4 a = ImGui::ColorConvertU32ToFloat4(left);
+    const ImVec4 b = ImGui::ColorConvertU32ToFloat4(right);
+    const float red = a.x - b.x;
+    const float green = a.y - b.y;
+    const float blue = a.z - b.z;
+    return red * red + green * green + blue * blue;
+}
+
+std::vector<ImU32> ResolveTimingColouriseGraphLaneColours(
+    std::span<const TimingColouriseKeyLaneSeries> lanes) {
+    std::vector<ImU32> resolved;
+    resolved.reserve(lanes.size());
+    constexpr float kMinimumDistinctDistanceSquared = 0.045F;
+    const auto minimumDistance = [&](ImU32 candidate) {
+        float distance = std::numeric_limits<float>::max();
+        for (const ImU32 existing : resolved) {
+            distance = std::min(
+                distance,
+                TimingColouriseGraphColourDistanceSquared(
+                    candidate,
+                    existing));
+        }
+        return distance;
+    };
+    for (std::size_t laneIndex = 0U;
+         laneIndex < lanes.size();
+         ++laneIndex) {
+        auto requested = ImGui::ColorConvertU32ToFloat4(
+            lanes[laneIndex].colour);
+        requested.w = 1.0F;
+        ImU32 chosen = ImGui::ColorConvertFloat4ToU32(requested);
+        if (!resolved.empty() &&
+            minimumDistance(chosen) <
+                kMinimumDistinctDistanceSquared) {
+            // Greedily choose the most separated colour from a stable HSV
+            // sequence. This retains authored semantic colours whenever
+            // they are readable, but guarantees duplicate stop/node colours
+            // get a distinct graph identity.
+            float bestDistance = -1.0F;
+            for (std::size_t candidateIndex = 0U;
+                 candidateIndex < 64U;
+                 ++candidateIndex) {
+                const float hue = std::fmod(
+                    0.08F +
+                        static_cast<float>(candidateIndex) *
+                            0.61803398875F,
+                    1.0F);
+                const float saturation =
+                    (candidateIndex / 16U) % 2U == 0U
+                        ? 0.78F
+                        : 0.58F;
+                const float value =
+                    (candidateIndex / 32U) % 2U == 0U
+                        ? 0.96F
+                        : 0.78F;
+                float red = 0.0F;
+                float green = 0.0F;
+                float blue = 0.0F;
+                ImGui::ColorConvertHSVtoRGB(
+                    hue,
+                    saturation,
+                    value,
+                    red,
+                    green,
+                    blue);
+                const ImU32 candidate =
+                    ImGui::ColorConvertFloat4ToU32(
+                        ImVec4{red, green, blue, 1.0F});
+                const float distance = minimumDistance(candidate);
+                if (distance > bestDistance) {
+                    bestDistance = distance;
+                    chosen = candidate;
+                }
+            }
+        }
+        resolved.push_back(chosen);
+    }
+    return resolved;
+}
+
 std::optional<std::pair<float, float>>
 TimingColouriseSelectorRangeFromStats(
     PreviewRuntimeState* runtimeState,
@@ -96948,6 +99630,124 @@ void AddUniqueTimingColouriseKeyHandle(
         return;
     }
     handles->push_back(std::move(handle));
+}
+
+enum class TimingColouriseBoundsKeyFamily : std::uint8_t {
+    Geometry,
+    Fade,
+};
+
+std::optional<TimingColouriseBoundsKeyFamily>
+TimingColouriseBoundsKeyFamilyFor(
+    const TimingColouriseKeyHandle& handle) {
+    if (handle.track != TimingColouriseKeyTrack::Bounds ||
+        !handle.boundsParameter.has_value()) {
+        return std::nullopt;
+    }
+    using invisible_places::timing::TimingColouriseBoundsParameter;
+    switch (handle.boundsParameter.value()) {
+        case TimingColouriseBoundsParameter::Lower:
+        case TimingColouriseBoundsParameter::Upper:
+        case TimingColouriseBoundsParameter::Centre:
+        case TimingColouriseBoundsParameter::Spread:
+            return TimingColouriseBoundsKeyFamily::Geometry;
+        case TimingColouriseBoundsParameter::EdgeFade:
+        case TimingColouriseBoundsParameter::EdgeFadeLower:
+        case TimingColouriseBoundsParameter::EdgeFadeUpper:
+            return TimingColouriseBoundsKeyFamily::Fade;
+    }
+    return std::nullopt;
+}
+
+bool TimingColouriseKeyHandlesCanSnapTogether(
+    const TimingColouriseKeyHandle& dragged,
+    const TimingColouriseKeyHandle& target) {
+    using invisible_places::ui::VisualFeatureTimelineSnapDomain;
+    const auto domainFor = [](const TimingColouriseKeyHandle& handle) {
+        if (handle.track == TimingColouriseKeyTrack::Palette) {
+            return VisualFeatureTimelineSnapDomain::Palette;
+        }
+        if (handle.track == TimingColouriseKeyTrack::EmissiveFalloff) {
+            return VisualFeatureTimelineSnapDomain::Intensity;
+        }
+        return invisible_places::ui::VisualFeatureTimelineSnapDomainFor(
+            handle.boundsParameter,
+            handle.effectParameter);
+    };
+    // Every visible family occupies one shared graph but retains its own snap
+    // domain. Model identity checks elsewhere still prevent collisions within
+    // a setting after a candidate snap is found.
+    return invisible_places::ui::VisualFeatureTimelineSnapDomainsCanSnap(
+        domainFor(dragged),
+        domainFor(target));
+}
+
+void AddCoincidentTimingColouriseBoundsFamilyHandles(
+    const invisible_places::timing::TimingColouriseEffect& effect,
+    const std::vector<TimingColouriseKeyHandle>& anchors,
+    std::vector<TimingColouriseKeyHandle>* handles) {
+    if (handles == nullptr) {
+        return;
+    }
+    // A Bounds graph represents two coherent pairs: the two coordinates of
+    // its selected parameterisation, and the two edge fades. Once members of
+    // a pair share an authored time, retiming either keeps that pair intact;
+    // the two families never pull one another along.
+    for (const auto& anchor : anchors) {
+        const auto family = TimingColouriseBoundsKeyFamilyFor(anchor);
+        if (!family.has_value()) {
+            continue;
+        }
+        for (const auto& key : effect.boundsParameterKeys) {
+            TimingColouriseKeyHandle candidate{
+                .track = TimingColouriseKeyTrack::Bounds,
+                .boundsParameter = key.parameter,
+                .position = key.position,
+            };
+            if (TimingColouriseBoundsKeyFamilyFor(candidate) == family &&
+                std::abs(key.position - anchor.position) <=
+                    invisible_places::timing::
+                        kTimingColouriseKeyTolerance) {
+                AddUniqueTimingColouriseKeyHandle(
+                    handles,
+                    std::move(candidate));
+            }
+        }
+    }
+}
+
+void AddCoincidentTimingColourisePaletteMarkerHandles(
+    const invisible_places::timing::TimingColouriseEffect& effect,
+    const std::vector<TimingColouriseKeyHandle>& anchors,
+    std::vector<TimingColouriseKeyHandle>* handles) {
+    if (handles == nullptr) {
+        return;
+    }
+    using invisible_places::timing::TimingColourisePaletteStopParameter;
+    for (const auto& anchor : anchors) {
+        if (anchor.track != TimingColouriseKeyTrack::Palette ||
+            anchor.stopParameter !=
+                TimingColourisePaletteStopParameter::Position) {
+            continue;
+        }
+        for (const auto& key : effect.paletteStopParameterKeys) {
+            if (key.parameter !=
+                    TimingColourisePaletteStopParameter::Position ||
+                std::abs(key.position - anchor.position) >
+                    invisible_places::timing::
+                        kTimingColouriseKeyTolerance) {
+                continue;
+            }
+            AddUniqueTimingColouriseKeyHandle(
+                handles,
+                TimingColouriseKeyHandle{
+                    .track = TimingColouriseKeyTrack::Palette,
+                    .stopId = key.stopId,
+                    .stopParameter = key.parameter,
+                    .position = key.position,
+                });
+        }
+    }
 }
 
 void AddCoincidentTimingColouriseKeyHandles(
@@ -97254,12 +100054,20 @@ bool DeleteSelectedTimingColouriseKeys(
         } else if (
             handle.track == TimingColouriseKeyTrack::Palette &&
             handle.stopParameter.has_value()) {
-            removed += invisible_places::timing::
-                RemoveTimingColourisePaletteStopParameterKeysAtPosition(
-                    effect,
-                    handle.stopId,
-                    handle.stopParameter.value(),
-                    handle.position);
+            if (handle.stopParameter == invisible_places::timing::
+                    TimingColourisePaletteStopParameter::Position) {
+                removed += invisible_places::timing::
+                    RemoveTimingColourisePaletteMarkerKeysAtPosition(
+                        effect,
+                        handle.position);
+            } else {
+                removed += invisible_places::timing::
+                    RemoveTimingColourisePaletteStopParameterKeysAtPosition(
+                        effect,
+                        handle.stopId,
+                        handle.stopParameter.value(),
+                        handle.position);
+            }
         } else if (handle.track == TimingColouriseKeyTrack::Palette) {
             removed += invisible_places::timing::
                 RemoveTimingColourisePaletteKeysAtPosition(
@@ -97391,6 +100199,47 @@ bool PasteTimingColouriseKeysAtPlayhead(
                         position,
                         item.colourValue,
                         item.interpolation);
+            } else if (
+                item.paletteStopParameter.value() ==
+                invisible_places::timing::
+                    TimingColourisePaletteStopParameter::Position) {
+                auto palette = invisible_places::timing::
+                    EvaluateTimingColourisePalette(
+                        *effect,
+                        position,
+                        CurrentAnimationTimingIsCyclic(*runtimeState));
+                const auto evaluatedStop = std::find_if(
+                    palette.stops.begin(),
+                    palette.stops.end(),
+                    [&](const auto& candidate) {
+                        return candidate.id == stop.id;
+                    });
+                if (evaluatedStop != palette.stops.end()) {
+                    evaluatedStop->position = std::clamp(
+                        item.value,
+                        0.0F,
+                        1.0F);
+                    pasted = invisible_places::timing::
+                        AddOrUpdateTimingColourisePaletteMarkerKeys(
+                            effect,
+                            position,
+                            std::move(palette));
+                    if (pasted) {
+                        // Preserve the copied curve style for the marker whose
+                        // value was pasted; the other grouped markers retain
+                        // their own established interpolation modes.
+                        pasted = invisible_places::timing::
+                            AddOrUpdateTimingColourisePaletteStopScalarKey(
+                                effect,
+                                stop.id,
+                                invisible_places::timing::
+                                    TimingColourisePaletteStopParameter::
+                                        Position,
+                                position,
+                                item.value,
+                                item.interpolation);
+                    }
+                }
             } else {
                 pasted = invisible_places::timing::
                     AddOrUpdateTimingColourisePaletteStopScalarKey(
@@ -97450,6 +100299,16 @@ void DrawTimingKeyLaneGroup(
     const bool cyclicTiming =
         CurrentAnimationTimingIsCyclic(*runtimeState);
     ImGui::PushID(id);
+    const auto laneDisplayColours =
+        ResolveTimingColouriseGraphLaneColours(series);
+    const auto displayColourForLane =
+        [&](const TimingColouriseKeyLaneSeries& lane) {
+            const auto index = static_cast<std::size_t>(
+                &lane - series.data());
+            return index < laneDisplayColours.size()
+                ? laneDisplayColours[index]
+                : lane.colour;
+        };
     const auto laneDrawsValueGraph =
         [&](const TimingColouriseKeyLaneSeries& lane) {
             if (lane.track == TimingColouriseKeyTrack::Bounds &&
@@ -97486,7 +100345,10 @@ void DrawTimingKeyLaneGroup(
         series.end(),
         laneDrawsValueGraph);
     constexpr float kCompactLaneHeight = 14.0F;
-    constexpr float kValueGraphHeight = 92.0F;
+    // Preserve the original curve height and add a separate lower rail. A
+    // minimum-valued dot now sits a full hit radius above its time handle.
+    constexpr float kValueGraphMarkerRailHeight = 20.0F;
+    constexpr float kValueGraphHeight = 105.0F;
     const ImVec2 size{
         std::max(24.0F, ImGui::GetContentRegionAvail().x),
         drawsValueGraph ? kValueGraphHeight : kCompactLaneHeight};
@@ -97503,8 +100365,10 @@ void DrawTimingKeyLaneGroup(
     const float width = std::max(1.0F, maximum.x - minimum.x);
     const float axisY =
         drawsValueGraph
-            ? maximum.y - kCompactLaneHeight * 0.5F
+            ? maximum.y - kValueGraphMarkerRailHeight
             : std::midpoint(minimum.y, maximum.y);
+    const float markerCentreY =
+        drawsValueGraph ? axisY + 13.0F : axisY;
     const float graphTopY = minimum.y + 5.0F;
     const float graphHeight = std::max(1.0F, axisY - graphTopY);
     const auto activation = invisible_places::timing::
@@ -97620,15 +100484,14 @@ void DrawTimingKeyLaneGroup(
         itemHovered && std::hypot(
                            mouse.x - helpCentre.x,
                            mouse.y - helpCentre.y) <= 8.0F;
-    // In value graphs the time markers hang below the axis so keys resting
-    // at their minimum value stay clear of them.
+    // The lower marker rail is deliberately disjoint from the curve-dot hit
+    // area, so a minimum-valued key can always be selected directly.
     const bool markerHovered =
         itemHovered && !keyHelpHovered &&
         nearestSeries != nullptr &&
         nearestDistance <= kMarkerHitRadius &&
         (drawsValueGraph
-             ? mouse.y > axisY + 1.0F &&
-                   mouse.y <= axisY + kMarkerHitRadius + 2.0F
+             ? std::abs(mouse.y - markerCentreY) <= 6.0F
              : std::abs(mouse.y - axisY) <= kMarkerHitRadius);
     const auto sameTrack =
         [](const auto& state,
@@ -97685,8 +100548,65 @@ void DrawTimingKeyLaneGroup(
             }
             if (lane.track == TimingColouriseKeyTrack::Palette &&
                 lane.stopParameter.has_value()) {
-                // Move one stop track's key alone; the cluster branch
-                // below moves every stop key at the position together.
+                if (lane.stopParameter == invisible_places::timing::
+                        TimingColourisePaletteStopParameter::Position) {
+                    const float destination = std::clamp(
+                        destinationPosition,
+                        0.0F,
+                        1.0F);
+                    for (const auto& key :
+                         effect->paletteStopParameterKeys) {
+                        if (key.parameter != invisible_places::timing::
+                                TimingColourisePaletteStopParameter::
+                                    Position ||
+                            std::abs(key.position - sourcePosition) >
+                                invisible_places::timing::
+                                    kTimingColouriseKeyTolerance) {
+                            continue;
+                        }
+                        const bool occupied = std::any_of(
+                            effect->paletteStopParameterKeys.begin(),
+                            effect->paletteStopParameterKeys.end(),
+                            [&](const auto& candidate) {
+                                return candidate.stopId == key.stopId &&
+                                       candidate.parameter == key.parameter &&
+                                       std::abs(
+                                           candidate.position -
+                                           destination) <=
+                                           invisible_places::timing::
+                                               kTimingColouriseKeyTolerance &&
+                                       std::abs(
+                                           candidate.position -
+                                           sourcePosition) >
+                                           invisible_places::timing::
+                                               kTimingColouriseKeyTolerance;
+                            });
+                        if (occupied) {
+                            return false;
+                        }
+                    }
+                    auto updated = *effect;
+                    bool moved = false;
+                    for (auto& key :
+                         updated.paletteStopParameterKeys) {
+                        if (key.parameter == invisible_places::timing::
+                                TimingColourisePaletteStopParameter::
+                                    Position &&
+                            std::abs(key.position - sourcePosition) <=
+                                invisible_places::timing::
+                                    kTimingColouriseKeyTolerance) {
+                            key.position = destination;
+                            moved = true;
+                        }
+                    }
+                    if (!moved) {
+                        return false;
+                    }
+                    *effect = invisible_places::timing::
+                        SanitizeTimingColouriseEffect(std::move(updated));
+                    return true;
+                }
+                // Colour and Amount remain independent stop-property tracks.
                 const auto found = std::find_if(
                     effect->paletteStopParameterKeys.begin(),
                     effect->paletteStopParameterKeys.end(),
@@ -97722,26 +100642,72 @@ void DrawTimingKeyLaneGroup(
                 if (!lane.boundsParameter.has_value()) {
                     return false;
                 }
-                const auto found = std::find_if(
-                    effect->boundsParameterKeys.begin(),
-                    effect->boundsParameterKeys.end(),
-                    [&](const auto& key) {
-                        return key.parameter ==
-                                   lane.boundsParameter.value() &&
-                               std::abs(
-                                   key.position - sourcePosition) <=
-                                   invisible_places::timing::
-                                       kTimingColouriseKeyTolerance;
-                    });
-                if (found == effect->boundsParameterKeys.end()) {
+                const auto sourceHandle =
+                    TimingColouriseKeyHandleForLane(
+                        lane,
+                        sourcePosition);
+                const auto family =
+                    TimingColouriseBoundsKeyFamilyFor(sourceHandle);
+                if (!family.has_value()) {
                     return false;
                 }
-                found->position = std::clamp(
+                std::vector<invisible_places::timing::
+                                TimingColouriseBoundsParameter>
+                    movingParameters;
+                for (const auto& key : effect->boundsParameterKeys) {
+                    TimingColouriseKeyHandle candidate{
+                        .track = TimingColouriseKeyTrack::Bounds,
+                        .boundsParameter = key.parameter,
+                        .position = key.position,
+                    };
+                    if (TimingColouriseBoundsKeyFamilyFor(candidate) ==
+                            family &&
+                        std::abs(key.position - sourcePosition) <=
+                            invisible_places::timing::
+                                kTimingColouriseKeyTolerance) {
+                        movingParameters.push_back(key.parameter);
+                    }
+                }
+                if (movingParameters.empty()) {
+                    return false;
+                }
+                const float destination = std::clamp(
                     destinationPosition,
                     0.0F,
                     1.0F);
+                for (const auto parameter : movingParameters) {
+                    const bool occupied = std::any_of(
+                        effect->boundsParameterKeys.begin(),
+                        effect->boundsParameterKeys.end(),
+                        [&](const auto& key) {
+                            return key.parameter == parameter &&
+                                   std::abs(
+                                       key.position - destination) <=
+                                       invisible_places::timing::
+                                           kTimingColouriseKeyTolerance &&
+                                   std::abs(
+                                       key.position - sourcePosition) >
+                                       invisible_places::timing::
+                                           kTimingColouriseKeyTolerance;
+                        });
+                    if (occupied) {
+                        return false;
+                    }
+                }
+                auto updated = *effect;
+                for (auto& key : updated.boundsParameterKeys) {
+                    if (std::find(
+                            movingParameters.begin(),
+                            movingParameters.end(),
+                            key.parameter) != movingParameters.end() &&
+                        std::abs(key.position - sourcePosition) <=
+                            invisible_places::timing::
+                                kTimingColouriseKeyTolerance) {
+                        key.position = destination;
+                    }
+                }
                 *effect = invisible_places::timing::
-                    SanitizeTimingColouriseEffect(std::move(*effect));
+                    SanitizeTimingColouriseEffect(std::move(updated));
                 return true;
             }
             return lane.effectParameter.has_value() &&
@@ -97781,6 +100747,36 @@ void DrawTimingKeyLaneGroup(
             }
             if (lane.track == TimingColouriseKeyTrack::Palette &&
                 lane.stopParameter.has_value()) {
+                if (lane.stopParameter == invisible_places::timing::
+                        TimingColourisePaletteStopParameter::Position) {
+                    return std::any_of(
+                        effect->paletteStopParameterKeys.begin(),
+                        effect->paletteStopParameterKeys.end(),
+                        [&](const auto& source) {
+                            if (source.parameter != invisible_places::timing::
+                                    TimingColourisePaletteStopParameter::
+                                        Position ||
+                                std::abs(
+                                    source.position - sourcePosition) >
+                                    invisible_places::timing::
+                                        kTimingColouriseKeyTolerance) {
+                                return false;
+                            }
+                            return std::any_of(
+                                effect->paletteStopParameterKeys.begin(),
+                                effect->paletteStopParameterKeys.end(),
+                                [&](const auto& candidate) {
+                                    return candidate.stopId == source.stopId &&
+                                           candidate.parameter ==
+                                               source.parameter &&
+                                           std::abs(
+                                               candidate.position -
+                                               destinationPosition) <=
+                                               invisible_places::timing::
+                                                   kTimingColouriseKeyTolerance;
+                                });
+                        });
+                }
                 return invisible_places::timing::
                            TimingColourisePaletteStopParameterKeyCountAtPosition(
                                *effect,
@@ -97797,12 +100793,50 @@ void DrawTimingKeyLaneGroup(
                                 destinationPosition);
             }
             if (lane.track == TimingColouriseKeyTrack::Bounds) {
-                return lane.boundsParameter.has_value() &&
-                       invisible_places::timing::
-                               TimingColouriseBoundsParameterKeyCountAtPosition(
-                                   *effect,
-                                   lane.boundsParameter.value(),
-                                   destinationPosition) > 0U;
+                if (!lane.boundsParameter.has_value()) {
+                    return false;
+                }
+                const auto sourceHandle =
+                    TimingColouriseKeyHandleForLane(
+                        lane,
+                        sourcePosition);
+                const auto family =
+                    TimingColouriseBoundsKeyFamilyFor(sourceHandle);
+                return family.has_value() && std::any_of(
+                    effect->boundsParameterKeys.begin(),
+                    effect->boundsParameterKeys.end(),
+                    [&](const auto& movingKey) {
+                        TimingColouriseKeyHandle movingHandle{
+                            .track = TimingColouriseKeyTrack::Bounds,
+                            .boundsParameter = movingKey.parameter,
+                            .position = movingKey.position,
+                        };
+                        if (TimingColouriseBoundsKeyFamilyFor(
+                                movingHandle) != family ||
+                            std::abs(
+                                movingKey.position - sourcePosition) >
+                                invisible_places::timing::
+                                    kTimingColouriseKeyTolerance) {
+                            return false;
+                        }
+                        return std::any_of(
+                            effect->boundsParameterKeys.begin(),
+                            effect->boundsParameterKeys.end(),
+                            [&](const auto& destinationKey) {
+                                return destinationKey.parameter ==
+                                           movingKey.parameter &&
+                                       std::abs(
+                                           destinationKey.position -
+                                           destinationPosition) <=
+                                           invisible_places::timing::
+                                               kTimingColouriseKeyTolerance &&
+                                       std::abs(
+                                           destinationKey.position -
+                                           sourcePosition) >
+                                           invisible_places::timing::
+                                               kTimingColouriseKeyTolerance;
+                            });
+                    });
             }
             return lane.effectParameter.has_value() &&
                    invisible_places::timing::
@@ -97874,13 +100908,14 @@ void DrawTimingKeyLaneGroup(
             if (lane.track == TimingColouriseKeyTrack::Bounds &&
                 lane.boundsParameter.has_value()) {
                 value = invisible_places::timing::
-                    TimingColouriseBoundsParameterValue(
+                    TimingColouriseAuthoredBoundsParameterValue(
                         invisible_places::timing::
-                            EvaluateTimingColouriseBounds(
+                            EvaluateTimingColouriseAuthoredBounds(
                                 *effect,
                                 position,
                                 cyclicTiming),
-                        lane.boundsParameter.value());
+                        lane.boundsParameter.value(),
+                        effect->edgeFadeMode);
             } else if (
                 lane.track == TimingColouriseKeyTrack::Palette &&
                 lane.stopParameter.has_value()) {
@@ -97988,13 +101023,17 @@ void DrawTimingKeyLaneGroup(
 
     struct ValueGraph {
         const TimingColouriseKeyLaneSeries* lane = nullptr;
+        ImU32 displayColour = IM_COL32_WHITE;
         std::vector<float> values;
-        // Per-sample stroke colours for stop Colour lanes, so the curve
-        // itself shows the interpolated colour. Empty for scalar lanes.
+        // Per-sample authored colours for stop Colour lanes. Their broad
+        // under-stroke shows the colour animation while the narrow,
+        // lane-specific display stroke remains distinct from every other
+        // keyed line in this graph. Empty for scalar lanes.
         std::vector<ImU32> sampleColours;
         float minimum = 0.0F;
         float maximum = 0.0F;
         bool wrappedPalettePhase = false;
+        bool sharedPaletteMarkerRange = false;
     };
     std::vector<float> graphPositions;
     std::vector<float> graphViewFractions;
@@ -98033,7 +101072,7 @@ void DrawTimingKeyLaneGroup(
             for (const float position : graphPositions) {
                 evaluatedBounds.push_back(
                     invisible_places::timing::
-                        EvaluateTimingColouriseBounds(
+                        EvaluateTimingColouriseAuthoredBounds(
                             *effect,
                             position,
                             cyclicTiming));
@@ -98078,6 +101117,7 @@ void DrawTimingKeyLaneGroup(
                         TimingColourisePaletteStopParameter::Colour;
             ValueGraph graph{
                 .lane = &lane,
+                .displayColour = displayColourForLane(lane),
                 .minimum = std::numeric_limits<float>::max(),
                 .maximum = std::numeric_limits<float>::lowest(),
                 .wrappedPalettePhase =
@@ -98094,9 +101134,10 @@ void DrawTimingKeyLaneGroup(
                     lane.track == TimingColouriseKeyTrack::Bounds
                         ? std::optional<float>{
                               invisible_places::timing::
-                                  TimingColouriseBoundsParameterValue(
+                                  TimingColouriseAuthoredBoundsParameterValue(
                                       evaluatedBounds[index],
-                                      lane.boundsParameter.value())}
+                                      lane.boundsParameter.value(),
+                                      effect->edgeFadeMode)}
                     : stopLane
                         ? stopLaneValueFromPalette(
                               evaluatedPalettes[index],
@@ -98163,6 +101204,27 @@ void DrawTimingKeyLaneGroup(
             valueGraphs.push_back(std::move(graph));
         }
 
+        // Position keys are authored as one marker group, but invariant
+        // markers should not force the graph to show the palette's full
+        // 0..1 domain. Give every marker Position curve the same range made
+        // from only the marker tracks whose authored values actually vary.
+        if (const auto markerRange = invisible_places::timing::
+                TimingColouriseAnimatedPaletteMarkerRange(*effect);
+            markerRange.has_value()) {
+            for (auto& graph : valueGraphs) {
+                if (graph.lane->track !=
+                        TimingColouriseKeyTrack::Palette ||
+                    graph.lane->stopParameter !=
+                        invisible_places::timing::
+                            TimingColourisePaletteStopParameter::Position) {
+                    continue;
+                }
+                graph.minimum = markerRange->first;
+                graph.maximum = markerRange->second;
+                graph.sharedPaletteMarkerRange = true;
+            }
+        }
+
         drawList->AddRectFilled(
             minimum,
             maximum,
@@ -98173,6 +101235,11 @@ void DrawTimingKeyLaneGroup(
             maximum,
             ImGui::GetColorU32(ImGuiCol_Border),
             2.0F);
+        drawList->AddRectFilled(
+            ImVec2{minimum.x + 1.0F, axisY + 1.0F},
+            ImVec2{maximum.x - 1.0F, maximum.y - 1.0F},
+            ImGui::GetColorU32(
+                ImVec4{0.0F, 0.0F, 0.0F, 0.10F}));
     }
 
     const auto yForValue =
@@ -98186,6 +101253,16 @@ void DrawTimingKeyLaneGroup(
                                                  graph.minimum),
                                      0.0F,
                                      1.0F);
+        };
+    const auto valueForY =
+        [&](const ValueGraph& graph, float y) {
+            return std::lerp(
+                graph.minimum,
+                graph.maximum,
+                std::clamp(
+                    (axisY - y) / graphHeight,
+                    0.0F,
+                    1.0F));
         };
     const ValueGraph* hoveredGraph = nullptr;
     float hoveredGraphPosition = 0.0F;
@@ -98278,17 +101355,274 @@ void DrawTimingKeyLaneGroup(
                 replaceSelection(std::move(selected), handle);
                 return;
             }
-            if (handleSelected(handle) &&
-                timings.colouriseKeySelection->keys.size() > 1U) {
-                timings.colouriseKeySelection->rangeAnchor = handle;
-                return;
-            }
+            // A plain dot click always means this dot. Deliberate
+            // multi-selection remains available through Cmd/Ctrl, Shift,
+            // marquee, and the lower time handle; it must not leak into a
+            // later single-node value drag.
             replaceSelection({handle}, handle);
+        };
+
+    // Every Colourise/Emissive value graph reaches this one insertion path.
+    // It deliberately calls the existing model APIs, so adding a key from a
+    // graph has the same sanitisation, interpolation, legacy promotion, and
+    // Palette Phase delta handling as the adjacent + controls.
+    const auto addKeyAt =
+        [&](const TimingColouriseKeyLaneSeries& lane,
+            float position,
+            float scalarValue) {
+            using invisible_places::timing::
+                TimingColouriseBoundsParameter;
+            using invisible_places::timing::
+                TimingColouriseEffectParameter;
+            using invisible_places::timing::
+                TimingColourisePaletteKeyModel;
+            using invisible_places::timing::
+                TimingColourisePaletteStopParameter;
+            position = std::clamp(position, 0.0F, 1.0F);
+            bool added = false;
+            bool groupedMarkerPositions = false;
+            if (lane.track == TimingColouriseKeyTrack::EffectParameter &&
+                lane.effectParameter.has_value()) {
+                const auto parameter = lane.effectParameter.value();
+                const auto interpolation = TimingScalarTrackInterpolationAt(
+                    effect->effectParameterKeys,
+                    [&](const auto& key) {
+                        return key.parameter == parameter;
+                    },
+                    position);
+                // The Phase graph displays an accumulated absolute target,
+                // but its stored keys are relative deltas. Inserting the
+                // evaluated delta preserves the visible path and lets the
+                // established split-next-delta rule preserve later targets.
+                const float authoredValue =
+                    parameter == TimingColouriseEffectParameter::PalettePhase
+                        ? invisible_places::timing::
+                              TimingColourisePalettePhaseDeltaFromPrevious(
+                                  *effect,
+                                  position)
+                        : scalarValue;
+                added = invisible_places::timing::
+                    AddOrUpdateTimingColouriseEffectParameterKey(
+                        effect,
+                        parameter,
+                        position,
+                        authoredValue,
+                        interpolation);
+            } else if (
+                lane.track == TimingColouriseKeyTrack::Bounds &&
+                lane.boundsParameter.has_value()) {
+                const auto parameter = lane.boundsParameter.value();
+                auto interpolation = TimingScalarTrackInterpolationAt(
+                    effect->boundsParameterKeys,
+                    [&](const auto& key) {
+                        return key.parameter == parameter;
+                    },
+                    position);
+                const bool hasParameterKeys = std::any_of(
+                    effect->boundsParameterKeys.begin(),
+                    effect->boundsParameterKeys.end(),
+                    [&](const auto& key) {
+                        return key.parameter == parameter;
+                    });
+                if (!hasParameterKeys &&
+                    !effect->boundsKeys.empty()) {
+                    interpolation = TimingScalarTrackInterpolationAt(
+                        effect->boundsKeys,
+                        [](const auto&) { return true; },
+                        position);
+                }
+                added = invisible_places::timing::
+                    AddOrUpdateTimingColouriseBoundsParameterKey(
+                        effect,
+                        parameter,
+                        position,
+                        scalarValue,
+                        interpolation);
+                if (added) {
+                    effect->boundsEdited = true;
+                    const bool fade =
+                        parameter == TimingColouriseBoundsParameter::
+                                         EdgeFadeLower ||
+                        parameter == TimingColouriseBoundsParameter::
+                                         EdgeFadeUpper;
+                    if (invisible_places::timing::
+                            TimingColouriseEdgeFadesAreLinked(
+                                effect->edgeFadeMode) &&
+                        fade) {
+                        const auto partner =
+                            parameter == TimingColouriseBoundsParameter::
+                                             EdgeFadeLower
+                                ? TimingColouriseBoundsParameter::
+                                      EdgeFadeUpper
+                                : TimingColouriseBoundsParameter::
+                                      EdgeFadeLower;
+                        (void)invisible_places::timing::
+                            AddOrUpdateTimingColouriseBoundsParameterKey(
+                                effect,
+                                partner,
+                                position,
+                                scalarValue,
+                                interpolation);
+                    }
+                }
+            } else if (
+                lane.track == TimingColouriseKeyTrack::Palette &&
+                lane.stopParameter.has_value()) {
+                const auto parameter = lane.stopParameter.value();
+                const auto interpolation = TimingScalarTrackInterpolationAt(
+                    effect->paletteStopParameterKeys,
+                    [&](const auto& key) {
+                        return key.stopId == lane.stopId &&
+                               key.parameter == parameter;
+                    },
+                    position);
+                if (parameter ==
+                    TimingColourisePaletteStopParameter::Colour) {
+                    const auto palette = invisible_places::timing::
+                        EvaluateTimingColourisePalette(
+                            *effect,
+                            position,
+                            cyclicTiming);
+                    const auto stop = std::find_if(
+                        palette.stops.begin(),
+                        palette.stops.end(),
+                        [&](const auto& candidate) {
+                            return candidate.id == lane.stopId;
+                        });
+                    if (stop != palette.stops.end()) {
+                        // A single graph ordinate is OkLab lightness only;
+                        // key the full evaluated colour rather than inventing
+                        // chroma from a vertical click.
+                        added = invisible_places::timing::
+                            AddOrUpdateTimingColourisePaletteStopColourKey(
+                                effect,
+                                lane.stopId,
+                                position,
+                                stop->colour,
+                                interpolation);
+                    }
+                } else if (
+                    parameter ==
+                    TimingColourisePaletteStopParameter::Position) {
+                    auto palette = invisible_places::timing::
+                        EvaluateTimingColourisePalette(
+                            *effect,
+                            position,
+                            cyclicTiming);
+                    const auto stop = std::find_if(
+                        palette.stops.begin(),
+                        palette.stops.end(),
+                        [&](const auto& candidate) {
+                            return candidate.id == lane.stopId;
+                        });
+                    if (stop != palette.stops.end()) {
+                        stop->position = std::clamp(
+                            scalarValue,
+                            0.0F,
+                            1.0F);
+                        added = invisible_places::timing::
+                            AddOrUpdateTimingColourisePaletteMarkerKeys(
+                                effect,
+                                position,
+                                std::move(palette));
+                        groupedMarkerPositions = added;
+                    }
+                } else {
+                    added = invisible_places::timing::
+                        AddOrUpdateTimingColourisePaletteStopScalarKey(
+                            effect,
+                            lane.stopId,
+                            parameter,
+                            position,
+                            scalarValue,
+                            interpolation);
+                }
+            } else if (
+                lane.track == TimingColouriseKeyTrack::EmissiveFalloff &&
+                lane.falloffParameter.has_value()) {
+                const auto parameter = lane.falloffParameter.value();
+                const auto interpolation = TimingScalarTrackInterpolationAt(
+                    effect->emissiveFalloffKeys,
+                    [&](const auto& key) {
+                        return key.nodeId == lane.stopId &&
+                               key.parameter == parameter;
+                    },
+                    position);
+                added = invisible_places::timing::
+                    AddOrUpdateTimingColouriseEmissiveFalloffKey(
+                        effect,
+                        lane.stopId,
+                        parameter,
+                        position,
+                        scalarValue,
+                        interpolation);
+            } else if (
+                lane.track == TimingColouriseKeyTrack::Palette &&
+                effect->paletteKeyModel ==
+                    TimingColourisePaletteKeyModel::LegacySnapshots) {
+                const auto interpolation = TimingScalarTrackInterpolationAt(
+                    effect->paletteKeys,
+                    [](const auto&) { return true; },
+                    position);
+                invisible_places::timing::
+                    AddOrUpdateTimingColourisePaletteKey(
+                        effect,
+                        position,
+                        invisible_places::timing::
+                            EvaluateTimingColourisePalette(
+                                *effect,
+                                position,
+                                cyclicTiming),
+                        interpolation);
+                added = true;
+            }
+            if (!added) {
+                runtimeState->statusMessage =
+                    lane.track == TimingColouriseKeyTrack::Palette &&
+                            !lane.stopParameter.has_value()
+                        ? "Select a palette stop and use its + control to choose which stop properties to key."
+                        : "A key could not be added to this Visual Feature curve.";
+                return false;
+            }
+            StopAnimationPlayback(runtimeState);
+            timings.colouriseGraphKeyDrag.reset();
+            timings.colouriseLocalKeyDrag.reset();
+            timings.colouriseKeyMarquee.reset();
+            const auto handle =
+                TimingColouriseKeyHandleForLane(lane, position);
+            if (groupedMarkerPositions) {
+                std::vector<TimingColouriseKeyHandle> markerHandles;
+                markerHandles.reserve(effect->basePalette.stops.size());
+                for (const auto& stop : effect->basePalette.stops) {
+                    markerHandles.push_back({
+                        .track = TimingColouriseKeyTrack::Palette,
+                        .stopId = stop.id,
+                        .stopParameter =
+                            TimingColourisePaletteStopParameter::Position,
+                        .position = position,
+                    });
+                }
+                replaceSelection(std::move(markerHandles), handle);
+            } else {
+                replaceSelection({handle}, handle);
+            }
+            ScrubFeatureTimelineToAuthoredPosition(
+                runtimeState,
+                position);
+            runtimeState->previewRenderStateSignatureValid = false;
+            runtimeState->statusMessage =
+                groupedMarkerPositions
+                    ? "Added grouped palette-marker Position keys at " +
+                          FormatFixed(position, 4) + "."
+                    : std::string{"Added "} + lane.label +
+                          " key at " + FormatFixed(position, 4) + ".";
+            return true;
         };
 
     const ValueGraph* hoveredDotGraph = nullptr;
     TimingColouriseKeyHandle hoveredDotHandle{};
     float hoveredDotValue = 0.0F;
+    float hoveredDotDrawnValue = 0.0F;
     float hoveredDotDistance = 7.0F;
     if (itemHovered && !keyHelpHovered) {
         for (const auto& graph : valueGraphs) {
@@ -98322,6 +101656,7 @@ void DrawTimingKeyLaneGroup(
                             *graph.lane,
                             position);
                         hoveredDotValue = value.value();
+                        hoveredDotDrawnValue = drawnValue;
                     }
                 }
             }
@@ -98358,6 +101693,16 @@ void DrawTimingKeyLaneGroup(
                     &handles);
                 replaceSelection(handles, rangeAnchor);
             }
+            const auto selectedHandles = handles;
+            const auto semanticAnchors = handles;
+            AddCoincidentTimingColourisePaletteMarkerHandles(
+                *effect,
+                semanticAnchors,
+                &handles);
+            AddCoincidentTimingColouriseBoundsFamilyHandles(
+                *effect,
+                semanticAnchors,
+                &handles);
             TimingColouriseGraphKeyDragState drag{
                 .effectId = effect->id,
                 .laneGroupId = id,
@@ -98366,26 +101711,27 @@ void DrawTimingKeyLaneGroup(
                 .mouseStartX = mouse.x,
                 .mouseStartY = mouse.y,
                 .originalEffect = *effect,
+                .selectedHandles = selectedHandles,
                 .handles = std::move(handles),
                 .rangeAnchor = rangeAnchor,
                 .shakeLastMouseX = mouse.x,
             };
             if (drag.valueDrag) {
-                for (const auto& handle : drag.handles) {
-                    const auto graph = std::find_if(
-                        valueGraphs.begin(),
-                        valueGraphs.end(),
-                        [&](const auto& candidate) {
-                            return sameTrack(handle, *candidate.lane);
-                        });
-                    const auto scalar =
-                        TimingColouriseExactScalarKey(*effect, handle);
-                    if (graph == valueGraphs.end() ||
-                        !scalar.has_value()) {
-                        continue;
-                    }
+                // Vertical motion belongs only to the dot under the pointer.
+                // Semantic partners above share its time offset, never its
+                // value (unless the explicit linked-fade setting mirrors it
+                // in the value update below).
+                const auto graph = std::find_if(
+                    valueGraphs.begin(),
+                    valueGraphs.end(),
+                    [&](const auto& candidate) {
+                        return sameTrack(clicked, *candidate.lane);
+                    });
+                const auto scalar =
+                    TimingColouriseExactScalarKey(*effect, clicked);
+                if (graph != valueGraphs.end() && scalar.has_value()) {
                     drag.values.push_back({
-                        .handle = handle,
+                        .handle = clicked,
                         .originalValue = scalar->first,
                         .unitsPerPixel =
                             -(graph->maximum - graph->minimum) /
@@ -98417,7 +101763,55 @@ void DrawTimingKeyLaneGroup(
             ImGui::OpenPopup("Edit Local Effect Key Position");
         };
 
+    const auto graphForOpenSpaceDoubleClick =
+        [&](float position) -> const ValueGraph* {
+            if (valueGraphs.empty()) {
+                return nullptr;
+            }
+            if (valueGraphs.size() == 1U) {
+                return &valueGraphs.front();
+            }
+            const ValueGraph* nearest = nullptr;
+            float nearestDistance = 28.0F;
+            for (const auto& graph : valueGraphs) {
+                const auto evaluated =
+                    scalarValueAt(*graph.lane, position);
+                if (!evaluated.has_value()) {
+                    continue;
+                }
+                float distance = std::numeric_limits<float>::max();
+                if (graph.wrappedPalettePhase) {
+                    const int firstOffset = static_cast<int>(
+                        std::ceil(evaluated.value() - 1.0F));
+                    const int lastOffset = static_cast<int>(
+                        std::floor(evaluated.value() + 1.0F));
+                    for (int offset = firstOffset;
+                         offset <= lastOffset;
+                         ++offset) {
+                        distance = std::min(
+                            distance,
+                            std::abs(
+                                mouse.y -
+                                yForValue(
+                                    graph,
+                                    evaluated.value() -
+                                        static_cast<float>(offset))));
+                    }
+                } else {
+                    distance = std::abs(
+                        mouse.y -
+                        yForValue(graph, evaluated.value()));
+                }
+                if (distance < nearestDistance) {
+                    nearestDistance = distance;
+                    nearest = &graph;
+                }
+            }
+            return nearest;
+        };
+
     if (hoveredDotGraph != nullptr) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
         if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
             selectClickedHandle(
                 *hoveredDotGraph->lane,
@@ -98433,74 +101827,60 @@ void DrawTimingKeyLaneGroup(
             }
         }
     } else if (markerHovered && nearestSeries != nullptr) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
         const auto handle = TimingColouriseKeyHandleForLane(
             *nearestSeries,
             nearestPosition);
-        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-            selectClickedHandle(*nearestSeries, nearestPosition);
-            openPositionEditor(handle);
-        } else if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-            const auto& io = ImGui::GetIO();
-            if (io.KeyCtrl || io.KeySuper || io.KeyShift) {
-                selectClickedHandle(*nearestSeries, nearestPosition);
-            } else {
-                // A time marker addresses the whole moment: it selects
-                // every key at this time across the lanes. But when the
-                // current selection already holds keys here - the user
-                // picked out specific nodes first - the marker drags just
-                // that subset, pulling it away from the rest.
-                const auto atMarkerTime =
-                    [&](const TimingColouriseKeyHandle& candidate) {
-                        return std::abs(
-                                   candidate.position -
-                                   nearestPosition) <=
-                               invisible_places::timing::
-                                   kTimingColouriseKeyTolerance;
-                    };
-                TimingColouriseKeyHandle anchor = handle;
-                const bool selectionAtTime =
-                    timings.colouriseKeySelection.has_value() &&
-                    timings.colouriseKeySelection->effectId ==
-                        effect->id &&
-                    std::any_of(
-                        timings.colouriseKeySelection->keys.begin(),
-                        timings.colouriseKeySelection->keys.end(),
-                        atMarkerTime);
-                if (selectionAtTime) {
-                    for (const auto& selected :
-                         timings.colouriseKeySelection->keys) {
-                        if (atMarkerTime(selected)) {
-                            anchor = selected;
-                            break;
-                        }
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            // The lower rail is a cluster control, not another copy of a
+            // curve dot. It always selects every visible key at this time,
+            // ignores selection modifiers, and never carries value motion.
+            std::vector<TimingColouriseKeyHandle> cluster;
+            for (const auto& lane : series) {
+                for (const float lanePosition : lane.positions) {
+                    if (std::abs(
+                            lanePosition - nearestPosition) <=
+                        invisible_places::timing::
+                            kTimingColouriseKeyTolerance) {
+                        AddUniqueTimingColouriseKeyHandle(
+                            &cluster,
+                            TimingColouriseKeyHandleForLane(
+                                lane,
+                                lanePosition));
                     }
-                } else {
-                    std::vector<TimingColouriseKeyHandle> cluster;
-                    for (const auto& lane : series) {
-                        for (const float lanePosition :
-                             lane.positions) {
-                            if (std::abs(
-                                    lanePosition - nearestPosition) <=
-                                invisible_places::timing::
-                                    kTimingColouriseKeyTolerance) {
-                                AddUniqueTimingColouriseKeyHandle(
-                                    &cluster,
-                                    TimingColouriseKeyHandleForLane(
-                                        lane,
-                                        lanePosition));
-                            }
-                        }
-                    }
-                    replaceSelection(std::move(cluster), handle);
                 }
-                // The selection is exactly what should move, so the
-                // Time-only coincident gather stays off even when that
-                // mode is enabled.
-                armKeyDrag(
-                    anchor,
-                    false,
-                    /*suppressTimeOnlyGather=*/true);
             }
+            replaceSelection(std::move(cluster), handle);
+            // The marker's visible cluster is exactly what should move, so
+            // the global Time-only gather stays off even when enabled.
+            armKeyDrag(
+                handle,
+                false,
+                /*suppressTimeOnlyGather=*/true);
+        }
+    } else if (
+        itemHovered && !keyHelpHovered &&
+        ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) &&
+        (!drawsValueGraph ||
+         (mouse.y >= graphTopY && mouse.y <= axisY))) {
+        // Match the Water settings graph contract: open graph space keys the
+        // only curve, or the nearest curve when several are overlaid. The
+        // shared add path above keeps each track's model-specific semantics.
+        const float newPosition = positionForX(mouse.x);
+        if (drawsValueGraph) {
+            if (const auto* target =
+                    graphForOpenSpaceDoubleClick(newPosition);
+                target != nullptr) {
+                (void)addKeyAt(
+                    *target->lane,
+                    newPosition,
+                    valueForY(*target, mouse.y));
+            }
+        } else if (series.size() == 1U) {
+            (void)addKeyAt(
+                series.front(),
+                newPosition,
+                0.0F);
         }
     } else if (
         itemHovered && !keyHelpHovered &&
@@ -98812,28 +102192,35 @@ void DrawTimingKeyLaneGroup(
         // group keeps the raw offset. Shake while dragging to toggle
         // snapping off and on.
         if (!cyclicDrag && !drag.snappingDisabled) {
-            std::vector<float> draggedPositions;
-            draggedPositions.reserve(drag.handles.size());
-            for (const auto& handle : drag.handles) {
-                draggedPositions.push_back(handle.position);
-            }
-            std::vector<float> snapTargets;
-            snapTargets.reserve(existingHandles.size());
-            for (const auto& existing : existingHandles) {
-                if (!isDraggedHandle(existing)) {
-                    snapTargets.push_back(existing.position);
-                }
-            }
             const float viewSpan = std::abs(
                 positionForX(maximum.x) - positionForX(minimum.x));
             const float snapTolerance =
                 7.0F * viewSpan / std::max(1.0F, width);
-            const auto snapped = invisible_places::timing::
-                TimingColouriseSnapKeyDragOffset(
-                    draggedPositions,
-                    snapTargets,
-                    offset,
-                    snapTolerance);
+            std::optional<float> snapped;
+            float bestSnapDistance = snapTolerance;
+            for (const auto& dragged : drag.handles) {
+                for (const auto& target : existingHandles) {
+                    if (isDraggedHandle(target) ||
+                        !TimingColouriseKeyHandlesCanSnapTogether(
+                            dragged,
+                            target)) {
+                        continue;
+                    }
+                    const float candidate =
+                        target.position - dragged.position;
+                    const float distance =
+                        std::abs(candidate - offset);
+                    if (distance <= bestSnapDistance) {
+                        bestSnapDistance = distance;
+                        snapped = candidate;
+                    }
+                }
+            }
+            if (snapped.has_value() &&
+                std::abs(snapped.value() - offset) <=
+                    std::numeric_limits<float>::epsilon()) {
+                snapped.reset();
+            }
             if (snapped.has_value()) {
                 float first = 1.0F;
                 float last = 0.0F;
@@ -98883,12 +102270,22 @@ void DrawTimingKeyLaneGroup(
                             handle.track ==
                                 TimingColouriseKeyTrack::Palette &&
                             handle.stopParameter.has_value()) {
-                            (void)invisible_places::timing::
-                                RemoveTimingColourisePaletteStopParameterKeysAtPosition(
-                                    target,
-                                    handle.stopId,
-                                    handle.stopParameter.value(),
-                                    handle.position);
+                            if (handle.stopParameter ==
+                                invisible_places::timing::
+                                    TimingColourisePaletteStopParameter::
+                                        Position) {
+                                (void)invisible_places::timing::
+                                    RemoveTimingColourisePaletteMarkerKeysAtPosition(
+                                        target,
+                                        handle.position);
+                            } else {
+                                (void)invisible_places::timing::
+                                    RemoveTimingColourisePaletteStopParameterKeysAtPosition(
+                                        target,
+                                        handle.stopId,
+                                        handle.stopParameter.value(),
+                                        handle.position);
+                            }
                         } else if (
                             handle.track ==
                             TimingColouriseKeyTrack::Palette) {
@@ -99135,6 +102532,42 @@ void DrawTimingKeyLaneGroup(
                     if (found != updated.boundsParameterKeys.end()) {
                         found->value = value;
                         updated.boundsEdited = true;
+                        using invisible_places::timing::
+                            TimingColouriseBoundsParameter;
+                        const bool fade =
+                            parameter == TimingColouriseBoundsParameter::
+                                             EdgeFadeLower ||
+                            parameter == TimingColouriseBoundsParameter::
+                                             EdgeFadeUpper;
+                        if (invisible_places::timing::
+                                TimingColouriseEdgeFadesAreLinked(
+                                    updated.edgeFadeMode) &&
+                            fade) {
+                            const auto partner =
+                                parameter == TimingColouriseBoundsParameter::
+                                                 EdgeFadeLower
+                                    ? TimingColouriseBoundsParameter::
+                                          EdgeFadeUpper
+                                    : TimingColouriseBoundsParameter::
+                                          EdgeFadeLower;
+                            const auto partnerKey = std::find_if(
+                                updated.boundsParameterKeys.begin(),
+                                updated.boundsParameterKeys.end(),
+                                [&](const auto& key) {
+                                    return key.parameter == partner &&
+                                           std::abs(
+                                               key.position -
+                                               movedKeyPosition(
+                                                   valueDrag.handle
+                                                       .position)) <=
+                                               invisible_places::timing::
+                                                   kTimingColouriseKeyTolerance;
+                                });
+                            if (partnerKey !=
+                                updated.boundsParameterKeys.end()) {
+                                partnerKey->value = value;
+                            }
+                        }
                     }
                 } else if (
                     valueDrag.handle.track ==
@@ -99233,8 +102666,8 @@ void DrawTimingKeyLaneGroup(
             }
             *effect = invisible_places::timing::
                 SanitizeTimingColouriseEffect(std::move(updated));
-            std::vector<TimingColouriseKeyHandle> movedHandles;
-            for (const auto& handle : drag.handles) {
+            std::vector<TimingColouriseKeyHandle> movedSelection;
+            for (const auto& handle : drag.selectedHandles) {
                 if (std::any_of(
                         coalescedHandles.begin(),
                         coalescedHandles.end(),
@@ -99247,13 +102680,13 @@ void DrawTimingKeyLaneGroup(
                 }
                 auto moved = handle;
                 moved.position = movedKeyPosition(handle.position);
-                movedHandles.push_back(moved);
+                movedSelection.push_back(moved);
             }
             auto anchor = drag.rangeAnchor;
             if (anchor.has_value() && isDraggedHandle(anchor.value())) {
                 anchor->position = movedKeyPosition(anchor->position);
             }
-            replaceSelection(std::move(movedHandles), anchor);
+            replaceSelection(std::move(movedSelection), anchor);
             if (!drag.handles.empty()) {
                 ScrubFeatureTimelineToAuthoredPosition(
                     runtimeState,
@@ -99313,22 +102746,38 @@ void DrawTimingKeyLaneGroup(
             const float leftPosition = graphPositions[index - 1U];
             const float rightPosition = graphPositions[index];
             const ImU32 segmentColour = markerColour(
-                graph.sampleColours.empty()
-                    ? graph.lane->colour
-                    : graph.sampleColours[index - 1U],
+                graph.displayColour,
                 std::midpoint(leftPosition, rightPosition));
             if (!graph.wrappedPalettePhase) {
+                const ImVec2 leftPoint{
+                    minimum.x + width *
+                        graphViewFractions[index - 1U],
+                    yForValue(graph, graph.values[index - 1U])};
+                const ImVec2 rightPoint{
+                    minimum.x + width *
+                        graphViewFractions[index],
+                    yForValue(graph, graph.values[index])};
+                if (!graph.sampleColours.empty()) {
+                    // Preserve the stop's animated colour as a soft broad
+                    // swatch, then draw the graph-unique identity stroke on
+                    // top so two equal stop colours remain distinguishable.
+                    drawList->AddLine(
+                        leftPoint,
+                        rightPoint,
+                        colourWithOpacity(
+                            markerColour(
+                                graph.sampleColours[index - 1U],
+                                std::midpoint(
+                                    leftPosition,
+                                    rightPosition)),
+                            0.52F),
+                        3.5F);
+                }
                 drawList->AddLine(
-                    ImVec2{
-                        minimum.x + width *
-                            graphViewFractions[index - 1U],
-                        yForValue(graph, graph.values[index - 1U])},
-                    ImVec2{
-                        minimum.x + width *
-                            graphViewFractions[index],
-                        yForValue(graph, graph.values[index])},
+                    leftPoint,
+                    rightPoint,
                     segmentColour,
-                    1.5F);
+                    graph.sampleColours.empty() ? 1.5F : 1.35F);
                 continue;
             }
 
@@ -99489,7 +102938,7 @@ void DrawTimingKeyLaneGroup(
                 // authored keys read directly off the tinted curve.
                 const ImU32 dotBaseColour =
                     graph.sampleColours.empty()
-                        ? graph.lane->colour
+                        ? graph.displayColour
                         : stopLaneColourFromPalette(
                               invisible_places::timing::
                                   EvaluateTimingColourisePalette(
@@ -99497,7 +102946,7 @@ void DrawTimingKeyLaneGroup(
                                       drawnPosition,
                                       cyclicTiming),
                               *graph.lane)
-                              .value_or(graph.lane->colour);
+                              .value_or(graph.displayColour);
                 const ImU32 pointColour = colourWithOpacity(
                     markerColour(
                         dotBaseColour,
@@ -99515,13 +102964,85 @@ void DrawTimingKeyLaneGroup(
                     selected && primary
                         ? ImGui::GetColorU32(ImGuiCol_SliderGrabActive)
                         : colourWithOpacity(
-                              ImGui::GetColorU32(ImGuiCol_Border),
+                              graph.displayColour,
                               primary ? 1.0F : 0.45F),
                     0,
                     selected && primary ? 2.0F : 1.0F);
             }
         }
     }
+
+    const auto drawHoveredDotTarget = [&]() {
+        if (hoveredDotGraph == nullptr) {
+            return;
+        }
+        // A labelled target halo removes the ambiguity where several
+        // independently scaled curves cross or place dots at the same pixel.
+        const ImVec2 point{
+            xForPosition(hoveredDotHandle.position),
+            yForValue(*hoveredDotGraph, hoveredDotDrawnValue)};
+        const ImU32 targetColour =
+            ImGui::GetColorU32(ImGuiCol_SliderGrabActive);
+        drawList->AddCircle(
+            point,
+            8.0F,
+            targetColour,
+            0,
+            2.25F);
+        drawList->AddCircle(
+            point,
+            6.0F,
+            hoveredDotGraph->displayColour,
+            0,
+            1.25F);
+
+        const ImVec2 textSize = ImGui::CalcTextSize(
+            hoveredDotGraph->lane->label);
+        const ImVec2 badgeSize{
+            textSize.x + 8.0F,
+            textSize.y + 4.0F};
+        float badgeX = point.x + 11.0F;
+        if (badgeX + badgeSize.x > maximum.x - 2.0F) {
+            badgeX = point.x - 11.0F - badgeSize.x;
+        }
+        badgeX = std::clamp(
+            badgeX,
+            minimum.x + 2.0F,
+            std::max(
+                minimum.x + 2.0F,
+                maximum.x - badgeSize.x - 2.0F));
+        float badgeY = point.y - badgeSize.y - 8.0F;
+        if (badgeY < minimum.y + 2.0F) {
+            badgeY = point.y + 8.0F;
+        }
+        badgeY = std::clamp(
+            badgeY,
+            minimum.y + 2.0F,
+            std::max(
+                minimum.y + 2.0F,
+                axisY - badgeSize.y - 2.0F));
+        const ImVec2 badgeMinimum{badgeX, badgeY};
+        const ImVec2 badgeMaximum{
+            badgeX + badgeSize.x,
+            badgeY + badgeSize.y};
+        drawList->AddRectFilled(
+            badgeMinimum,
+            badgeMaximum,
+            ImGui::GetColorU32(
+                ImVec4{0.08F, 0.09F, 0.11F, 0.94F}),
+            3.0F);
+        drawList->AddRect(
+            badgeMinimum,
+            badgeMaximum,
+            hoveredDotGraph->displayColour,
+            3.0F,
+            0,
+            1.25F);
+        drawList->AddText(
+            ImVec2{badgeX + 4.0F, badgeY + 2.0F},
+            hoveredDotGraph->displayColour,
+            hoveredDotGraph->lane->label);
+    };
 
     const ImU32 activationColour =
         ImGui::GetColorU32(
@@ -99540,10 +103061,10 @@ void DrawTimingKeyLaneGroup(
         drawList->AddRectFilled(
             ImVec2{
                 minimum.x + width * visibleActivation.first,
-                axisY - 2.5F},
+                markerCentreY - 2.5F},
             ImVec2{
                 minimum.x + width * visibleActivation.second,
-                axisY + 2.5F},
+                markerCentreY + 2.5F},
             activationColour,
             2.0F);
     }
@@ -99557,8 +103078,8 @@ void DrawTimingKeyLaneGroup(
         }
         const float x = xForPosition(boundary);
         drawList->AddLine(
-            ImVec2{x, axisY - 4.0F},
-            ImVec2{x, axisY + 4.0F},
+            ImVec2{x, markerCentreY - 4.0F},
+            ImVec2{x, markerCentreY + 4.0F},
             activationBoundaryColour,
             1.0F);
     }
@@ -99566,6 +103087,14 @@ void DrawTimingKeyLaneGroup(
         ImVec2{minimum.x, axisY},
         ImVec2{maximum.x, axisY},
         ImGui::GetColorU32(ImGuiCol_Border));
+    if (drawsValueGraph) {
+        drawList->AddLine(
+            ImVec2{minimum.x, markerCentreY},
+            ImVec2{maximum.x, markerCentreY},
+            colourWithOpacity(
+                ImGui::GetColorU32(ImGuiCol_Border),
+                0.55F));
+    }
     const float scrubPosition =
         CurrentAuthoredTrackPosition(*runtimeState);
     const float scrubX = xForPosition(scrubPosition);
@@ -99583,10 +103112,10 @@ void DrawTimingKeyLaneGroup(
                 continue;
             }
             const float x = xForPosition(drawnPosition);
-            const float markerCentreY =
-                drawsValueGraph ? axisY + 5.0F : axisY;
             const ImU32 drawnColour =
-                markerColour(lane.colour, drawnPosition);
+                markerColour(
+                    displayColourForLane(lane),
+                    drawnPosition);
             const bool isHoveredMarker =
                 markerHovered && nearestSeries != nullptr &&
                 sameTrack(*nearestSeries, lane) &&
@@ -99613,10 +103142,8 @@ void DrawTimingKeyLaneGroup(
                     drawnColour);
             } else if (!isHoveredMarker) {
                 drawList->AddLine(
-                    drawsValueGraph
-                        ? ImVec2{x, axisY + 1.5F}
-                        : ImVec2{x, axisY - 4.5F},
-                    ImVec2{x, axisY + (drawsValueGraph ? 8.5F : 4.5F)},
+                    ImVec2{x, markerCentreY - 4.5F},
+                    ImVec2{x, markerCentreY + 4.5F},
                     drawnColour,
                     2.0F);
             }
@@ -99626,8 +103153,8 @@ void DrawTimingKeyLaneGroup(
                 invisible_places::timing::
                     kTimingColouriseKeyTolerance) {
                 drawList->AddLine(
-                    ImVec2{x - 3.0F, axisY - 5.5F},
-                    ImVec2{x + 3.0F, axisY - 5.5F},
+                    ImVec2{x - 3.0F, markerCentreY - 6.5F},
+                    ImVec2{x + 3.0F, markerCentreY - 6.5F},
                     ImGui::GetColorU32(
                         ImGuiCol_SliderGrabActive),
                     1.5F);
@@ -99646,12 +103173,31 @@ void DrawTimingKeyLaneGroup(
                 : nearestPosition;
         const float x = xForPosition(drawnPosition);
         drawList->AddCircleFilled(
-            ImVec2{x, drawsValueGraph ? axisY + 5.0F : axisY},
+            ImVec2{x, markerCentreY},
             4.25F,
             markerColour(
-                nearestSeries->colour,
+                displayColourForLane(*nearestSeries),
                 drawnPosition));
+        drawList->AddCircle(
+            ImVec2{x, markerCentreY},
+            6.25F,
+            ImGui::GetColorU32(ImGuiCol_SliderGrabActive),
+            0,
+            2.0F);
+        drawList->AddLine(
+            ImVec2{x - 10.0F, markerCentreY},
+            ImVec2{x - 7.0F, markerCentreY},
+            ImGui::GetColorU32(ImGuiCol_SliderGrabActive),
+            1.5F);
+        drawList->AddLine(
+            ImVec2{x + 7.0F, markerCentreY},
+            ImVec2{x + 10.0F, markerCentreY},
+            ImGui::GetColorU32(ImGuiCol_SliderGrabActive),
+            1.5F);
     }
+    // Selection affordances draw last so axes, activation bands, and other
+    // coincident keys cannot obscure the target under the pointer.
+    drawHoveredDotTarget();
 
     if (marqueeMatches() &&
         ImGui::IsMouseDragging(ImGuiMouseButton_Left, 2.0F)) {
@@ -99710,15 +103256,17 @@ void DrawTimingKeyLaneGroup(
         ImGui::TextUnformatted(
             "Right-click or right-drag to scrub the animation position.");
         ImGui::TextUnformatted(
-            "Left-click selects a key; drag a curve dot to change time and value.");
+            "Left-click a curve dot to select only that key; its labelled halo shows the exact target. Drag changes its time and value.");
         ImGui::TextUnformatted(
-            "Drag a lower marker to change time only. With Time-only drag enabled, every key in this Visual Feature at each selected time moves together.");
+            "A lower time handle always selects every visible key at that time and changes time only. With Time-only drag enabled, a curve-dot drag moves every key in this Visual Feature at each selected time together.");
+        ImGui::TextUnformatted(
+            "In Bounds graphs, coincident geometry keys retime as one pair and coincident fade keys retime as another; fades never snap to geometry.");
         ImGui::TextUnformatted(
             "Left-drag empty space for a selection window. Cmd/Ctrl-click toggles; Shift-click selects a range.");
         ImGui::TextUnformatted(
             "Cmd/Ctrl+A selects this graph. C, X, and V copy, cut, and paste at the playhead. Delete removes; Esc clears.");
         ImGui::TextUnformatted(
-            "Double-click a key to enter its exact normalized animation position.");
+            "Double-click open graph space to add a key on the only or nearest curve. Double-click an existing key to enter its exact normalized animation position.");
         ImGui::Separator();
         const float position =
             CurrentAuthoredTrackPosition(*runtimeState);
@@ -99760,20 +103308,22 @@ void DrawTimingKeyLaneGroup(
                     : " and value");
         }
     } else if (markerHovered && nearestSeries != nullptr) {
-        const auto markerValue =
-            scalarValueAt(*nearestSeries, nearestPosition);
-        if (markerValue.has_value()) {
-            ImGui::SetTooltip(
-                "%s key\nValue = %.6g\nAnimation position %.4f\nLeft-drag this lower marker to change time only.",
-                nearestSeries->label,
-                markerValue.value(),
-                nearestPosition);
-        } else {
-            ImGui::SetTooltip(
-                "%s key\nAnimation position %.4f\nLeft-drag this lower marker to change time only.",
-                nearestSeries->label,
-                nearestPosition);
+        std::size_t clusterKeyCount = 0U;
+        for (const auto& lane : series) {
+            clusterKeyCount += static_cast<std::size_t>(std::count_if(
+                lane.positions.begin(),
+                lane.positions.end(),
+                [&](float position) {
+                    return std::abs(position - nearestPosition) <=
+                           invisible_places::timing::
+                               kTimingColouriseKeyTolerance;
+                }));
         }
+        ImGui::SetTooltip(
+            "Time handle — %zu visible key%s\nAnimation position %.4f\nLeft-drag retimes the complete cluster; values are locked.",
+            clusterKeyCount,
+            clusterKeyCount == 1U ? "" : "s",
+            nearestPosition);
     } else if (itemHovered) {
         const float startDistance = positionInView(activation.start)
             ? std::abs(
@@ -99784,7 +103334,7 @@ void DrawTimingKeyLaneGroup(
                   mouseX - xForPosition(activation.end))
             : std::numeric_limits<float>::max();
         const bool axisHovered =
-            std::abs(mouse.y - axisY) <= kMarkerHitRadius;
+            std::abs(mouse.y - markerCentreY) <= kMarkerHitRadius;
         if (axisHovered &&
             std::min(startDistance, endDistance) <= 5.0F) {
             ImGui::SetTooltip(
@@ -99800,6 +103350,14 @@ void DrawTimingKeyLaneGroup(
                     hoveredGraph->lane->label,
                     hoveredGraphValue,
                     hoveredGraphPosition);
+            } else if (hoveredGraph->sharedPaletteMarkerRange) {
+                ImGui::SetTooltip(
+                    "%s %.6g at animation position %.4f\nShared marker range %.6g–%.6g; only marker Position tracks that actually move set this axis. Group-keyed markers that stay fixed do not widen it.",
+                    hoveredGraph->lane->label,
+                    hoveredGraphValue,
+                    hoveredGraphPosition,
+                    hoveredGraph->minimum,
+                    hoveredGraph->maximum);
             } else {
                 ImGui::SetTooltip(
                     "%s %.6g at animation position %.4f\nGraph range %.6g–%.6g; each setting is scaled from its own minimum at the axis to its maximum at the top.",
@@ -99811,7 +103369,7 @@ void DrawTimingKeyLaneGroup(
             }
         } else {
             ImGui::SetTooltip(
-                "Animation position %.4f\nRight-click or right-drag to scrub. Left-drag empty space to select keys.",
+                "Animation position %.4f\nDouble-click open graph space to add a key on the only or nearest curve. Right-click or right-drag to scrub; left-drag empty space to select keys.",
                 positionForX(mouseX));
         }
     }
@@ -99974,39 +103532,6 @@ void DrawTimingKeyLaneGroup(
         }
     }
     ImGui::PopID();
-}
-
-void DrawTimingKeyLane(
-    const char* id,
-    PreviewRuntimeState* runtimeState,
-    invisible_places::timing::TimingColouriseEffect* effect,
-    TimingColouriseKeyTrack track,
-    std::optional<
-        invisible_places::timing::TimingColouriseBoundsParameter>
-        boundsParameter,
-    std::optional<
-        invisible_places::timing::TimingColouriseEffectParameter>
-        effectParameter,
-    std::span<const float> positions,
-    ImU32 colour) {
-    const TimingColouriseKeyLaneSeries lane{
-        .label =
-            track == TimingColouriseKeyTrack::Palette
-                ? "Palette"
-            : track == TimingColouriseKeyTrack::Bounds
-                ? "Bounds"
-                : "Effect control",
-        .track = track,
-        .boundsParameter = boundsParameter,
-        .effectParameter = effectParameter,
-        .positions = positions,
-        .colour = colour,
-    };
-    DrawTimingKeyLaneGroup(
-        id,
-        runtimeState,
-        effect,
-        std::span<const TimingColouriseKeyLaneSeries>{&lane, 1U});
 }
 
 void DrawTimingPaletteGradientRect(
@@ -100210,90 +103735,6 @@ void ApplyTimingColourisePaletteSource(
     effect->paletteEdited = false;
 }
 
-void DrawTimingColouriseTrackButtons(
-    PreviewRuntimeState* runtimeState,
-    invisible_places::timing::TimingColouriseEffect* effect,
-    bool paletteTrack) {
-    if (runtimeState == nullptr || effect == nullptr) {
-        return;
-    }
-    const float position = CurrentAuthoredTrackPosition(*runtimeState);
-    const auto previous =
-        paletteTrack
-            ? invisible_places::timing::
-                  PreviousTimingColourisePaletteKeyPosition(
-                      *effect,
-                      position)
-            : invisible_places::timing::
-                  PreviousTimingColouriseBoundsKeyPosition(
-                      *effect,
-                      position);
-    const auto next =
-        paletteTrack
-            ? invisible_places::timing::
-                  NextTimingColourisePaletteKeyPosition(
-                      *effect,
-                      position)
-            : invisible_places::timing::
-                  NextTimingColouriseBoundsKeyPosition(
-                      *effect,
-                      position);
-    const std::size_t currentCount =
-        paletteTrack
-            ? invisible_places::timing::
-                  TimingColourisePaletteKeyCountAtPosition(
-                      *effect,
-                      position)
-            : invisible_places::timing::
-                  TimingColouriseBoundsKeyCountAtPosition(
-                      *effect,
-                      position);
-    ImGui::BeginDisabled(!previous.has_value());
-    if (ImGui::SmallButton("<")) {
-        ScrubFeatureTimelineToAuthoredPosition(
-            runtimeState,
-            previous.value());
-    }
-    ImGui::EndDisabled();
-    DrawTimingControlTooltip(
-        previous.has_value()
-            ? "Go to the previous key on this track."
-            : "This track has no earlier key.");
-    ImGui::SameLine(0.0F, 2.0F);
-    ImGui::BeginDisabled(!next.has_value());
-    if (ImGui::SmallButton(">")) {
-        ScrubFeatureTimelineToAuthoredPosition(
-            runtimeState,
-            next.value());
-    }
-    ImGui::EndDisabled();
-    DrawTimingControlTooltip(
-        next.has_value()
-            ? "Go to the next key on this track."
-            : "This track has no later key.");
-    ImGui::SameLine(0.0F, 2.0F);
-    ImGui::BeginDisabled(currentCount == 0U);
-    if (ImGui::SmallButton("X")) {
-        if (paletteTrack) {
-            (void)invisible_places::timing::
-                RemoveTimingColourisePaletteKeysAtPosition(
-                    effect,
-                    position);
-        } else {
-            (void)invisible_places::timing::
-                RemoveTimingColouriseBoundsKeysAtPosition(
-                    effect,
-                    position);
-        }
-        runtimeState->previewRenderStateSignatureValid = false;
-    }
-    ImGui::EndDisabled();
-    DrawTimingControlTooltip(
-        currentCount > 0U
-            ? "Delete the key on this track at the current animation position."
-            : "Move onto a key on this track before deleting it.");
-}
-
 const char* TimingColouriseEffectParameterLabel(
     invisible_places::timing::TimingColouriseEffectParameter parameter) {
     using invisible_places::timing::TimingColouriseEffectParameter;
@@ -100301,7 +103742,7 @@ const char* TimingColouriseEffectParameterLabel(
         case TimingColouriseEffectParameter::PalettePhase:
             return "Colour Phase";
         case TimingColouriseEffectParameter::AmountOverride:
-            return "Colourise Amount Overrides";
+            return "Colourise Amount";
         case TimingColouriseEffectParameter::EmissiveLevel:
             return "Emissive Level";
         case TimingColouriseEffectParameter::PaletteSkewCentre:
@@ -100444,6 +103885,71 @@ bool TimingEffectIsEmissive(
     return effect.emissiveEnabled && !effect.colouriseEnabled;
 }
 
+ImU32 TimingColouriseEffectParameterDisplayColour(
+    invisible_places::timing::TimingColouriseEffectParameter parameter) {
+    using invisible_places::timing::TimingColouriseEffectParameter;
+    switch (parameter) {
+        case TimingColouriseEffectParameter::PaletteSkewCentre:
+            return IM_COL32(186, 132, 232, 255);
+        case TimingColouriseEffectParameter::PaletteSkewSpread:
+            return IM_COL32(150, 142, 240, 255);
+        case TimingColouriseEffectParameter::EmissiveSkewCentre:
+            return IM_COL32(226, 145, 116, 255);
+        case TimingColouriseEffectParameter::EmissiveSkewSpread:
+            return IM_COL32(250, 178, 120, 255);
+        case TimingColouriseEffectParameter::AmountOverride:
+            return IM_COL32(120, 205, 172, 255);
+        case TimingColouriseEffectParameter::PalettePhase:
+            return IM_COL32(238, 174, 72, 255);
+        case TimingColouriseEffectParameter::EmissiveLevel:
+            return IM_COL32(244, 155, 78, 255);
+        case TimingColouriseEffectParameter::PaletteSkewLower:
+        case TimingColouriseEffectParameter::PaletteSkewUpper:
+            return IM_COL32(174, 142, 230, 255);
+    }
+    return ImGui::GetColorU32(ImGuiCol_Text);
+}
+
+bool DrawTimingColouriseBlendModeCombo(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::timing::TimingColouriseEffect* effect) {
+    if (runtimeState == nullptr || effect == nullptr) {
+        return false;
+    }
+    static constexpr std::array<const char*, 6>
+        kTimingColouriseBlendModeLabels = {
+            "Normal",
+            "Multiply",
+            "Screen",
+            "Add",
+            "Divide",
+            "Vivid Light",
+        };
+    int blendModeIndex = std::clamp(
+        static_cast<int>(effect->blendMode),
+        0,
+        static_cast<int>(kTimingColouriseBlendModeLabels.size()) - 1);
+    SetNextTimingLabelledControlWidth("Blend");
+    if (!ImGui::Combo(
+            "Blend",
+            &blendModeIndex,
+            kTimingColouriseBlendModeLabels.data(),
+            static_cast<int>(kTimingColouriseBlendModeLabels.size()))) {
+        DrawTimingControlTooltip(
+            "How this feature's colour combines with earlier features or "
+            "the cloud colour. Colourise Amount remains the layer opacity.");
+        return false;
+    }
+    effect->blendMode = static_cast<
+        invisible_places::timing::TimingColouriseBlendMode>(
+        blendModeIndex);
+    runtimeState->previewRenderStateSignatureValid = false;
+    DrawTimingControlTooltip(
+        "How this feature's colour combines with earlier features or the "
+        "cloud colour. Colourise Amount remains the layer opacity.");
+    return true;
+}
+
 bool DrawTimingColouriseEffectParameterTrackButtons(
     PreviewRuntimeState* runtimeState,
     invisible_places::timing::TimingColouriseEffect* effect,
@@ -100451,6 +103957,9 @@ bool DrawTimingColouriseEffectParameterTrackButtons(
     if (runtimeState == nullptr || effect == nullptr) {
         return false;
     }
+    ImGui::PushStyleVar(
+        ImGuiStyleVar_FramePadding,
+        ImVec2{2.0F, 1.0F});
     bool changed = false;
     const float position = CurrentAuthoredTrackPosition(*runtimeState);
     const auto previous = invisible_places::timing::
@@ -100511,18 +104020,21 @@ bool DrawTimingColouriseEffectParameterTrackButtons(
         effect->effectParameterKeys.end(),
         [&](const auto& key) { return key.parameter == parameter; });
     if (hasKeys) {
-        ImGui::SetNextItemWidth(
-            std::max(96.0F, ImGui::GetContentRegionAvail().x));
+        ImGui::SetNextItemWidth(std::min(
+            78.0F,
+            std::max(54.0F, ImGui::GetContentRegionAvail().x)));
         if (DrawTimingScalarTrackInterpolationCombo(
                 "##CurveStyle",
                 &effect->effectParameterKeys,
                 [&](const auto& key) {
                     return key.parameter == parameter;
-                })) {
+                },
+                /*compactPreview=*/true)) {
             runtimeState->previewRenderStateSignatureValid = false;
             changed = true;
         }
     }
+    ImGui::PopStyleVar();
     return changed;
 }
 
@@ -100573,16 +104085,12 @@ bool DrawTimingColouriseEffectParameterEditor(
                       position)
             : evaluatedTotal;
     ImGui::PushID(static_cast<int>(parameter));
-    if (hasKeys) {
-        ImGui::PushStyleColor(
-            ImGuiCol_Text,
-            kWaterKeyedSettingColour);
-    }
+    ImGui::PushStyleColor(
+        ImGuiCol_Text,
+        TimingColouriseEffectParameterDisplayColour(parameter));
     ImGui::TextUnformatted(
         TimingColouriseEffectParameterLabel(parameter));
-    if (hasKeys) {
-        ImGui::PopStyleColor();
-    }
+    ImGui::PopStyleColor();
     bool changed = false;
     // Authored, non-keyed choices sit between the label and the animated
     // value so the keyable value row stays uniform across parameters.
@@ -100608,71 +104116,11 @@ bool DrawTimingColouriseEffectParameterEditor(
         }
         DrawTimingControlTooltip(
             "Multiply every stop's Colourise Amount by the override value.");
-        ImGui::SetNextItemWidth(-FLT_MIN);
-        static constexpr std::array<const char*, 6>
-            kTimingColouriseBlendModeLabels = {
-                "Normal",
-                "Multiply",
-                "Screen",
-                "Add",
-                "Divide",
-                "Vivid Light",
-            };
-        int blendModeIndex = std::clamp(
-            static_cast<int>(effect->blendMode),
-            0,
-            static_cast<int>(kTimingColouriseBlendModeLabels.size()) - 1);
-        if (ImGui::Combo(
-                "##colouriseBlendMode",
-                &blendModeIndex,
-                kTimingColouriseBlendModeLabels.data(),
-                static_cast<int>(
-                    kTimingColouriseBlendModeLabels.size()))) {
-            effect->blendMode = static_cast<
-                invisible_places::timing::TimingColouriseBlendMode>(
-                blendModeIndex);
-            changed = true;
-        }
-        DrawTimingControlTooltip(
-            "How this feature's colour lays into the colour beneath it "
-            "(earlier features, or the cloud colour). Normal mixes toward "
-            "the palette colour - the historical behaviour. Multiply and "
-            "Divide darken and brighten like the AE exhibition grade's "
-            "washes over a white render; Screen and Add lay colour into "
-            "dark points instead. Vivid Light pushes contrast hard. "
-            "Colourise Amount acts as the layer opacity for every mode.");
     }
     if (drawBelowLabel) {
         drawBelowLabel();
     }
-    if (hasKeys) {
-        ImGui::PushStyleColor(
-            ImGuiCol_Text,
-            kWaterKeyedSettingColour);
-    }
-    const std::string valueText =
-        (parameter == TimingColouriseEffectParameter::PalettePhase &&
-                 hasKeys
-             ? std::string{"Delta "}
-             : std::string{}) +
-        FormatFixed(authoredValue, 3) +
-        (parameter == TimingColouriseEffectParameter::PalettePhase
-             ? " turns"
-             : std::string{});
     bool valueChanged = false;
-    const ImVec2 valueSize{
-        ImGui::CalcTextSize(valueText.c_str()).x + 8.0F,
-        0.0F};
-    if (ImGui::Selectable(
-            valueText.c_str(),
-            false,
-            ImGuiSelectableFlags_None,
-            valueSize)) {
-        ImGui::OpenPopup("Edit Value");
-    }
-    if (hasKeys) {
-        ImGui::PopStyleColor();
-    }
     const char* parameterTooltip = nullptr;
     switch (parameter) {
         case TimingColouriseEffectParameter::PalettePhase:
@@ -100681,30 +104129,54 @@ bool DrawTimingColouriseEffectParameterEditor(
             break;
         case TimingColouriseEffectParameter::AmountOverride:
             parameterTooltip =
-                "Animate the value used by the selected Max or Scale mode. This changes colour mixing, not point opacity.";
+                "Animate the value used by the selected Max or Scale mode. Drag the slider for live changes or double-click it for exact entry. This changes colour mixing, not point opacity.";
             break;
         case TimingColouriseEffectParameter::EmissiveLevel:
             parameterTooltip =
-                "Apply a field-masked light level without changing point opacity. Positive values add emission; negative values darken, with -1 fully dark at full mask. Click to edit or double-click to type any finite value.";
+                "Apply a field-masked light level without changing point opacity. Drag across the -2.5 to +2.5 working range; double-click to type any finite value. Positive values add emission and negative values darken, with -1 fully dark at full mask.";
             break;
         case TimingColouriseEffectParameter::PaletteSkewCentre:
         case TimingColouriseEffectParameter::EmissiveSkewCentre:
             parameterTooltip =
-                "Bounds fraction where the centre node lands, from 0 to 1. 0.5 keeps the mapping symmetric. Drag the node in the histogram left and right, or click here for exact entry.";
+                "Bounds fraction where the centre node lands, from 0 to 1. 0.5 keeps the mapping symmetric. Drag this slider or the histogram node left and right; double-click the slider for exact entry.";
             break;
         case TimingColouriseEffectParameter::PaletteSkewSpread:
         case TimingColouriseEffectParameter::EmissiveSkewSpread:
             parameterTooltip =
-                "The centre node's local density from -1 to +1: positive spreads the area around it, negative pinches it. Drag the node in the histogram up and down. Markers never move - only how they are sampled changes.";
+                "The centre node's local density from -1 to +1: positive spreads the area around it, negative pinches it. Drag this slider or the histogram node up and down; double-click the slider for exact entry. Markers never move - only how they are sampled changes.";
             break;
         case TimingColouriseEffectParameter::PaletteSkewLower:
         case TimingColouriseEffectParameter::PaletteSkewUpper:
             parameterTooltip = "Legacy per-side skew.";
             break;
     }
-    DrawTimingControlTooltip(parameterTooltip);
-
     if (parameter == TimingColouriseEffectParameter::PalettePhase) {
+        // Phase keys are relative signed turns, while their graph is the
+        // accumulated phase. Keep this one specialised control beside the
+        // common scalar slider used by every absolute-valued parameter.
+        if (hasKeys) {
+            ImGui::PushStyleColor(
+                ImGuiCol_Text,
+                kWaterKeyedSettingColour);
+        }
+        const std::string valueText =
+            (hasKeys ? std::string{"Delta "} : std::string{}) +
+            FormatFixed(authoredValue, 3) + " turns";
+        const ImVec2 valueSize{
+            ImGui::CalcTextSize(valueText.c_str()).x + 8.0F,
+            0.0F};
+        if (ImGui::Selectable(
+                valueText.c_str(),
+                false,
+                ImGuiSelectableFlags_None,
+                valueSize)) {
+            ImGui::OpenPopup("Edit Value");
+        }
+        if (hasKeys) {
+            ImGui::PopStyleColor();
+        }
+        DrawTimingControlTooltip(parameterTooltip);
+
         const auto slider = DrawTimingColourPhaseSlider(
             "##PalettePhaseTurns",
             &authoredValue);
@@ -100719,25 +104191,10 @@ bool DrawTimingColouriseEffectParameterEditor(
             hasKeys
                 ? "Drag from -1 to +1 turn relative to the preceding phase key. The graph below shows the accumulated phase as wrapped copies. Double-click for exact entry."
                 : "Drag the unkeyed base phase from -1 to +1 turn. Double-click for exact entry.");
-    }
-
-    if (ImGui::BeginPopup("Edit Value")) {
-        if (ImGui::IsWindowAppearing() &&
-            parameter != TimingColouriseEffectParameter::EmissiveLevel) {
-            ImGui::SetKeyboardFocusHere();
-        }
-        if (parameter ==
-            TimingColouriseEffectParameter::EmissiveLevel) {
-            valueChanged = DrawRangedFloatControl(
-                "##EmissiveLevel",
-                &authoredValue,
-                {.visualMin = -2.5F,
-                 .visualMax = 2.5F,
-                 .format = "%.3f",
-                 .showLabel = false});
-            DrawTimingControlTooltip(
-                "Drag from -2.5 to +2.5. Negative values darken masked points; -1 is fully dark at full mask. Double-click the bar to type any finite value.");
-        } else {
+        if (ImGui::BeginPopup("Edit Value")) {
+            if (ImGui::IsWindowAppearing()) {
+                ImGui::SetKeyboardFocusHere();
+            }
             ImGui::SetNextItemWidth(120.0F);
             valueChanged =
                 ImGui::InputFloat(
@@ -100748,16 +104205,53 @@ bool DrawTimingColouriseEffectParameterEditor(
                     "%.3f") ||
                 valueChanged;
             DrawTimingControlTooltip(
-                parameter == TimingColouriseEffectParameter::PalettePhase
-                    ? "Enter a signed phase change from -1 to +1 turn."
-                : parameter == TimingColouriseEffectParameter::
-                                   PaletteSkewSpread ||
-                        parameter == TimingColouriseEffectParameter::
-                                         EmissiveSkewSpread
-                    ? "Enter a signed spread from -1 to +1."
-                    : "Enter a value from 0 to 1.");
+                "Enter a signed phase change from -1 to +1 turn.");
+            ImGui::EndPopup();
         }
-        ImGui::EndPopup();
+    } else {
+        RangedFloatControlConfig sliderConfig{
+            .visualMin = 0.0F,
+            .visualMax = 1.0F,
+            .format = "%.3f",
+            .showLabel = false,
+            .scaleDragToWidth = true,
+            .hardMin = 0.0F,
+            .hardMax = 1.0F,
+        };
+        if (parameter == TimingColouriseEffectParameter::EmissiveLevel) {
+            sliderConfig.visualMin = -2.5F;
+            sliderConfig.visualMax = 2.5F;
+            // The rail is a useful working range, but exact entry preserves
+            // the established ability to author any finite emissive level.
+            sliderConfig.hardMin.reset();
+            sliderConfig.hardMax.reset();
+        } else if (
+            parameter == TimingColouriseEffectParameter::PaletteSkewSpread ||
+            parameter == TimingColouriseEffectParameter::EmissiveSkewSpread ||
+            parameter == TimingColouriseEffectParameter::PaletteSkewLower ||
+            parameter == TimingColouriseEffectParameter::PaletteSkewUpper) {
+            sliderConfig.visualMin = -1.0F;
+            sliderConfig.visualMax = 1.0F;
+            sliderConfig.hardMin = -1.0F;
+            sliderConfig.hardMax = 1.0F;
+        }
+        if (hasKeys) {
+            ImGui::PushStyleColor(
+                ImGuiCol_Text,
+                kWaterKeyedSettingColour);
+        }
+        valueChanged = DrawRangedFloatControl(
+            "##AnimatedValue",
+            &authoredValue,
+            sliderConfig);
+        const bool valueActive = ImGui::IsItemActive();
+        if (hasKeys) {
+            ImGui::PopStyleColor();
+        }
+        if (valueActive || valueChanged) {
+            StopAnimationPlayback(runtimeState);
+        }
+        DrawTimingControlTooltip(parameterTooltip);
     }
     if (valueChanged && std::isfinite(authoredValue)) {
         if (parameter == TimingColouriseEffectParameter::PalettePhase) {
@@ -101224,64 +104718,28 @@ void DrawTimingEmissiveFalloffCurveEditor(
     }
 }
 
-void DrawTimingEmissiveLevelEditor(
-    PreviewRuntimeState* runtimeState,
-    invisible_places::timing::TimingColouriseEffect* effect) {
-    if (runtimeState == nullptr || effect == nullptr) {
+void AppendTimingEmissiveTimelineLanes(
+    const invisible_places::timing::TimingColouriseEffect* effect,
+    std::vector<TimingColouriseKeyLaneSeries>* lanes) {
+    if (effect == nullptr || lanes == nullptr) {
         return;
     }
     using invisible_places::timing::TimingColouriseEffectParameter;
     using invisible_places::timing::
         TimingColouriseEmissiveFalloffParameter;
-    (void)DrawTimingColouriseEffectParameterEditor(
-        runtimeState,
-        effect,
-        TimingColouriseEffectParameter::EmissiveLevel);
-    DrawTimingEmissiveFalloffCurveEditor(runtimeState, effect);
-    const auto keyPositions = invisible_places::timing::
+    TimingColouriseKeyLaneSeries levelLane{
+        .label = "Emissive Level",
+        .track = TimingColouriseKeyTrack::EffectParameter,
+        .effectParameter =
+            TimingColouriseEffectParameter::EmissiveLevel,
+        .colour = IM_COL32(244, 155, 78, 255),
+    };
+    levelLane.ownedPositions = invisible_places::timing::
         TimingColouriseEffectParameterKeyPositions(
             *effect,
             TimingColouriseEffectParameter::EmissiveLevel);
-    const auto emissiveSkewCentreKeys = invisible_places::timing::
-        TimingColouriseEffectParameterKeyPositions(
-            *effect,
-            TimingColouriseEffectParameter::EmissiveSkewCentre);
-    const auto emissiveSkewSpreadKeys = invisible_places::timing::
-        TimingColouriseEffectParameterKeyPositions(
-            *effect,
-            TimingColouriseEffectParameter::EmissiveSkewSpread);
-    std::vector<TimingColouriseKeyLaneSeries> lanes{
-        TimingColouriseKeyLaneSeries{
-            .label = "Emissive Level",
-            .track = TimingColouriseKeyTrack::EffectParameter,
-            .effectParameter =
-                TimingColouriseEffectParameter::EmissiveLevel,
-            .positions = std::span<const float>{keyPositions},
-            .colour = IM_COL32(244, 155, 78, 255),
-        },
-    };
-    if (!emissiveSkewCentreKeys.empty()) {
-        lanes.push_back(TimingColouriseKeyLaneSeries{
-            .label = "Falloff Skew Centre",
-            .track = TimingColouriseKeyTrack::EffectParameter,
-            .effectParameter =
-                TimingColouriseEffectParameter::EmissiveSkewCentre,
-            .positions =
-                std::span<const float>{emissiveSkewCentreKeys},
-            .colour = IM_COL32(186, 132, 232, 255),
-        });
-    }
-    if (!emissiveSkewSpreadKeys.empty()) {
-        lanes.push_back(TimingColouriseKeyLaneSeries{
-            .label = "Falloff Skew Spread",
-            .track = TimingColouriseKeyTrack::EffectParameter,
-            .effectParameter =
-                TimingColouriseEffectParameter::EmissiveSkewSpread,
-            .positions =
-                std::span<const float>{emissiveSkewSpreadKeys},
-            .colour = IM_COL32(150, 142, 240, 255),
-        });
-    }
+    lanes->push_back(std::move(levelLane));
+
     // Keyed falloff-node coordinates join the same graph, one auto-ranged
     // lane per (node, coordinate) track.
     const auto nodeOrdinal =
@@ -101297,17 +104755,17 @@ void DrawTimingEmissiveLevelEditor(
     };
     for (const auto& key : effect->emissiveFalloffKeys) {
         auto lane = std::find_if(
-            lanes.begin(),
-            lanes.end(),
+            lanes->begin(),
+            lanes->end(),
             [&](const auto& candidate) {
                 return candidate.track ==
                            TimingColouriseKeyTrack::EmissiveFalloff &&
                        candidate.falloffParameter == key.parameter &&
                        candidate.stopId == key.nodeId;
             });
-        if (lane == lanes.end()) {
+        if (lane == lanes->end()) {
             const auto ordinal = nodeOrdinal(key.nodeId);
-            lanes.push_back(TimingColouriseKeyLaneSeries{
+            lanes->push_back(TimingColouriseKeyLaneSeries{
                 .ownedLabel =
                     "Falloff " +
                     (ordinal.has_value()
@@ -101327,31 +104785,133 @@ void DrawTimingEmissiveLevelEditor(
                               ? IM_COL32(226, 186, 116, 255)
                               : IM_COL32(250, 208, 120, 255),
             });
-            lane = std::prev(lanes.end());
+            lane = std::prev(lanes->end());
         }
         lane->ownedPositions.push_back(key.position);
     }
-    for (auto& lane : lanes) {
-        if (!lane.ownedLabel.empty()) {
-            lane.label = lane.ownedLabel.c_str();
-        }
-        if (!lane.ownedPositions.empty()) {
-            lane.positions = std::span<const float>{lane.ownedPositions};
-        }
-    }
-    ImGui::TextDisabled("Value over animation position");
-    DrawTimingControlTooltip(
-        "Curve height shows the evaluated setting value, each lane scaled to its own range. Keyed falloff nodes join as Falloff N Position/Level lanes. Left-drag a key dot to change its time and value, or its lower marker to retime only. Left-drag empty space to window-select; right-drag scrubs.");
-    DrawTimingKeyLaneGroup(
-        "##TimingEmissiveLevelKeyLane",
-        runtimeState,
-        effect,
-        lanes);
 }
+
+void DrawTimingEmissiveInteractiveEditor(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::timing::TimingColouriseEffect* effect) {
+    if (runtimeState == nullptr || effect == nullptr) {
+        return;
+    }
+    DrawTimingEmissiveFalloffCurveEditor(runtimeState, effect);
+}
+
+void AppendTimingColourisePaletteTimelineLanes(
+    const invisible_places::timing::TimingColouriseEffect* effect,
+    std::vector<TimingColouriseKeyLaneSeries>* lanes) {
+    if (effect == nullptr || lanes == nullptr) {
+        return;
+    }
+    using invisible_places::timing::TimingColouriseEffectParameter;
+    using invisible_places::timing::TimingColourisePaletteKeyModel;
+    using invisible_places::timing::TimingColourisePaletteStopParameter;
+
+    const auto appendEffectParameterLane =
+        [&](TimingColouriseEffectParameter parameter,
+            const char* label,
+            ImU32 colour) {
+            TimingColouriseKeyLaneSeries lane{
+                .label = label,
+                .track = TimingColouriseKeyTrack::EffectParameter,
+                .effectParameter = parameter,
+                .colour = colour,
+            };
+            lane.ownedPositions = invisible_places::timing::
+                TimingColouriseEffectParameterKeyPositions(
+                    *effect,
+                    parameter);
+            lanes->push_back(std::move(lane));
+        };
+    appendEffectParameterLane(
+        TimingColouriseEffectParameter::AmountOverride,
+        "Colourise Amount",
+        IM_COL32(120, 205, 172, 255));
+    appendEffectParameterLane(
+        TimingColouriseEffectParameter::PalettePhase,
+        "Colour Phase",
+        IM_COL32(238, 174, 72, 255));
+
+    if (effect->paletteKeyModel ==
+        TimingColourisePaletteKeyModel::LegacySnapshots) {
+        return;
+    }
+    const auto stopOrdinal =
+        [&](std::string_view stopId) -> std::optional<std::size_t> {
+        const auto found = std::find_if(
+            effect->basePalette.stops.begin(),
+            effect->basePalette.stops.end(),
+            [&](const auto& candidate) {
+                return candidate.id == stopId;
+            });
+        return found == effect->basePalette.stops.end()
+                   ? std::nullopt
+                   : std::optional<std::size_t>{
+                         static_cast<std::size_t>(std::distance(
+                             effect->basePalette.stops.begin(),
+                             found))};
+    };
+    for (const auto& key : effect->paletteStopParameterKeys) {
+        auto lane = std::find_if(
+            lanes->begin(),
+            lanes->end(),
+            [&](const auto& candidate) {
+                return candidate.track == TimingColouriseKeyTrack::Palette &&
+                       candidate.stopParameter == key.parameter &&
+                       candidate.stopId == key.stopId;
+            });
+        if (lane == lanes->end()) {
+            const auto ordinal = stopOrdinal(key.stopId);
+            const char* propertyName =
+                key.parameter ==
+                        TimingColourisePaletteStopParameter::Position
+                    ? "Position"
+                : key.parameter ==
+                        TimingColourisePaletteStopParameter::Colour
+                    ? "Colour"
+                    : "Amount";
+            const auto stopColour = [&]() {
+                if (!ordinal.has_value()) {
+                    return IM_COL32(222, 134, 190, 255);
+                }
+                const auto& authored =
+                    effect->basePalette.stops[ordinal.value()].colour;
+                return ImGui::ColorConvertFloat4ToU32(ImVec4{
+                    authored[0],
+                    authored[1],
+                    authored[2],
+                    1.0F});
+            }();
+            lanes->push_back(TimingColouriseKeyLaneSeries{
+                .ownedLabel =
+                    "Stop " +
+                    (ordinal.has_value()
+                         ? std::to_string(ordinal.value() + 1U)
+                         : std::string{"?"}) +
+                    " " + propertyName,
+                .track = TimingColouriseKeyTrack::Palette,
+                .stopId = key.stopId,
+                .stopParameter = key.parameter,
+                .colour = stopColour,
+            });
+            lane = std::prev(lanes->end());
+        }
+        lane->ownedPositions.push_back(key.position);
+    }
+}
+
+enum class TimingColourisePaletteEditorPart : std::uint8_t {
+    Sources,
+    Interactive,
+};
 
 void DrawTimingColourisePaletteEditor(
     PreviewRuntimeState* runtimeState,
-    invisible_places::timing::TimingColouriseEffect* effect) {
+    invisible_places::timing::TimingColouriseEffect* effect,
+    TimingColourisePaletteEditorPart part) {
     if (runtimeState == nullptr || effect == nullptr) {
         return;
     }
@@ -101364,8 +104924,6 @@ void DrawTimingColourisePaletteEditor(
     using invisible_places::timing::TimingColourisePaletteStopParameter;
     using invisible_places::timing::
         TimingColourisePaletteStopParameterKey;
-    using invisible_places::water::WaterScenarioInterpolation;
-
     auto& timings = runtimeState->timingsPanel;
     auto& water = runtimeState->water;
     const float position = CurrentAuthoredTrackPosition(*runtimeState);
@@ -101477,516 +105035,463 @@ void DrawTimingColourisePaletteEditor(
         return ImGui::CalcTextSize(label).x +
                ImGui::GetStyle().FramePadding.x * 2.0F;
     };
-    const auto* currentPreset =
-        effect->paletteSourceKind ==
-                TimingColourisePaletteSourceKind::Preset
-            ? findPreset(effect->paletteSourceId)
-            : nullptr;
-    const auto* currentLocalEdit =
-        currentPreset != nullptr
-            ? invisible_places::timing::
-                  FindTimingColouriseLocalPaletteEdit(
-                      *effect,
-                      currentPreset->id)
-            : nullptr;
-
-    ImGui::AlignTextToFramePadding();
-    ImGui::TextDisabled("Preset");
-    ImGui::SameLine();
-    const float presetActionWidth =
-        currentLocalEdit != nullptr
-            ? compactButtonWidth("X") + 2.0F
-            : 0.0F;
-    ImGui::SetNextItemWidth(
-        std::max(
-            40.0F,
-            ImGui::GetContentRegionAvail().x -
-                presetActionWidth));
-    const std::string presetPreview =
-        effect->paletteSourceKind ==
-                TimingColourisePaletteSourceKind::Preset
-            ? paletteDisplayName()
-            : "Choose preset...";
-    ImGui::BeginDisabled(paletteSourceLocked);
-    if (ImGui::BeginCombo(
-            "##TimingColourisePresetPalette",
-            presetPreview.c_str())) {
-        for (const auto& preset : presets) {
-            const bool originalSelected =
-                effect->paletteSourceKind ==
-                    TimingColourisePaletteSourceKind::Preset &&
-                effect->paletteSourceId == preset.id &&
-                !effect->paletteEdited;
-            if (DrawTimingPaletteComboEntry(
-                    preset,
-                    originalSelected) &&
-                invisible_places::timing::
-                    ActivateTimingColouriseOriginalPreset(
-                        effect,
-                        preset)) {
-                resetPaletteInteraction();
-            }
-            const auto* localEdit = invisible_places::timing::
-                FindTimingColouriseLocalPaletteEdit(
-                    *effect,
-                    preset.id);
-            if (localEdit == nullptr) {
-                continue;
-            }
-            TimingColourisePaletteDefinition editedDefinition{
-                .id = preset.id + "-effect-local-edit",
-                .name = localEdit->presetName + "_edited",
-                .palette = localEdit->palette,
-            };
-            const bool localEditSelected =
-                effect->paletteSourceKind ==
-                    TimingColourisePaletteSourceKind::Preset &&
-                effect->paletteSourceId == preset.id &&
-                effect->paletteEdited;
-            ImGui::Indent(10.0F);
-            if (DrawTimingPaletteComboEntry(
-                    editedDefinition,
-                    localEditSelected) &&
-                invisible_places::timing::
-                    ActivateTimingColouriseLocalPaletteEdit(
-                        effect,
-                        preset.id)) {
-                resetPaletteInteraction();
-            }
-            ImGui::Unindent(10.0F);
+    if (part == TimingColourisePaletteEditorPart::Sources) {
+        const int sourceColumns = TimingResponsiveColumnCount(
+            2U,
+            280.0F,
+            2);
+        const bool sourceTableVisible = ImGui::BeginTable(
+            "##TimingColourisePaletteSources",
+            sourceColumns,
+            ImGuiTableFlags_NoSavedSettings |
+                ImGuiTableFlags_NoPadOuterX |
+                ImGuiTableFlags_SizingStretchSame);
+        if (sourceTableVisible) {
+            ImGui::TableNextColumn();
         }
-        ImGui::EndCombo();
-    }
-    ImGui::EndDisabled();
-    DrawTimingControlTooltip(
-        hasPaletteKeys
-            ? "Palette source changes are locked while this effect has keyed palette versions."
-        : paletteSourceLocked
-            ? "Save the active _edited palette before changing its source."
-            : "Choose a built-in original or one of this effect's private _edited versions. Editing an original creates its private version; switching does not discard either version.");
-    const auto* activePreset =
-        effect->paletteSourceKind ==
-                TimingColourisePaletteSourceKind::Preset
-            ? findPreset(effect->paletteSourceId)
-            : nullptr;
-    const auto* activeLocalEdit =
-        activePreset != nullptr
-            ? invisible_places::timing::
-                  FindTimingColouriseLocalPaletteEdit(
-                      *effect,
-                      activePreset->id)
-            : nullptr;
-    const bool canDiscardLocalEdit =
-        activePreset != nullptr && activeLocalEdit != nullptr &&
-        !hasPaletteKeys;
-    if (activeLocalEdit != nullptr) {
-        ImGui::SameLine(0.0F, 2.0F);
-        ImGui::BeginDisabled(!canDiscardLocalEdit);
-        if (ImGui::SmallButton("X##DiscardLocalPaletteEdit") &&
-            activePreset != nullptr &&
-            invisible_places::timing::
-                DiscardTimingColouriseLocalPaletteEdit(
-                    effect,
-                    *activePreset)) {
-            resetPaletteInteraction();
-            runtimeState->statusMessage =
-                "Discarded " + activePreset->name +
-                "_edited and restored the built-in preset.";
-            runtimeState->errorMessage.clear();
+        // Keep the source widths stable when a private _edited variant adds
+        // its discard button.
+        const float presetActionWidth =
+            compactButtonWidth("X") + 2.0F;
+        SetNextTimingLabelledControlWidth(
+            "Colour",
+            presetActionWidth);
+        const std::string presetPreview =
+            effect->paletteSourceKind ==
+                    TimingColourisePaletteSourceKind::Preset
+                ? paletteDisplayName()
+                : "Choose preset...";
+        ImGui::BeginDisabled(paletteSourceLocked);
+        if (ImGui::BeginCombo("Colour##TimingColourisePresetPalette",
+                              presetPreview.c_str())) {
+            for (const auto &preset : presets) {
+                const bool originalSelected =
+                    effect->paletteSourceKind ==
+                        TimingColourisePaletteSourceKind::Preset &&
+                    effect->paletteSourceId == preset.id &&
+                    !effect->paletteEdited;
+                if (DrawTimingPaletteComboEntry(preset, originalSelected) &&
+                    invisible_places::timing::
+                        ActivateTimingColouriseOriginalPreset(effect, preset)) {
+                    resetPaletteInteraction();
+                }
+                const auto *localEdit = invisible_places::timing::
+                    FindTimingColouriseLocalPaletteEdit(*effect, preset.id);
+                if (localEdit == nullptr) {
+                    continue;
+                }
+                TimingColourisePaletteDefinition editedDefinition{
+                    .id = preset.id + "-effect-local-edit",
+                    .name = localEdit->presetName + "_edited",
+                    .palette = localEdit->palette,
+                };
+                const bool localEditSelected =
+                    effect->paletteSourceKind ==
+                        TimingColourisePaletteSourceKind::Preset &&
+                    effect->paletteSourceId == preset.id &&
+                    effect->paletteEdited;
+                ImGui::Indent(10.0F);
+                if (DrawTimingPaletteComboEntry(editedDefinition,
+                                                localEditSelected) &&
+                    invisible_places::timing::
+                        ActivateTimingColouriseLocalPaletteEdit(effect,
+                                                                preset.id)) {
+                    resetPaletteInteraction();
+                }
+                ImGui::Unindent(10.0F);
+            }
+            ImGui::EndCombo();
         }
         ImGui::EndDisabled();
         DrawTimingControlTooltip(
-            canDiscardLocalEdit
-                ? "Discard this effect's private _edited preset and restore the built-in original."
-                : "Palette keys lock this private edit. Remove its palette keys before discarding it.");
-    }
-
-    ImGui::AlignTextToFramePadding();
-    ImGui::TextDisabled("Saved");
-    ImGui::SameLine();
-    const std::string savedPreview =
-        effect->paletteSourceKind ==
-                TimingColourisePaletteSourceKind::Saved
-            ? paletteDisplayName()
-            : "Choose saved palette...";
-    const float savedActionWidth =
-        compactButtonWidth("+") + compactButtonWidth("Save") +
-        compactButtonWidth("X") + 6.0F;
-    ImGui::SetNextItemWidth(std::max(
-        40.0F,
-        ImGui::GetContentRegionAvail().x -
-            savedActionWidth));
-    ImGui::BeginDisabled(paletteSourceLocked);
-    if (ImGui::BeginCombo(
-            "##TimingColouriseSavedPalette",
-            savedPreview.c_str())) {
-        for (const auto& saved :
-             water.savedTimingColourisePalettes) {
-            const bool originalSelected =
-                effect->paletteSourceKind ==
-                    TimingColourisePaletteSourceKind::Saved &&
-                effect->paletteSourceId == saved.id &&
-                !effect->paletteEdited;
-            if (DrawTimingPaletteComboEntry(
-                    saved,
-                    originalSelected) &&
+            hasPaletteKeys ? "Palette source changes are locked while this "
+                             "effect has keyed palette versions."
+            : paletteSourceLocked
+                ? "Save the active _edited palette before changing its source."
+                : "Choose a built-in original or one of this effect's private "
+                  "_edited versions. Editing an original creates its private "
+                  "version; switching does not discard either version.");
+        const auto *activePreset =
+            effect->paletteSourceKind ==
+                    TimingColourisePaletteSourceKind::Preset
+                ? findPreset(effect->paletteSourceId)
+                : nullptr;
+        const auto *activeLocalEdit =
+            activePreset != nullptr
+                ? invisible_places::timing::FindTimingColouriseLocalPaletteEdit(
+                      *effect, activePreset->id)
+                : nullptr;
+        const bool canDiscardLocalEdit = activePreset != nullptr &&
+                                         activeLocalEdit != nullptr &&
+                                         !hasPaletteKeys;
+        if (activeLocalEdit != nullptr) {
+            ImGui::SameLine(0.0F, 2.0F);
+            ImGui::BeginDisabled(!canDiscardLocalEdit);
+            if (ImGui::SmallButton("X##DiscardLocalPaletteEdit") &&
+                activePreset != nullptr &&
                 invisible_places::timing::
-                    ActivateTimingColouriseOriginalSource(
-                        effect,
-                        TimingColourisePaletteSourceKind::Saved,
-                        saved)) {
+                    DiscardTimingColouriseLocalPaletteEdit(effect,
+                                                           *activePreset)) {
                 resetPaletteInteraction();
+                runtimeState->statusMessage =
+                    "Discarded " + activePreset->name +
+                    "_edited and restored the built-in preset.";
+                runtimeState->errorMessage.clear();
             }
-            const auto* savedLocalEdit = invisible_places::timing::
-                FindTimingColouriseLocalPaletteEdit(
-                    *effect,
-                    TimingColourisePaletteSourceKind::Saved,
-                    saved.id);
-            if (savedLocalEdit == nullptr) {
-                continue;
-            }
-            TimingColourisePaletteDefinition editedDefinition{
-                .id = saved.id + "-effect-local-edit",
-                .name = savedLocalEdit->presetName + "_edited",
-                .palette = savedLocalEdit->palette,
-            };
-            const bool localEditSelected =
-                effect->paletteSourceKind ==
-                    TimingColourisePaletteSourceKind::Saved &&
-                effect->paletteSourceId == saved.id &&
-                effect->paletteEdited;
-            ImGui::Indent(10.0F);
-            if (DrawTimingPaletteComboEntry(
-                    editedDefinition,
-                    localEditSelected) &&
-                invisible_places::timing::
-                    ActivateTimingColouriseLocalPaletteEdit(
-                        effect,
-                        TimingColourisePaletteSourceKind::Saved,
-                        saved.id)) {
-                resetPaletteInteraction();
-            }
-            ImGui::Unindent(10.0F);
+            ImGui::EndDisabled();
+            DrawTimingControlTooltip(
+                canDiscardLocalEdit
+                    ? "Discard this effect's private _edited preset and "
+                      "restore the built-in original."
+                    : "Palette keys lock this private edit. Remove its palette "
+                      "keys before discarding it.");
         }
-        if (water.savedTimingColourisePalettes.empty()) {
-            ImGui::TextDisabled(
-                "No saved palettes in this project.");
+
+        if (sourceTableVisible) {
+            ImGui::TableNextColumn();
         }
-        ImGui::EndCombo();
-    }
-    ImGui::EndDisabled();
-    DrawTimingControlTooltip(
-        hasPaletteKeys
-            ? "Palette source changes are locked while this effect has keyed palette versions."
-        : paletteSourceLocked
-            ? "Save the active custom palette with + before choosing another palette if you want to keep the changes."
-            : "Choose a saved project palette or one of this effect's private _edited versions. Editing an original creates its private version; switching does not discard either version.");
+        const std::string savedPreview =
+            effect->paletteSourceKind == TimingColourisePaletteSourceKind::Saved
+                ? paletteDisplayName()
+                : "Choose saved palette...";
+        const float savedActionWidth = compactButtonWidth("+") +
+                                       compactButtonWidth("Save") +
+                                       compactButtonWidth("X") + 6.0F;
+        SetNextTimingLabelledControlWidth(
+            "Saved",
+            savedActionWidth);
+        ImGui::BeginDisabled(paletteSourceLocked);
+        if (ImGui::BeginCombo("Saved##TimingColouriseSavedPalette",
+                              savedPreview.c_str())) {
+            for (const auto &saved : water.savedTimingColourisePalettes) {
+                const bool originalSelected =
+                    effect->paletteSourceKind ==
+                        TimingColourisePaletteSourceKind::Saved &&
+                    effect->paletteSourceId == saved.id &&
+                    !effect->paletteEdited;
+                if (DrawTimingPaletteComboEntry(saved, originalSelected) &&
+                    invisible_places::timing::
+                        ActivateTimingColouriseOriginalSource(
+                            effect, TimingColourisePaletteSourceKind::Saved,
+                            saved)) {
+                    resetPaletteInteraction();
+                }
+                const auto *savedLocalEdit = invisible_places::timing::
+                    FindTimingColouriseLocalPaletteEdit(
+                        *effect, TimingColourisePaletteSourceKind::Saved,
+                        saved.id);
+                if (savedLocalEdit == nullptr) {
+                    continue;
+                }
+                TimingColourisePaletteDefinition editedDefinition{
+                    .id = saved.id + "-effect-local-edit",
+                    .name = savedLocalEdit->presetName + "_edited",
+                    .palette = savedLocalEdit->palette,
+                };
+                const bool localEditSelected =
+                    effect->paletteSourceKind ==
+                        TimingColourisePaletteSourceKind::Saved &&
+                    effect->paletteSourceId == saved.id &&
+                    effect->paletteEdited;
+                ImGui::Indent(10.0F);
+                if (DrawTimingPaletteComboEntry(editedDefinition,
+                                                localEditSelected) &&
+                    invisible_places::timing::
+                        ActivateTimingColouriseLocalPaletteEdit(
+                            effect, TimingColourisePaletteSourceKind::Saved,
+                            saved.id)) {
+                    resetPaletteInteraction();
+                }
+                ImGui::Unindent(10.0F);
+            }
+            if (water.savedTimingColourisePalettes.empty()) {
+                ImGui::TextDisabled("No saved palettes in this project.");
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::EndDisabled();
+        DrawTimingControlTooltip(
+            hasPaletteKeys ? "Palette source changes are locked while this "
+                             "effect has keyed palette versions."
+            : paletteSourceLocked
+                ? "Save the active custom palette with + before choosing "
+                  "another palette if you want to keep the changes."
+                : "Choose a saved project palette or one of this effect's "
+                  "private _edited versions. Editing an original creates its "
+                  "private version; switching does not discard either "
+                  "version.");
 
-    // The active private variant, when one is selected: promoted by "+",
-    // written over its saved original by "Save", removed by "X".
-    const bool activeVariantSelected =
-        (effect->paletteSourceKind ==
-             TimingColourisePaletteSourceKind::Preset ||
-         effect->paletteSourceKind ==
-             TimingColourisePaletteSourceKind::Saved) &&
-        effect->paletteEdited &&
-        invisible_places::timing::
-                FindTimingColouriseLocalPaletteEdit(
-                    *effect,
-                    effect->paletteSourceKind,
-                    effect->paletteSourceId) != nullptr;
-    ImGui::SameLine();
-    if (ImGui::SmallButton("+")) {
-        timings.paletteNameBuffer =
-            effect->paletteSourceName.empty()
-                ? "Palette " +
-                      std::to_string(
-                          water.savedTimingColourisePalettes
-                                  .size() +
-                              1U)
-            : activeVariantSelected &&
-                      effect->paletteSourceKind ==
-                          TimingColourisePaletteSourceKind::Preset
-                ? effect->paletteSourceName
-                : effect->paletteSourceName + " Copy";
-        ImGui::OpenPopup(
-            "Save New Colourise Palette");
-    }
-    DrawTimingControlTooltip(
-        activeVariantSelected
-            ? "Promote the active private _edited version to a shared saved project palette. Other private edits on this effect remain available."
-            : "Save this palette under a new editable project name. Effect-local keys remain attached.");
+        // The active private variant, when one is selected: promoted by "+",
+        // written over its saved original by "Save", removed by "X".
+        const bool activeVariantSelected =
+            (effect->paletteSourceKind ==
+                 TimingColourisePaletteSourceKind::Preset ||
+             effect->paletteSourceKind ==
+                 TimingColourisePaletteSourceKind::Saved) &&
+            effect->paletteEdited &&
+            invisible_places::timing::FindTimingColouriseLocalPaletteEdit(
+                *effect, effect->paletteSourceKind, effect->paletteSourceId) !=
+                nullptr;
+        ImGui::SameLine();
+        if (ImGui::SmallButton("+")) {
+            timings.paletteNameBuffer =
+                effect->paletteSourceName.empty()
+                    ? "Palette " +
+                          std::to_string(
+                              water.savedTimingColourisePalettes.size() + 1U)
+                : activeVariantSelected &&
+                        effect->paletteSourceKind ==
+                            TimingColourisePaletteSourceKind::Preset
+                    ? effect->paletteSourceName
+                    : effect->paletteSourceName + " Copy";
+            ImGui::OpenPopup("Save New Colourise Palette");
+        }
+        DrawTimingControlTooltip(
+            activeVariantSelected
+                ? "Promote the active private _edited version to a shared "
+                  "saved project palette. Other private edits on this effect "
+                  "remain available."
+                : "Save this palette under a new editable project name. "
+                  "Effect-local keys remain attached.");
 
-    ImGui::SameLine(0.0F, 2.0F);
-    auto* selectedSavedPalette =
-        effect->paletteSourceKind ==
-                TimingColourisePaletteSourceKind::Saved
-            ? findSavedPalette(effect->paletteSourceId)
-            : nullptr;
-    const bool canSaveEdited =
-        selectedSavedPalette != nullptr &&
-        effect->paletteEdited;
-    ImGui::BeginDisabled(!canSaveEdited);
-    if (ImGui::SmallButton("Save") &&
-        selectedSavedPalette != nullptr) {
-        // Write the active _edited version over its saved original, then
-        // retire the variant: discarding it against the updated original
-        // returns this effect to the (now identical) saved base.
-        selectedSavedPalette->palette =
-            invisible_places::timing::
-                SanitizeTimingColourisePalette(
+        ImGui::SameLine(0.0F, 2.0F);
+        auto *selectedSavedPalette =
+            effect->paletteSourceKind == TimingColourisePaletteSourceKind::Saved
+                ? findSavedPalette(effect->paletteSourceId)
+                : nullptr;
+        const bool canSaveEdited =
+            selectedSavedPalette != nullptr && effect->paletteEdited;
+        ImGui::BeginDisabled(!canSaveEdited);
+        if (ImGui::SmallButton("Save") && selectedSavedPalette != nullptr) {
+            // Write the active _edited version over its saved original, then
+            // retire the variant: discarding it against the updated original
+            // returns this effect to the (now identical) saved base.
+            selectedSavedPalette->palette =
+                invisible_places::timing::SanitizeTimingColourisePalette(
                     effect->basePalette);
-        if (invisible_places::timing::
-                DiscardTimingColouriseLocalPaletteEdit(
-                    effect,
-                    TimingColourisePaletteSourceKind::Saved,
-                    *selectedSavedPalette)) {
-            resetPaletteInteraction();
-        } else {
-            effect->paletteEdited = false;
+            if (invisible_places::timing::
+                    DiscardTimingColouriseLocalPaletteEdit(
+                        effect, TimingColourisePaletteSourceKind::Saved,
+                        *selectedSavedPalette)) {
+                resetPaletteInteraction();
+            } else {
+                effect->paletteEdited = false;
+            }
+            runtimeState->statusMessage =
+                "Saved palette " + selectedSavedPalette->name + ".";
         }
-        runtimeState->statusMessage =
-            "Saved palette " +
-            selectedSavedPalette->name + ".";
-    }
-    ImGui::EndDisabled();
-    DrawTimingControlTooltip(
-        canSaveEdited
-            ? "Overwrite the saved palette with this _edited version and return to its saved name. The private version is retired because the original now matches it."
-            : "Select a saved palette's _edited version before overwriting its original.");
+        ImGui::EndDisabled();
+        DrawTimingControlTooltip(
+            canSaveEdited
+                ? "Overwrite the saved palette with this _edited version and "
+                  "return to its saved name. The private version is retired "
+                  "because the original now matches it."
+                : "Select a saved palette's _edited version before overwriting "
+                  "its original.");
 
-    ImGui::SameLine(0.0F, 2.0F);
-    const bool savedPaletteHasKeyedUse =
-        selectedSavedPalette != nullptr &&
-        TimingColouriseSavedPaletteHasKeyedUse(
-            water,
-            selectedSavedPalette->id);
-    const bool hadSelectedSavedPalette =
-        selectedSavedPalette != nullptr;
-    const bool savedEditExists =
-        selectedSavedPalette != nullptr &&
-        invisible_places::timing::
-                FindTimingColouriseLocalPaletteEdit(
-                    *effect,
-                    TimingColourisePaletteSourceKind::Saved,
-                    selectedSavedPalette->id) != nullptr;
-    const auto deleteSelectedSavedPalette = [&]() {
-        if (selectedSavedPalette == nullptr) {
-            return;
-        }
-        const std::string deletedId =
-            selectedSavedPalette->id;
-        const std::string deletedName =
-            selectedSavedPalette->name;
-        DetachTimingColouriseSavedPaletteSource(
-            &water,
-            deletedId);
-        std::erase_if(
-            water.savedTimingColourisePalettes,
-            [&](const auto& candidate) {
-                return candidate.id == deletedId;
-            });
-        selectedSavedPalette = nullptr;
-        resetPaletteInteraction();
-        runtimeState->statusMessage =
-            "Deleted saved palette " + deletedName + ".";
-    };
-    const auto discardSelectedSavedEdit = [&]() {
-        if (selectedSavedPalette == nullptr) {
-            return;
-        }
-        const std::string editedName =
-            selectedSavedPalette->name;
-        if (invisible_places::timing::
-                DiscardTimingColouriseLocalPaletteEdit(
-                    effect,
-                    TimingColourisePaletteSourceKind::Saved,
-                    *selectedSavedPalette)) {
+        ImGui::SameLine(0.0F, 2.0F);
+        const bool savedPaletteHasKeyedUse =
+            selectedSavedPalette != nullptr &&
+            TimingColouriseSavedPaletteHasKeyedUse(water,
+                                                   selectedSavedPalette->id);
+        const bool hadSelectedSavedPalette = selectedSavedPalette != nullptr;
+        const bool savedEditExists =
+            selectedSavedPalette != nullptr &&
+            invisible_places::timing::FindTimingColouriseLocalPaletteEdit(
+                *effect, TimingColourisePaletteSourceKind::Saved,
+                selectedSavedPalette->id) != nullptr;
+        const auto deleteSelectedSavedPalette = [&]() {
+            if (selectedSavedPalette == nullptr) {
+                return;
+            }
+            const std::string deletedId = selectedSavedPalette->id;
+            const std::string deletedName = selectedSavedPalette->name;
+            DetachTimingColouriseSavedPaletteSource(&water, deletedId);
+            std::erase_if(water.savedTimingColourisePalettes,
+                          [&](const auto &candidate) {
+                              return candidate.id == deletedId;
+                          });
+            selectedSavedPalette = nullptr;
             resetPaletteInteraction();
             runtimeState->statusMessage =
-                "Discarded " + editedName +
-                "_edited and restored the saved palette.";
-            runtimeState->errorMessage.clear();
+                "Deleted saved palette " + deletedName + ".";
+        };
+        const auto discardSelectedSavedEdit = [&]() {
+            if (selectedSavedPalette == nullptr) {
+                return;
+            }
+            const std::string editedName = selectedSavedPalette->name;
+            if (invisible_places::timing::
+                    DiscardTimingColouriseLocalPaletteEdit(
+                        effect, TimingColourisePaletteSourceKind::Saved,
+                        *selectedSavedPalette)) {
+                resetPaletteInteraction();
+                runtimeState->statusMessage =
+                    "Discarded " + editedName +
+                    "_edited and restored the saved palette.";
+                runtimeState->errorMessage.clear();
+            }
+        };
+        // X deletes the active _edited version when one is selected; on an
+        // original it deletes the saved palette, asking which of the two to
+        // remove when an _edited version also exists.
+        const bool deletesActiveSavedEdit = selectedSavedPalette != nullptr &&
+                                            effect->paletteEdited &&
+                                            savedEditExists;
+        const bool savedDeleteDisabled =
+            selectedSavedPalette == nullptr ||
+            (deletesActiveSavedEdit ? hasPaletteKeys
+                                    : savedPaletteHasKeyedUse ||
+                                          (savedEditExists && hasPaletteKeys));
+        ImGui::BeginDisabled(savedDeleteDisabled);
+        if (ImGui::SmallButton("X") && selectedSavedPalette != nullptr) {
+            if (deletesActiveSavedEdit) {
+                discardSelectedSavedEdit();
+            } else if (savedEditExists) {
+                ImGui::OpenPopup("Delete Saved Palette");
+            } else {
+                deleteSelectedSavedPalette();
+            }
         }
-    };
-    // X deletes the active _edited version when one is selected; on an
-    // original it deletes the saved palette, asking which of the two to
-    // remove when an _edited version also exists.
-    const bool deletesActiveSavedEdit =
-        selectedSavedPalette != nullptr && effect->paletteEdited &&
-        savedEditExists;
-    const bool savedDeleteDisabled =
-        selectedSavedPalette == nullptr ||
-        (deletesActiveSavedEdit
-             ? hasPaletteKeys
-             : savedPaletteHasKeyedUse ||
-                   (savedEditExists && hasPaletteKeys));
-    ImGui::BeginDisabled(savedDeleteDisabled);
-    if (ImGui::SmallButton("X") &&
-        selectedSavedPalette != nullptr) {
-        if (deletesActiveSavedEdit) {
-            discardSelectedSavedEdit();
-        } else if (savedEditExists) {
-            ImGui::OpenPopup("Delete Saved Palette");
-        } else {
-            deleteSelectedSavedPalette();
-        }
-    }
-    ImGui::EndDisabled();
-    DrawTimingControlTooltip(
-        !hadSelectedSavedPalette
-            ? "Select a saved palette before deleting it."
-        : deletesActiveSavedEdit
-            ? hasPaletteKeys
-                  ? "Palette keys lock this private edit. Remove its palette keys before discarding it."
-                  : "Delete this saved palette's _edited version and restore the saved original."
-        : savedPaletteHasKeyedUse
-            ? "This saved palette is used by keyed Colourise versions and cannot be deleted."
-        : savedEditExists
-            ? hasPaletteKeys
-                  ? "Palette keys lock this palette's _edited version; remove them before deleting."
-                  : "Delete this saved palette. Because an _edited version exists you will be asked whether it goes too."
-            : "Delete this saved palette. Unkeyed effects keep independent custom snapshots.");
-    if (ImGui::BeginPopupModal(
-            "Delete Saved Palette",
-            nullptr,
-            ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::TextUnformatted(
-            selectedSavedPalette != nullptr
-                ? selectedSavedPalette->name.c_str()
-                : "Saved palette");
-        ImGui::TextDisabled(
-            "An _edited version of this saved palette exists.");
-        if (ImGui::Button("Delete Palette and Edited Version") &&
-            selectedSavedPalette != nullptr) {
-            discardSelectedSavedEdit();
-            deleteSelectedSavedPalette();
-            ImGui::CloseCurrentPopup();
-        }
+        ImGui::EndDisabled();
         DrawTimingControlTooltip(
-            "Remove the saved palette and this effect's private _edited version of it.");
-        ImGui::SameLine();
-        if (ImGui::Button("Delete Edited Version")) {
-            discardSelectedSavedEdit();
-            ImGui::CloseCurrentPopup();
+            !hadSelectedSavedPalette
+                ? "Select a saved palette before deleting it."
+            : deletesActiveSavedEdit
+                ? hasPaletteKeys
+                      ? "Palette keys lock this private edit. Remove its "
+                        "palette keys before discarding it."
+                      : "Delete this saved palette's _edited version and "
+                        "restore the saved original."
+            : savedPaletteHasKeyedUse
+                ? "This saved palette is used by keyed Colourise versions and "
+                  "cannot be deleted."
+            : savedEditExists
+                ? hasPaletteKeys
+                      ? "Palette keys lock this palette's _edited version; "
+                        "remove them before deleting."
+                      : "Delete this saved palette. Because an _edited version "
+                        "exists you will be asked whether it goes too."
+                : "Delete this saved palette. Unkeyed effects keep independent "
+                  "custom snapshots.");
+        if (ImGui::BeginPopupModal("Delete Saved Palette", nullptr,
+                                   ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextUnformatted(selectedSavedPalette != nullptr
+                                       ? selectedSavedPalette->name.c_str()
+                                       : "Saved palette");
+            ImGui::TextDisabled(
+                "An _edited version of this saved palette exists.");
+            if (ImGui::Button("Delete Palette and Edited Version") &&
+                selectedSavedPalette != nullptr) {
+                discardSelectedSavedEdit();
+                deleteSelectedSavedPalette();
+                ImGui::CloseCurrentPopup();
+            }
+            DrawTimingControlTooltip("Remove the saved palette and this "
+                                     "effect's private _edited version of it.");
+            ImGui::SameLine();
+            if (ImGui::Button("Delete Edited Version")) {
+                discardSelectedSavedEdit();
+                ImGui::CloseCurrentPopup();
+            }
+            DrawTimingControlTooltip("Keep the saved palette; remove only its "
+                                     "private _edited version.");
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) {
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
         }
-        DrawTimingControlTooltip(
-            "Keep the saved palette; remove only its private _edited version.");
-        ImGui::SameLine();
-        if (ImGui::Button("Cancel")) {
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::EndPopup();
-    }
 
-    if (ImGui::BeginPopupModal(
-            "Save New Colourise Palette",
-            nullptr,
-            ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::TextUnformatted(
-            "Save an editable project palette");
-        ImGui::SetNextItemWidth(280.0F);
-        InputTextString(
-            "Name",
-            &timings.paletteNameBuffer);
-        const std::string newName =
-            TrimText(timings.paletteNameBuffer);
-        const std::string normalizedNewName =
-            LowercaseAsciiCopy(newName);
-        const bool duplicateName =
-            std::any_of(
+        if (ImGui::BeginPopupModal("Save New Colourise Palette", nullptr,
+                                   ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextUnformatted("Save an editable project palette");
+            ImGui::SetNextItemWidth(280.0F);
+            InputTextString("Name", &timings.paletteNameBuffer);
+            const std::string newName = TrimText(timings.paletteNameBuffer);
+            const std::string normalizedNewName = LowercaseAsciiCopy(newName);
+            const bool duplicateName = std::any_of(
                 water.savedTimingColourisePalettes.begin(),
                 water.savedTimingColourisePalettes.end(),
-                [&](const auto& saved) {
-                    return LowercaseAsciiCopy(
-                               TrimText(saved.name)) ==
+                [&](const auto &saved) {
+                    return LowercaseAsciiCopy(TrimText(saved.name)) ==
                            normalizedNewName;
                 });
-        if (duplicateName) {
-            ImGui::TextDisabled(
-                "A saved palette already uses this name.");
-        }
-        ImGui::BeginDisabled(
-            newName.empty() || duplicateName);
-        const bool saveNew =
-            ImGui::Button("Save New");
-        ImGui::EndDisabled();
-        ImGui::SameLine();
-        const bool cancelNew =
-            ImGui::Button("Cancel");
-        if (saveNew && !newName.empty() &&
-            !duplicateName) {
-            const std::string savedId =
-                invisible_places::timing::
-                    AllocateTimingColourisePaletteId(
+            if (duplicateName) {
+                ImGui::TextDisabled("A saved palette already uses this name.");
+            }
+            ImGui::BeginDisabled(newName.empty() || duplicateName);
+            const bool saveNew = ImGui::Button("Save New");
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            const bool cancelNew = ImGui::Button("Cancel");
+            if (saveNew && !newName.empty() && !duplicateName) {
+                const std::string savedId =
+                    invisible_places::timing::AllocateTimingColourisePaletteId(
                         water.savedTimingColourisePalettes,
-                        &water
-                             .nextTimingColourisePaletteSequence);
-            const bool promotesLocalEdit =
-                (effect->paletteSourceKind ==
-                     TimingColourisePaletteSourceKind::Preset ||
-                 effect->paletteSourceKind ==
-                     TimingColourisePaletteSourceKind::Saved) &&
-                effect->paletteEdited &&
-                invisible_places::timing::
-                        FindTimingColouriseLocalPaletteEdit(
-                            *effect,
-                            effect->paletteSourceKind,
-                            effect->paletteSourceId) != nullptr;
-            bool saved = false;
-            if (promotesLocalEdit) {
-                const auto sourceKind = effect->paletteSourceKind;
-                const std::string sourceId =
-                    effect->paletteSourceId;
-                if (auto promoted = invisible_places::timing::
-                        PromoteTimingColouriseLocalPaletteEdit(
-                            effect,
-                            sourceKind,
-                            sourceId,
-                            savedId,
-                            newName);
-                    promoted.has_value()) {
+                        &water.nextTimingColourisePaletteSequence);
+                const bool promotesLocalEdit =
+                    (effect->paletteSourceKind ==
+                         TimingColourisePaletteSourceKind::Preset ||
+                     effect->paletteSourceKind ==
+                         TimingColourisePaletteSourceKind::Saved) &&
+                    effect->paletteEdited &&
+                    invisible_places::timing::
+                            FindTimingColouriseLocalPaletteEdit(
+                                *effect, effect->paletteSourceKind,
+                                effect->paletteSourceId) != nullptr;
+                bool saved = false;
+                if (promotesLocalEdit) {
+                    const auto sourceKind = effect->paletteSourceKind;
+                    const std::string sourceId = effect->paletteSourceId;
+                    if (auto promoted = invisible_places::timing::
+                            PromoteTimingColouriseLocalPaletteEdit(
+                                effect, sourceKind, sourceId, savedId, newName);
+                        promoted.has_value()) {
+                        water.savedTimingColourisePalettes.push_back(
+                            invisible_places::timing::
+                                SanitizeTimingColourisePaletteDefinition(
+                                    std::move(promoted.value())));
+                        saved = true;
+                    }
+                } else {
+                    TimingColourisePaletteDefinition definition{
+                        .id = savedId,
+                        .name = newName,
+                        .palette = effect->basePalette,
+                    };
                     water.savedTimingColourisePalettes.push_back(
                         invisible_places::timing::
                             SanitizeTimingColourisePaletteDefinition(
-                                std::move(promoted.value())));
+                                std::move(definition)));
+                    ApplyTimingColourisePaletteSource(
+                        effect, TimingColourisePaletteSourceKind::Saved,
+                        water.savedTimingColourisePalettes.back(), true);
                     saved = true;
                 }
-            } else {
-                TimingColourisePaletteDefinition definition{
-                    .id = savedId,
-                    .name = newName,
-                    .palette = effect->basePalette,
-                };
-                water.savedTimingColourisePalettes.push_back(
-                    invisible_places::timing::
-                        SanitizeTimingColourisePaletteDefinition(
-                            std::move(definition)));
-                ApplyTimingColourisePaletteSource(
-                    effect,
-                    TimingColourisePaletteSourceKind::Saved,
-                    water.savedTimingColourisePalettes.back(),
-                    true);
-                saved = true;
-            }
-            if (saved) {
-                resetPaletteInteraction();
+                if (saved) {
+                    resetPaletteInteraction();
+                    timings.paletteNameBuffer.clear();
+                    runtimeState->statusMessage =
+                        "Saved palette " + newName +
+                        " and assigned it to this Colourise effect.";
+                    runtimeState->errorMessage.clear();
+                    ImGui::CloseCurrentPopup();
+                } else {
+                    runtimeState->errorMessage =
+                        "The private palette edit could not be promoted.";
+                    runtimeState->statusMessage.clear();
+                }
+            } else if (cancelNew) {
                 timings.paletteNameBuffer.clear();
-                runtimeState->statusMessage =
-                    "Saved palette " + newName +
-                    " and assigned it to this Colourise effect.";
-                runtimeState->errorMessage.clear();
                 ImGui::CloseCurrentPopup();
-            } else {
-                runtimeState->errorMessage =
-                    "The private palette edit could not be promoted.";
-                runtimeState->statusMessage.clear();
             }
-        } else if (cancelNew) {
-            timings.paletteNameBuffer.clear();
-            ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
         }
-        ImGui::EndPopup();
+        if (sourceTableVisible) {
+            ImGui::EndTable();
+        }
+        return;
     }
 
     hasPaletteKeys =
@@ -102138,8 +105643,11 @@ void DrawTimingColourisePaletteEditor(
         DrawTimingControlTooltip(
             "These _RunNN versions belong only to this Colourise effect. Their numbers follow key order automatically.");
       } else {
-        ImGui::TextDisabled(
-            "No keyed palette versions for this Colourise effect.");
+        ImGui::TextDisabled("No keyed palette versions");
+        DrawTimingControlTooltip(
+            "Key all marker Positions with +, or key a stop's Colour or "
+            "Colourise Amount from its editor, to create animated palette "
+            "versions for this Visual Feature.");
       }
     };
 
@@ -102388,15 +105896,150 @@ void DrawTimingColourisePaletteEditor(
         [&](std::string_view stopId,
             TimingColourisePaletteStopParameter parameter,
             float keyPosition) {
-        const auto* key =
-            findParameterKeyAt(
-                stopId,
-                parameter,
-                keyPosition);
-        return key != nullptr
-                   ? key->interpolation
-                   : WaterScenarioInterpolation::SmoothVelocity;
+        return TimingScalarTrackInterpolationAt(
+            effect->paletteStopParameterKeys,
+            [&](const auto& key) {
+                return key.stopId == stopId &&
+                       key.parameter == parameter;
+            },
+            keyPosition);
     };
+
+    drawFlipPaletteButton();
+
+    // Marker Position keys are one authored group. Keep their controls next
+    // to the markers themselves and leave stop Colour / Amount keying in the
+    // stop editor and value graph, where those independent tracks belong.
+    const auto previousMarkerKey = invisible_places::timing::
+        PreviousTimingColourisePaletteMarkerKeyPosition(
+            *effect,
+            position);
+    const auto nextMarkerKey = invisible_places::timing::
+        NextTimingColourisePaletteMarkerKeyPosition(
+            *effect,
+            position);
+    const std::size_t markerKeyCount = invisible_places::timing::
+        TimingColourisePaletteMarkerKeyCountAtPosition(
+            *effect,
+            position);
+    const bool canKeyMarkerGroup =
+        !baseEditingBlocked && !workingPalette.stops.empty();
+    bool markerKeysMutated = false;
+    const float paletteEditorHeight = kTimingPalettePreviewHeight;
+    ImGui::SameLine(0.0F, 10.0F);
+    ImGui::PushID("TimingPaletteMarkerKeyToolbar");
+    ImGui::BeginDisabled(!canKeyMarkerGroup);
+    if (ImGui::SmallButton("+##MarkerGroup") &&
+        invisible_places::timing::
+            AddOrUpdateTimingColourisePaletteMarkerKeys(
+                effect,
+                position,
+                workingPalette)) {
+        StopAnimationPlayback(runtimeState);
+        markerKeysMutated = true;
+        runtimeState->statusMessage =
+            "Keyed every palette marker Position at animation position " +
+            FormatFixed(position, 4) + ".";
+    }
+    ImGui::EndDisabled();
+    DrawTimingControlTooltip(
+        canKeyMarkerGroup
+            ? "Key every colour marker's Position together at the current animation position. Stop Colour and Colourise Amount remain independent tracks."
+            : "This palette source is currently view-only, so its marker Positions cannot be keyed.");
+
+    ImGui::SameLine(0.0F, 2.0F);
+    ImGui::BeginDisabled(!previousMarkerKey.has_value());
+    if (ImGui::SmallButton("<##MarkerGroup")) {
+        ScrubFeatureTimelineToAuthoredPosition(
+            runtimeState,
+            previousMarkerKey.value());
+    }
+    ImGui::EndDisabled();
+    DrawTimingControlTooltip(
+        previousMarkerKey.has_value()
+            ? "Go to the previous grouped palette-marker Position key."
+            : "There is no earlier grouped marker Position key.");
+
+    ImGui::SameLine(0.0F, 2.0F);
+    ImGui::BeginDisabled(!nextMarkerKey.has_value());
+    if (ImGui::SmallButton(">##MarkerGroup")) {
+        ScrubFeatureTimelineToAuthoredPosition(
+            runtimeState,
+            nextMarkerKey.value());
+    }
+    ImGui::EndDisabled();
+    DrawTimingControlTooltip(
+        nextMarkerKey.has_value()
+            ? "Go to the next grouped palette-marker Position key."
+            : "There is no later grouped marker Position key.");
+
+    ImGui::SameLine(0.0F, 2.0F);
+    ImGui::BeginDisabled(markerKeyCount == 0U);
+    if (ImGui::SmallButton("X##MarkerGroup")) {
+        StopAnimationPlayback(runtimeState);
+        const std::size_t removed = invisible_places::timing::
+            RemoveTimingColourisePaletteMarkerKeysAtPosition(
+                effect,
+                position);
+        if (removed > 0U) {
+            markerKeysMutated = true;
+            runtimeState->statusMessage = legacyModel
+                ? "Removed the legacy palette snapshot at animation position " +
+                      FormatFixed(position, 4) + "."
+                : "Removed the grouped palette-marker Position keys at animation position " +
+                      FormatFixed(position, 4) +
+                      "; Colour and Amount keys were preserved.";
+        }
+    }
+    ImGui::EndDisabled();
+    DrawTimingControlTooltip(
+        markerKeyCount > 0U
+            ? legacyModel
+                  ? "Remove this legacy whole-palette snapshot key."
+                  : "Remove every marker Position key at this animation position. Stop Colour and Colourise Amount keys are preserved."
+            : "There is no grouped marker Position key here to remove.");
+    ImGui::PopID();
+
+    if (markerKeysMutated) {
+        hasPaletteKeys =
+            TimingColouriseEffectHasPaletteKeys(*effect);
+        paletteKeyPositions = invisible_places::timing::
+            TimingColourisePaletteKeyPositions(*effect);
+        rawEvaluatedLut = evaluateRawPaletteLut();
+        evaluatedLut = invisible_places::timing::
+            EvaluateTimingColourisePaletteLut(
+                *effect,
+                position,
+                cyclicTiming);
+        if (legacyModel) {
+            legacyExactKey = std::find_if(
+                effect->paletteKeys.begin(),
+                effect->paletteKeys.end(),
+                [&](const auto& key) {
+                    return std::abs(key.position - position) <=
+                           invisible_places::timing::
+                               kTimingColouriseKeyTolerance;
+                });
+            if (effect->paletteKeys.empty()) {
+                legacyEditable = &effect->basePalette;
+            } else if (legacyExactKey != effect->paletteKeys.end()) {
+                legacyEditable = &legacyExactKey->palette;
+            } else {
+                legacyEditable = nullptr;
+            }
+            workingPalette = legacyEditable != nullptr
+                ? invisible_places::timing::
+                      SanitizeTimingColourisePalette(*legacyEditable)
+                : MaterializeTimingPaletteFromLut(rawEvaluatedLut);
+        } else {
+            workingPalette = invisible_places::timing::
+                EvaluateTimingColourisePalette(
+                    *effect,
+                    position,
+                    cyclicTiming);
+        }
+        runtimeState->previewRenderStateSignatureValid = false;
+    }
 
     const auto paletteBeforePreview = workingPalette;
     const bool wasDraggingPaletteStop =
@@ -102416,207 +106059,8 @@ void DrawTimingColourisePaletteEditor(
                  .requestedColourisePalettePickerStopIndex,
             canEditStops,
             canEditTopology,
+            paletteEditorHeight,
             "##TimingColourisePalettePreview");
-    bool effectControlsChanged = false;
-    if (ImGui::BeginTable(
-            "##TimingColouriseEffectControls",
-            2,
-            ImGuiTableFlags_SizingStretchSame |
-                ImGuiTableFlags_NoSavedSettings)) {
-        ImGui::TableNextColumn();
-        effectControlsChanged =
-            DrawTimingColouriseEffectParameterEditor(
-                runtimeState,
-                effect,
-                TimingColouriseEffectParameter::AmountOverride);
-        ImGui::TableNextColumn();
-        effectControlsChanged =
-            DrawTimingColouriseEffectParameterEditor(
-                runtimeState,
-                effect,
-                TimingColouriseEffectParameter::PalettePhase,
-                drawFlipPaletteButton) ||
-            effectControlsChanged;
-        ImGui::EndTable();
-    }
-    // Palette Skew editors mirror the histogram's centre node: its two
-    // coordinates, each independently keyable with the shared track
-    // buttons. Extra warp nodes are authored directly in the histogram.
-    if (ImGui::BeginTable(
-            "##TimingColouriseSkewControls",
-            2,
-            ImGuiTableFlags_SizingStretchSame |
-                ImGuiTableFlags_NoSavedSettings)) {
-        ImGui::TableNextColumn();
-        effectControlsChanged =
-            DrawTimingColouriseEffectParameterEditor(
-                runtimeState,
-                effect,
-                TimingColouriseEffectParameter::PaletteSkewCentre) ||
-            effectControlsChanged;
-        ImGui::TableNextColumn();
-        effectControlsChanged =
-            DrawTimingColouriseEffectParameterEditor(
-                runtimeState,
-                effect,
-                TimingColouriseEffectParameter::PaletteSkewSpread) ||
-            effectControlsChanged;
-        ImGui::EndTable();
-    }
-    const auto amountKeyPositions = invisible_places::timing::
-        TimingColouriseEffectParameterKeyPositions(
-            *effect,
-            TimingColouriseEffectParameter::AmountOverride);
-    const auto phaseKeyPositions = invisible_places::timing::
-        TimingColouriseEffectParameterKeyPositions(
-            *effect,
-            TimingColouriseEffectParameter::PalettePhase);
-    const auto skewCentreKeyPositions = invisible_places::timing::
-        TimingColouriseEffectParameterKeyPositions(
-            *effect,
-            TimingColouriseEffectParameter::PaletteSkewCentre);
-    const auto skewSpreadKeyPositions = invisible_places::timing::
-        TimingColouriseEffectParameterKeyPositions(
-            *effect,
-            TimingColouriseEffectParameter::PaletteSkewSpread);
-    std::vector<TimingColouriseKeyLaneSeries> effectParameterLanes{
-        TimingColouriseKeyLaneSeries{
-            .label = "Colourise Amount",
-            .track = TimingColouriseKeyTrack::EffectParameter,
-            .effectParameter =
-                TimingColouriseEffectParameter::AmountOverride,
-            .positions = std::span<const float>{amountKeyPositions},
-            .colour = IM_COL32(120, 205, 172, 255),
-        },
-        TimingColouriseKeyLaneSeries{
-            .label = "Colour Phase",
-            .track = TimingColouriseKeyTrack::EffectParameter,
-            .effectParameter =
-                TimingColouriseEffectParameter::PalettePhase,
-            .positions = std::span<const float>{phaseKeyPositions},
-            .colour = IM_COL32(238, 174, 72, 255),
-        },
-    };
-    // Skew lanes join the shared graph only once they own keys, keeping the
-    // default view down to the two established curves.
-    if (!skewCentreKeyPositions.empty()) {
-        effectParameterLanes.push_back(TimingColouriseKeyLaneSeries{
-            .label = "Skew Centre",
-            .track = TimingColouriseKeyTrack::EffectParameter,
-            .effectParameter =
-                TimingColouriseEffectParameter::PaletteSkewCentre,
-            .positions = std::span<const float>{skewCentreKeyPositions},
-            .colour = IM_COL32(186, 132, 232, 255),
-        });
-    }
-    if (!skewSpreadKeyPositions.empty()) {
-        effectParameterLanes.push_back(TimingColouriseKeyLaneSeries{
-            .label = "Skew Spread",
-            .track = TimingColouriseKeyTrack::EffectParameter,
-            .effectParameter =
-                TimingColouriseEffectParameter::PaletteSkewSpread,
-            .positions =
-                std::span<const float>{skewSpreadKeyPositions},
-            .colour = IM_COL32(150, 142, 240, 255),
-        });
-    }
-    // Keyed palette settings join the same graph as the effect controls:
-    // one lane per keyed (stop, property) track. Position and Amount draw
-    // scalar curves in the stop's colour; Colour lanes tint their curve
-    // with the interpolated colour itself.
-    if (!legacyModel) {
-        const auto stopOrdinal =
-            [&](std::string_view stopId) -> std::optional<std::size_t> {
-            const auto found = std::find_if(
-                effect->basePalette.stops.begin(),
-                effect->basePalette.stops.end(),
-                [&](const auto& candidate) {
-                    return candidate.id == stopId;
-                });
-            return found == effect->basePalette.stops.end()
-                       ? std::nullopt
-                       : std::optional<std::size_t>{
-                             static_cast<std::size_t>(std::distance(
-                                 effect->basePalette.stops.begin(),
-                                 found))};
-        };
-        for (const auto& key : effect->paletteStopParameterKeys) {
-            auto lane = std::find_if(
-                effectParameterLanes.begin(),
-                effectParameterLanes.end(),
-                [&](const auto& candidate) {
-                    return candidate.stopParameter == key.parameter &&
-                           candidate.stopId == key.stopId;
-                });
-            if (lane == effectParameterLanes.end()) {
-                const auto ordinal = stopOrdinal(key.stopId);
-                const char* propertyName =
-                    key.parameter ==
-                            TimingColourisePaletteStopParameter::Position
-                        ? "Position"
-                    : key.parameter ==
-                            TimingColourisePaletteStopParameter::Colour
-                        ? "Colour"
-                        : "Amount";
-                const auto stopColour = [&]() {
-                    if (!ordinal.has_value()) {
-                        return IM_COL32(222, 134, 190, 255);
-                    }
-                    const auto& authored =
-                        effect->basePalette.stops[ordinal.value()]
-                            .colour;
-                    return ImGui::ColorConvertFloat4ToU32(ImVec4{
-                        authored[0],
-                        authored[1],
-                        authored[2],
-                        1.0F});
-                }();
-                effectParameterLanes.push_back(
-                    TimingColouriseKeyLaneSeries{
-                        .ownedLabel =
-                            "Stop " +
-                            (ordinal.has_value()
-                                 ? std::to_string(
-                                       ordinal.value() + 1U)
-                                 : std::string{"?"}) +
-                            " " + propertyName,
-                        .track = TimingColouriseKeyTrack::Palette,
-                        .stopId = key.stopId,
-                        .stopParameter = key.parameter,
-                        .colour = stopColour,
-                    });
-                lane = std::prev(effectParameterLanes.end());
-            }
-            lane->ownedPositions.push_back(key.position);
-        }
-        // Growth above may have relocated owned storage; point the view
-        // fields at their final homes only once the vector is stable.
-        for (auto& lane : effectParameterLanes) {
-            if (!lane.ownedLabel.empty()) {
-                lane.label = lane.ownedLabel.c_str();
-            }
-            if (!lane.ownedPositions.empty()) {
-                lane.positions =
-                    std::span<const float>{lane.ownedPositions};
-            }
-        }
-    }
-    ImGui::TextDisabled("Value over animation position");
-    DrawTimingControlTooltip(
-        "Colourise Amount uses its own visible value range. Colour Phase uses a fixed -1 to +1 turn range with wrapped copies. Keyed palette settings join as one curve per stop property, each scaled to its own value range; Colour curves tint the line with the interpolated colour and drag time-only. Left-drag dots to edit time and value; lower markers and Time-only drag retime only. Right-drag scrubs.");
-    DrawTimingKeyLaneGroup(
-        "##TimingColouriseEffectParameterKeyLane",
-        runtimeState,
-        effect,
-        effectParameterLanes);
-    if (effectControlsChanged) {
-        evaluatedLut = invisible_places::timing::
-            EvaluateTimingColourisePaletteLut(
-                *effect,
-                position,
-                cyclicTiming);
-        runtimeState->previewRenderStateSignatureValid = false;
-    }
     drawKeyedPaletteVersionsCombo();
     // Colour keys can blend along different colour paths; the choice is
     // authored per effect and only matters once a stop colour is keyed.
@@ -102730,6 +106174,7 @@ void DrawTimingColourisePaletteEditor(
             workingPalette = effect->basePalette;
             markPaletteBaseEdited();
         } else if (!legacyModel) {
+            bool markerPositionChanged = false;
             for (const auto& stop :
                  workingPalette.stops) {
                 const auto beforeIndex =
@@ -102749,21 +106194,8 @@ void DrawTimingColourisePaletteEditor(
                         before.colouriseAmount -
                         stop.colouriseAmount) >
                     std::numeric_limits<float>::epsilon();
-                if (positionChanged) {
-                    (void)invisible_places::timing::
-                        AddOrUpdateTimingColourisePaletteStopScalarKey(
-                            effect,
-                            stop.id,
-                            TimingColourisePaletteStopParameter::
-                                Position,
-                            previewKeyPosition,
-                            stop.position,
-                            interpolationForAt(
-                                stop.id,
-                                TimingColourisePaletteStopParameter::
-                                    Position,
-                                previewKeyPosition));
-                }
+                markerPositionChanged =
+                    markerPositionChanged || positionChanged;
                 if (!amountChanged) {
                     continue;
                 }
@@ -102801,6 +106233,13 @@ void DrawTimingColourisePaletteEditor(
                         .colouriseAmount = stop.colouriseAmount;
                     markPaletteBaseEdited();
                 }
+            }
+            if (markerPositionChanged) {
+                (void)invisible_places::timing::
+                    AddOrUpdateTimingColourisePaletteMarkerKeys(
+                        effect,
+                        previewKeyPosition,
+                        workingPalette);
             }
         }
         runtimeState->previewRenderStateSignatureValid =
@@ -102914,62 +106353,49 @@ void DrawTimingColourisePaletteEditor(
             }
 
             ImGui::TextDisabled("Position");
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(92.0F);
+            const float positionControlWidth = std::max(
+                110.0F,
+                ImGui::GetContentRegionAvail().x);
             const bool positionChanged =
-                ImGui::InputFloat(
+                DrawRangedFloatControl(
                     "##TimingColourStopPosition",
                     &editedStop.position,
-                    0.0F,
-                    0.0F,
-                    "%.4f");
-            if (!legacyModel) {
-                ImGui::SameLine(0.0F, 2.0F);
-                const bool positionExact =
-                    findParameterKeyAt(
-                        originalStop.id,
-                        TimingColourisePaletteStopParameter::
-                            Position,
-                        pickerPosition) != nullptr;
-                if (ImGui::SmallButton("+##KeyPosition")) {
-                    (void)invisible_places::timing::
-                        AddOrUpdateTimingColourisePaletteStopScalarKey(
-                            effect,
-                            originalStop.id,
-                            TimingColourisePaletteStopParameter::
-                                Position,
-                            pickerPosition,
-                            std::clamp(
-                                editedStop.position,
-                                0.0F,
-                                1.0F),
-                            interpolationForAt(
-                                originalStop.id,
-                                TimingColourisePaletteStopParameter::
-                                    Position,
-                                pickerPosition));
-                    runtimeState
-                        ->previewRenderStateSignatureValid =
-                        false;
-                }
-                DrawTimingControlTooltip(
-                    positionExact
-                        ? "Update Position Key: update only this stop's gradient-position key at the captured animation position."
-                        : "Key Position: key only this stop's gradient position at the captured animation position.");
-            }
-            ImGui::SameLine();
+                    {.visualMin = 0.0F,
+                     .visualMax = 1.0F,
+                     .format = "%.4f",
+                     .showLabel = false,
+                     .scaleDragToWidth = true,
+                     .hardMin = 0.0F,
+                     .hardMax = 1.0F,
+                     .width = positionControlWidth});
+            DrawTimingControlTooltip(
+                hasPaletteKeys && !legacyModel
+                    ? "Drag to position this stop from 0 to 1. Double-click the slider to type an exact value. A keyed edit writes Position keys for every marker at this captured animation position; use the vertical + rail beside the palette to key the group without moving one."
+                    : "Drag to position this stop from 0 to 1. Double-click the slider to type an exact value. Use the vertical + rail beside the palette to key all marker Positions together.");
             ImGui::TextDisabled("Amount");
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(92.0F);
+            const float amountControlWidth = std::max(
+                110.0F,
+                ImGui::GetContentRegionAvail().x -
+                    (!legacyModel
+                         ? ImGui::GetFrameHeight() +
+                               ImGui::GetStyle().ItemSpacing.x
+                         : 0.0F));
             const bool amountChanged =
-                ImGui::InputFloat(
+                DrawRangedFloatControl(
                     "##TimingColourStopAmount",
                     &editedStop.colouriseAmount,
-                    0.0F,
-                    0.0F,
-                    "%.3f");
+                    {.visualMin = 0.0F,
+                     .visualMax = 1.0F,
+                     .format = "%.3f",
+                     .showLabel = false,
+                     .scaleDragToWidth = true,
+                     .hardMin = 0.0F,
+                     .hardMax = 1.0F,
+                     .width = amountControlWidth});
+            DrawTimingControlTooltip(
+                "Drag to set this stop's Colourise Amount from 0 to 1. Double-click the slider to type an exact value.");
             if (!legacyModel) {
-                ImGui::SameLine(0.0F, 2.0F);
+                ImGui::SameLine();
                 const bool amountExact =
                     findParameterKeyAt(
                         originalStop.id,
@@ -103055,18 +106481,10 @@ void DrawTimingColourisePaletteEditor(
                     }
                     if (positionChanged) {
                         (void)invisible_places::timing::
-                            AddOrUpdateTimingColourisePaletteStopScalarKey(
+                            AddOrUpdateTimingColourisePaletteMarkerKeys(
                                 effect,
-                                originalStop.id,
-                                TimingColourisePaletteStopParameter::
-                                    Position,
                                 pickerPosition,
-                                editedStop.position,
-                                interpolationForAt(
-                                    originalStop.id,
-                                    TimingColourisePaletteStopParameter::
-                                        Position,
-                                    pickerPosition));
+                                workingPalette);
                     }
                     if (amountChanged) {
                         const bool amountTrackArmed = std::any_of(
@@ -103190,7 +106608,7 @@ void DrawTimingColourisePaletteEditor(
                     .selectedColourisePaletteStopIndex
                     .value()];
         ImGui::TextDisabled(
-            "Stop %zu/%zu   position %.4f   amount %.3f   (double-click marker to edit)",
+            "Stop %zu/%zu   Pos %.4f   Amount %.3f",
             timings
                     .selectedColourisePaletteStopIndex
                     .value() +
@@ -103198,102 +106616,10 @@ void DrawTimingColourisePaletteEditor(
             workingPalette.stops.size(),
             selected.position,
             selected.colouriseAmount);
-    }
-
-    DrawTimingKeyLane(
-        "##TimingPaletteKeyLane",
-        runtimeState,
-        effect,
-        TimingColouriseKeyTrack::Palette,
-        std::nullopt,
-        std::nullopt,
-        paletteKeyPositions,
-        IM_COL32(222, 134, 190, 255));
-    const bool exact =
-        invisible_places::timing::
-            TimingColourisePaletteKeyCountAtPosition(
-                *effect,
-                position) > 0U;
-    if (legacyModel) {
-        if (ImGui::SmallButton("+##SetPaletteKey")) {
-            invisible_places::timing::
-                AddOrUpdateTimingColourisePaletteKey(
-                    effect,
-                    position,
-                    workingPalette,
-                    legacyExactKey !=
-                            effect->paletteKeys.end()
-                        ? legacyExactKey->interpolation
-                        : WaterScenarioInterpolation::
-                              Smooth);
-            runtimeState
-                ->previewRenderStateSignatureValid = false;
-        }
         DrawTimingControlTooltip(
-            exact
-                ? "Update Palette Key: legacy projects retain whole-palette snapshot keys exactly. New saved palettes use independent stop-property keys."
-                : "Set Palette Key: legacy projects retain whole-palette snapshot keys exactly. New saved palettes use independent stop-property keys.");
-    } else {
-        const auto selectedIndex =
-            timings.selectedColourisePaletteStopIndex
-                .value_or(0U);
-        const bool canKeySelected =
-            selectedIndex < workingPalette.stops.size();
-        ImGui::BeginDisabled(!canKeySelected);
-        if (ImGui::SmallButton("+##KeySelectedStop")) {
-            const auto& stop =
-                workingPalette.stops[selectedIndex];
-            (void)invisible_places::timing::
-                AddOrUpdateTimingColourisePaletteStopScalarKey(
-                    effect,
-                    stop.id,
-                    TimingColourisePaletteStopParameter::
-                        Position,
-                    position,
-                    stop.position,
-                    interpolationForAt(
-                        stop.id,
-                        TimingColourisePaletteStopParameter::
-                            Position,
-                        position));
-            (void)invisible_places::timing::
-                AddOrUpdateTimingColourisePaletteStopColourKey(
-                    effect,
-                    stop.id,
-                    position,
-                    stop.colour,
-                    interpolationForAt(
-                        stop.id,
-                        TimingColourisePaletteStopParameter::
-                            Colour,
-                        position));
-            (void)invisible_places::timing::
-                AddOrUpdateTimingColourisePaletteStopScalarKey(
-                    effect,
-                    stop.id,
-                    TimingColourisePaletteStopParameter::
-                        ColouriseAmount,
-                    position,
-                    stop.colouriseAmount,
-                    interpolationForAt(
-                        stop.id,
-                        TimingColourisePaletteStopParameter::
-                            ColouriseAmount,
-                        position));
-            runtimeState
-                ->previewRenderStateSignatureValid = false;
-        }
-        ImGui::EndDisabled();
-        DrawTimingControlTooltip(
-            exact
-                ? "Update Selected Stop Keys: key all three properties of the selected stop here. Editing an already-keyed palette writes only the property that changed."
-                : "Key Selected Stop: key all three properties of the selected stop here. Editing an already-keyed palette writes only the property that changed.");
+            "Double-click the selected marker to edit its exact colour, "
+            "position, amount, and independent keys.");
     }
-    ImGui::SameLine(0.0F, 2.0F);
-    DrawTimingColouriseTrackButtons(
-        runtimeState,
-        effect,
-        true);
 
     if (legacyModel) {
         legacyExactKey = std::find_if(
@@ -104064,8 +107390,9 @@ void SetTimingColouriseBaseBoundsParameter(
         return;
     }
     auto bounds =
-        invisible_places::timing::SanitizeTimingColouriseBounds(
-            effect->baseBounds);
+        invisible_places::timing::SanitizeTimingColouriseAuthoredBounds(
+            effect->baseBounds,
+            effect->edgeFadeMode);
     const float spread = bounds.upper - bounds.lower;
     const float centre = std::midpoint(bounds.lower, bounds.upper);
     switch (parameter) {
@@ -104115,19 +107442,38 @@ void SetTimingColouriseBaseBoundsParameter(
         }
         case TimingColouriseBoundsParameter::EdgeFade:
             // Legacy shared lane: apply to both edges.
-            bounds.edgeFadeLower = std::clamp(value, -1.0F, 1.0F);
+            bounds.edgeFadeLower =
+                invisible_places::timing::
+                        TimingColouriseEdgeFadesAreAbsolute(
+                            effect->edgeFadeMode)
+                    ? value
+                    : invisible_places::timing::
+                          SanitizeTimingColouriseEdgeFade(value);
             bounds.edgeFadeUpper = bounds.edgeFadeLower;
             break;
         case TimingColouriseBoundsParameter::EdgeFadeLower:
-            bounds.edgeFadeLower = std::clamp(value, -1.0F, 1.0F);
+            bounds.edgeFadeLower =
+                invisible_places::timing::
+                        TimingColouriseEdgeFadesAreAbsolute(
+                            effect->edgeFadeMode)
+                    ? value
+                    : invisible_places::timing::
+                          SanitizeTimingColouriseEdgeFade(value);
             break;
         case TimingColouriseBoundsParameter::EdgeFadeUpper:
-            bounds.edgeFadeUpper = std::clamp(value, -1.0F, 1.0F);
+            bounds.edgeFadeUpper =
+                invisible_places::timing::
+                        TimingColouriseEdgeFadesAreAbsolute(
+                            effect->edgeFadeMode)
+                    ? value
+                    : invisible_places::timing::
+                          SanitizeTimingColouriseEdgeFade(value);
             break;
     }
     effect->baseBounds =
-        invisible_places::timing::SanitizeTimingColouriseBounds(
-            bounds);
+        invisible_places::timing::SanitizeTimingColouriseAuthoredBounds(
+            bounds,
+            effect->edgeFadeMode);
 }
 
 bool SetTimingColouriseBoundsParameterAt(
@@ -104146,7 +107492,7 @@ bool SetTimingColouriseBoundsParameterAt(
         return false;
     }
     const auto evaluated =
-        invisible_places::timing::EvaluateTimingColouriseBounds(
+        invisible_places::timing::EvaluateTimingColouriseAuthoredBounds(
             *effect,
             position,
             cyclicTiming);
@@ -104169,11 +107515,14 @@ bool SetTimingColouriseBoundsParameterAt(
             value = std::max(0.0F, value);
             break;
         case TimingColouriseBoundsParameter::EdgeFade:
-            value = std::clamp(value, -0.5F, 0.5F);
-            break;
         case TimingColouriseBoundsParameter::EdgeFadeLower:
         case TimingColouriseBoundsParameter::EdgeFadeUpper:
-            value = std::clamp(value, -1.0F, 1.0F);
+            if (!invisible_places::timing::
+                    TimingColouriseEdgeFadesAreAbsolute(
+                        effect->edgeFadeMode)) {
+                value = invisible_places::timing::
+                    SanitizeTimingColouriseEdgeFade(value);
+            }
             break;
         case TimingColouriseBoundsParameter::Centre:
             break;
@@ -104319,7 +107668,8 @@ bool TimingColouriseHistogramHandleEditableAt(
 
 float TimingColouriseHistogramHandleValue(
     const invisible_places::timing::TimingColouriseBounds& bounds,
-    TimingColouriseHistogramHandle handle) {
+    TimingColouriseHistogramHandle handle,
+    invisible_places::timing::TimingColouriseEdgeFadeMode fadeMode) {
     const float centre =
         std::midpoint(bounds.lower, bounds.upper);
     const float span = bounds.upper - bounds.lower;
@@ -104331,9 +107681,15 @@ float TimingColouriseHistogramHandleValue(
         case TimingColouriseHistogramHandle::UpperSpread:
             return bounds.upper;
         case TimingColouriseHistogramHandle::LowerFade:
-            return bounds.lower + span * bounds.edgeFadeLower;
+            return invisible_places::timing::
+                       TimingColouriseEdgeFadesAreAbsolute(fadeMode)
+                       ? bounds.edgeFadeLower
+                       : bounds.lower + span * bounds.edgeFadeLower;
         case TimingColouriseHistogramHandle::UpperFade:
-            return bounds.upper - span * bounds.edgeFadeUpper;
+            return invisible_places::timing::
+                       TimingColouriseEdgeFadesAreAbsolute(fadeMode)
+                       ? bounds.edgeFadeUpper
+                       : bounds.upper - span * bounds.edgeFadeUpper;
         case TimingColouriseHistogramHandle::Centre:
         case TimingColouriseHistogramHandle::None:
         default:
@@ -104360,13 +107716,15 @@ bool ApplyTimingColouriseBoundsDesiredState(
     bool changed = false;
     for (const auto parameter : parameters) {
         const float currentValue = invisible_places::timing::
-            TimingColouriseBoundsParameterValue(
+            TimingColouriseAuthoredBoundsParameterValue(
                 current,
-                parameter);
+                parameter,
+                effect->edgeFadeMode);
         const float desiredValue = invisible_places::timing::
-            TimingColouriseBoundsParameterValue(
+            TimingColouriseAuthoredBoundsParameterValue(
                 desired,
-                parameter);
+                parameter,
+                effect->edgeFadeMode);
         if (std::abs(currentValue - desiredValue) >
             std::numeric_limits<float>::epsilon()) {
             changed |= SetTimingColouriseBoundsParameterAt(
@@ -104400,24 +107758,28 @@ bool ApplyTimingColouriseHistogramBounds(
         return false;
     }
     const auto bounds =
-        invisible_places::timing::EvaluateTimingColouriseBounds(
+        invisible_places::timing::EvaluateTimingColouriseAuthoredBounds(
             *effect,
             position,
             cyclicTiming);
     const float span = bounds.upper - bounds.lower;
     if (handle == TimingColouriseHistogramHandle::LowerFade ||
         handle == TimingColouriseHistogramHandle::UpperFade) {
-        if (span <= std::numeric_limits<float>::epsilon()) {
+        const bool absoluteFade = invisible_places::timing::
+            TimingColouriseEdgeFadesAreAbsolute(effect->edgeFadeMode);
+        if (!absoluteFade &&
+            span <= std::numeric_limits<float>::epsilon()) {
             return false;
         }
         const bool lowerHandle =
             handle == TimingColouriseHistogramHandle::LowerFade;
-        const float fade = std::clamp(
-            lowerHandle
-                ? (targetValue - bounds.lower) / span
-                : (bounds.upper - targetValue) / span,
-            -1.0F,
-            1.0F);
+        const float fade = absoluteFade
+            ? targetValue
+            : invisible_places::timing::
+                  SanitizeTimingColouriseEdgeFade(
+                      lowerHandle
+                          ? (targetValue - bounds.lower) / span
+                          : (bounds.upper - targetValue) / span);
         bool changed = SetTimingColouriseBoundsParameterAt(
             stores,
             effect,
@@ -104429,10 +107791,10 @@ bool ApplyTimingColouriseHistogramBounds(
             position,
             fade,
             cyclicTiming);
-        // Linked fades move together: the dragged edge's value is written
-        // to its partner as well. Double-clicking a fade handle separates
-        // them.
-        if (effect->edgeFadesLinked) {
+        // Relative Joined writes the same percentage to both edges.
+        if (invisible_places::timing::
+                TimingColouriseEdgeFadesAreLinked(
+                    effect->edgeFadeMode)) {
             changed = SetTimingColouriseBoundsParameterAt(
                           stores,
                           effect,
@@ -104702,7 +108064,7 @@ void DrawTimingColouriseHistogram(
     }
     const auto evaluated =
         invisible_places::timing::
-            EvaluateTimingColouriseBounds(
+            EvaluateTimingColouriseAuthoredBounds(
                 *effect,
                 position,
                 cyclicTiming);
@@ -104715,10 +108077,12 @@ void DrawTimingColouriseHistogram(
         IM_COL32(242, 104, 96, 255);
     // Linked fades share the familiar green; separated edges show their
     // own warm/cool tints so the split state reads immediately.
-    const ImU32 lowerFadeColour = effect->edgeFadesLinked
+    const bool linkedFades = invisible_places::timing::
+        TimingColouriseEdgeFadesAreLinked(effect->edgeFadeMode);
+    const ImU32 lowerFadeColour = linkedFades
         ? kTimingLinkedFadeColour
         : kTimingSeparatedLowerFadeColour;
-    const ImU32 upperFadeColour = effect->edgeFadesLinked
+    const ImU32 upperFadeColour = linkedFades
         ? kTimingLinkedFadeColour
         : kTimingSeparatedUpperFadeColour;
     const auto drawBound = [&](float value, ImU32 colour) {
@@ -104747,10 +108111,14 @@ void DrawTimingColouriseHistogram(
     // triangles at the top and the centre/spacing rail.
     const float fadeY = plotTop + kHistogramPlotHeight * 0.25F;
     const float rawSpan = evaluated.upper - evaluated.lower;
-    const float lowerFadeValue =
-        evaluated.lower + rawSpan * evaluated.edgeFadeLower;
-    const float upperFadeValue =
-        evaluated.upper - rawSpan * evaluated.edgeFadeUpper;
+    const bool absoluteFades = invisible_places::timing::
+        TimingColouriseEdgeFadesAreAbsolute(effect->edgeFadeMode);
+    const float lowerFadeValue = absoluteFades
+        ? evaluated.edgeFadeLower
+        : evaluated.lower + rawSpan * evaluated.edgeFadeLower;
+    const float upperFadeValue = absoluteFades
+        ? evaluated.edgeFadeUpper
+        : evaluated.upper - rawSpan * evaluated.edgeFadeUpper;
     const float lowerFadeX = xForRaw(lowerFadeValue);
     const float upperFadeX = xForRaw(upperFadeValue);
     const bool histogramRangeEditable =
@@ -104819,9 +108187,51 @@ void DrawTimingColouriseHistogram(
                 ImVec2{handleX, fadeY + 4.0F},
                 colour,
                 2.0F);
-        };
+    };
     drawFadeHandle(lowerX, lowerFadeX, lowerFadeColour);
     drawFadeHandle(upperX, upperFadeX, upperFadeColour);
+
+    // A compact in-plot fade-mode toggle keeps the mode interaction beside
+    // the handles it affects. Double-click cycles Joined -> Separate ->
+    // Absolute; individual handles retain their double-click numeric editor.
+    const char* fadeModeToggleLabel = linkedFades
+        ? "J"
+        : absoluteFades ? "A" : "S";
+    const ImVec2 fadeModeToggleMinimum{
+        minimum.x + 4.0F,
+        fadeY - 8.0F};
+    const ImVec2 fadeModeToggleMaximum{
+        fadeModeToggleMinimum.x + 18.0F,
+        fadeModeToggleMinimum.y + 16.0F};
+    const ImU32 fadeModeToggleColour = linkedFades
+        ? kTimingLinkedFadeColour
+        : absoluteFades
+            ? IM_COL32(104, 176, 232, 230)
+            : IM_COL32(224, 142, 112, 230);
+    drawList->AddRectFilled(
+        fadeModeToggleMinimum,
+        fadeModeToggleMaximum,
+        fadeModeToggleColour,
+        3.0F);
+    drawList->AddRect(
+        fadeModeToggleMinimum,
+        fadeModeToggleMaximum,
+        ImGui::GetColorU32(ImGuiCol_Border),
+        3.0F);
+    const ImVec2 fadeModeToggleTextSize =
+        ImGui::CalcTextSize(fadeModeToggleLabel);
+    drawList->AddText(
+        ImVec2{
+            std::midpoint(
+                fadeModeToggleMinimum.x,
+                fadeModeToggleMaximum.x) -
+                fadeModeToggleTextSize.x * 0.5F,
+            std::midpoint(
+                fadeModeToggleMinimum.y,
+                fadeModeToggleMaximum.y) -
+                fadeModeToggleTextSize.y * 0.5F},
+        IM_COL32(24, 28, 32, 255),
+        fadeModeToggleLabel);
 
     // Palette warp band: attached to the widget bottom, a comb of notch
     // lines (evenly spaced palette coordinates drawn where the warp lands
@@ -104833,6 +108243,8 @@ void DrawTimingColouriseHistogram(
         std::string nodeId;
         bool emissive = false;
         float palettePosition = 0.5F;
+        float fieldPosition = 0.5F;
+        float spread = 0.0F;
         float x = 0.0F;
         float y = 0.0F;
     };
@@ -104967,6 +108379,8 @@ void DrawTimingColouriseHistogram(
             warpNodeVisuals.push_back(TimingColouriseWarpNodeVisual{
                 .nodeId = nodeId,
                 .palettePosition = palettePosition,
+                .fieldPosition = fieldPosition,
+                .spread = spread,
                 .x = xForBoundsFraction(fieldPosition),
                 .y = warpSpreadToY(spread),
             });
@@ -105137,6 +108551,8 @@ void DrawTimingColouriseHistogram(
                     .nodeId = nodeId,
                     .emissive = true,
                     .palettePosition = curvePosition,
+                    .fieldPosition = fieldPosition,
+                    .spread = spread,
                     .x = xForBoundsFraction(fieldPosition),
                     .y = emissiveSpreadToY(spread),
                 });
@@ -105181,10 +108597,10 @@ void DrawTimingColouriseHistogram(
             "Bounds histogram\n"
             "Drag the upper part of either vertical line to move that bound.\n"
             "Drag the centre rail to translate the interval. Drag either rail circle to resize symmetrically.\n"
-            "The sideways T handles set each edge's signed Fade: inward is positive, outward is negative, up to a whole span either way.\n"
-            "Fades move together while linked; double-click a fade handle to separate them, and double-click again to relink using that handle's value.\n"} +
+            "The sideways T handles set each edge's signed Fade: inward is positive up to 100%; outward is negative and may exceed 100% to feather far beyond a narrow bound.\n"
+            "Double-click any bounds or fade handle to type an exact value. Double-click the J/S/A fade badge to cycle modes. Relative Joined moves both fade percentages together; Relative Separate edits them independently; Absolute keeps each typed scalar fade endpoint fixed while its bound moves. Each mode keeps its own keyed frames.\n"} +
         (paletteBandVisible
-             ? "The bottom band is Palette Skew: notches mark evenly spaced palette coordinates at their warped homes over the sampled palette strip, whose opacity follows the colourise amount. Drag a node left/right to skew around it, away from the strip to spread the area near it, toward it to pinch. Nodes snap onto neutral spread and their unskewed home. Double-click empty band to add a node, a node to remove it (the centre node resets instead).\n"
+             ? "The bottom band is Palette Skew: notches mark evenly spaced palette coordinates at their warped homes over the sampled palette strip, whose opacity follows the colourise amount. Drag a node left/right to skew around it, away from the strip to spread the area near it, toward it to pinch. Nodes snap onto neutral spread and their unskewed home. Double-click empty band to add a node, or double-click a node to type its exact Field Position and Spread; that editor also removes extras or resets the centre.\n"
              : std::string{}) +
         (emissiveBandVisible
              ? "The top band is the emissive falloff's own skew, with a mid-grey strip showing the applied emission - brighter where it adds, darker where negative levels dim. Same node interactions as the palette band.\n"
@@ -105212,6 +108628,17 @@ void DrawTimingColouriseHistogram(
                   (mouseUnit - 1.0F) *
                       (histogramData.maximum - histogramData.minimum)
             : axis.UnitToRaw(mouseUnit);
+    const bool fadeModeToggleHovered =
+        ImGui::IsItemHovered() && !watermarkHovered &&
+        mouse.x >= fadeModeToggleMinimum.x &&
+        mouse.x <= fadeModeToggleMaximum.x &&
+        mouse.y >= fadeModeToggleMinimum.y &&
+        mouse.y <= fadeModeToggleMaximum.y;
+    if (fadeModeToggleHovered) {
+        ImGui::SetTooltip(
+            "Fade mode %s\nDouble-click to cycle Joined, Separate, and Absolute. Each mode remembers its own keys.",
+            fadeModeToggleLabel);
+    }
     TimingColouriseHistogramHandle hoveredHandle =
         TimingColouriseHistogramHandle::None;
     std::optional<std::size_t> hoveredWarpNode;
@@ -105243,7 +108670,9 @@ void DrawTimingColouriseHistogram(
                 hoveredWarpNode = index;
             }
         }
-        if (hoveredWarpNode.has_value()) {
+        if (fadeModeToggleHovered) {
+            // The mode badge owns the pointer.
+        } else if (hoveredWarpNode.has_value()) {
             // A warp node claimed the pointer.
         } else if (std::min(lowerFadeDistance, upperFadeDistance) <= 9.0F) {
             hoveredHandle =
@@ -105278,6 +108707,41 @@ void DrawTimingColouriseHistogram(
             mouse.x <= std::max(lowerX, upperX)) {
             hoveredHandle =
                 TimingColouriseHistogramHandle::Centre;
+        }
+    }
+    if (fadeModeToggleHovered &&
+        ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        using invisible_places::timing::TimingColouriseEdgeFadeMode;
+        const auto nextMode =
+            effect->edgeFadeMode ==
+                    TimingColouriseEdgeFadeMode::RelativeLinked
+                ? TimingColouriseEdgeFadeMode::RelativeSeparate
+                : effect->edgeFadeMode ==
+                          TimingColouriseEdgeFadeMode::RelativeSeparate
+                    ? TimingColouriseEdgeFadeMode::Absolute
+                    : TimingColouriseEdgeFadeMode::RelativeLinked;
+        const bool restoring = std::any_of(
+            effect->edgeFadeModeMemories.begin(),
+            effect->edgeFadeModeMemories.end(),
+            [&](const auto& memory) {
+                return memory.mode == nextMode &&
+                       !memory.keys.empty();
+            });
+        if (invisible_places::timing::SetTimingColouriseEdgeFadeMode(
+                effect,
+                nextMode,
+                position,
+                cyclicTiming)) {
+            runtimeState->timingsPanel.activeHistogramHandle =
+                TimingColouriseHistogramHandle::None;
+            runtimeState->timingsPanel
+                .colouriseHistogramValueEdit.reset();
+            runtimeState->timingsPanel
+                .colouriseBoundsValueEdit.reset();
+            runtimeState->previewRenderStateSignatureValid = false;
+            runtimeState->statusMessage = restoring
+                ? "Restored this Fade Ends mode and its own keyed frames."
+                : "Started this Fade Ends mode from the currently visible fade values.";
         }
     }
     auto& skewNodeDrag = runtimeState->timingsPanel.skewNodeDrag;
@@ -105322,33 +108786,25 @@ void DrawTimingColouriseHistogram(
             invisible_places::timing::TimingColouriseWarpPoint>& {
         return emissiveAspect ? emissiveWarpPoints : paletteWarpPoints;
     };
+    auto& warpValueEdit =
+        runtimeState->timingsPanel.colouriseHistogramWarpValueEdit;
+    if (warpValueEdit.has_value() &&
+        warpValueEdit->effectId != effect->id) {
+        warpValueEdit.reset();
+    }
     if (spanUsable && hoveredWarpNode.has_value() &&
         ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
         const auto visual = warpNodeVisuals[hoveredWarpNode.value()];
-        if (visual.nodeId.empty()) {
-            // The centre node cannot be removed; reset it instead.
-            (void)SetTimingColouriseEffectParameterAt(
-                effect,
-                aspectCentreParameter(visual.emissive),
-                position,
-                0.5F);
-            (void)SetTimingColouriseEffectParameterAt(
-                effect,
-                aspectSpreadParameter(visual.emissive),
-                position,
-                0.0F);
-            runtimeState->statusMessage =
-                "Reset the centre warp node.";
-        } else {
-            std::erase_if(
-                *aspectNodes(visual.emissive),
-                [&](const auto& node) {
-                    return node.id == visual.nodeId;
-                });
-            runtimeState->statusMessage = "Removed the warp node.";
-        }
+        warpValueEdit = TimingColouriseHistogramWarpValueEditState{
+            .effectId = effect->id,
+            .emissiveAspect = visual.emissive,
+            .nodeId = visual.nodeId,
+            .fieldPosition = visual.fieldPosition,
+            .spread = visual.spread,
+            .requestKeyboardFocus = true,
+        };
+        ImGui::OpenPopup("Edit Histogram Warp Node");
         skewNodeDrag.reset();
-        runtimeState->previewRenderStateSignatureValid = false;
     } else if (
         !hoveredWarpNode.has_value() &&
         (mouseInPaletteBand || mouseInEmissiveBand) &&
@@ -105503,48 +108959,187 @@ void DrawTimingColouriseHistogram(
         !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
         skewNodeDrag.reset();
     }
-    const bool fadeHandleHovered =
-        hoveredHandle == TimingColouriseHistogramHandle::LowerFade ||
-        hoveredHandle == TimingColouriseHistogramHandle::UpperFade;
-    if (fadeHandleHovered &&
+    if (ImGui::BeginPopup("Edit Histogram Warp Node")) {
+        if (warpValueEdit.has_value() &&
+            warpValueEdit->effectId == effect->id) {
+            const bool centreNode = warpValueEdit->nodeId.empty();
+            ImGui::TextDisabled(
+                "%s %s node",
+                warpValueEdit->emissiveAspect ? "Emissive" : "Palette",
+                centreNode ? "centre" : "warp");
+            if (warpValueEdit->requestKeyboardFocus) {
+                ImGui::SetKeyboardFocusHere();
+                warpValueEdit->requestKeyboardFocus = false;
+            }
+            ImGui::SetNextItemWidth(180.0F);
+            ImGui::InputFloat(
+                "Field Position",
+                &warpValueEdit->fieldPosition,
+                0.0F,
+                0.0F,
+                "%.7g");
+            ImGui::SetNextItemWidth(180.0F);
+            ImGui::InputFloat(
+                "Spread",
+                &warpValueEdit->spread,
+                0.0F,
+                0.0F,
+                "%.7g");
+            const bool validDraft =
+                std::isfinite(warpValueEdit->fieldPosition) &&
+                std::isfinite(warpValueEdit->spread);
+            ImGui::BeginDisabled(!validDraft);
+            const bool apply = ImGui::Button("Apply");
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            const bool removeOrReset = ImGui::Button(
+                centreNode ? "Reset" : "Remove");
+            ImGui::SameLine();
+            const bool cancel = ImGui::Button("Cancel");
+            if (apply && validDraft) {
+                bool changed = false;
+                const bool emissiveAspect =
+                    warpValueEdit->emissiveAspect;
+                if (centreNode) {
+                    changed = SetTimingColouriseEffectParameterAt(
+                        effect,
+                        aspectCentreParameter(emissiveAspect),
+                        position,
+                        std::clamp(
+                            warpValueEdit->fieldPosition,
+                            0.0F,
+                            1.0F));
+                    changed = SetTimingColouriseEffectParameterAt(
+                                  effect,
+                                  aspectSpreadParameter(emissiveAspect),
+                                  position,
+                                  std::clamp(
+                                      warpValueEdit->spread,
+                                      -1.0F,
+                                      1.0F)) ||
+                              changed;
+                } else {
+                    auto* nodes = aspectNodes(emissiveAspect);
+                    const auto node = std::find_if(
+                        nodes->begin(),
+                        nodes->end(),
+                        [&](const auto& candidate) {
+                            return candidate.id == warpValueEdit->nodeId;
+                        });
+                    if (node != nodes->end()) {
+                        float lowerLimit = 0.01F;
+                        float upperLimit = 0.99F;
+                        for (const auto& point :
+                             aspectWarpPoints(emissiveAspect)) {
+                            if (std::abs(
+                                    point.palettePosition -
+                                    node->palettePosition) <= 1.0e-4F) {
+                                continue;
+                            }
+                            if (point.palettePosition <
+                                node->palettePosition) {
+                                lowerLimit = std::max(
+                                    lowerLimit,
+                                    point.fieldPosition + 0.01F);
+                            } else {
+                                upperLimit = std::min(
+                                    upperLimit,
+                                    point.fieldPosition - 0.01F);
+                            }
+                        }
+                        node->fieldPosition = std::clamp(
+                            warpValueEdit->fieldPosition,
+                            lowerLimit,
+                            std::max(lowerLimit, upperLimit));
+                        node->spread = std::clamp(
+                            warpValueEdit->spread,
+                            -1.0F,
+                            1.0F);
+                        changed = true;
+                    }
+                }
+                if (changed) {
+                    runtimeState->previewRenderStateSignatureValid = false;
+                    runtimeState->statusMessage =
+                        "Updated the histogram warp node values.";
+                }
+                warpValueEdit.reset();
+                ImGui::CloseCurrentPopup();
+            } else if (removeOrReset) {
+                if (centreNode) {
+                    (void)SetTimingColouriseEffectParameterAt(
+                        effect,
+                        aspectCentreParameter(
+                            warpValueEdit->emissiveAspect),
+                        position,
+                        0.5F);
+                    (void)SetTimingColouriseEffectParameterAt(
+                        effect,
+                        aspectSpreadParameter(
+                            warpValueEdit->emissiveAspect),
+                        position,
+                        0.0F);
+                    runtimeState->statusMessage =
+                        "Reset the centre warp node.";
+                } else {
+                    std::erase_if(
+                        *aspectNodes(warpValueEdit->emissiveAspect),
+                        [&](const auto& node) {
+                            return node.id == warpValueEdit->nodeId;
+                        });
+                    runtimeState->statusMessage =
+                        "Removed the warp node.";
+                }
+                runtimeState->previewRenderStateSignatureValid = false;
+                warpValueEdit.reset();
+                ImGui::CloseCurrentPopup();
+            } else if (cancel) {
+                warpValueEdit.reset();
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::EndPopup();
+    } else if (warpValueEdit.has_value() &&
+               warpValueEdit->effectId == effect->id &&
+               !ImGui::IsPopupOpen("Edit Histogram Warp Node")) {
+        warpValueEdit.reset();
+    }
+    auto& histogramValueEdit =
+        runtimeState->timingsPanel.colouriseHistogramValueEdit;
+    if (histogramValueEdit.has_value() &&
+        histogramValueEdit->effectId != effect->id) {
+        histogramValueEdit.reset();
+    }
+    if (hoveredHandle != TimingColouriseHistogramHandle::None &&
         ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) &&
         TimingColouriseHistogramHandleEditableAt(
             effect,
             hoveredHandle,
             position)) {
-        // Double-click toggles the fade link. Re-linking adopts the
-        // double-clicked side's value on both edges.
-        if (effect->edgeFadesLinked) {
-            effect->edgeFadesLinked = false;
-            runtimeState->statusMessage =
-                "Separated the lower and upper fades. Double-click a "
-                "fade handle again to relink them.";
-        } else {
-            const bool lowerHandle =
-                hoveredHandle ==
-                TimingColouriseHistogramHandle::LowerFade;
-            const float adoptedFade = lowerHandle
-                ? evaluated.edgeFadeLower
-                : evaluated.edgeFadeUpper;
-            effect->edgeFadesLinked = true;
-            if (SetTimingColouriseBoundsParameterAt(
-                    &runtimeState->water.timingScalarBoundsStores,
-                    effect,
-                    lowerHandle
-                        ? invisible_places::timing::
-                              TimingColouriseBoundsParameter::
-                                  EdgeFadeUpper
-                        : invisible_places::timing::
-                              TimingColouriseBoundsParameter::
-                                  EdgeFadeLower,
-                    position,
-                    adoptedFade,
-                    cyclicTiming)) {
-                runtimeState->previewRenderStateSignatureValid = false;
-            }
-            runtimeState->statusMessage =
-                "Linked the fades to the double-clicked handle's value.";
+        const bool fadeHandle =
+            hoveredHandle == TimingColouriseHistogramHandle::LowerFade ||
+            hoveredHandle == TimingColouriseHistogramHandle::UpperFade;
+        const bool percentage = fadeHandle && !absoluteFades;
+        float draftValue = TimingColouriseHistogramHandleValue(
+            evaluated,
+            hoveredHandle,
+            effect->edgeFadeMode);
+        if (percentage) {
+            draftValue =
+                (hoveredHandle ==
+                         TimingColouriseHistogramHandle::LowerFade
+                     ? evaluated.edgeFadeLower
+                     : evaluated.edgeFadeUpper) *
+                100.0F;
         }
+        histogramValueEdit = TimingColouriseHistogramValueEditState{
+            .effectId = effect->id,
+            .handle = hoveredHandle,
+            .draftValue = draftValue,
+            .percentage = percentage,
+            .requestKeyboardFocus = true,
+        };
+        ImGui::OpenPopup("Edit Histogram Node");
         runtimeState->timingsPanel.activeHistogramHandle =
             TimingColouriseHistogramHandle::None;
     } else if (
@@ -105561,7 +109156,107 @@ void DrawTimingColouriseHistogram(
             mouseValue -
             TimingColouriseHistogramHandleValue(
                 evaluated,
-                hoveredHandle);
+                hoveredHandle,
+                effect->edgeFadeMode);
+    }
+    if (ImGui::BeginPopup("Edit Histogram Node")) {
+        if (histogramValueEdit.has_value() &&
+            histogramValueEdit->effectId == effect->id) {
+            const auto editHandle = histogramValueEdit->handle;
+            const bool lowerFade =
+                editHandle == TimingColouriseHistogramHandle::LowerFade;
+            const bool upperFade =
+                editHandle == TimingColouriseHistogramHandle::UpperFade;
+            const char* label = histogramValueEdit->percentage
+                ? lowerFade ? "Lower Fade (%)" : "Upper Fade (%)"
+                : lowerFade ? "Lower Fade End"
+                : upperFade ? "Upper Fade End"
+                : editHandle == TimingColouriseHistogramHandle::Lower ||
+                          editHandle ==
+                              TimingColouriseHistogramHandle::LowerSpread
+                    ? "Lower"
+                : editHandle == TimingColouriseHistogramHandle::Upper ||
+                          editHandle ==
+                              TimingColouriseHistogramHandle::UpperSpread
+                    ? "Upper"
+                    : "Centre";
+            if (histogramValueEdit->requestKeyboardFocus) {
+                ImGui::SetKeyboardFocusHere();
+                histogramValueEdit->requestKeyboardFocus = false;
+            }
+            ImGui::SetNextItemWidth(180.0F);
+            const bool submitted = ImGui::InputFloat(
+                label,
+                &histogramValueEdit->draftValue,
+                0.0F,
+                0.0F,
+                "%.7g",
+                ImGuiInputTextFlags_EnterReturnsTrue);
+            const bool apply = submitted || ImGui::Button("Apply");
+            ImGui::SameLine();
+            const bool cancel = ImGui::Button("Cancel");
+            if (apply &&
+                std::isfinite(histogramValueEdit->draftValue)) {
+                bool changed = false;
+                if (histogramValueEdit->percentage &&
+                    (lowerFade || upperFade)) {
+                    using invisible_places::timing::
+                        TimingColouriseBoundsParameter;
+                    const auto parameter = lowerFade
+                        ? TimingColouriseBoundsParameter::EdgeFadeLower
+                        : TimingColouriseBoundsParameter::EdgeFadeUpper;
+                    const float fade =
+                        histogramValueEdit->draftValue * 0.01F;
+                    changed = SetTimingColouriseBoundsParameterAt(
+                        &runtimeState->water.timingScalarBoundsStores,
+                        effect,
+                        parameter,
+                        position,
+                        fade,
+                        cyclicTiming);
+                    if (invisible_places::timing::
+                            TimingColouriseEdgeFadesAreLinked(
+                                effect->edgeFadeMode)) {
+                        changed = SetTimingColouriseBoundsParameterAt(
+                                      &runtimeState->water
+                                           .timingScalarBoundsStores,
+                                      effect,
+                                      lowerFade
+                                          ? TimingColouriseBoundsParameter::
+                                                EdgeFadeUpper
+                                          : TimingColouriseBoundsParameter::
+                                                EdgeFadeLower,
+                                      position,
+                                      fade,
+                                      cyclicTiming) ||
+                                  changed;
+                    }
+                } else {
+                    changed = ApplyTimingColouriseHistogramBounds(
+                        &runtimeState->water.timingScalarBoundsStores,
+                        effect,
+                        editHandle,
+                        position,
+                        histogramValueEdit->draftValue,
+                        histogramData.minimum,
+                        histogramData.maximum,
+                        cyclicTiming);
+                }
+                if (changed) {
+                    runtimeState->previewRenderStateSignatureValid = false;
+                }
+                histogramValueEdit.reset();
+                ImGui::CloseCurrentPopup();
+            } else if (cancel) {
+                histogramValueEdit.reset();
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::EndPopup();
+    } else if (histogramValueEdit.has_value() &&
+               histogramValueEdit->effectId == effect->id &&
+               !ImGui::IsPopupOpen("Edit Histogram Node")) {
+        histogramValueEdit.reset();
     }
     if (runtimeState->timingsPanel.activeHistogramHandle !=
             TimingColouriseHistogramHandle::None &&
@@ -105682,13 +109377,14 @@ void DrawTimingColouriseBoundsParameterTrackButtons(
             effect->boundsKeyMode,
             parameter);
     const float evaluatedValue = invisible_places::timing::
-        TimingColouriseBoundsParameterValue(
+        TimingColouriseAuthoredBoundsParameterValue(
             invisible_places::timing::
-                EvaluateTimingColouriseBounds(
+                EvaluateTimingColouriseAuthoredBounds(
                     *effect,
                     position,
                     CurrentAnimationTimingIsCyclic(*runtimeState)),
-            parameter);
+            parameter,
+            effect->edgeFadeMode);
     auto interpolation = TimingScalarTrackInterpolationAt(
         effect->boundsParameterKeys,
         [&](const auto& key) { return key.parameter == parameter; },
@@ -105780,8 +109476,9 @@ void DrawTimingColouriseBoundsParameterTrackButtons(
         *effect,
         parameter);
     if (hasKeys) {
-        ImGui::SetNextItemWidth(
-            std::max(48.0F, ImGui::GetContentRegionAvail().x));
+        ImGui::SetNextItemWidth(std::min(
+            78.0F,
+            std::max(54.0F, ImGui::GetContentRegionAvail().x)));
         if (DrawTimingScalarTrackInterpolationCombo(
                 "##CurveStyle",
                 &effect->boundsParameterKeys,
@@ -105789,7 +109486,8 @@ void DrawTimingColouriseBoundsParameterTrackButtons(
                     return key.parameter == parameter ||
                            (mirrorLinkedFadePartner &&
                             key.parameter == fadePartner);
-                })) {
+                },
+                /*compactPreview=*/true)) {
             runtimeState->previewRenderStateSignatureValid = false;
         }
     }
@@ -105806,14 +109504,16 @@ void DrawTimingColouriseBoundsParameterEditor(
     }
     const float position = CurrentAuthoredTrackPosition(*runtimeState);
     const auto evaluatedBounds =
-        invisible_places::timing::EvaluateTimingColouriseBounds(
+        invisible_places::timing::EvaluateTimingColouriseAuthoredBounds(
             *effect,
             position,
             CurrentAnimationTimingIsCyclic(*runtimeState));
     const float evaluatedValue =
-        invisible_places::timing::TimingColouriseBoundsParameterValue(
+        invisible_places::timing::
+            TimingColouriseAuthoredBoundsParameterValue(
             evaluatedBounds,
-            parameter);
+            parameter,
+            effect->edgeFadeMode);
     const bool allowed =
         TimingColouriseBoundsParameterEditableAt(
             effect,
@@ -105837,7 +109537,7 @@ void DrawTimingColouriseBoundsParameterEditor(
         TimingColouriseBoundsParameterHasKeys(
             *effect,
             parameter);
-    const bool percentage =
+    const bool fadeParameter =
         parameter == invisible_places::timing::
                          TimingColouriseBoundsParameter::EdgeFade ||
         parameter ==
@@ -105846,6 +109546,9 @@ void DrawTimingColouriseBoundsParameterEditor(
         parameter ==
             invisible_places::timing::
                 TimingColouriseBoundsParameter::EdgeFadeUpper;
+    const bool percentage = fadeParameter &&
+        !invisible_places::timing::TimingColouriseEdgeFadesAreAbsolute(
+            effect->edgeFadeMode);
     const auto formatDraft = [&](float value) {
         std::array<char, 64> buffer{};
         std::snprintf(
@@ -106013,7 +109716,9 @@ void DrawTimingColouriseBoundsParameterEditor(
             CurrentAnimationTimingIsCyclic(*runtimeState))) {
         // While the fades are linked, editing either edge writes both.
         using invisible_places::timing::TimingColouriseBoundsParameter;
-        if (effect->edgeFadesLinked &&
+        if (invisible_places::timing::
+                TimingColouriseEdgeFadesAreLinked(
+                    effect->edgeFadeMode) &&
             (parameter == TimingColouriseBoundsParameter::EdgeFadeLower ||
              parameter ==
                  TimingColouriseBoundsParameter::EdgeFadeUpper)) {
@@ -106038,10 +109743,17 @@ void DrawTimingColouriseBoundsParameterEditor(
     if (percentage) {
         DrawTimingControlTooltip(
             editable
-                ? effect->edgeFadesLinked
-                      ? "Signed fade for this edge as a percentage of spacing, up to a whole span: positive fades inward, negative fades outward. Fades are linked - editing either writes both. Double-click a green fade handle in the histogram to separate them."
-                      : "Signed fade for this edge as a percentage of spacing, up to a whole span: positive fades inward, negative fades outward. Fades are separated - double-click a green fade handle in the histogram to relink them."
+                ? invisible_places::timing::
+                      TimingColouriseEdgeFadesAreLinked(
+                          effect->edgeFadeMode)
+                      ? "Signed fade for this edge as a percentage of spacing: positive fades inward (up to 100%); negative fades outward and may exceed 100%. Relative Joined writes both edges together."
+                      : "Signed fade for this edge as a percentage of spacing: positive fades inward (up to 100%); negative fades outward and may exceed 100%. Relative Separate keys this edge independently."
                 : "Fade is view-only in this Bounds Keying mode.");
+    } else if (fadeParameter) {
+        DrawTimingControlTooltip(
+            editable
+                ? "Absolute scalar position of this fade end. It remains fixed when the corresponding Lower or Upper bound moves, and can be keyed independently."
+                : "Fade end is view-only in this Bounds Keying mode.");
     } else {
         DrawTimingControlTooltip(
             crossEdit
@@ -106073,7 +109785,25 @@ void DrawTimingColouriseBoundsEditor(
     }
     using invisible_places::timing::TimingColouriseBoundsKeyMode;
     using invisible_places::timing::TimingColouriseBoundsParameter;
+    using invisible_places::timing::TimingColouriseEdgeFadeMode;
+    const float fadeModeSwitchPosition =
+        CurrentAuthoredTrackPosition(*runtimeState);
+    const bool fadeModeSwitchCyclic =
+        CurrentAnimationTimingIsCyclic(*runtimeState);
     if (drawKeyMode) {
+    const int modeColumns = TimingResponsiveColumnCount(
+        2U,
+        260.0F,
+        2);
+    const bool modeTableVisible = ImGui::BeginTable(
+        "##TimingColouriseBoundsModes",
+        modeColumns,
+        ImGuiTableFlags_NoSavedSettings |
+            ImGuiTableFlags_NoPadOuterX |
+            ImGuiTableFlags_SizingStretchSame);
+    if (modeTableVisible) {
+        ImGui::TableNextColumn();
+    }
     struct ModeChoice {
         TimingColouriseBoundsKeyMode mode;
         const char* label;
@@ -106107,39 +109837,36 @@ void DrawTimingColouriseBoundsEditor(
         currentChoice != modeChoices.end()
             ? currentChoice->label
             : modeChoices.front().label;
+    SetNextTimingLabelledControlWidth("Bounds Keying");
     if (ImGui::BeginCombo("Bounds Keying", currentLabel)) {
         for (const auto& choice : modeChoices) {
-            const bool compatible = std::all_of(
-                effect->boundsParameterKeys.begin(),
-                effect->boundsParameterKeys.end(),
-                [&](const auto& key) {
-                    return invisible_places::timing::
-                        TimingColouriseBoundsParameterIsAllowed(
-                            choice.mode,
-                            key.parameter);
-                });
-            ImGui::BeginDisabled(!compatible);
             const bool selected =
                 effect->boundsKeyMode == choice.mode;
             if (ImGui::Selectable(
                     choice.label,
                     selected) &&
-                compatible &&
+                !selected &&
                 invisible_places::timing::
                     SetTimingColouriseBoundsKeyMode(
                         effect,
                         choice.mode)) {
-                runtimeState->timingsPanel
-                    .activeHistogramHandle =
+                auto& timings = runtimeState->timingsPanel;
+                timings.activeHistogramHandle =
                     TimingColouriseHistogramHandle::None;
+                timings.colouriseLocalKeyDrag.reset();
+                timings.colouriseLocalKeyPositionEdit.reset();
+                timings.colouriseBoundsValueEdit.reset();
+                timings.colouriseHistogramValueEdit.reset();
+                ClearTimingColouriseGraphInteraction(&timings);
                 runtimeState->previewRenderStateSignatureValid =
                     false;
+                runtimeState->statusMessage =
+                    std::string{"Converted Bounds Keying to "} +
+                    choice.label +
+                    "; existing key times and interval values were preserved.";
+                runtimeState->errorMessage.clear();
             }
-            ImGui::EndDisabled();
-            DrawTimingControlTooltip(
-                compatible
-                    ? choice.explanation
-                    : "This mode conflicts with an existing Bounds parameter track. Delete that track's keys before changing mode.");
+            DrawTimingControlTooltip(choice.explanation);
             if (selected) {
                 ImGui::SetItemDefaultFocus();
             }
@@ -106147,7 +109874,72 @@ void DrawTimingColouriseBoundsEditor(
         ImGui::EndCombo();
     }
     DrawTimingLabelTooltip(
-        "Choose the only two interval coordinates that this effect can key. Incompatible combinations are unavailable for the whole Timing Take.");
+        "Choose the two interval coordinates this effect keys. Existing bounds tracks are converted at every authored key time, preserving the interval there; derived interpolation between keys can change.");
+
+    if (modeTableVisible) {
+        ImGui::TableNextColumn();
+    }
+
+    struct FadeModeChoice {
+        TimingColouriseEdgeFadeMode mode;
+        const char* label;
+        const char* explanation;
+    };
+    constexpr std::array fadeModeChoices{
+        FadeModeChoice{
+            TimingColouriseEdgeFadeMode::RelativeLinked,
+            "Relative - Joined",
+            "Store signed percentages of the live bounds spacing and write both fade tracks together."},
+        FadeModeChoice{
+            TimingColouriseEdgeFadeMode::RelativeSeparate,
+            "Relative - Separate",
+            "Store independent signed percentages of the live bounds spacing."},
+        FadeModeChoice{
+            TimingColouriseEdgeFadeMode::Absolute,
+            "Absolute",
+            "Store independent scalar fade-end positions. They remain fixed when Lower or Upper changes."},
+    };
+    const auto currentFadeMode = std::find_if(
+        fadeModeChoices.begin(),
+        fadeModeChoices.end(),
+        [&](const auto& choice) {
+            return choice.mode == effect->edgeFadeMode;
+        });
+    const char* currentFadeModeLabel =
+        currentFadeMode != fadeModeChoices.end()
+            ? currentFadeMode->label
+            : fadeModeChoices.front().label;
+    SetNextTimingLabelledControlWidth("Fade Ends");
+    if (ImGui::BeginCombo("Fade Ends", currentFadeModeLabel)) {
+        for (const auto& choice : fadeModeChoices) {
+            const bool selected = effect->edgeFadeMode == choice.mode;
+            if (ImGui::Selectable(choice.label, selected) &&
+                invisible_places::timing::
+                    SetTimingColouriseEdgeFadeMode(
+                        effect,
+                        choice.mode,
+                        fadeModeSwitchPosition,
+                        fadeModeSwitchCyclic)) {
+                runtimeState->timingsPanel.activeHistogramHandle =
+                    TimingColouriseHistogramHandle::None;
+                runtimeState->timingsPanel
+                    .colouriseHistogramValueEdit.reset();
+                runtimeState->timingsPanel
+                    .colouriseBoundsValueEdit.reset();
+                runtimeState->previewRenderStateSignatureValid = false;
+            }
+            DrawTimingControlTooltip(choice.explanation);
+            if (selected) {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        ImGui::EndCombo();
+    }
+    DrawTimingLabelTooltip(
+        "Choose whether fade ends follow bounds as percentages or stay at fixed scalar values. Each mode remembers its own keys. A mode without keys starts unkeyed from the fade ends visible at the switch position.");
+    if (modeTableVisible) {
+        ImGui::EndTable();
+    }
     }
 
     if (!drawParameters) {
@@ -106161,18 +109953,17 @@ void DrawTimingColouriseBoundsEditor(
         ImGui::TextDisabled(
             "Legacy Bounds snapshot keys remain active as a fallback. New keys below override their individual coordinates.");
     }
-    // While the fades are linked one "Ends Fade" column drives both edge
-    // tracks together; separating them (double-click a fade handle in the
-    // histogram) splits the column in two, each tinted to match its
-    // histogram toggle.
-    const bool linkedFades = effect->edgeFadesLinked;
+    // Relative Joined presents one "Ends Fade" column that drives both edge
+    // tracks. Relative Separate and Absolute expose two tinted columns; the
+    // Fade Ends selector above owns that choice.
+    const bool linkedFades = invisible_places::timing::
+        TimingColouriseEdgeFadesAreLinked(effect->edgeFadeMode);
     struct BoundsColumn {
         TimingColouriseBoundsParameter parameter =
             TimingColouriseBoundsParameter::Lower;
         const char* label = "";
         ImU32 laneColour = IM_COL32_WHITE;
         bool mirrorLinkedFadePartner = false;
-        std::optional<ImU32> labelTint;
     };
     std::vector<BoundsColumn> columns{
         {TimingColouriseBoundsParameter::Lower,
@@ -106197,98 +109988,438 @@ void DrawTimingColouriseBoundsEditor(
     } else {
         columns.push_back(
             {TimingColouriseBoundsParameter::EdgeFadeLower,
-             "Lower Fade",
+             invisible_places::timing::
+                     TimingColouriseEdgeFadesAreAbsolute(
+                         effect->edgeFadeMode)
+                 ? "Lower Fade End"
+                 : "Lower Fade",
              kTimingSeparatedLowerFadeColour,
-             false,
-             kTimingSeparatedLowerFadeColour});
+             false});
         columns.push_back(
             {TimingColouriseBoundsParameter::EdgeFadeUpper,
-             "Upper Fade",
+             invisible_places::timing::
+                     TimingColouriseEdgeFadesAreAbsolute(
+                         effect->edgeFadeMode)
+                 ? "Upper Fade End"
+                 : "Upper Fade",
              kTimingSeparatedUpperFadeColour,
-             false,
-             kTimingSeparatedUpperFadeColour});
+             false});
     }
+    const int parameterColumns = TimingResponsiveColumnCount(
+        columns.size(),
+        100.0F,
+        static_cast<int>(columns.size()));
+    ImGui::PushFont(
+        nullptr,
+        ImGui::GetStyle().FontSizeBase * 0.84F);
     if (ImGui::BeginTable(
             "##BoundsParameters",
-            static_cast<int>(columns.size()),
-            ImGuiTableFlags_SizingStretchSame)) {
-        ImGui::TableNextRow();
-        for (std::size_t index = 0U;
-             index < columns.size();
-             ++index) {
-            ImGui::TableSetColumnIndex(
-                static_cast<int>(index));
-            const auto& column = columns[index];
+            parameterColumns,
+            ImGuiTableFlags_SizingStretchSame |
+                ImGuiTableFlags_NoSavedSettings |
+                ImGuiTableFlags_NoPadOuterX)) {
+        for (const auto& column : columns) {
+            ImGui::TableNextColumn();
             const bool allowed = invisible_places::timing::
                 TimingColouriseBoundsParameterIsAllowed(
                     effect->boundsKeyMode,
                     column.parameter);
-            const bool keyed =
-                TimingColouriseBoundsParameterHasKeys(
-                    *effect,
-                    column.parameter);
+            ImVec4 labelColour =
+                ImGui::ColorConvertU32ToFloat4(column.laneColour);
             if (!allowed) {
-                ImGui::TextDisabled("%s", column.label);
-            } else {
-                if (keyed) {
-                    ImGui::PushStyleColor(
-                        ImGuiCol_Text,
-                        kWaterKeyedSettingColour);
-                } else if (column.labelTint.has_value()) {
-                    ImGui::PushStyleColor(
-                        ImGuiCol_Text,
-                        column.labelTint.value());
-                }
-                ImGui::TextUnformatted(column.label);
-                if (keyed || column.labelTint.has_value()) {
-                    ImGui::PopStyleColor();
-                }
+                labelColour.w *= 0.48F;
             }
-        }
-        ImGui::TableNextRow();
-        for (std::size_t index = 0U;
-             index < columns.size();
-             ++index) {
-            ImGui::TableSetColumnIndex(
-                static_cast<int>(index));
+            ImGui::PushStyleColor(ImGuiCol_Text, labelColour);
+            ImGui::TextUnformatted(column.label);
+            ImGui::PopStyleColor();
             DrawTimingColouriseBoundsParameterEditor(
                 runtimeState,
                 effect,
-                columns[index].parameter,
-                columns[index].mirrorLinkedFadePartner);
+                column.parameter,
+                column.mirrorLinkedFadePartner);
         }
         ImGui::EndTable();
     }
-    std::vector<std::vector<float>> boundsKeyPositions(columns.size());
-    for (const auto& key : effect->boundsParameterKeys) {
-        for (std::size_t index = 0U; index < columns.size(); ++index) {
-            if (columns[index].parameter == key.parameter) {
-                boundsKeyPositions[index].push_back(key.position);
+    ImGui::PopFont();
+    ImGui::PopID();
+}
+
+void DrawTimingColouriseTopVisualControls(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::timing::TimingColouriseEffect* effect) {
+    if (runtimeState == nullptr || effect == nullptr) {
+        return;
+    }
+    if (effect->colouriseEnabled) {
+        DrawTimingColourisePaletteEditor(
+            runtimeState,
+            effect,
+            TimingColourisePaletteEditorPart::Sources);
+        const int blendColumns = TimingResponsiveColumnCount(
+            2U,
+            260.0F,
+            2);
+        if (ImGui::BeginTable(
+                "##TimingColouriseBlendRow",
+                blendColumns,
+                ImGuiTableFlags_NoSavedSettings |
+                    ImGuiTableFlags_NoPadOuterX |
+                    ImGuiTableFlags_SizingStretchSame)) {
+            ImGui::TableNextColumn();
+            (void)DrawTimingColouriseBlendModeCombo(
+                runtimeState,
+                effect);
+            ImGui::EndTable();
+        }
+    }
+    DrawTimingColouriseBoundsEditor(
+        runtimeState,
+        effect,
+        /*drawKeyMode=*/true,
+        /*drawParameters=*/false);
+}
+
+void DrawTimingColouriseUnifiedTimeline(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::timing::TimingColouriseEffect* effect) {
+    if (runtimeState == nullptr || effect == nullptr) {
+        return;
+    }
+    using invisible_places::timing::TimingColouriseBoundsParameter;
+    using invisible_places::timing::TimingColouriseEffectParameter;
+
+    auto& timings = runtimeState->timingsPanel;
+    ImGui::PushID(effect->id.c_str());
+    ImGui::TextDisabled("Visible key groups");
+    DrawTimingControlTooltip(
+        "Choose which key families share the graph below. Hiding a family "
+        "does not remove its keys, and each family snaps only to itself.");
+    struct TimelineVisibilityChoice {
+        const char* label = "";
+        bool* visible = nullptr;
+        const char* tooltip = "";
+    };
+    std::vector<TimelineVisibilityChoice> visibilityChoices{
+        {"Position##TimelineVisibility",
+         &timings.colourisePositionTimelineVisible,
+         "Show or hide Bounds Position curves. Their authored keys stay stored while hidden."},
+        {"Fade##TimelineVisibility",
+         &timings.colouriseFadeTimelineVisible,
+         "Show or hide Bounds Fade curves. Their authored keys stay stored while hidden."},
+        {"Skew##TimelineVisibility",
+         &timings.colouriseSkewTimelineVisible,
+         "Show or hide enabled Palette and Emissive skew curves. Their authored keys stay stored while hidden."},
+    };
+    if (effect->colouriseEnabled) {
+        visibilityChoices.push_back(
+            {"Palette##TimelineVisibility",
+             &timings.colourisePaletteTimelineVisible,
+             "Show or hide Colourise Amount, Colour Phase, and keyed palette-marker curves. Their authored keys stay stored while hidden."});
+    }
+    if (effect->emissiveEnabled) {
+        visibilityChoices.push_back(
+            {"Intensity##TimelineVisibility",
+             &timings.colouriseIntensityTimelineVisible,
+             "Show or hide Emissive Level and keyed falloff-node curves. Their authored keys stay stored while hidden."});
+    }
+    bool visibilityChanged = false;
+    const int visibilityColumns = TimingResponsiveColumnCount(
+        visibilityChoices.size(),
+        104.0F,
+        static_cast<int>(visibilityChoices.size()));
+    ImGui::PushFont(
+        nullptr,
+        ImGui::GetStyle().FontSizeBase * 0.88F);
+    if (ImGui::BeginTable(
+            "##VisualFeatureTimelineVisibility",
+            visibilityColumns,
+            ImGuiTableFlags_NoSavedSettings |
+                ImGuiTableFlags_SizingStretchSame |
+                ImGuiTableFlags_NoPadOuterX)) {
+        for (const auto& choice : visibilityChoices) {
+            ImGui::TableNextColumn();
+            visibilityChanged = ImGui::Checkbox(
+                                    choice.label,
+                                    choice.visible) ||
+                                visibilityChanged;
+            DrawTimingControlTooltip(choice.tooltip);
+        }
+        ImGui::EndTable();
+    }
+    ImGui::PopFont();
+    if (visibilityChanged) {
+        timings.colouriseLocalKeyDrag.reset();
+        ClearTimingColouriseGraphInteraction(&timings);
+    }
+
+    const auto appendBoundsLane =
+        [&](TimingColouriseBoundsParameter parameter,
+            const char* label,
+            ImU32 colour) {
+            TimingColouriseKeyLaneSeries lane{
+                .label = label,
+                .track = TimingColouriseKeyTrack::Bounds,
+                .boundsParameter = parameter,
+                .colour = colour,
+            };
+            for (const auto& key : effect->boundsParameterKeys) {
+                if (key.parameter == parameter) {
+                    lane.ownedPositions.push_back(key.position);
+                }
+            }
+            return lane;
+        };
+    const auto appendEffectLane =
+        [&](TimingColouriseEffectParameter parameter,
+            const char* label,
+            ImU32 colour) {
+            TimingColouriseKeyLaneSeries lane{
+                .label = label,
+                .track = TimingColouriseKeyTrack::EffectParameter,
+                .effectParameter = parameter,
+                .colour = colour,
+            };
+            for (const auto& key : effect->effectParameterKeys) {
+                if (key.parameter == parameter) {
+                    lane.ownedPositions.push_back(key.position);
+                }
+            }
+            return lane;
+        };
+
+    std::vector<TimingColouriseKeyLaneSeries> lanes;
+    lanes.reserve(20U);
+    constexpr std::array positionDefinitions{
+        std::tuple{
+            TimingColouriseBoundsParameter::Lower,
+            "Lower",
+            IM_COL32(255, 190, 74, 255)},
+        std::tuple{
+            TimingColouriseBoundsParameter::Upper,
+            "Upper",
+            IM_COL32(242, 104, 96, 255)},
+        std::tuple{
+            TimingColouriseBoundsParameter::Centre,
+            "Centre",
+            IM_COL32(100, 176, 232, 255)},
+        std::tuple{
+            TimingColouriseBoundsParameter::Spread,
+            "Spacing",
+            IM_COL32(190, 132, 224, 255)},
+    };
+    if (timings.colourisePositionTimelineVisible) {
+        for (const auto& [parameter, label, colour] :
+             positionDefinitions) {
+            if (invisible_places::timing::
+                    TimingColouriseBoundsParameterIsAllowed(
+                        effect->boundsKeyMode,
+                        parameter)) {
+                lanes.push_back(
+                    appendBoundsLane(parameter, label, colour));
             }
         }
     }
-    std::vector<TimingColouriseKeyLaneSeries> boundsLanes(columns.size());
-    for (std::size_t index = 0U;
-         index < columns.size();
-         ++index) {
-        boundsLanes[index] = TimingColouriseKeyLaneSeries{
-            .label = columns[index].label,
-            .track = TimingColouriseKeyTrack::Bounds,
-            .boundsParameter = columns[index].parameter,
-            .positions =
-                std::span<const float>{boundsKeyPositions[index]},
-            .colour = columns[index].laneColour,
-        };
+
+    if (timings.colouriseFadeTimelineVisible) {
+        if (invisible_places::timing::
+                TimingColouriseEdgeFadesAreLinked(
+                    effect->edgeFadeMode)) {
+            lanes.push_back(appendBoundsLane(
+                TimingColouriseBoundsParameter::EdgeFadeLower,
+                "Ends Fade",
+                kTimingLinkedFadeColour));
+        } else {
+            const bool absolute = invisible_places::timing::
+                TimingColouriseEdgeFadesAreAbsolute(
+                    effect->edgeFadeMode);
+            lanes.push_back(appendBoundsLane(
+                TimingColouriseBoundsParameter::EdgeFadeLower,
+                absolute ? "Lower Fade End" : "Lower Fade",
+                kTimingSeparatedLowerFadeColour));
+            lanes.push_back(appendBoundsLane(
+                TimingColouriseBoundsParameter::EdgeFadeUpper,
+                absolute ? "Upper Fade End" : "Upper Fade",
+                kTimingSeparatedUpperFadeColour));
+        }
     }
-    ImGui::TextDisabled("Value over animation position");
-    DrawTimingControlTooltip(
-        "Allowed Bounds settings are drawn as coloured evaluated curves. Left-drag dots to edit time and value, left-drag empty space to window-select, and use lower markers or Time-only drag to retime only. Right-drag scrubs.");
-    DrawTimingKeyLaneGroup(
-        "##TimingColouriseBoundsParameterKeyLane",
-        runtimeState,
-        effect,
-        boundsLanes);
+
+    if (timings.colouriseSkewTimelineVisible) {
+        if (effect->colouriseEnabled) {
+            lanes.push_back(appendEffectLane(
+                TimingColouriseEffectParameter::PaletteSkewCentre,
+                "Palette Skew Centre",
+                IM_COL32(186, 132, 232, 255)));
+            lanes.push_back(appendEffectLane(
+                TimingColouriseEffectParameter::PaletteSkewSpread,
+                "Palette Skew Spread",
+                IM_COL32(150, 142, 240, 255)));
+        }
+        if (effect->emissiveEnabled) {
+            lanes.push_back(appendEffectLane(
+                TimingColouriseEffectParameter::EmissiveSkewCentre,
+                "Falloff Skew Centre",
+                IM_COL32(226, 145, 116, 255)));
+            lanes.push_back(appendEffectLane(
+                TimingColouriseEffectParameter::EmissiveSkewSpread,
+                "Falloff Skew Spread",
+                IM_COL32(250, 178, 120, 255)));
+        }
+    }
+
+    if (effect->colouriseEnabled &&
+        timings.colourisePaletteTimelineVisible) {
+        AppendTimingColourisePaletteTimelineLanes(effect, &lanes);
+    }
+    if (effect->emissiveEnabled &&
+        timings.colouriseIntensityTimelineVisible) {
+        AppendTimingEmissiveTimelineLanes(effect, &lanes);
+    }
+
+    // Growth above can relocate every owned label/position vector. Bind the
+    // non-owning views only after the final visible lane set is stable.
+    for (auto& lane : lanes) {
+        if (!lane.ownedLabel.empty()) {
+            lane.label = lane.ownedLabel.c_str();
+        }
+        lane.positions = std::span<const float>{lane.ownedPositions};
+    }
+    if (lanes.empty()) {
+        ImGui::TextDisabled(
+            "Select at least one key group to show its curves.");
+    } else {
+        ImGui::TextDisabled("Values over animation position");
+        DrawTimingControlTooltip(
+            "All enabled Visual Feature key groups share this graph. Position, Fade, Skew, Palette, and Intensity each snap only to their own kind. Every curve keeps its existing value range and typed key behaviour. Double-click open graph space to add a key on the only or nearest visible curve; drag a dot to edit time and value, drag its lower marker to retime only, left-drag empty space to window-select, and right-drag to scrub.");
+        DrawTimingKeyLaneGroup(
+            "##TimingColouriseUnifiedKeyLane",
+            runtimeState,
+            effect,
+            lanes);
+    }
     ImGui::PopID();
+}
+
+void DrawTimingColouriseCompactNumberEditors(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::timing::TimingColouriseEffect* effect) {
+    if (runtimeState == nullptr || effect == nullptr) {
+        return;
+    }
+    using invisible_places::timing::TimingColouriseEffectParameter;
+    std::vector<TimingColouriseEffectParameter> parameters;
+    parameters.reserve(7U);
+    if (effect->colouriseEnabled) {
+        parameters.push_back(
+            TimingColouriseEffectParameter::PaletteSkewCentre);
+        parameters.push_back(
+            TimingColouriseEffectParameter::PaletteSkewSpread);
+        parameters.push_back(
+            TimingColouriseEffectParameter::AmountOverride);
+        parameters.push_back(
+            TimingColouriseEffectParameter::PalettePhase);
+    }
+    if (effect->emissiveEnabled) {
+        parameters.push_back(
+            TimingColouriseEffectParameter::EmissiveSkewCentre);
+        parameters.push_back(
+            TimingColouriseEffectParameter::EmissiveSkewSpread);
+        parameters.push_back(
+            TimingColouriseEffectParameter::EmissiveLevel);
+    }
+    if (parameters.empty()) {
+        return;
+    }
+    const int columns = TimingResponsiveColumnCount(
+        std::max<std::size_t>(parameters.size(), 6U),
+        100.0F,
+        6);
+    ImGui::PushFont(
+        nullptr,
+        ImGui::GetStyle().FontSizeBase * 0.84F);
+    if (ImGui::BeginTable(
+            "##TimingVisualFeatureNumericControls",
+            columns,
+            ImGuiTableFlags_SizingStretchSame |
+                ImGuiTableFlags_NoSavedSettings |
+                ImGuiTableFlags_NoPadOuterX)) {
+        for (const auto parameter : parameters) {
+            ImGui::TableNextColumn();
+            (void)DrawTimingColouriseEffectParameterEditor(
+                runtimeState,
+                effect,
+                parameter);
+        }
+        ImGui::EndTable();
+    }
+    ImGui::PopFont();
+}
+
+void DrawTimingVisualFeatureAspectToggles(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::timing::TimingColouriseEffect* effect) {
+    if (runtimeState == nullptr || effect == nullptr) {
+        return;
+    }
+    {
+        const bool onlyEnabledAspect =
+            effect->colouriseEnabled &&
+            !effect->emissiveEnabled;
+        ImGui::BeginDisabled(onlyEnabledAspect);
+        bool colouriseEnabled = effect->colouriseEnabled;
+        if (ImGui::Checkbox(
+                "Colourise##Aspect",
+                &colouriseEnabled)) {
+            effect->colouriseEnabled = colouriseEnabled;
+            *effect = invisible_places::timing::
+                SanitizeTimingColouriseEffect(*effect);
+            runtimeState->timingsPanel.colouriseLocalKeyDrag.reset();
+            ClearTimingColouriseGraphInteraction(
+                &runtimeState->timingsPanel);
+            runtimeState->previewRenderStateSignatureValid =
+                false;
+        }
+        ImGui::EndDisabled();
+        DrawTimingControlTooltip(
+            onlyEnabledAspect
+                ? "A Visual Feature needs at least one output aspect."
+            : effect->colouriseEnabled
+                ? "Disable this feature's colourise output. Its palette, stops, and keys stay stored but dormant."
+                : "Add palette colourise output to this feature. A feature with both aspects uses two of the eight renderer slots while active.");
+    }
+    ImGui::SameLine(0.0F, 12.0F);
+    {
+        const bool scalarSource =
+            effect->field.source ==
+            invisible_places::timing::
+                TimingColouriseFieldSource::Scalar;
+        const bool onlyEnabledAspect =
+            effect->emissiveEnabled &&
+            !effect->colouriseEnabled;
+        ImGui::BeginDisabled(
+            !scalarSource || onlyEnabledAspect);
+        bool emissiveEnabled = effect->emissiveEnabled;
+        if (ImGui::Checkbox(
+                "Emissive##Aspect",
+                &emissiveEnabled)) {
+            effect->emissiveEnabled = emissiveEnabled;
+            *effect = invisible_places::timing::
+                SanitizeTimingColouriseEffect(*effect);
+            runtimeState->timingsPanel.colouriseLocalKeyDrag.reset();
+            ClearTimingColouriseGraphInteraction(
+                &runtimeState->timingsPanel);
+            runtimeState->previewRenderStateSignatureValid =
+                false;
+        }
+        ImGui::EndDisabled();
+        DrawTimingControlTooltip(
+            !scalarSource
+                ? "Emissive output needs a Scalar field source. Normal components cannot drive emission."
+            : onlyEnabledAspect
+                ? "A Visual Feature needs at least one output aspect."
+            : effect->emissiveEnabled
+                ? "Disable this feature's emissive output. Its Emissive Level track stays stored but dormant."
+                : "Add field-masked emissive output to this feature. A feature with both aspects uses two of the eight renderer slots while active.");
+    }
 }
 
 struct TimingColouriseActivationConcurrencySpan {
@@ -106418,8 +110549,7 @@ void DrawTimingColouriseTimelineZoomToggle(
     }
     if (ResolveAnimationTimelineCoordinateContext(*runtimeState)
             .linkedCyclic) {
-        ImGui::TextDisabled(
-            "Setting lanes follow the linked-loop focus above.");
+        ImGui::TextDisabled("Linked-loop focus");
         DrawTimingControlTooltip(
             "Linked animations share the signed -1 to +1 focus lens. Setting keys remain stored on their authored 0..1 phase.");
         return;
@@ -106429,7 +110559,7 @@ void DrawTimingColouriseTimelineZoomToggle(
         timings.colouriseTimelineView ==
         TimingColouriseTimelineView::ActiveRange;
     if (ImGui::Checkbox(
-            "Zoom setting lanes to active range",
+            "Zoom lanes to active range",
             &activeRangeView)) {
         timings.colouriseTimelineView =
             activeRangeView
@@ -107891,6 +112021,8 @@ void DrawTimingColouriseSection(
     ImGui::SameLine();
     ImGui::BeginDisabled(!hasSelection);
     if (ImGui::Button("Delete") && hasSelection) {
+        timings.selectedBoundsProfileByEffectId.erase(
+            effects[timings.selectedColouriseEffectIndex.value()].id);
         effects.erase(
             effects.begin() +
             static_cast<std::ptrdiff_t>(
@@ -107932,15 +112064,64 @@ void DrawTimingColouriseSection(
         "Name",
         &effect.name);
     DrawTimingLabelTooltip(
-        "Rename this Visual Feature. Its output aspects are toggled in the Emissive and Colourise sections below.");
-    if (ImGui::Checkbox(
-            "Apply To Water Cloud",
-            &effect.applyToWaterFill)) {
-        runtimeState->previewRenderStateSignatureValid = false;
+        "Rename this Visual Feature. Its output aspects are toggled in the row below.");
+    const int featureFlagColumns = TimingResponsiveColumnCount(
+        2U,
+        240.0F,
+        2);
+    if (ImGui::BeginTable(
+            "##TimingVisualFeatureFlags",
+            featureFlagColumns,
+            ImGuiTableFlags_NoSavedSettings |
+                ImGuiTableFlags_NoPadOuterX |
+                ImGuiTableFlags_SizingStretchSame)) {
+        ImGui::TableNextColumn();
+        if (ImGui::Checkbox(
+                "Apply To Water Cloud",
+                &effect.applyToWaterFill)) {
+            runtimeState->previewRenderStateSignatureValid = false;
+        }
+        DrawTimingControlTooltip(
+            "Include the generated standing-water sheet in this Visual "
+            "Feature. Untick it to affect only the scanned point clouds.");
+        ImGui::TableNextColumn();
+        if (ImGui::Checkbox(
+                "Field-Linked Visuals",
+                &effect.fieldScopedVisualSettings)) {
+            if (effect.fieldScopedVisualSettings) {
+                // Turning the link on adopts the current settings as this
+                // field's remembered state.
+                invisible_places::timing::StashTimingColouriseFieldVisuals(
+                    &effect);
+            }
+            runtimeState->previewRenderStateSignatureValid = false;
+        }
+        DrawTimingControlTooltip(
+            "When on, each scalar field remembers its own palette, visual "
+            "keys, phase, amounts, skew, loop, and emissive level. When off, "
+            "one visual setup is shared as you change fields. Bounds remain "
+            "remembered per field in both modes.");
+        ImGui::EndTable();
     }
-    DrawTimingLabelTooltip(
-        "The generated standing-water sheet carries flat curvature and roughness fields, so a feature bound to those fields paints the whole sheet with one dominant colour. Untick to leave the water cloud out of this Visual Feature; every scanned cloud keeps it.");
-    DrawTimingColouriseTimelineZoomToggle(runtimeState);
+    ImGui::SeparatorText("Output Aspects");
+    const int outputControlColumns = TimingResponsiveColumnCount(
+        2U,
+        280.0F,
+        2);
+    if (ImGui::BeginTable(
+            "##TimingVisualFeatureOutputControls",
+            outputControlColumns,
+            ImGuiTableFlags_NoSavedSettings |
+                ImGuiTableFlags_NoPadOuterX |
+                ImGuiTableFlags_SizingStretchSame)) {
+        ImGui::TableNextColumn();
+        DrawTimingVisualFeatureAspectToggles(
+            runtimeState,
+            &effect);
+        ImGui::TableNextColumn();
+        DrawTimingColouriseTimelineZoomToggle(runtimeState);
+        ImGui::EndTable();
+    }
     ImGui::SeparatorText("Scalar Field and Bounds");
     auto catalog =
         BuildActiveTimingColouriseFieldCatalog(
@@ -107964,7 +112145,9 @@ void DrawTimingColouriseSection(
     if (catalog.empty()) {
         ImGui::TextDisabled(
             "Load a committed SAND / ROCK / VEG scene bundle to choose fields and compute a histogram.");
-        DrawTimingColouriseBoundsEditor(
+        // Keep visual-source and key-mode management available for an
+        // existing feature while its scalar catalogue is temporarily absent.
+        DrawTimingColouriseTopVisualControls(
             runtimeState,
             &effect);
     } else {
@@ -108010,7 +112193,12 @@ void DrawTimingColouriseSection(
                 if (selector == effect.field) {
                     return;
                 }
-                auto fallbackBounds = effect.baseBounds;
+                auto fallbackBounds = invisible_places::timing::
+                    ConvertTimingColouriseBoundsEdgeFadeMode(
+                        effect.baseBounds,
+                        effect.edgeFadeMode,
+                        invisible_places::timing::
+                            TimingColouriseEdgeFadeMode::RelativeSeparate);
                 if (const auto range =
                         TimingColouriseSelectorRangeFromStats(
                             runtimeState,
@@ -108034,6 +112222,8 @@ void DrawTimingColouriseSection(
                                     water
                                         .timingScalarBoundsStores),
                                 selector));
+                timings.selectedBoundsProfileByEffectId.erase(
+                    effect.id);
                 runtimeState->previewRenderStateSignatureValid =
                     false;
             };
@@ -108113,6 +112303,20 @@ void DrawTimingColouriseSection(
             familyIndex = catalog.size() - 1U;
             variantIndex = 0U;
         }
+        const int scalarColumns = TimingResponsiveColumnCount(
+            2U,
+            270.0F,
+            2);
+        const bool scalarTableVisible = ImGui::BeginTable(
+            "##TimingColouriseScalarSelection",
+            scalarColumns,
+            ImGuiTableFlags_NoSavedSettings |
+                ImGuiTableFlags_NoPadOuterX |
+                ImGuiTableFlags_SizingStretchSame);
+        if (scalarTableVisible) {
+            ImGui::TableNextColumn();
+        }
+        SetNextTimingLabelledControlWidth("Scalar Family");
         if (ImGui::BeginCombo(
                 "Scalar Family",
                 catalog[familyIndex].name.c_str())) {
@@ -108142,11 +112346,15 @@ void DrawTimingColouriseSection(
         }
         DrawTimingLabelTooltip(
             "Choose a scalar family shared by committed SAND, ROCK, and VEG. Related scale and vector components are grouped. Switching fields keeps every field's Bounds authoring remembered.");
+        if (scalarTableVisible) {
+            ImGui::TableNextColumn();
+        }
         const auto& variants =
             catalog[familyIndex].variants;
         variantIndex = std::min(
             variantIndex,
             variants.size() - 1U);
+        SetNextTimingLabelledControlWidth("Variant");
         if (ImGui::BeginCombo(
                 "Variant",
                 variants[variantIndex].name.c_str())) {
@@ -108174,18 +112382,83 @@ void DrawTimingColouriseSection(
         }
         DrawTimingLabelTooltip(
             "Choose Fine, Medium, Broad, Combined, X, Y, Z, Magnitude, or the available single variant. The chosen variant is remembered per family.");
+        if (scalarTableVisible) {
+            ImGui::EndTable();
+        }
         auto& boundsStores = water.timingScalarBoundsStores;
         const auto* boundsStore =
             invisible_places::timing::
                 FindTimingScalarBoundsStore(
                     std::as_const(boundsStores),
                     effect.field);
+        std::string activeBoundsProfileName;
+        if (const auto active =
+                timings.selectedBoundsProfileByEffectId.find(
+                    effect.id);
+            active !=
+                timings.selectedBoundsProfileByEffectId.end()) {
+            const bool stillExists = boundsStore != nullptr &&
+                std::any_of(
+                    boundsStore->profiles.begin(),
+                    boundsStore->profiles.end(),
+                    [&](const auto& profile) {
+                        return profile.name == active->second;
+                    });
+            if (stillExists) {
+                activeBoundsProfileName = active->second;
+            } else {
+                timings.selectedBoundsProfileByEffectId.erase(active);
+            }
+        }
+        const auto* histogram =
+            EnsureTimingColouriseHistogram(
+                runtimeState,
+                effect.field);
+        const bool spreadAvailable =
+            histogram != nullptr &&
+            std::isfinite(histogram->data.minimum) &&
+            std::isfinite(histogram->data.maximum) &&
+            histogram->data.maximum > histogram->data.minimum;
+        bool useDistributionSpread =
+            histogram != nullptr &&
+            timings.spreadColouriseHistogramSignatures.contains(
+                histogram->signature);
+        const auto compactControlButtonWidth = [](const char* label) {
+            return ImGui::CalcTextSize(label).x +
+                   ImGui::GetStyle().FramePadding.x * 2.0F;
+        };
+        const float boundsProfileActionWidth =
+            compactControlButtonWidth("+") +
+            compactControlButtonWidth("Save") +
+            compactControlButtonWidth("X") + 6.0F;
+        const int boundsSelectionColumns = TimingResponsiveColumnCount(
+            2U,
+            290.0F,
+            2);
+        const bool boundsSelectionTableVisible = ImGui::BeginTable(
+            "##TimingColouriseBoundsSelection",
+            boundsSelectionColumns,
+            ImGuiTableFlags_NoSavedSettings |
+                ImGuiTableFlags_NoPadOuterX |
+                ImGuiTableFlags_SizingStretchSame);
+        if (boundsSelectionTableVisible) {
+            ImGui::TableNextColumn();
+        }
+        SetNextTimingLabelledControlWidth(
+            "Bounds Profile",
+            boundsProfileActionWidth);
         if (ImGui::BeginCombo(
                 "Bounds Profile",
-                effect.boundsEdited ? "Edited" : "Global")) {
+                !activeBoundsProfileName.empty()
+                    ? activeBoundsProfileName.c_str()
+                    : effect.boundsEdited ? "Edited" : "Global")) {
             if (effect.boundsEdited) {
-                if (ImGui::Selectable("Edited", true)) {
-                    // The live local edit is already active.
+                if (ImGui::Selectable(
+                        "Edited",
+                        activeBoundsProfileName.empty())) {
+                    timings.selectedBoundsProfileByEffectId.erase(
+                        effect.id);
+                    activeBoundsProfileName.clear();
                 }
                 DrawTimingControlTooltip(
                     "This feature's Bounds are a local edit detached from the shared Global bounds for this scalar field.");
@@ -108196,10 +112469,19 @@ void DrawTimingColouriseSection(
                     !effect.boundsEdited) &&
                 boundsStore != nullptr) {
                 effect.baseBounds =
-                    boundsStore->globalBounds;
+                    invisible_places::timing::
+                        ConvertTimingColouriseBoundsEdgeFadeMode(
+                            boundsStore->globalBounds,
+                            invisible_places::timing::
+                                TimingColouriseEdgeFadeMode::
+                                    RelativeSeparate,
+                            effect.edgeFadeMode);
                 effect.boundsEdited = false;
                 effect.boundsAdoptedGlobalRevision =
                     boundsStore->revision;
+                timings.selectedBoundsProfileByEffectId.erase(
+                    effect.id);
+                activeBoundsProfileName.clear();
                 runtimeState
                     ->previewRenderStateSignatureValid =
                     false;
@@ -108214,12 +112496,19 @@ void DrawTimingColouriseSection(
                      boundsStore->profiles) {
                     if (ImGui::Selectable(
                             profile.name.c_str(),
-                            false)) {
+                            profile.name == activeBoundsProfileName)) {
                         effect.baseBounds =
                             invisible_places::timing::
-                                SanitizeTimingColouriseBounds(
-                                    profile.bounds);
+                                ConvertTimingColouriseBoundsEdgeFadeMode(
+                                    profile.bounds,
+                                    invisible_places::timing::
+                                        TimingColouriseEdgeFadeMode::
+                                            RelativeSeparate,
+                                    effect.edgeFadeMode);
                         effect.boundsEdited = true;
+                        timings.selectedBoundsProfileByEffectId
+                            [effect.id] = profile.name;
+                        activeBoundsProfileName = profile.name;
                         runtimeState
                             ->previewRenderStateSignatureValid =
                             false;
@@ -108232,7 +112521,7 @@ void DrawTimingColouriseSection(
         }
         DrawTimingLabelTooltip(
             "Bounds provenance for this scalar field. Global follows the latest edit shared across features, Edited is this feature's detached local state, and named profiles are saved states to reapply.");
-        ImGui::SameLine();
+        ImGui::SameLine(0.0F, 2.0F);
         if (ImGui::SmallButton("+##SaveBoundsProfile")) {
             timings.boundsProfileNameBuffer =
                 "Bounds " +
@@ -108245,6 +112534,70 @@ void DrawTimingColouriseSection(
         }
         DrawTimingControlTooltip(
             "Save the current Bounds as a named profile for this scalar field so any feature can reapply them.");
+        ImGui::SameLine(0.0F, 2.0F);
+        ImGui::BeginDisabled(activeBoundsProfileName.empty());
+        if (ImGui::SmallButton("Save##UpdateBoundsProfile")) {
+            if (auto* store =
+                    invisible_places::timing::
+                        FindTimingScalarBoundsStore(
+                            &boundsStores,
+                            effect.field);
+                store != nullptr) {
+                const auto profile = std::find_if(
+                    store->profiles.begin(),
+                    store->profiles.end(),
+                    [&](const auto& candidate) {
+                        return candidate.name ==
+                               activeBoundsProfileName;
+                    });
+                if (profile != store->profiles.end()) {
+                    profile->bounds = invisible_places::timing::
+                        ConvertTimingColouriseBoundsEdgeFadeMode(
+                            effect.baseBounds,
+                            effect.edgeFadeMode,
+                            invisible_places::timing::
+                                TimingColouriseEdgeFadeMode::
+                                    RelativeSeparate);
+                    runtimeState->statusMessage =
+                        "Updated bounds profile " +
+                        activeBoundsProfileName + ".";
+                }
+            }
+        }
+        ImGui::EndDisabled();
+        DrawTimingControlTooltip(
+            activeBoundsProfileName.empty()
+                ? "Choose a named Bounds profile before overwriting it."
+                : "Overwrite the selected named Bounds profile with the current values.");
+        ImGui::SameLine(0.0F, 2.0F);
+        ImGui::BeginDisabled(activeBoundsProfileName.empty());
+        if (ImGui::SmallButton("X##DeleteBoundsProfile")) {
+            if (auto* store =
+                    invisible_places::timing::
+                        FindTimingScalarBoundsStore(
+                            &boundsStores,
+                            effect.field);
+                store != nullptr) {
+                const std::string deletedName =
+                    activeBoundsProfileName;
+                std::erase_if(
+                    store->profiles,
+                    [&](const auto& candidate) {
+                        return candidate.name == deletedName;
+                    });
+                timings.selectedBoundsProfileByEffectId.erase(
+                    effect.id);
+                activeBoundsProfileName.clear();
+                runtimeState->statusMessage =
+                    "Deleted bounds profile " + deletedName +
+                    "; the feature kept its current Edited bounds.";
+            }
+        }
+        ImGui::EndDisabled();
+        DrawTimingControlTooltip(
+            activeBoundsProfileName.empty()
+                ? "Choose a named Bounds profile before deleting it."
+                : "Delete the selected named profile. This feature keeps its current values as Edited bounds.");
         if (ImGui::BeginPopup("Save Bounds Profile")) {
             ImGui::SetNextItemWidth(220.0F);
             InputTextString(
@@ -108296,15 +112649,30 @@ void DrawTimingColouriseSection(
                                profileName;
                     });
                 if (existing != store->profiles.end()) {
-                    existing->bounds = effect.baseBounds;
+                    existing->bounds = invisible_places::timing::
+                        ConvertTimingColouriseBoundsEdgeFadeMode(
+                            effect.baseBounds,
+                            effect.edgeFadeMode,
+                            invisible_places::timing::
+                                TimingColouriseEdgeFadeMode::
+                                    RelativeSeparate);
                 } else {
                     store->profiles.push_back(
                         {.name = profileName,
-                         .bounds = effect.baseBounds});
+                         .bounds = invisible_places::timing::
+                             ConvertTimingColouriseBoundsEdgeFadeMode(
+                                 effect.baseBounds,
+                                 effect.edgeFadeMode,
+                                 invisible_places::timing::
+                                     TimingColouriseEdgeFadeMode::
+                                         RelativeSeparate)});
                 }
                 runtimeState->statusMessage =
                     "Saved bounds profile " + profileName +
                     ".";
+                timings.selectedBoundsProfileByEffectId
+                    [effect.id] = profileName;
+                activeBoundsProfileName = profileName;
                 timings.boundsProfileNameBuffer.clear();
                 ImGui::CloseCurrentPopup();
             }
@@ -108313,19 +112681,10 @@ void DrawTimingColouriseSection(
                 "Save the current Bounds under this name. An existing profile with the same name is replaced.");
             ImGui::EndPopup();
         }
-        const auto* histogram =
-            EnsureTimingColouriseHistogram(
-                runtimeState,
-                effect.field);
-        const bool spreadAvailable =
-            histogram != nullptr &&
-            std::isfinite(histogram->data.minimum) &&
-            std::isfinite(histogram->data.maximum) &&
-            histogram->data.maximum > histogram->data.minimum;
-        bool useDistributionSpread =
-            histogram != nullptr &&
-            timings.spreadColouriseHistogramSignatures.contains(
-                histogram->signature);
+        if (boundsSelectionTableVisible) {
+            ImGui::TableNextColumn();
+        }
+        SetNextTimingLabelledControlWidth("Histogram Axis");
         ImGui::BeginDisabled(!spreadAvailable);
         if (ImGui::BeginCombo(
                 "Histogram Axis",
@@ -108357,6 +112716,12 @@ void DrawTimingColouriseSection(
             spreadAvailable
                 ? "Raw Values uses the scalar's linear range. Distribution Spread uses the cached 16,384-bin distribution to reveal concentrated detail and give it more mouse resolution. It changes only this editing graph; Bounds keys, rendering, and export stay in raw scalar units."
                 : "The editing axis becomes available when this finite, non-constant histogram is ready.");
+        if (boundsSelectionTableVisible) {
+            ImGui::EndTable();
+        }
+        DrawTimingColouriseTopVisualControls(
+            runtimeState,
+            &effect);
         DrawTimingColouriseHistogram(
             runtimeState,
             &effect,
@@ -108367,88 +112732,34 @@ void DrawTimingColouriseSection(
                           DistributionSpread
                 : invisible_places::timing::
                       TimingColouriseHistogramAxisMode::Raw);
-        DrawTimingColouriseBoundsEditor(
+    }
+    if (effect.colouriseEnabled) {
+        ImGui::SeparatorText("Colour Palette");
+        DrawTimingColourisePaletteEditor(
+            runtimeState,
+            &effect,
+            TimingColourisePaletteEditorPart::Interactive);
+    }
+    if (effect.emissiveEnabled) {
+        ImGui::SeparatorText("Emissive Falloff");
+        DrawTimingEmissiveInteractiveEditor(
             runtimeState,
             &effect);
     }
-    if (ImGui::Checkbox(
-            "Field-Linked Visuals",
-            &effect.fieldScopedVisualSettings)) {
-        if (effect.fieldScopedVisualSettings) {
-            // Turning the link on adopts the current settings as this
-            // field's remembered state.
-            invisible_places::timing::StashTimingColouriseFieldVisuals(
-                &effect);
-        }
-        runtimeState->previewRenderStateSignatureValid = false;
-    }
-    DrawTimingLabelTooltip(
-        "When ticked, the Colourise and Emissive settings below - palette, its keys, phase, amounts, skew, loop, and emissive level - follow the selected scalar field: switching fields restores what each field was using, and Bounds already do. Untick for one global set of settings shared across every field. A field visited for the first time keeps the current settings either way.");
-    ImGui::SeparatorText("Emissive");
-    {
-        const bool scalarSource =
-            effect.field.source ==
-            invisible_places::timing::
-                TimingColouriseFieldSource::Scalar;
-        const bool onlyEnabledAspect =
-            effect.emissiveEnabled &&
-            !effect.colouriseEnabled;
-        ImGui::BeginDisabled(
-            !scalarSource || onlyEnabledAspect);
-        bool emissiveEnabled = effect.emissiveEnabled;
-        if (ImGui::Checkbox(
-                "Emissive##Aspect",
-                &emissiveEnabled)) {
-            effect.emissiveEnabled = emissiveEnabled;
-            effect = invisible_places::timing::
-                SanitizeTimingColouriseEffect(effect);
-            runtimeState->previewRenderStateSignatureValid =
-                false;
-        }
-        ImGui::EndDisabled();
-        DrawTimingControlTooltip(
-            !scalarSource
-                ? "Emissive output needs a Scalar field source. Normal components cannot drive emission."
-            : onlyEnabledAspect
-                ? "A Visual Feature needs at least one output aspect."
-            : effect.emissiveEnabled
-                ? "Disable this feature's emissive output. Its Emissive Level track stays stored but dormant."
-                : "Add field-masked emissive output to this feature. A feature with both aspects uses two of the eight renderer slots while active.");
-        if (effect.emissiveEnabled) {
-            DrawTimingEmissiveLevelEditor(
-                runtimeState,
-                &effect);
-        }
-    }
-    ImGui::SeparatorText("Colourise");
-    {
-        const bool onlyEnabledAspect =
-            effect.colouriseEnabled &&
-            !effect.emissiveEnabled;
-        ImGui::BeginDisabled(onlyEnabledAspect);
-        bool colouriseEnabled = effect.colouriseEnabled;
-        if (ImGui::Checkbox(
-                "Colourise##Aspect",
-                &colouriseEnabled)) {
-            effect.colouriseEnabled = colouriseEnabled;
-            effect = invisible_places::timing::
-                SanitizeTimingColouriseEffect(effect);
-            runtimeState->previewRenderStateSignatureValid =
-                false;
-        }
-        ImGui::EndDisabled();
-        DrawTimingControlTooltip(
-            onlyEnabledAspect
-                ? "A Visual Feature needs at least one output aspect."
-            : effect.colouriseEnabled
-                ? "Disable this feature's colourise output. Its palette, stops, and keys stay stored but dormant."
-                : "Add palette colourise output to this feature. A feature with both aspects uses two of the eight renderer slots while active.");
-        if (effect.colouriseEnabled) {
-            DrawTimingColourisePaletteEditor(
-                runtimeState,
-                &effect);
-        }
-    }
+    ImGui::SeparatorText("Keyframe Timeline");
+    DrawTimingColouriseUnifiedTimeline(
+        runtimeState,
+        &effect);
+
+    ImGui::SeparatorText("Numeric Settings");
+    DrawTimingColouriseBoundsEditor(
+        runtimeState,
+        &effect,
+        /*drawKeyMode=*/false,
+        /*drawParameters=*/true);
+    DrawTimingColouriseCompactNumberEditors(
+        runtimeState,
+        &effect);
     EndPanelSection();
 }
 
@@ -110376,7 +114687,7 @@ bool DrawAnimationTimelineViewRangeSelector(
 
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip(
-            "Drag either end to zoom Feature Run timelines; drag the highlighted middle to pan.\nDouble-click or press Full to reset. Stored key times, playback, and exports remain unchanged.");
+            "Drag either end to zoom Feature Run timelines; drag the highlighted middle to pan.\nThe focused range also prepares a fixed-density live frustum mask for unlinked animation cameras. Double-click or press Full to reset. Stored key times, playback, and exports remain unchanged.");
     }
     ImGui::PopID();
 
@@ -113467,6 +117778,14 @@ bool PreviewLiveVisualEffectsRequireSceneRedraw(
             overlayPtr,
             scenario,
             &fixedOverlay);
+    const bool resolvedShorelinesAnimate = std::any_of(
+        resolvedShorelines.begin(),
+        resolvedShorelines.end(),
+        [](const PointCloudShorelineWaveSettings& shoreline) {
+            return invisible_places::renderer::pointcloud::
+                PointCloudShorelineWaveSettingsHasActiveMotion(
+                    shoreline);
+        });
 
     for (std::size_t sessionIndex = 0; sessionIndex < runtimeState.sessions.size(); ++sessionIndex) {
         const auto& session = runtimeState.sessions[sessionIndex];
@@ -113475,7 +117794,7 @@ bool PreviewLiveVisualEffectsRequireSceneRedraw(
         }
         auto renderStyle = MakeSceneRenderStyle(runtimeState, session, session.pointStyle);
         ClearPointCloudStyleShoreline(&renderStyle);
-        if (!resolvedShorelines.empty() &&
+        if (resolvedShorelinesAnimate &&
             ShorelineWaveEligibleSession(session)) {
             return true;
         }
@@ -113618,6 +117937,30 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                        runtimeState.sessions[sessionIndex].gpuResident &&
                        viewport.HasPointCloudResources(sessionIndex);
             });
+    const bool linkedHqEnabled =
+        linkedHqLiveReady && runtimeState.linkedHqPreview.ready &&
+        runtimeState.linkedHqPreview.enabled &&
+        runtimeState.linkedHqPreview.publishedFingerprint != 0U;
+    const bool adaptiveHqEnabled =
+        linkedHqEnabled && runtimeState.linkedHqPreview.adaptiveEnabled;
+    const bool adaptiveHqCoverageValid =
+        adaptiveHqEnabled &&
+        runtimeState.linkedHqPreview.publishedAdaptiveTransition.Valid() &&
+        LinkedHqFrustumUnionCoversView(
+            runtimeState.linkedHqPreview.publishedPatchFrustums,
+            matrices.view,
+            matrices.projection,
+            runtimeState.linkedHqPreview.publishedAdaptiveTransition
+                .endDepthMeters);
+    const auto linkedHqPatchDrawPolicy = ResolveLinkedHqPatchDrawPolicy(
+        linkedHqEnabled,
+        adaptiveHqEnabled,
+        adaptiveHqCoverageValid,
+        runtimeState.linkedHqPreview.publishedAdaptiveTransition.Valid());
+    if (linkedHqPatchDrawPolicy.applyFineAdaptiveDensity) {
+        renderState.adaptiveDensityTransition =
+            runtimeState.linkedHqPreview.publishedAdaptiveTransition;
+    }
 
     for (std::size_t sessionIndex = 0; sessionIndex < runtimeState.sessions.size(); ++sessionIndex) {
         const auto& session = runtimeState.sessions[sessionIndex];
@@ -113630,9 +117973,8 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
             if (!renderable) {
                 continue;
             }
-            if (linkedHqLiveReady &&
-                runtimeState.linkedHqPreview.ready &&
-                runtimeState.linkedHqPreview.enabled) {
+            const LinkedHqPatchRuntime* matchingHqPatch = nullptr;
+            if (linkedHqEnabled) {
                 const auto hqPatch = std::find_if(
                     runtimeState.linkedHqPreview.patches.begin(),
                     runtimeState.linkedHqPreview.patches.end(),
@@ -113640,6 +117982,10 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                         return patch.baseSessionIndex == sessionIndex;
                     });
                 if (hqPatch !=
+                    runtimeState.linkedHqPreview.patches.end()) {
+                    matchingHqPatch = &*hqPatch;
+                }
+                if (!adaptiveHqEnabled && hqPatch !=
                         runtimeState.linkedHqPreview.patches.end() &&
                     hqPatch->fiveMillimeterOutsideIndices.empty()) {
                     continue;
@@ -113706,6 +118052,13 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                  .worldMaxZ = session.bounds.maximum.z,
                  .drawPointCount = static_cast<std::uint32_t>(drawPointCount),
                  .densityCompensation = ResolveSessionDensityCompensation(runtimeState, session),
+                 .adaptiveDensityRole =
+                     linkedHqPatchDrawPolicy.applyCoarseAdaptiveDensity &&
+                             matchingHqPatch != nullptr
+                         ? invisible_places::renderer::pointcloud::
+                               PointCloudAdaptiveDensityRole::Coarse
+                         : invisible_places::renderer::pointcloud::
+                               PointCloudAdaptiveDensityRole::Disabled,
                  .rainCollisionRole = RainCollisionRoleForSession(session)});
         } else {
             if (!session.loaded || !session.visible) {
@@ -113726,14 +118079,22 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
         }
     }
 
-    if (linkedHqLiveReady &&
-        runtimeState.linkedHqPreview.ready &&
-        runtimeState.linkedHqPreview.enabled &&
+    if (linkedHqPatchDrawPolicy.renderFinePatches &&
         !runtimeState.offlineRenderJob.active) {
         for (const auto& patch : runtimeState.linkedHqPreview.patches) {
             if (!patch.uploaded || patch.cloud == nullptr ||
                 patch.cloud->PointCount() == 0U ||
                 patch.baseSessionIndex >= runtimeState.sessions.size()) {
+                continue;
+            }
+            if (linkedHqPatchDrawPolicy.retainingFineDuringRefresh &&
+                patch.cloud->bounds.valid &&
+                !BoundsIntersectsViewFrustum(
+                    patch.cloud->bounds,
+                    renderState.viewProjection)) {
+                // Keep the GPU/CPU patch resident for a quick return, but do
+                // not submit millions of old vertices after a discontinuous
+                // move that leaves the patch completely outside the frame.
                 continue;
             }
             const auto& baseSession =
@@ -113781,6 +118142,19 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                 &waterFrame.featureOverlay,
                 &waterFrame.fixedSettingOverlay);
             ClearPointCloudStyleShoreline(&renderStyle);
+            const bool patchIsWaterFill =
+                IsWaterFillPointCloudSession(patchSession);
+            const bool patchShorelineEligible =
+                ShorelineWaveEligibleSession(patchSession);
+            if (patchShorelineEligible &&
+                !resolvedShorelines.empty() &&
+                (!patchIsWaterFill ||
+                 resolvedShorelines.front().applyToWaterFill)) {
+                invisible_places::renderer::pointcloud::
+                    ApplyPointCloudShorelineWaveSettings(
+                        &renderStyle,
+                        resolvedShorelines.front());
+            }
             renderState.pointCloudLayers.push_back(
                 {.layerId = patch.layerId,
                  .style = fastBasicRenderer
@@ -113807,7 +118181,9 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                  .hasNormals = patch.cloud->hasNormals,
                  .timingColouriseEligible =
                      IsAuthoredTimingColouriseLayer(baseSession),
-                 .shorelineInstancesEligible = false,
+                 .shorelineInstancesEligible =
+                     patchShorelineEligible,
+                 .waterFillLayer = patchIsWaterFill,
                  .worldZBoundsValid = patch.cloud->bounds.valid,
                  .worldMinZ = patch.cloud->bounds.minimum.z,
                  .worldMaxZ = patch.cloud->bounds.maximum.z,
@@ -113819,6 +118195,12 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                      runtimeState.linkedHqPreview.request
                          ->patchSpacingMicrometres,
                      patch),
+                 .adaptiveDensityRole =
+                     linkedHqPatchDrawPolicy.applyFineAdaptiveDensity
+                     ? invisible_places::renderer::pointcloud::
+                           PointCloudAdaptiveDensityRole::Fine
+                     : invisible_places::renderer::pointcloud::
+                           PointCloudAdaptiveDensityRole::Disabled,
                  .rainCollisionRole =
                      RainCollisionRoleForSession(baseSession)});
         }
@@ -113827,10 +118209,13 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
         // cloud. Transparent/emissive point materials can be order-sensitive,
         // so each compact patch occupies its base role's position instead of
         // being composited after every other scene role.
-        std::array<const LinkedHqPatchRuntime*, 2U> orderedPatches{
-            &runtimeState.linkedHqPreview.patches[0U],
-            &runtimeState.linkedHqPreview.patches[1U],
-        };
+        std::vector<const LinkedHqPatchRuntime*> orderedPatches;
+        orderedPatches.reserve(
+            runtimeState.linkedHqPreview.patches.size());
+        for (const auto& patch :
+             runtimeState.linkedHqPreview.patches) {
+            orderedPatches.push_back(&patch);
+        }
         std::sort(
             orderedPatches.begin(),
             orderedPatches.end(),
@@ -115303,6 +119688,76 @@ nlohmann::json RendererFrameTimingSampleSummary(
           {"postprocess", summary(samples.gpuPostProcessMilliseconds)},
           {"imgui", summary(samples.gpuImGuiMilliseconds)}}},
     };
+}
+
+void AppendRendererFrameTimingSample(
+    RendererFrameTimingSamples* samples,
+    const invisible_places::renderer::core::ViewportDiagnostics& diagnostics) {
+    if (samples == nullptr) {
+        return;
+    }
+    samples->cpuMilliseconds.push_back(diagnostics.frameRenderMs);
+    samples->cpuUiFinalizeMilliseconds.push_back(
+        diagnostics.frameUiRenderMs);
+    samples->cpuFrameSlotFenceWaitMilliseconds.push_back(
+        diagnostics.frameFenceWaitMs);
+    samples->cpuCompletedMaintenanceMilliseconds.push_back(
+        diagnostics.frameCompletedMaintenanceMs);
+    samples->cpuHighQualityGaussianPrepareMilliseconds.push_back(
+        diagnostics.frameHighQualityGaussianPrepareMs);
+    samples->cpuUniformResourceUploadMilliseconds.push_back(
+        diagnostics.frameUniformResourceUploadMs);
+    samples->cpuAcquireMilliseconds.push_back(diagnostics.frameAcquireMs);
+    samples->imageOwnerWaitMilliseconds.push_back(
+        diagnostics.frameImageWaitMs);
+    samples->cpuResetRetirePollingMilliseconds.push_back(
+        diagnostics.frameResetRetirePollingMs);
+    samples->cpuCommandEncodingMilliseconds.push_back(
+        diagnostics.frameCommandBufferMs);
+    samples->cpuSubmitMilliseconds.push_back(diagnostics.frameSubmitMs);
+    samples->cpuPresentMilliseconds.push_back(diagnostics.framePresentMs);
+    samples->cpuPlatformWindowsMilliseconds.push_back(
+        diagnostics.framePlatformWindowsMs);
+    if (diagnostics.imageOwnerWaited) {
+        samples->imageOwnerWaits.push_back({
+            .submissionSerial =
+                diagnostics.imageWaitOwnerSubmissionSerial,
+            .imageIndex = diagnostics.imageWaitImageIndex,
+            .frameSlot = diagnostics.imageWaitOwnerFrameSlot,
+            .milliseconds = diagnostics.frameImageWaitMs,
+        });
+    }
+    if (!diagnostics.gpuTimestampResultsAvailable) {
+        return;
+    }
+    samples->gpuMilliseconds.push_back(
+        diagnostics.gpuTotal.milliseconds);
+    const auto appendActive = [](
+        std::vector<double>* values,
+        const invisible_places::renderer::core::GpuPhaseDiagnostics& phase) {
+        if (phase.active) {
+            values->push_back(phase.milliseconds);
+        }
+    };
+    appendActive(
+        &samples->gpuRainComputeMilliseconds,
+        diagnostics.gpuRainCompute);
+    appendActive(&samples->gpuDepthMilliseconds, diagnostics.gpuDepth);
+    appendActive(
+        &samples->gpuWeightedAccumulationMilliseconds,
+        diagnostics.gpuWeightedAccumulation);
+    appendActive(
+        &samples->gpuCompositeMilliseconds,
+        diagnostics.gpuComposite);
+    appendActive(
+        &samples->gpuOpaqueAndHighQualityMilliseconds,
+        diagnostics.gpuOpaqueAndHighQuality);
+    appendActive(
+        &samples->gpuPostProcessMilliseconds,
+        diagnostics.gpuPostProcess);
+    appendActive(
+        &samples->gpuImGuiMilliseconds,
+        diagnostics.gpuImGui);
 }
 
 int RunRendererFrameTimingScene3Smoke(
@@ -124727,9 +129182,7 @@ std::size_t LinkedHqPatchLayerCount(
         state.pointCloudLayers.begin(),
         state.pointCloudLayers.end(),
         [](const auto& layer) {
-            return layer.layerId == kLinkedHqRockPatchLayerId ||
-                   layer.layerId ==
-                       kLinkedHqVegetationPatchLayerId;
+            return IsLinkedHqPatchLayerId(layer.layerId);
         }));
 }
 
@@ -125018,7 +129471,7 @@ int RunLinkedHqPreviewSmoke(
     runtimeState->persistence.projectFilePath =
         projectPath.string();
     std::string projectError;
-    const auto project =
+    auto project =
         invisible_places::serialization::LoadProjectDocument(
             projectPath,
             &projectError);
@@ -125028,6 +129481,10 @@ int RunLinkedHqPreviewSmoke(
             projectError);
         return finish();
     }
+    // This diagnostic pins the safe default: merely opening HQ must not
+    // touch the exceptionally large 1 mm SAND source. The opt-in path is
+    // exercised by the ordinary request/publish pipeline when enabled.
+    project->linkedHqIncludeSand = false;
     if (!ApplyProjectDocumentToRuntime(
             project.value(),
             runtimeState,
@@ -125472,8 +129929,7 @@ int RunLinkedHqPreviewSmoke(
         canonicalExports = canonicalExports &&
             spacing.has_value() && spacing.value() == 1'000U &&
             role.has_value() &&
-            index.value() != kLinkedHqRockPatchLayerId &&
-            index.value() != kLinkedHqVegetationPatchLayerId;
+            !IsLinkedHqPatchLayerId(index.value());
         if (role.has_value()) {
             canonicalRoles[invisible_places::scene::
                 ScenePointCloudRoleIndex(role.value())] = true;
@@ -125554,6 +130010,938 @@ int RunLinkedHqPreviewSmoke(
         report.Fail(
             "HQ did not return atomically to the cached complete 5 mm view.");
     }
+
+    if (sampleScene) {
+        // aHQ is deliberately scene/camera-owned, not animation-owned. Clear
+        // the active animation while retaining the visible SampleScene, then
+        // prove that a camera-only request publishes and renders adaptive
+        // roles. The registry may still list saved files; with no current
+        // path, none of them can contribute animation-prefetch coverage.
+        ClearActiveAnimationSelection(runtimeState);
+        const bool adaptiveRequested = SetLinkedHqPreviewMode(
+            runtimeState,
+            viewport,
+            LinkedHqPreviewMode::Adaptive);
+        const auto adaptiveDeadline =
+            std::chrono::steady_clock::now() + std::chrono::minutes{3};
+        invisible_places::renderer::core::SceneRenderState adaptiveState;
+        while (std::chrono::steady_clock::now() < adaptiveDeadline &&
+               !window->ShouldClose() &&
+               !(hq.ready && hq.enabled && hq.adaptiveEnabled &&
+                 hq.request.has_value() &&
+                 hq.request->mode == LinkedHqPreviewMode::Adaptive &&
+                 hq.publishedFingerprint == hq.request->fingerprint)) {
+            adaptiveState = PumpLinkedHqSmokeFrame(
+                window,
+                runtimeState,
+                viewport,
+                0.5F);
+            if (hq.stage == LinkedHqPreparationStage::Failed &&
+                !hq.failureMessage.empty()) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+        }
+        adaptiveState = PumpLinkedHqSmokeFrame(
+            window,
+            runtimeState,
+            viewport,
+            0.5F);
+        const auto fineRoleCount = std::count_if(
+            adaptiveState.pointCloudLayers.begin(),
+            adaptiveState.pointCloudLayers.end(),
+            [](const auto& layer) {
+                return layer.adaptiveDensityRole ==
+                    invisible_places::renderer::pointcloud::
+                        PointCloudAdaptiveDensityRole::Fine;
+            });
+        const auto coarseRoleCount = std::count_if(
+            adaptiveState.pointCloudLayers.begin(),
+            adaptiveState.pointCloudLayers.end(),
+            [](const auto& layer) {
+                return layer.adaptiveDensityRole ==
+                    invisible_places::renderer::pointcloud::
+                        PointCloudAdaptiveDensityRole::Coarse;
+            });
+        const bool cameraOnlyAdaptiveReady = adaptiveRequested &&
+            !runtimeState->animationPanel.currentPath.has_value() &&
+            !ResolveActiveAnimationLinkedPair(*runtimeState).has_value() &&
+            hq.ready && hq.enabled && hq.adaptiveEnabled &&
+            hq.request.has_value() &&
+            hq.request->mode == LinkedHqPreviewMode::Adaptive &&
+            !hq.request->usesFullAnimationPath &&
+            hq.request->patchFrustums.viewProjections.size() == 1U &&
+            hq.publishedAdaptiveTransition.Valid() &&
+            adaptiveState.adaptiveDensityTransition.Valid() &&
+            fineRoleCount == 2U && coarseRoleCount == 2U;
+        if (cameraOnlyAdaptiveReady) {
+            report.Pass(
+                "aHQ prepared and rendered a guarded camera-only cache with no animation loaded.");
+        } else {
+            report.Fail(
+                "aHQ did not publish a camera-only adaptive view after the active animation was cleared: " +
+                (hq.failureMessage.empty()
+                     ? std::string{LinkedHqPreparationStageName(hq.stage)}
+                     : hq.failureMessage));
+        }
+
+        if (cameraOnlyAdaptiveReady) {
+            const auto firstAdaptiveFingerprint =
+                hq.publishedFingerprint;
+            auto movedCamera = runtimeState->camera.CaptureState();
+            constexpr float kOutsideGuardOffsetMeters = 100.0F;
+            movedCamera.position[0] += kOutsideGuardOffsetMeters;
+            movedCamera.target[0] += kOutsideGuardOffsetMeters;
+            if (movedCamera.hasOrbitCenter) {
+                movedCamera.orbitCenter[0] +=
+                    kOutsideGuardOffsetMeters;
+            }
+            runtimeState->camera.ApplyState(movedCamera);
+            hq.resolveTimestampValid = false;
+            const auto fallbackState = PumpLinkedHqSmokeFrame(
+                window,
+                runtimeState,
+                viewport,
+                0.5F);
+            const auto fallbackFineRoleCount = std::count_if(
+                fallbackState.pointCloudLayers.begin(),
+                fallbackState.pointCloudLayers.end(),
+                [](const auto& layer) {
+                    return layer.adaptiveDensityRole ==
+                        invisible_places::renderer::pointcloud::
+                            PointCloudAdaptiveDensityRole::Fine;
+                });
+            const auto fallbackCoarseRoleCount = std::count_if(
+                fallbackState.pointCloudLayers.begin(),
+                fallbackState.pointCloudLayers.end(),
+                [](const auto& layer) {
+                    return layer.adaptiveDensityRole ==
+                        invisible_places::renderer::pointcloud::
+                            PointCloudAdaptiveDensityRole::Coarse;
+                });
+            const bool safeRefreshStarted =
+                hq.request.has_value() &&
+                hq.request->mode == LinkedHqPreviewMode::Adaptive &&
+                hq.request->fingerprint != firstAdaptiveFingerprint &&
+                hq.requestedMode == LinkedHqPreviewMode::Adaptive &&
+                !hq.adaptiveBaseGuardApplied &&
+                fallbackState.adaptiveDensityTransition.Valid() &&
+                fallbackFineRoleCount <= 2U &&
+                fallbackCoarseRoleCount == 0U &&
+                LinkedHqPatchLayerCount(fallbackState) ==
+                    static_cast<std::size_t>(fallbackFineRoleCount);
+            if (safeRefreshStarted) {
+                report.Pass(
+                    "Leaving the aHQ camera guard restored complete 5 mm while retaining the prior depth-faded fine patch during refresh.");
+            } else {
+                report.Fail(
+                    "Leaving the aHQ camera guard did not retain the prior fine patch safely over complete 5 mm or did not request a replacement.");
+            }
+
+            const auto refreshDeadline =
+                std::chrono::steady_clock::now() +
+                std::chrono::minutes{3};
+            while (safeRefreshStarted &&
+                   std::chrono::steady_clock::now() < refreshDeadline &&
+                   !window->ShouldClose() &&
+                   !(hq.ready && hq.enabled && hq.adaptiveEnabled &&
+                     hq.request.has_value() &&
+                     hq.publishedFingerprint ==
+                         hq.request->fingerprint)) {
+                (void)PumpLinkedHqSmokeFrame(
+                    window,
+                    runtimeState,
+                    viewport,
+                    0.5F);
+                if (hq.stage == LinkedHqPreparationStage::Failed &&
+                    !hq.failureMessage.empty()) {
+                    break;
+                }
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds{2});
+            }
+            const auto refreshedState = PumpLinkedHqSmokeFrame(
+                window,
+                runtimeState,
+                viewport,
+                0.5F);
+            const bool cameraRefreshPublished = safeRefreshStarted &&
+                hq.ready && hq.enabled && hq.adaptiveEnabled &&
+                hq.request.has_value() &&
+                hq.publishedFingerprint == hq.request->fingerprint &&
+                hq.publishedFingerprint != firstAdaptiveFingerprint &&
+                hq.request->patchFrustums.viewProjections.size() == 1U &&
+                !hq.request->usesFullAnimationPath &&
+                refreshedState.adaptiveDensityTransition.Valid();
+            if (cameraRefreshPublished) {
+                report.Pass(
+                    "aHQ published a replacement camera-only cache beyond the former guard and animation area.");
+            } else {
+                report.Fail(
+                    "aHQ did not publish the replacement camera-only cache beyond the former guard: " +
+                    (hq.failureMessage.empty()
+                         ? std::string{LinkedHqPreparationStageName(hq.stage)}
+                         : hq.failureMessage));
+            }
+        }
+    }
+    viewport->WaitIdle();
+    return finish();
+}
+
+int RunAdaptiveHqSurfacePerformanceSmoke(
+    const GuiSmokeOptions& options,
+    platform::Window* window,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    PreviewRuntimeState* runtimeState) {
+    const auto outputDirectory = options.outputDirectory.empty()
+        ? std::filesystem::path{
+              "build/macos-debug/adaptive-hq-surface05-performance"}
+        : options.outputDirectory;
+    const auto reportPath =
+        outputDirectory / "adaptive-hq-surface05-performance.json";
+    std::vector<std::string> passes;
+    std::vector<std::string> failures;
+    nlohmann::json report{
+        {"scenario", options.scenario},
+        {"passed", false},
+        {"policy",
+         {{"guard_fraction", kAdaptiveHqViewportGuardFraction},
+          {"refresh_border_fraction",
+           kAdaptiveHqRefreshBorderFraction},
+          {"retained_fringe_decoded_byte_budget_per_role",
+           kAdaptiveHqRetainedFringeByteBudgetPerRole},
+          {"complete_animation_path_prefetch", false},
+          {"parallel_block_readers",
+           kAdaptiveHqBlockReadWorkerCount},
+          {"parallel_assembly_workers", 8U},
+          {"five_mm_guard_grid_dimension",
+           kAdaptiveHqFiveMillimeterGuardGridDimension},
+          {"five_mm_guard_useful_fraction",
+           kAdaptiveHqFiveMillimeterGuardUsefulFraction}}},
+    };
+    const auto finish = [&]() {
+        report["passed"] = failures.empty();
+        report["passes"] = passes;
+        report["failures"] = failures;
+        std::error_code createError;
+        std::filesystem::create_directories(
+            outputDirectory,
+            createError);
+        if (createError) {
+            std::cerr << "Could not create aHQ performance output: "
+                      << createError.message() << '\n';
+            return 1;
+        }
+        std::ofstream output{reportPath, std::ios::trunc};
+        if (!output.is_open()) {
+            std::cerr << "Could not write aHQ performance report: "
+                      << reportPath.string() << '\n';
+            return 1;
+        }
+        output << report.dump(2) << '\n';
+        std::cout << "Adaptive HQ Surface_05 performance report: "
+                  << reportPath.string() << '\n';
+        for (const auto& failure : failures) {
+            std::cerr << "Adaptive HQ performance failure: "
+                      << failure << '\n';
+        }
+        return failures.empty() ? 0 : 1;
+    };
+    if (window == nullptr || viewport == nullptr ||
+        runtimeState == nullptr) {
+        failures.emplace_back(
+            "The Surface_05 performance validation needs a live viewport.");
+        return finish();
+    }
+
+    const auto projectPath = options.projectPath.empty()
+        ? std::filesystem::path{
+              runtimeState->persistence.authoredWorkspacePath} /
+              "ExhibitionFinal_project.json"
+        : options.projectPath;
+    report["project_path"] = projectPath.string();
+    std::string loadError;
+    auto project = invisible_places::serialization::LoadProjectDocument(
+        projectPath,
+        &loadError);
+    if (!project.has_value()) {
+        failures.emplace_back("Project did not load: " + loadError);
+        return finish();
+    }
+    project->linkedHqIncludeSand = false;
+    project->linkedHqPatchSpacingMicrometres = 1'000U;
+    if (!ApplyProjectDocumentToRuntime(
+            project.value(),
+            runtimeState,
+            viewport)) {
+        failures.emplace_back(
+            "Project could not be applied: " +
+            (runtimeState->errorMessage.empty()
+                 ? runtimeState->statusMessage
+                 : runtimeState->errorMessage));
+        return finish();
+    }
+    const auto animationPath =
+        projectPath.parent_path() / "animations" /
+        "Surface_05.ipanim.json";
+    report["animation_path"] = animationPath.string();
+    if (!LoadAnimationPathFromFile(runtimeState, animationPath) ||
+        !runtimeState->animationPanel.currentPath.has_value()) {
+        failures.emplace_back(
+            "Surface_05 did not load: " + runtimeState->errorMessage);
+        return finish();
+    }
+    const auto& animation =
+        runtimeState->animationPanel.currentPath.value();
+    if (animation.name != "Surface_05" ||
+        animation.keys.size() < 2U ||
+        animation.durationFrames == 0U ||
+        animation.exportSettings.framesPerSecond == 0U) {
+        failures.emplace_back(
+            "Surface_05 did not retain a valid authored camera path and timing.");
+        return finish();
+    }
+    const float durationSeconds = invisible_places::camera::
+        AnimationPathDurationSeconds(animation);
+    report["animation"] = {
+        {"name", animation.name},
+        {"duration_frames", animation.durationFrames},
+        {"frames_per_second",
+         animation.exportSettings.framesPerSecond},
+        {"duration_seconds", durationSeconds},
+    };
+    runtimeState->animationPanel.scrubAmount = 0.5F;
+    ApplyAnimationEvaluation(
+        runtimeState,
+        animation,
+        0.5F,
+        runtimeState->animationPanel.previewDepthOfField);
+    if (!SetLinkedHqPreviewMode(
+            runtimeState,
+            viewport,
+            LinkedHqPreviewMode::Adaptive)) {
+        failures.emplace_back(
+            "Could not request adaptive HQ: " +
+            runtimeState->linkedHqPreview.failureMessage);
+        return finish();
+    }
+
+    std::vector<double> wallClockMilliseconds;
+    const auto pumpFrame = [&](float simulatedSeconds,
+                               bool sceneCaching,
+                               RendererFrameTimingSamples* samples) {
+        const auto frameStarted = std::chrono::steady_clock::now();
+        window->PollEvents();
+        PollPendingLayerLoad(runtimeState, viewport);
+        PollTimingColouriseHistogram(runtimeState);
+        EnsureWaterSurfaceCacheReady(runtimeState, viewport);
+        PollWaterFlowTrailBuildJob(runtimeState, viewport);
+        CommitReadySceneDisplaySwitches(runtimeState, viewport);
+        StartQueuedLayerLoadIfIdle(runtimeState);
+        EnsureLinkedHqPreview(runtimeState, viewport);
+        viewport->BeginUiFrame();
+        const auto waterFrameState = ResolveWaterFrameState(runtimeState);
+        EnsureWaterSeepageRuntimeUpToDate(
+            runtimeState,
+            viewport,
+            &waterFrameState);
+        EnsureWaterDynamicMeshFlowGpuUpToDate(
+            runtimeState,
+            viewport,
+            waterFrameState,
+            simulatedSeconds);
+        viewport->SetDiagnosticsEnabled(true);
+        viewport->SetSceneCachingEnabled(sceneCaching);
+        viewport->SetLiveSceneRenderingEnabled(true);
+        viewport->SetLiveRainSimulationEnabled(true);
+        auto renderState = BuildRenderState(
+            *runtimeState,
+            *viewport,
+            simulatedSeconds,
+            &waterFrameState,
+            nullptr,
+            true);
+        const auto signature = RenderStateSignature(renderState);
+        const bool stateChanged =
+            !runtimeState->previewRenderStateSignatureValid ||
+            runtimeState->previewRenderStateSignature != signature;
+        if (stateChanged || !sceneCaching ||
+            runtimeState->projectSettings.constantUpdateView) {
+            viewport->UpdateRenderState(renderState);
+            runtimeState->previewRenderStateSignature = signature;
+            runtimeState->previewRenderStateSignatureValid = true;
+        }
+        viewport->DrawFrame();
+        AppendRendererFrameTimingSample(
+            samples,
+            viewport->Diagnostics());
+        if (samples != nullptr) {
+            wallClockMilliseconds.push_back(
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - frameStarted)
+                    .count());
+        }
+        return renderState;
+    };
+    const auto adaptiveRoleCounts = [](const auto& state) {
+        const auto fine = std::count_if(
+            state.pointCloudLayers.begin(),
+            state.pointCloudLayers.end(),
+            [](const auto& layer) {
+                return layer.adaptiveDensityRole ==
+                    invisible_places::renderer::pointcloud::
+                        PointCloudAdaptiveDensityRole::Fine;
+            });
+        const auto coarse = std::count_if(
+            state.pointCloudLayers.begin(),
+            state.pointCloudLayers.end(),
+            [](const auto& layer) {
+                return layer.adaptiveDensityRole ==
+                    invisible_places::renderer::pointcloud::
+                        PointCloudAdaptiveDensityRole::Coarse;
+            });
+        return std::pair{fine, coarse};
+    };
+    const auto adaptiveVisible = [&](const auto& state) {
+        const auto [fine, coarse] = adaptiveRoleCounts(state);
+        return state.adaptiveDensityTransition.Valid() &&
+            fine == 2 && coarse == 2;
+    };
+    const auto retainedRefreshOverlayVisible = [&](const auto& state) {
+        const auto [fine, coarse] = adaptiveRoleCounts(state);
+        return state.adaptiveDensityTransition.Valid() &&
+            fine > 0 && coarse == 0;
+    };
+    const auto patchMetrics = [&]() {
+        nlohmann::json patches = nlohmann::json::array();
+        for (const auto& patch :
+             runtimeState->linkedHqPreview.patches) {
+            std::uint64_t residentPayloadBytes = 0U;
+            std::uint64_t inactivePayloadBytes = 0U;
+            std::size_t inactiveBlockCount = 0U;
+            const std::unordered_set<std::uint32_t> activeBlocks{
+                patch.adaptiveActiveBlockIndices.begin(),
+                patch.adaptiveActiveBlockIndices.end(),
+            };
+            for (const auto& block : patch.adaptiveResidentBlocks) {
+                const auto payloadBytes =
+                    AdaptiveHqResidentBlockPayloadBytes(block);
+                residentPayloadBytes += payloadBytes;
+                if (!activeBlocks.contains(block.blockIndex)) {
+                    inactivePayloadBytes += payloadBytes;
+                    ++inactiveBlockCount;
+                }
+            }
+            nlohmann::json value{
+                {"layer_id", patch.layerId},
+                {"patch_point_count",
+                 patch.cloud != nullptr
+                     ? patch.cloud->PointCount()
+                     : 0U},
+                {"included_point_count", patch.includedPointCount},
+                {"active_block_count",
+                 patch.adaptiveActiveBlockIndices.size()},
+                {"resident_block_count",
+                 patch.adaptiveResidentBlocks.size()},
+                {"resident_decoded_bytes", residentPayloadBytes},
+                {"retained_inactive_block_count",
+                 inactiveBlockCount},
+                {"retained_inactive_decoded_bytes",
+                 inactivePayloadBytes},
+                {"active_block_bytes",
+                 patch.adaptiveActiveBlockBytes},
+                {"missing_block_count",
+                 patch.adaptiveMissingBlockCount},
+                {"missing_block_bytes",
+                 patch.adaptiveMissingBlockBytes},
+                {"reused_block_count",
+                 patch.adaptiveReusedBlockCount},
+                {"cache_built", patch.adaptiveCacheBuilt},
+                {"cache_open_ms",
+                 patch.adaptiveCacheOpenMilliseconds},
+                {"block_load_ms",
+                 patch.adaptiveBlockLoadMilliseconds},
+                {"assembly_ms",
+                 patch.adaptiveAssemblyMilliseconds},
+            };
+            if (patch.baseSessionIndex < runtimeState->sessions.size()) {
+                value["role"] = runtimeState
+                    ->sessions[patch.baseSessionIndex]
+                    .sceneRole;
+            }
+            if (patch.adaptiveCacheIndex.has_value()) {
+                value["cache_data_path"] =
+                    patch.adaptiveCacheIndex->dataPath.string();
+            }
+            patches.push_back(std::move(value));
+        }
+        return patches;
+    };
+    const auto fiveMillimeterGuardMetrics = [&]() {
+        const auto& hq = runtimeState->linkedHqPreview;
+        nlohmann::json roles = nlohmann::json::array();
+        std::uint64_t fullPoints = 0U;
+        std::uint64_t guardedPoints = 0U;
+        for (std::size_t role = 0U;
+             role < hq.fiveMillimeterGuardIndices.size();
+             ++role) {
+            const auto full = hq.fiveMillimeterFullPointCounts[role];
+            const auto guarded =
+                hq.fiveMillimeterGuardIndices[role].empty()
+                    ? full
+                    : hq.fiveMillimeterGuardIndices[role].size();
+            fullPoints += full;
+            guardedPoints += guarded;
+            nlohmann::json value{
+                {"role_index", role},
+                {"full_point_count", full},
+                {"guarded_point_count", guarded},
+                {"guard_used",
+                 !hq.fiveMillimeterGuardIndices[role].empty()},
+            };
+            if (hq.request.has_value()) {
+                const auto sessionIndex =
+                    hq.request->fiveMillimeterSessionIndices[role];
+                if (sessionIndex < runtimeState->sessions.size()) {
+                    value["role"] = runtimeState
+                        ->sessions[sessionIndex]
+                        .sceneRole;
+                }
+            }
+            roles.push_back(std::move(value));
+        }
+        return nlohmann::json{
+            {"applied", hq.adaptiveBaseGuardApplied},
+            {"full_point_count", fullPoints},
+            {"guarded_point_count", guardedPoints},
+            {"retained_fraction",
+             fullPoints > 0U
+                 ? static_cast<double>(guardedPoints) /
+                       static_cast<double>(fullPoints)
+                 : 1.0},
+            {"preparation_ms",
+             hq.fiveMillimeterGuardPreparationMilliseconds},
+            {"roles", std::move(roles)},
+        };
+    };
+    const auto timingJson = [&]() {
+        nlohmann::json timing;
+        timing["renderer"] = nlohmann::json::object();
+        timing["wall_clock_ms"] = {
+            {"sample_count", wallClockMilliseconds.size()},
+            {"p50", PercentileValue(wallClockMilliseconds, 0.50)},
+            {"p95", PercentileValue(wallClockMilliseconds, 0.95)},
+            {"p50_fps",
+             PercentileValue(wallClockMilliseconds, 0.50) > 0.0
+                 ? 1000.0 /
+                       PercentileValue(wallClockMilliseconds, 0.50)
+                 : 0.0},
+        };
+        return timing;
+    };
+
+    const auto preparationStarted = std::chrono::steady_clock::now();
+    const auto preparationDeadline =
+        preparationStarted + std::chrono::minutes{20};
+    invisible_places::renderer::core::SceneRenderState latestState;
+    while (std::chrono::steady_clock::now() < preparationDeadline &&
+           !window->ShouldClose()) {
+        latestState = pumpFrame(durationSeconds * 0.5F, false, nullptr);
+        const auto& hq = runtimeState->linkedHqPreview;
+        if (hq.ready && hq.enabled && hq.adaptiveEnabled &&
+            hq.request.has_value() &&
+            hq.request->mode == LinkedHqPreviewMode::Adaptive &&
+            hq.publishedFingerprint == hq.request->fingerprint &&
+            adaptiveVisible(latestState)) {
+            break;
+        }
+        if (hq.stage == LinkedHqPreparationStage::Failed &&
+            !hq.failureMessage.empty() &&
+            !runtimeState->pendingLoad.has_value() &&
+            runtimeState->persistence.queuedLoads.empty()) {
+            failures.emplace_back(
+                "Initial aHQ preparation failed: " +
+                hq.failureMessage);
+            return finish();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    }
+    const auto initialPrepareMilliseconds =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - preparationStarted)
+            .count();
+    if (!adaptiveVisible(latestState)) {
+        failures.emplace_back(
+            "Initial aHQ did not publish before the 20-minute deadline.");
+        return finish();
+    }
+    report["initial_prepare"] = {
+        {"wall_ms", initialPrepareMilliseconds},
+        {"patches", patchMetrics()},
+        {"five_mm_guard", fiveMillimeterGuardMetrics()},
+    };
+    const bool warmCache = std::all_of(
+        runtimeState->linkedHqPreview.patches.begin(),
+        runtimeState->linkedHqPreview.patches.end(),
+        [](const auto& patch) {
+            return patch.adaptiveCacheIndex.has_value() &&
+                !patch.adaptiveCacheBuilt;
+        });
+    if (warmCache &&
+        runtimeState->linkedHqPreview.patches.size() == 2U) {
+        passes.emplace_back(
+            "Surface_05 published ROCK/VEG from the existing local cache without touching 1 mm SAND.");
+    } else {
+        failures.emplace_back(
+            "Surface_05 did not reuse exactly two existing ROCK/VEG caches.");
+    }
+    const auto initialGuard = fiveMillimeterGuardMetrics();
+    if (initialGuard["applied"].get<bool>() &&
+        initialGuard["guarded_point_count"].get<std::uint64_t>() <
+            initialGuard["full_point_count"].get<std::uint64_t>()) {
+        passes.emplace_back(
+            "The current-camera guard reduced submitted 5 mm points while retaining the complete resident fallback.");
+    } else {
+        failures.emplace_back(
+            "The current-camera guard did not reduce the initial 5 mm draw.");
+    }
+    for (std::uint32_t frame = 0U; frame < 30U; ++frame) {
+        (void)pumpFrame(durationSeconds * 0.5F, true, nullptr);
+    }
+    wallClockMilliseconds.clear();
+    RendererFrameTimingSamples stationarySamples;
+    std::uint32_t cachedStationaryFrames = 0U;
+    for (std::uint32_t frame = 0U; frame < 120U; ++frame) {
+        latestState = pumpFrame(
+            durationSeconds * 0.5F,
+            true,
+            &stationarySamples);
+        cachedStationaryFrames +=
+            viewport->Diagnostics().sceneRenderedThisFrame ? 0U : 1U;
+    }
+    auto stationaryTiming = timingJson();
+    stationaryTiming["renderer"] =
+        RendererFrameTimingSampleSummary(stationarySamples);
+    stationaryTiming["cached_frame_count"] = cachedStationaryFrames;
+    stationaryTiming["adaptive_visible"] = adaptiveVisible(latestState);
+    stationaryTiming["five_mm_guard"] =
+        fiveMillimeterGuardMetrics();
+    report["stationary"] = std::move(stationaryTiming);
+    if (adaptiveVisible(latestState) && cachedStationaryFrames > 0U) {
+        passes.emplace_back(
+            "A stationary Surface_05 view reused the scene cache while retaining adaptive density.");
+    } else {
+        failures.emplace_back(
+            "The stationary Surface_05 phase did not retain aHQ or reuse a cached frame.");
+    }
+
+    // Advance 240 consecutive authored frames (eight animation seconds).
+    // This exercises real colour/emissive scalar animation and camera motion
+    // without making the validation wait for the full 120-second film.
+    constexpr std::uint32_t kPlaybackFrames = 240U;
+    constexpr std::uint32_t kPlaybackStartFrame = 1'440U;
+    wallClockMilliseconds.clear();
+    RendererFrameTimingSamples playbackSamples;
+    std::uint32_t playbackFallbackFrames = 0U;
+    std::uint32_t retainedRefreshOverlayFrames = 0U;
+    std::uint32_t stalePatchFrames = 0U;
+    std::uint32_t requestChanges = 0U;
+    auto priorRequestFingerprint =
+        runtimeState->linkedHqPreview.request->fingerprint;
+    for (std::uint32_t frame = 0U;
+         frame < kPlaybackFrames;
+         ++frame) {
+        const auto authoredFrame = kPlaybackStartFrame + frame;
+        const float position =
+            static_cast<float>(authoredFrame) /
+            static_cast<float>(animation.durationFrames);
+        runtimeState->animationPanel.scrubAmount = position;
+        ApplyAnimationEvaluation(
+            runtimeState,
+            animation,
+            position,
+            runtimeState->animationPanel.previewDepthOfField);
+        latestState = pumpFrame(
+            durationSeconds * position,
+            false,
+            &playbackSamples);
+        if (!adaptiveVisible(latestState)) {
+            ++playbackFallbackFrames;
+            if (retainedRefreshOverlayVisible(latestState)) {
+                ++retainedRefreshOverlayFrames;
+            } else if (LinkedHqPatchLayerCount(latestState) > 0U) {
+                ++stalePatchFrames;
+            }
+        }
+        if (runtimeState->linkedHqPreview.request.has_value() &&
+            runtimeState->linkedHqPreview.request->fingerprint !=
+                priorRequestFingerprint) {
+            priorRequestFingerprint = runtimeState
+                ->linkedHqPreview.request->fingerprint;
+            ++requestChanges;
+        }
+    }
+    auto playbackTiming = timingJson();
+    playbackTiming["renderer"] =
+        RendererFrameTimingSampleSummary(playbackSamples);
+    playbackTiming["authored_frame_count"] = kPlaybackFrames;
+    playbackTiming["fallback_frame_count"] =
+        playbackFallbackFrames;
+    playbackTiming["retained_refresh_overlay_frame_count"] =
+        retainedRefreshOverlayFrames;
+    playbackTiming["stale_patch_frame_count"] = stalePatchFrames;
+    playbackTiming["guard_refresh_count"] = requestChanges;
+    playbackTiming["five_mm_guard"] =
+        fiveMillimeterGuardMetrics();
+    report["animation_playback"] = std::move(playbackTiming);
+    if (stalePatchFrames == 0U) {
+        passes.emplace_back(
+            "The authored-frame sweep retained old fine points only as the intentional depth-faded refresh overlay over complete 5 mm.");
+    } else {
+        failures.emplace_back(
+            "Animation playback exposed stale fine patches outside their guard.");
+    }
+
+    // Settle a refresh still in flight before deliberately discontinuous
+    // camera moves.
+    const auto settleDeadline =
+        std::chrono::steady_clock::now() + std::chrono::minutes{3};
+    while (std::chrono::steady_clock::now() < settleDeadline &&
+           (runtimeState->linkedHqPreview.preparationShared != nullptr ||
+            runtimeState->linkedHqPreview.uploadPending.has_value())) {
+        (void)pumpFrame(
+            durationSeconds * runtimeState->animationPanel.scrubAmount,
+            false,
+            nullptr);
+    }
+
+    struct CapturedRgba {
+        std::uint32_t width = 0U;
+        std::uint32_t height = 0U;
+        std::vector<std::uint8_t> rgba;
+    };
+    const bool captureWasEnabled =
+        viewport->LiveSceneReadbackCaptureEnabled();
+    viewport->SetLiveSceneReadbackCaptureEnabled(true);
+    const auto capture = [&]() -> std::optional<CapturedRgba> {
+        try {
+            const auto frame = viewport->ReadLiveSceneFrame();
+            if (frame.width == 0U || frame.height == 0U ||
+                frame.colorRgba8.size() !=
+                    static_cast<std::size_t>(frame.width) *
+                        frame.height * 4U) {
+                return std::nullopt;
+            }
+            return CapturedRgba{
+                .width = frame.width,
+                .height = frame.height,
+                .rgba = frame.colorRgba8,
+            };
+        } catch (...) {
+            return std::nullopt;
+        }
+    };
+    const auto changedPixelFraction = [](
+        const CapturedRgba& before,
+        const CapturedRgba& after) {
+        if (before.width != after.width ||
+            before.height != after.height ||
+            before.rgba.size() != after.rgba.size() ||
+            before.rgba.empty()) {
+            return 0.0;
+        }
+        std::size_t changed = 0U;
+        const auto pixelCount = before.rgba.size() / 4U;
+        for (std::size_t pixel = 0U; pixel < pixelCount; ++pixel) {
+            const auto offset = pixel * 4U;
+            const int difference = std::max({
+                std::abs(
+                    static_cast<int>(before.rgba[offset]) -
+                    static_cast<int>(after.rgba[offset])),
+                std::abs(
+                    static_cast<int>(before.rgba[offset + 1U]) -
+                    static_cast<int>(after.rgba[offset + 1U])),
+                std::abs(
+                    static_cast<int>(before.rgba[offset + 2U]) -
+                    static_cast<int>(after.rgba[offset + 2U])),
+            });
+            changed += difference >= 8 ? 1U : 0U;
+        }
+        return pixelCount > 0U
+            ? static_cast<double>(changed) /
+                  static_cast<double>(pixelCount)
+            : 0.0;
+    };
+    constexpr std::array<float, 6U> kJumpPositions{
+        0.0F,
+        0.5F,
+        1.0F,
+        0.25F,
+        0.75F,
+        0.0F,
+    };
+    nlohmann::json jumps = nlohmann::json::array();
+    std::optional<CapturedRgba> previousCapture;
+    double maximumChangedPixelFraction = 0.0;
+    std::uint32_t totalJumpFallbackFrames = 0U;
+    std::uint32_t totalJumpRetainedOverlayFrames = 0U;
+    std::uint32_t totalJumpStaleFrames = 0U;
+    std::vector<float> publishedJumpTargets;
+    std::uint32_t warmReturnCount = 0U;
+    std::uint32_t warmReturnMissingBlockCount = 0U;
+    for (const float target : kJumpPositions) {
+        const bool returningToPublishedTarget = std::find(
+            publishedJumpTargets.begin(),
+            publishedJumpTargets.end(),
+            target) != publishedJumpTargets.end();
+        runtimeState->animationPanel.scrubAmount = target;
+        ApplyAnimationEvaluation(
+            runtimeState,
+            animation,
+            target,
+            runtimeState->animationPanel.previewDepthOfField);
+        runtimeState->linkedHqPreview.resolveTimestampValid = false;
+        const auto responseStarted = std::chrono::steady_clock::now();
+        const auto responseDeadline =
+            responseStarted + std::chrono::minutes{3};
+        std::uint32_t fallbackFrames = 0U;
+        std::uint32_t retainedOverlayFrames = 0U;
+        std::uint32_t staleFrames = 0U;
+        bool published = false;
+        while (std::chrono::steady_clock::now() < responseDeadline &&
+               !window->ShouldClose()) {
+            latestState = pumpFrame(
+                durationSeconds * target,
+                false,
+                nullptr);
+            const bool visible = adaptiveVisible(latestState);
+            fallbackFrames += visible ? 0U : 1U;
+            if (!visible &&
+                retainedRefreshOverlayVisible(latestState)) {
+                ++retainedOverlayFrames;
+            } else if (!visible &&
+                       LinkedHqPatchLayerCount(latestState) > 0U) {
+                ++staleFrames;
+            }
+            const auto& hq = runtimeState->linkedHqPreview;
+            published = visible && hq.ready && hq.adaptiveEnabled &&
+                hq.request.has_value() &&
+                hq.publishedFingerprint == hq.request->fingerprint;
+            if (published) {
+                break;
+            }
+            if (hq.stage == LinkedHqPreparationStage::Failed &&
+                !hq.failureMessage.empty()) {
+                break;
+            }
+        }
+        for (std::uint32_t settle = 0U;
+             published && settle < 4U;
+             ++settle) {
+            latestState = pumpFrame(
+                durationSeconds * target,
+                false,
+                nullptr);
+        }
+        const auto currentCapture = published
+            ? capture()
+            : std::nullopt;
+        const double changedFraction =
+            previousCapture.has_value() && currentCapture.has_value()
+            ? changedPixelFraction(
+                  previousCapture.value(),
+                  currentCapture.value())
+            : 0.0;
+        maximumChangedPixelFraction = std::max(
+            maximumChangedPixelFraction,
+            changedFraction);
+        totalJumpFallbackFrames += fallbackFrames;
+        totalJumpRetainedOverlayFrames += retainedOverlayFrames;
+        totalJumpStaleFrames += staleFrames;
+        std::uint32_t missingBlocks = 0U;
+        for (const auto& patch :
+             runtimeState->linkedHqPreview.patches) {
+            missingBlocks += patch.adaptiveMissingBlockCount;
+        }
+        if (published && returningToPublishedTarget) {
+            ++warmReturnCount;
+            warmReturnMissingBlockCount += missingBlocks;
+        }
+        jumps.push_back({
+            {"normalized_position", target},
+            {"published", published},
+            {"response_ms",
+             std::chrono::duration<double, std::milli>(
+                 std::chrono::steady_clock::now() - responseStarted)
+                 .count()},
+            {"fallback_frames", fallbackFrames},
+            {"retained_refresh_overlay_frames", retainedOverlayFrames},
+            {"stale_patch_frames", staleFrames},
+            {"returning_to_warm_position",
+             returningToPublishedTarget},
+            {"missing_block_count", missingBlocks},
+            {"changed_pixel_fraction", changedFraction},
+            {"patches", patchMetrics()},
+            {"five_mm_guard", fiveMillimeterGuardMetrics()},
+        });
+        if (!published) {
+            failures.emplace_back(
+                "A sudden Surface_05 camera jump did not publish within three minutes.");
+            break;
+        }
+        publishedJumpTargets.push_back(target);
+        previousCapture = currentCapture;
+    }
+    if (!captureWasEnabled) {
+        viewport->SetLiveSceneReadbackCaptureEnabled(false);
+    }
+    report["camera_jumps"] = {
+        {"positions", kJumpPositions},
+        {"results", std::move(jumps)},
+        {"maximum_changed_pixel_fraction",
+         maximumChangedPixelFraction},
+        {"total_fallback_frames", totalJumpFallbackFrames},
+        {"total_retained_refresh_overlay_frames",
+         totalJumpRetainedOverlayFrames},
+        {"total_stale_patch_frames", totalJumpStaleFrames},
+        {"warm_return_count", warmReturnCount},
+        {"warm_return_missing_block_count",
+         warmReturnMissingBlockCount},
+    };
+    if (totalJumpStaleFrames == 0U &&
+        maximumChangedPixelFraction > 0.05) {
+        passes.emplace_back(
+            "Discontinuous Surface_05 moves changed substantial screen content and retained the prior fine patch safely over complete 5 mm during cache refresh.");
+    } else if (totalJumpStaleFrames > 0U) {
+        failures.emplace_back(
+            "A sudden camera move exposed a stale fine patch.");
+    } else {
+        failures.emplace_back(
+            "The jump captures did not demonstrate a meaningful full-frame pixel change.");
+    }
+    if (warmReturnCount > 0U &&
+        warmReturnMissingBlockCount == 0U) {
+        passes.emplace_back(
+            "Returning to a previously published Surface_05 camera reused every decoded aHQ block without disk reads.");
+    } else {
+        failures.emplace_back(
+            "Returning to a previously published Surface_05 camera re-read an evicted aHQ block.");
+    }
+
+    const auto& diagnostics = viewport->Diagnostics();
+    report["renderer"] = {
+        {"name", diagnostics.rendererName},
+        {"present_mode", diagnostics.presentMode},
+        {"viewport_width", diagnostics.width},
+        {"viewport_height", diagnostics.height},
+        {"gpu_timestamp_supported",
+         diagnostics.gpuTimestampsSupported},
+    };
+    (void)SetLinkedHqPreviewMode(
+        runtimeState,
+        viewport,
+        LinkedHqPreviewMode::Off);
     viewport->WaitIdle();
     return finish();
 }
@@ -125973,7 +131361,8 @@ int RunLinkedHqFrameTimingSmoke(
         for (std::uint32_t frame = 0U; frame < kSampleFrames; ++frame) {
             pumpFrame(spec, &samples, &lastRenderState);
             const auto patchLayers = LinkedHqPatchLayerCount(lastRenderState);
-            if (patchLayers != (spec.hqEnabled ? 2U : 0U)) {
+            if (patchLayers !=
+                (spec.hqEnabled ? hq.patches.size() : 0U)) {
                 ++patchLayerMismatchFrames;
             }
         }
@@ -126014,9 +131403,7 @@ int RunLinkedHqFrameTimingSmoke(
             layers.push_back({
                 {"layer_id", layer.layerId},
                 {"draw_point_count", layer.drawPointCount},
-                {"hq_patch",
-                 layer.layerId == kLinkedHqRockPatchLayerId ||
-                     layer.layerId == kLinkedHqVegetationPatchLayerId},
+                {"hq_patch", IsLinkedHqPatchLayerId(layer.layerId)},
                 {"generated_water_overlay", layer.generatedWaterOverlay},
                 {"footprint_scale", layer.densityCompensation.footprintScale},
                 {"rain_impact_effects", layer.style.rainImpactEffects},
@@ -127231,8 +132618,8 @@ int RunWaterIntegrationSmoke(
 
     InstallWaterIntegrationScenario(runtimeState);
     // The smoke authors its Timing effects after the point clouds are already
-    // resident. Production projects include saved effects in the initial load
-    // filter; this deliberately exercises the lower-priority on-demand path.
+    // resident. Production also publishes geometry first, then resolves the
+    // selected Take's fields through this same lower-priority on-demand path.
     // Let every required field settle before asserting the full stack rather
     // than restoring the old always-resident scalar compatibility floor.
     const auto requiredScalarFieldsSettled = [&]() {
@@ -128441,6 +133828,762 @@ int RunWaterIntegrationSmoke(
     return finish();
 }
 
+int RunAdaptiveHqCacheBuild(
+    const AdaptiveHqCacheBuildOptions& options) {
+    const auto cacheRoot =
+        invisible_places::app::workspace::LocalSavedDirectory(
+            Application::DefaultDataDirectory()) /
+        ".invisible_places" / "cache" / "adaptive_hq";
+    const auto reportPath = options.reportPath.empty()
+        ? cacheRoot / "last-build-report.json"
+        : options.reportPath;
+    nlohmann::json report{
+        {"schema_version", 2U},
+        {"cache_root", cacheRoot.string()},
+        {"passed", true},
+        {"sources", nlohmann::json::array()},
+    };
+    const auto writeReport = [&]() {
+        std::error_code createError;
+        const auto parent = reportPath.parent_path();
+        if (!parent.empty()) {
+            std::filesystem::create_directories(parent, createError);
+        }
+        if (createError) {
+            std::cerr << "Unable to create adaptive-HQ report directory: "
+                      << createError.message() << '\n';
+            return false;
+        }
+        std::ofstream output{reportPath, std::ios::trunc};
+        if (!output.is_open()) {
+            std::cerr << "Unable to write adaptive-HQ cache report: "
+                      << reportPath.string() << '\n';
+            return false;
+        }
+        output << report.dump(2) << '\n';
+        std::cout << "Adaptive HQ cache report: " << reportPath.string()
+                  << '\n';
+        return output.good();
+    };
+    if (options.sourcePaths.empty()) {
+        report["passed"] = false;
+        report["error"] =
+            "At least one explicit source PLY is required.";
+        (void)writeReport();
+        std::cerr << report["error"].get<std::string>() << '\n';
+        return 2;
+    }
+
+    std::unordered_set<std::string> uniqueSources;
+    std::vector<invisible_places::io::AdaptiveHqCacheIndex>
+        validatedIndexes;
+    for (const auto& requestedPath : options.sourcePaths) {
+        const auto sourceStarted = std::chrono::steady_clock::now();
+        nlohmann::json sourceReport{
+            {"requested_path", requestedPath.string()},
+            {"passed", false},
+        };
+        const auto inspected =
+            invisible_places::io::InspectAdaptiveHqSource(requestedPath);
+        if (!inspected.success) {
+            sourceReport["error"] = inspected.errorMessage;
+            report["sources"].push_back(std::move(sourceReport));
+            report["passed"] = false;
+            continue;
+        }
+        const auto sourceKey = inspected.identity.path.generic_string();
+        if (!uniqueSources.insert(sourceKey).second) {
+            sourceReport["error"] = "The source was supplied more than once.";
+            report["sources"].push_back(std::move(sourceReport));
+            report["passed"] = false;
+            continue;
+        }
+        sourceReport["source_path"] = sourceKey;
+        sourceReport["source_byte_size"] = inspected.identity.byteSize;
+        sourceReport["source_point_count"] = inspected.identity.pointCount;
+        sourceReport["source_record_size"] = inspected.identity.recordSize;
+        sourceReport["source_schema_fingerprint"] =
+            inspected.identity.schemaFingerprint;
+        sourceReport["source_content_fingerprint"] =
+            inspected.identity.contentFingerprint;
+
+        std::cout << "Adaptive HQ cache: "
+                  << inspected.identity.path.filename().string() << " ("
+                  << inspected.identity.pointCount << " points, "
+                  << inspected.identity.byteSize << " bytes)\n";
+        int lastPercent = -5;
+        const auto opened = invisible_places::io::OpenOrBuildAdaptiveHqCache(
+            cacheRoot,
+            inspected.identity,
+            {},
+            [&](float progress) {
+                const int percent = std::clamp(
+                    static_cast<int>(std::floor(progress * 100.0F)),
+                    0,
+                    100);
+                if (percent >= lastPercent + 5 || percent == 100) {
+                    lastPercent = percent;
+                    std::cout << "  " << percent << "%" << std::endl;
+                }
+            });
+        sourceReport["cache_built"] = opened.built;
+        if (!opened.success) {
+            sourceReport["error"] = opened.errorMessage;
+            sourceReport["cancelled"] = opened.cancelled;
+            report["sources"].push_back(std::move(sourceReport));
+            report["passed"] = false;
+            continue;
+        }
+
+        const auto& index = opened.index;
+        std::uint64_t indexedPointCount = 0U;
+        std::uint64_t indexedByteCount = 0U;
+        std::uint64_t indexedScalarByteCount = 0U;
+        std::uint64_t expectedOffset = index.dataOffsetBytes;
+        std::uint64_t expectedScalarOffset = 0U;
+        bool indexValid = !index.blocks.empty();
+        for (std::size_t blockSlot = 0U;
+             blockSlot < index.blocks.size();
+             ++blockSlot) {
+            const auto& block = index.blocks[blockSlot];
+            indexValid = indexValid &&
+                block.blockIndex == blockSlot && block.bounds.valid &&
+                block.pointCount > 0U &&
+                block.fileOffsetBytes == expectedOffset &&
+                block.byteSize ==
+                    block.pointCount * index.cachedRecordSize &&
+                block.scalarFileOffsetBytes == expectedScalarOffset &&
+                block.scalarByteSize ==
+                    block.pointCount * index.scalarFields.size() *
+                        sizeof(float) &&
+                block.byteSize <=
+                    invisible_places::io::kAdaptiveHqCacheMaximumBlockBytes +
+                        index.cachedRecordSize;
+            indexedPointCount += block.pointCount;
+            indexedByteCount += block.byteSize;
+            indexedScalarByteCount += block.scalarByteSize;
+            expectedOffset += block.byteSize;
+            expectedScalarOffset += block.scalarByteSize;
+        }
+        indexValid = indexValid &&
+            indexedPointCount == index.source.pointCount &&
+            indexedByteCount == index.dataByteSize &&
+            indexedScalarByteCount == index.scalarDataByteSize;
+
+        // Decode representative geometry seeks and one compact scalar column.
+        // This validates both payloads without loading the complete production
+        // cloud into RAM.
+        invisible_places::io::PointCloudScalarFieldFilter geometryOnly;
+        geometryOnly.mode = invisible_places::io::
+            PointCloudScalarFieldFilter::Mode::Selected;
+        std::set<std::uint32_t> sampledBlocks{
+            0U,
+            static_cast<std::uint32_t>(index.blocks.size() / 2U),
+            static_cast<std::uint32_t>(index.blocks.size() - 1U),
+        };
+        nlohmann::json seekValidation = nlohmann::json::array();
+        for (const auto blockIndex : sampledBlocks) {
+            const auto loaded =
+                invisible_places::io::LoadAdaptiveHqCacheBlock(
+                    index,
+                    blockIndex,
+                    geometryOnly);
+            const auto expectedPoints = index.blocks[blockIndex].pointCount;
+            bool sampleValid = loaded.success &&
+                loaded.cloud.PointCount() == expectedPoints &&
+                loaded.cloud.scalarFields.empty() &&
+                loaded.sourcePointIndices.size() == expectedPoints &&
+                std::all_of(
+                    loaded.sourcePointIndices.begin(),
+                    loaded.sourcePointIndices.end(),
+                    [&](std::uint32_t sourceIndex) {
+                        return sourceIndex < index.source.pointCount;
+                    });
+            std::string scalarError;
+            if (!index.scalarFields.empty()) {
+                invisible_places::io::PointCloudScalarFieldFilter oneField;
+                oneField.mode = invisible_places::io::
+                    PointCloudScalarFieldFilter::Mode::Selected;
+                oneField.names.push_back(index.scalarFields.front().name);
+                const auto scalarLoaded =
+                    invisible_places::io::LoadAdaptiveHqCacheBlock(
+                        index,
+                        blockIndex,
+                        oneField);
+                sampleValid = sampleValid && scalarLoaded.success &&
+                    scalarLoaded.cloud.PointCount() == expectedPoints &&
+                    scalarLoaded.cloud.scalarFields.size() == 1U &&
+                    scalarLoaded.cloud.scalarFieldValues.size() ==
+                        expectedPoints;
+                scalarError = scalarLoaded.errorMessage;
+            }
+            indexValid = indexValid && sampleValid;
+            seekValidation.push_back({
+                {"block_index", blockIndex},
+                {"expected_points", expectedPoints},
+                {"decoded_points", loaded.cloud.PointCount()},
+                {"scalar_field",
+                 index.scalarFields.empty()
+                     ? std::string{}
+                     : index.scalarFields.front().name},
+                {"passed", sampleValid},
+                {"error",
+                 loaded.errorMessage.empty()
+                     ? scalarError
+                     : loaded.errorMessage},
+            });
+        }
+
+        sourceReport["cache_fingerprint"] = index.cacheFingerprint;
+        sourceReport["cache_index_path"] = index.indexPath.string();
+        sourceReport["cache_data_path"] = index.dataPath.string();
+        sourceReport["cache_scalar_data_path"] =
+            index.scalarDataPath.string();
+        sourceReport["cache_data_byte_size"] = index.dataByteSize;
+        sourceReport["cache_scalar_data_byte_size"] =
+            index.scalarDataByteSize;
+        sourceReport["cache_record_size"] = index.cachedRecordSize;
+        sourceReport["cache_scalar_field_count"] =
+            index.scalarFields.size();
+        sourceReport["block_count"] = index.blocks.size();
+        sourceReport["indexed_point_count"] = indexedPointCount;
+        sourceReport["seek_validation"] = std::move(seekValidation);
+        sourceReport["elapsed_ms"] =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - sourceStarted)
+                .count();
+        sourceReport["passed"] = indexValid;
+        if (!indexValid) {
+            sourceReport["error"] =
+                "The persisted index or representative block seeks failed validation.";
+            report["passed"] = false;
+        } else {
+            validatedIndexes.push_back(index);
+        }
+        report["sources"].push_back(std::move(sourceReport));
+    }
+
+    if (!options.profileAnimationPath.empty() &&
+        report["passed"].get<bool>()) {
+        std::string animationError;
+        const auto animation = invisible_places::serialization::
+            LoadAnimationPath(
+                options.profileAnimationPath,
+                &animationError);
+        if (!animation.has_value() || animation->keys.size() < 2U) {
+            report["passed"] = false;
+            report["profile_error"] = animation.has_value()
+                ? "The profile animation needs at least two camera keys."
+                : animationError;
+        } else {
+            struct AdaptiveProfileCamera {
+                glm::mat4 view{};
+                glm::mat4 projection{};
+                glm::mat4 viewProjection{};
+                invisible_places::renderer::pointcloud::
+                    PointCloudAdaptiveDensityTransition transition{};
+            };
+            const auto prepared = invisible_places::camera::
+                PrepareAnimationPathEvaluation(animation.value());
+            const auto frameCount = std::max<std::uint32_t>(
+                2U,
+                animation->durationFrames);
+            const float aspectRatio =
+                static_cast<float>(std::max<std::uint32_t>(
+                    1U,
+                    options.profileViewportWidth)) /
+                static_cast<float>(std::max<std::uint32_t>(
+                    1U,
+                    options.profileViewportHeight));
+            const auto makeCamera = [&](float normalizedPosition) {
+                invisible_places::camera::OrbitCamera camera;
+                camera.ApplyState(
+                    invisible_places::camera::
+                        EvaluatePreparedAnimationPath(
+                            prepared,
+                            prepared.durationSeconds *
+                                std::clamp(
+                                    normalizedPosition,
+                                    0.0F,
+                                    1.0F))
+                        .camera);
+                const auto matrices = camera.Matrices(aspectRatio);
+                return AdaptiveProfileCamera{
+                    .view = matrices.view,
+                    .projection = matrices.projection,
+                    .viewProjection = matrices.viewProjection,
+                    .transition = invisible_places::renderer::pointcloud::
+                        ResolvePointCloudAdaptiveDensityTransition(
+                            std::abs(matrices.projection[1][1]),
+                            static_cast<float>(std::max<std::uint32_t>(
+                                1U,
+                                options.profileViewportHeight))),
+                };
+            };
+            std::vector<AdaptiveProfileCamera> playbackCameras;
+            playbackCameras.reserve(frameCount);
+            for (std::uint32_t frame = 0U; frame < frameCount; ++frame) {
+                playbackCameras.push_back(makeCamera(
+                    static_cast<float>(frame) /
+                    static_cast<float>(frameCount - 1U)));
+            }
+
+            const auto selectionTotals = [&validatedIndexes](
+                const LinkedHqFrustumUnion& frustums) {
+                std::uint64_t blockCount = 0U;
+                std::uint64_t pointCount = 0U;
+                std::uint64_t byteCount = 0U;
+                for (const auto& index : validatedIndexes) {
+                    const auto blocks = invisible_places::io::
+                        SelectAdaptiveHqCacheBlocks(
+                            index,
+                            [&](const invisible_places::io::Bounds3f& bounds) {
+                                return frustums.IntersectsBounds(bounds);
+                            });
+                    blockCount += blocks.size();
+                    for (const auto blockIndex : blocks) {
+                        pointCount += index.blocks[blockIndex].pointCount;
+                        byteCount += index.blocks[blockIndex].byteSize;
+                    }
+                }
+                return std::array<std::uint64_t, 3U>{
+                    blockCount,
+                    pointCount,
+                    byteCount,
+                };
+            };
+
+            std::vector<glm::mat4> completePathViews;
+            const auto completePathTimes =
+                BuildUnlinkedAnimationHqSampleTimes(
+                    prepared.knots,
+                    prepared.durationSeconds);
+            completePathViews.reserve(completePathTimes.size() + 1U);
+            completePathViews.push_back(
+                playbackCameras.front().viewProjection);
+            for (const float sampleTime : completePathTimes) {
+                invisible_places::camera::OrbitCamera camera;
+                camera.ApplyState(
+                    invisible_places::camera::
+                        EvaluatePreparedAnimationPath(
+                            prepared,
+                            sampleTime)
+                        .camera);
+                completePathViews.push_back(
+                    camera.Matrices(aspectRatio).viewProjection);
+            }
+            auto completePathFrustums = BuildAnimationHqFrustumUnion(
+                completePathViews,
+                0.30F);
+            completePathFrustums.maximumViewDepthMeters =
+                playbackCameras.front()
+                    .transition.preparedFineDepthMeters;
+            const auto completePathTotals = selectionTotals(
+                completePathFrustums);
+
+            struct AdaptiveProfileSimulation {
+                std::uint64_t requestCount = 0U;
+                std::uint64_t totalNewBytes = 0U;
+                std::uint64_t totalNewBlocks = 0U;
+                std::uint64_t maximumNewBytes = 0U;
+                std::uint64_t maximumNewBlocks = 0U;
+                std::uint64_t maximumActiveBytes = 0U;
+                std::uint64_t maximumActivePoints = 0U;
+                std::uint64_t maximumResidentBytes = 0U;
+                std::vector<double> newBytesPerRequest;
+            };
+            const auto simulate = [&validatedIndexes](
+                std::span<const AdaptiveProfileCamera> cameras,
+                float guardFraction,
+                std::uint64_t retainedFringeByteBudget) {
+                AdaptiveProfileSimulation simulation;
+                std::vector<std::vector<std::uint64_t>> lastUsed;
+                lastUsed.reserve(validatedIndexes.size());
+                for (const auto& index : validatedIndexes) {
+                    lastUsed.emplace_back(index.blocks.size(), 0U);
+                }
+                std::optional<LinkedHqFrustumUnion> preparedGuard;
+                std::uint64_t requestSerial = 0U;
+                for (const auto& camera : cameras) {
+                    if (preparedGuard.has_value() &&
+                        LinkedHqFrustumUnionCoversView(
+                            preparedGuard.value(),
+                            camera.view,
+                            camera.projection,
+                            camera.transition.endDepthMeters,
+                            guardFraction * 0.5F)) {
+                        continue;
+                    }
+                    ++requestSerial;
+                    ++simulation.requestCount;
+                    std::array<glm::mat4, 1U> oneView{
+                        camera.viewProjection,
+                    };
+                    auto guard = BuildAnimationHqFrustumUnion(
+                        oneView,
+                        guardFraction);
+                    guard.maximumViewDepthMeters =
+                        camera.transition.preparedFineDepthMeters;
+                    std::uint64_t requestNewBytes = 0U;
+                    std::uint64_t requestNewBlocks = 0U;
+                    std::uint64_t requestActiveBytes = 0U;
+                    std::uint64_t requestActivePoints = 0U;
+                    std::uint64_t requestResidentBytes = 0U;
+                    for (std::size_t source = 0U;
+                         source < validatedIndexes.size();
+                         ++source) {
+                        const auto& index = validatedIndexes[source];
+                        auto& sourceLastUsed = lastUsed[source];
+                        const auto active = invisible_places::io::
+                            SelectAdaptiveHqCacheBlocks(
+                                index,
+                                [&](const invisible_places::io::Bounds3f& bounds) {
+                                    return guard.IntersectsBounds(bounds);
+                                });
+                        std::vector<bool> activeFlags(
+                            index.blocks.size(),
+                            false);
+                        for (const auto blockIndex : active) {
+                            activeFlags[blockIndex] = true;
+                            const auto& block = index.blocks[blockIndex];
+                            requestActiveBytes += block.byteSize;
+                            requestActivePoints += block.pointCount;
+                            if (sourceLastUsed[blockIndex] == 0U) {
+                                requestNewBytes += block.byteSize;
+                                ++requestNewBlocks;
+                            }
+                            sourceLastUsed[blockIndex] = requestSerial;
+                        }
+                        std::vector<std::uint32_t> inactive;
+                        for (std::uint32_t blockIndex = 0U;
+                             blockIndex < sourceLastUsed.size();
+                             ++blockIndex) {
+                            if (sourceLastUsed[blockIndex] > 0U &&
+                                !activeFlags[blockIndex]) {
+                                inactive.push_back(blockIndex);
+                            }
+                        }
+                        std::sort(
+                            inactive.begin(),
+                            inactive.end(),
+                            [&](std::uint32_t left, std::uint32_t right) {
+                                return sourceLastUsed[left] >
+                                    sourceLastUsed[right];
+                            });
+                        std::uint64_t retainedInactiveBytes = 0U;
+                        for (const auto blockIndex : inactive) {
+                            const auto blockBytes =
+                                index.blocks[blockIndex].byteSize;
+                            if (blockBytes > retainedFringeByteBudget -
+                                    retainedInactiveBytes) {
+                                sourceLastUsed[blockIndex] = 0U;
+                                continue;
+                            }
+                            retainedInactiveBytes += blockBytes;
+                        }
+                        for (std::uint32_t blockIndex = 0U;
+                             blockIndex < sourceLastUsed.size();
+                             ++blockIndex) {
+                            if (sourceLastUsed[blockIndex] > 0U) {
+                                requestResidentBytes +=
+                                    index.blocks[blockIndex].byteSize;
+                            }
+                        }
+                    }
+                    simulation.totalNewBytes += requestNewBytes;
+                    simulation.totalNewBlocks += requestNewBlocks;
+                    simulation.maximumNewBytes = std::max(
+                        simulation.maximumNewBytes,
+                        requestNewBytes);
+                    simulation.maximumNewBlocks = std::max(
+                        simulation.maximumNewBlocks,
+                        requestNewBlocks);
+                    simulation.maximumActiveBytes = std::max(
+                        simulation.maximumActiveBytes,
+                        requestActiveBytes);
+                    simulation.maximumActivePoints = std::max(
+                        simulation.maximumActivePoints,
+                        requestActivePoints);
+                    simulation.maximumResidentBytes = std::max(
+                        simulation.maximumResidentBytes,
+                        requestResidentBytes);
+                    simulation.newBytesPerRequest.push_back(
+                        static_cast<double>(requestNewBytes));
+                    preparedGuard = std::move(guard);
+                }
+                return simulation;
+            };
+            const auto simulationJson = [](const auto& simulation) {
+                return nlohmann::json{
+                    {"request_count", simulation.requestCount},
+                    {"total_new_bytes", simulation.totalNewBytes},
+                    {"total_new_blocks", simulation.totalNewBlocks},
+                    {"maximum_new_bytes", simulation.maximumNewBytes},
+                    {"maximum_new_blocks", simulation.maximumNewBlocks},
+                    {"p95_new_bytes",
+                     PercentileValue(
+                         simulation.newBytesPerRequest,
+                         0.95)},
+                    {"maximum_active_bytes",
+                     simulation.maximumActiveBytes},
+                    {"maximum_active_points",
+                     simulation.maximumActivePoints},
+                    {"maximum_resident_bytes",
+                     simulation.maximumResidentBytes},
+                };
+            };
+
+            constexpr std::array<float, 4U> kGuardFractions{
+                0.20F,
+                0.30F,
+                0.40F,
+                0.50F,
+            };
+            constexpr std::array<std::uint64_t, 3U> kFringeByteBudgets{
+                128ULL * 1024ULL * 1024ULL,
+                1024ULL * 1024ULL * 1024ULL,
+                kAdaptiveHqRetainedFringeByteBudgetPerRole,
+            };
+            constexpr std::array<float, 7U> kJumpPositions{
+                0.0F,
+                0.5F,
+                1.0F,
+                0.25F,
+                0.75F,
+                0.0F,
+                1.0F,
+            };
+            std::vector<AdaptiveProfileCamera> jumpCameras;
+            jumpCameras.reserve(kJumpPositions.size());
+            for (const float position : kJumpPositions) {
+                jumpCameras.push_back(makeCamera(position));
+            }
+            nlohmann::json candidates = nlohmann::json::array();
+            for (const float guard : kGuardFractions) {
+                for (const auto fringeBytes : kFringeByteBudgets) {
+                    candidates.push_back({
+                        {"guard_fraction", guard},
+                        {"refresh_border_fraction", guard * 0.5F},
+                        {"retained_fringe_byte_budget", fringeBytes},
+                        {"sequential_playback",
+                         simulationJson(simulate(
+                             playbackCameras,
+                             guard,
+                             fringeBytes))},
+                        {"abrupt_jumps",
+                         simulationJson(simulate(
+                             jumpCameras,
+                             guard,
+                             fringeBytes))},
+                    });
+                }
+            }
+            report["profile"] = {
+                {"animation_path",
+                 options.profileAnimationPath.string()},
+                {"animation_name", animation->name},
+                {"duration_frames", frameCount},
+                {"duration_seconds", prepared.durationSeconds},
+                {"viewport_width", options.profileViewportWidth},
+                {"viewport_height", options.profileViewportHeight},
+                {"source_count", validatedIndexes.size()},
+                {"legacy_full_path_policy",
+                 {{"guard_fraction",
+                   0.30F},
+                  {"sampled_camera_count",
+                   completePathFrustums.viewProjections.size()},
+                  {"initial_block_count", completePathTotals[0U]},
+                  {"initial_point_count", completePathTotals[1U]},
+                  {"initial_bytes", completePathTotals[2U]}}},
+                {"selected_runtime_policy",
+                 {{"guard_fraction", kAdaptiveHqViewportGuardFraction},
+                  {"refresh_border_fraction",
+                   kAdaptiveHqRefreshBorderFraction},
+                  {"retained_fringe_decoded_byte_budget_per_role",
+                   kAdaptiveHqRetainedFringeByteBudgetPerRole},
+                  {"complete_animation_path_prefetch", false}}},
+                {"camera_guard_candidates", std::move(candidates)},
+            };
+        }
+    }
+    if (!writeReport()) {
+        return 1;
+    }
+    return report["passed"].get<bool>() ? 0 : 1;
+}
+
+int RunPointCloudFieldCacheBuild(
+    const PointCloudFieldCacheBuildOptions& options) {
+    const auto cacheRoot =
+        invisible_places::app::workspace::LocalSavedDirectory(
+            Application::DefaultDataDirectory()) /
+        ".invisible_places" / "cache";
+    invisible_places::io::SetPointCloudFieldCacheRoot(cacheRoot);
+    const auto reportPath = options.reportPath.empty()
+        ? cacheRoot / "fields" / "last-build-report.json"
+        : options.reportPath;
+    nlohmann::json report{
+        {"schema_version", 1U},
+        {"field_cache_schema_version",
+         invisible_places::io::kPointCloudFieldCacheSchemaVersion},
+        {"cache_root", (cacheRoot / "fields").string()},
+        {"point_id_encoding", "implicit-file-order-uint32"},
+        {"passed", true},
+        {"sources", nlohmann::json::array()},
+    };
+    const auto writeReport = [&]() {
+        std::error_code createError;
+        if (!reportPath.parent_path().empty()) {
+            std::filesystem::create_directories(
+                reportPath.parent_path(),
+                createError);
+        }
+        if (createError) {
+            std::cerr << "Unable to create field-cache report directory: "
+                      << createError.message() << '\n';
+            return false;
+        }
+        std::ofstream output{reportPath, std::ios::trunc};
+        if (!output.is_open()) {
+            std::cerr << "Unable to write point-cloud field-cache report: "
+                      << reportPath.string() << '\n';
+            return false;
+        }
+        output << report.dump(2) << '\n';
+        std::cout << "Point-cloud field cache report: "
+                  << reportPath.string() << '\n';
+        return output.good();
+    };
+    if (options.sourcePaths.empty()) {
+        report["passed"] = false;
+        report["error"] = "At least one explicit source PLY is required.";
+        (void)writeReport();
+        return 2;
+    }
+
+    std::unordered_set<std::string> uniqueSources;
+    for (const auto& requestedPath : options.sourcePaths) {
+        nlohmann::json sourceReport{
+            {"requested_path", requestedPath.string()},
+            {"passed", false},
+        };
+        const auto inspected =
+            invisible_places::io::InspectAdaptiveHqSource(requestedPath);
+        if (!inspected.success) {
+            sourceReport["error"] = inspected.errorMessage;
+            report["sources"].push_back(std::move(sourceReport));
+            report["passed"] = false;
+            continue;
+        }
+        const auto sourceKey = inspected.identity.path.generic_string();
+        if (!uniqueSources.insert(sourceKey).second) {
+            sourceReport["error"] = "The source was supplied more than once.";
+            report["sources"].push_back(std::move(sourceReport));
+            report["passed"] = false;
+            continue;
+        }
+        std::cout << "Point-cloud geometry + scalar cache: "
+                  << inspected.identity.path.filename().string() << " ("
+                  << inspected.identity.pointCount << " points)\n";
+        const auto loaded =
+            invisible_places::io::RebuildPointCloudFieldCache(
+                inspected.identity.path);
+        const auto manifest = invisible_places::io::
+            LoadValidPointCloudFieldCacheManifest(inspected.identity.path);
+        const auto cacheDirectory = invisible_places::io::
+            PointCloudFieldCacheDirectory(inspected.identity.path);
+        const auto geometryPath = cacheDirectory / "geometry.bin";
+        std::error_code sizeError;
+        const auto geometryByteSize =
+            std::filesystem::file_size(geometryPath, sizeError);
+        const auto expectedGeometryByteSize =
+            inspected.identity.pointCount *
+            (sizeof(invisible_places::io::Float3) +
+             sizeof(std::uint32_t) +
+             (loaded.cloud.hasNormals
+                  ? sizeof(invisible_places::io::Float3)
+                  : 0U));
+        std::size_t scalarFileCount = 0U;
+        std::uint64_t scalarByteSize = 0U;
+        std::error_code directoryError;
+        for (const auto& entry : std::filesystem::directory_iterator{
+                 cacheDirectory,
+                 directoryError}) {
+            if (directoryError) {
+                break;
+            }
+            const auto fileName = entry.path().filename().string();
+            if (!entry.is_regular_file() ||
+                !fileName.starts_with("field_") ||
+                entry.path().extension() != ".bin") {
+                continue;
+            }
+            std::error_code fieldSizeError;
+            const auto fieldBytes =
+                std::filesystem::file_size(entry.path(), fieldSizeError);
+            if (fieldSizeError ||
+                fieldBytes != inspected.identity.pointCount * sizeof(float)) {
+                directoryError = fieldSizeError
+                    ? fieldSizeError
+                    : std::make_error_code(std::errc::invalid_argument);
+                break;
+            }
+            ++scalarFileCount;
+            scalarByteSize += fieldBytes;
+        }
+        const bool valid = loaded.success && manifest.has_value() &&
+            loaded.cloud.PointCount() == inspected.identity.pointCount &&
+            loaded.cloud.scalarFields.size() ==
+                loaded.cloud.availableScalarFields.size() &&
+            !sizeError &&
+            geometryByteSize == expectedGeometryByteSize &&
+            !directoryError &&
+            scalarFileCount == loaded.cloud.availableScalarFields.size() &&
+            manifest->pointCount == inspected.identity.pointCount &&
+            manifest->sourceRecordSize == inspected.identity.recordSize &&
+            manifest->sourceSchemaFingerprint ==
+                inspected.identity.schemaFingerprint &&
+            manifest->sourceContentFingerprint ==
+                inspected.identity.contentFingerprint;
+        sourceReport["source_path"] = sourceKey;
+        sourceReport["source_byte_size"] = inspected.identity.byteSize;
+        sourceReport["source_point_count"] = inspected.identity.pointCount;
+        sourceReport["source_record_size"] = inspected.identity.recordSize;
+        sourceReport["source_schema_fingerprint"] =
+            inspected.identity.schemaFingerprint;
+        sourceReport["source_content_fingerprint"] =
+            inspected.identity.contentFingerprint;
+        sourceReport["cache_directory"] = cacheDirectory.string();
+        sourceReport["geometry_path"] = geometryPath.string();
+        sourceReport["geometry_byte_size"] =
+            sizeError ? 0U : geometryByteSize;
+        sourceReport["scalar_byte_size"] = scalarByteSize;
+        sourceReport["scalar_file_count"] = scalarFileCount;
+        sourceReport["available_scalar_field_count"] =
+            loaded.cloud.availableScalarFields.size();
+        sourceReport["resident_scalar_field_count"] =
+            loaded.cloud.scalarFields.size();
+        sourceReport["point_ids_stored_explicitly"] = false;
+        sourceReport["point_id_encoding"] = "array-index equals source ID";
+        sourceReport["layout"] = {
+            {"hot", "positions, packed colour, normals, implicit source ID"},
+            {"cold", "one contiguous float file per scalar field"},
+        };
+        sourceReport["passed"] = valid;
+        if (!valid) {
+            sourceReport["error"] = loaded.errorMessage.empty()
+                ? "The geometry/scalar field cache failed validation."
+                : loaded.errorMessage;
+            report["passed"] = false;
+        }
+        report["sources"].push_back(std::move(sourceReport));
+    }
+    if (!writeReport()) {
+        return 1;
+    }
+    return report["passed"].get<bool>() ? 0 : 1;
+}
+
 }  // namespace
 
 Application::Application(std::filesystem::path dataRoot)
@@ -128451,6 +134594,13 @@ std::filesystem::path Application::DefaultDataDirectory() {
 }
 
 int Application::Run(ApplicationRunOptions options) const {
+    if (options.pointCloudFieldCacheBuild.has_value()) {
+        return RunPointCloudFieldCacheBuild(
+            options.pointCloudFieldCacheBuild.value());
+    }
+    if (options.adaptiveHqCacheBuild.has_value()) {
+        return RunAdaptiveHqCacheBuild(options.adaptiveHqCacheBuild.value());
+    }
     if (options.backgroundRenderStatusMonitor.has_value()) {
         return RunBackgroundRenderStatusMonitor(
             options.backgroundRenderStatusMonitor.value());
@@ -128922,6 +135072,18 @@ int Application::Run(ApplicationRunOptions options) const {
             viewport->WaitIdle();
             return smokeExitCode;
         }
+        if (options.guiSmoke->scenario ==
+            "adaptive-hq-surface05-performance") {
+            const auto smokeExitCode =
+                RunAdaptiveHqSurfacePerformanceSmoke(
+                    options.guiSmoke.value(),
+                    &window,
+                    &viewport.value(),
+                    &runtimeState);
+            StopBackgroundWorkForShutdown(&runtimeState);
+            viewport->WaitIdle();
+            return smokeExitCode;
+        }
         if (options.guiSmoke->scenario == "scene3-patch-boundaries") {
             const auto smokeExitCode = RunScene3PatchBoundarySmoke(
                 options.guiSmoke.value(),
@@ -129292,6 +135454,9 @@ int Application::Run(ApplicationRunOptions options) const {
                     liveWaterTimeSeconds);
             }
             PrunePreviewLodSampleCaches(&runtimeState);
+            EnsureLiveAnimationSectionMask(
+                &runtimeState,
+                &viewport.value());
             if (!pauseLiveViewport) {
                 DrawPivotOverlay(runtimeState, viewport.value());
                 if (!reciprocalPanWizardActive &&

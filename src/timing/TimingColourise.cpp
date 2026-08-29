@@ -270,6 +270,16 @@ bool IsValidBoundsKeyMode(TimingColouriseBoundsKeyMode mode) {
     return false;
 }
 
+bool IsValidEdgeFadeMode(TimingColouriseEdgeFadeMode mode) {
+    switch (mode) {
+        case TimingColouriseEdgeFadeMode::RelativeLinked:
+        case TimingColouriseEdgeFadeMode::RelativeSeparate:
+        case TimingColouriseEdgeFadeMode::Absolute:
+            return true;
+    }
+    return false;
+}
+
 bool IsValidBoundsParameter(TimingColouriseBoundsParameter parameter) {
     switch (parameter) {
         case TimingColouriseBoundsParameter::Lower:
@@ -284,6 +294,19 @@ bool IsValidBoundsParameter(TimingColouriseBoundsParameter parameter) {
             return true;
     }
     return false;
+}
+
+bool IsEdgeFadeBoundsParameter(
+    TimingColouriseBoundsParameter parameter) {
+    return parameter == TimingColouriseBoundsParameter::EdgeFade ||
+           parameter == TimingColouriseBoundsParameter::EdgeFadeLower ||
+           parameter == TimingColouriseBoundsParameter::EdgeFadeUpper;
+}
+
+bool IsPerEdgeFadeBoundsParameter(
+    TimingColouriseBoundsParameter parameter) {
+    return parameter == TimingColouriseBoundsParameter::EdgeFadeLower ||
+           parameter == TimingColouriseBoundsParameter::EdgeFadeUpper;
 }
 
 // Splits every legacy shared EdgeFade key into coincident EdgeFadeLower and
@@ -425,14 +448,14 @@ void SortAndCoalescePaletteStopParameterKeys(
 
 float SanitizeBoundsParameterValue(
     TimingColouriseBoundsParameter parameter,
-    float value) {
-    if (parameter == TimingColouriseBoundsParameter::EdgeFade) {
-        return std::clamp(FiniteOr(value, 0.10F), -0.5F, 0.5F);
-    }
-    if (parameter == TimingColouriseBoundsParameter::EdgeFadeLower ||
+    float value,
+    TimingColouriseEdgeFadeMode fadeMode) {
+    if (parameter == TimingColouriseBoundsParameter::EdgeFade ||
+        parameter == TimingColouriseBoundsParameter::EdgeFadeLower ||
         parameter == TimingColouriseBoundsParameter::EdgeFadeUpper) {
-        // The split fades reach a whole-span fade in either direction.
-        return std::clamp(FiniteOr(value, 0.10F), -1.0F, 1.0F);
+        return TimingColouriseEdgeFadesAreAbsolute(fadeMode)
+                   ? FiniteOr(value, 0.0F)
+                   : SanitizeTimingColouriseEdgeFade(value);
     }
     value = FiniteOr(value, 0.0F);
     if (parameter == TimingColouriseBoundsParameter::Spread) {
@@ -467,6 +490,148 @@ void SortAndCoalesceBoundsParameterKeys(
         }
     }
     *keys = std::move(unique);
+}
+
+std::vector<TimingColouriseBoundsParameterKey>
+ExtractEdgeFadeBoundsParameterKeys(
+    const std::vector<TimingColouriseBoundsParameterKey>& keys) {
+    std::vector<TimingColouriseBoundsParameterKey> fadeKeys;
+    fadeKeys.reserve(keys.size());
+    for (const auto& key : keys) {
+        if (IsPerEdgeFadeBoundsParameter(key.parameter)) {
+            fadeKeys.push_back(key);
+        }
+    }
+    return fadeKeys;
+}
+
+void RemoveEdgeFadeBoundsParameterKeys(
+    std::vector<TimingColouriseBoundsParameterKey>* keys) {
+    if (keys == nullptr) {
+        return;
+    }
+    std::erase_if(
+        *keys,
+        [](const TimingColouriseBoundsParameterKey& key) {
+            return IsEdgeFadeBoundsParameter(key.parameter);
+        });
+}
+
+bool HasInactiveEdgeFadeModeMemory(
+    const std::vector<TimingColouriseEdgeFadeModeMemory>& memories,
+    TimingColouriseEdgeFadeMode activeMode) {
+    return std::any_of(
+        memories.begin(),
+        memories.end(),
+        [&](const TimingColouriseEdgeFadeModeMemory& memory) {
+            return IsValidEdgeFadeMode(memory.mode) &&
+                   memory.mode != activeMode &&
+                   !memory.keys.empty();
+        });
+}
+
+// Whole-bounds snapshot keys are a legacy container that also carried fade
+// animation. Project that animation into the active per-edge tracks before
+// mode isolation begins; thereafter the snapshots supply geometry only.
+void SeedActiveEdgeFadeKeysFromLegacyBoundsKeys(
+    std::vector<TimingColouriseBoundsParameterKey>* parameterKeys,
+    const std::vector<TimingColouriseBoundsKey>& boundsKeys,
+    TimingColouriseEdgeFadeMode activeMode,
+    bool modeIsolationAlreadyActive) {
+    if (parameterKeys == nullptr || boundsKeys.empty() ||
+        modeIsolationAlreadyActive) {
+        return;
+    }
+    for (const auto parameter : {
+             TimingColouriseBoundsParameter::EdgeFadeLower,
+             TimingColouriseBoundsParameter::EdgeFadeUpper}) {
+        const bool alreadyProjected = std::any_of(
+            parameterKeys->begin(),
+            parameterKeys->end(),
+            [&](const TimingColouriseBoundsParameterKey& key) {
+                return key.parameter == parameter;
+            });
+        if (alreadyProjected) {
+            continue;
+        }
+        parameterKeys->reserve(
+            parameterKeys->size() + boundsKeys.size());
+        for (const auto& legacy : boundsKeys) {
+            parameterKeys->push_back({
+                .parameter = parameter,
+                .position = legacy.position,
+                .value = TimingColouriseAuthoredBoundsParameterValue(
+                    legacy.bounds,
+                    parameter,
+                    activeMode),
+                .interpolation = legacy.interpolation,
+            });
+        }
+    }
+}
+
+void SanitizeInactiveEdgeFadeModeMemories(
+    const TimingColouriseBounds& referenceBounds,
+    TimingColouriseEdgeFadeMode activeMode,
+    std::vector<TimingColouriseEdgeFadeModeMemory>* memories) {
+    if (memories == nullptr) {
+        return;
+    }
+    std::vector<TimingColouriseEdgeFadeModeMemory> kept;
+    kept.reserve(memories->size());
+    for (auto& memory : *memories) {
+        if (!IsValidEdgeFadeMode(memory.mode) ||
+            memory.mode == activeMode ||
+            std::any_of(
+                kept.begin(),
+                kept.end(),
+                [&](const TimingColouriseEdgeFadeModeMemory& candidate) {
+                    return candidate.mode == memory.mode;
+                })) {
+            continue;
+        }
+        auto authored = referenceBounds;
+        authored.edgeFadeLower = memory.edgeFadeLower;
+        authored.edgeFadeUpper = memory.edgeFadeUpper;
+        authored = SanitizeTimingColouriseAuthoredBounds(
+            authored,
+            memory.mode);
+        memory.edgeFadeLower = authored.edgeFadeLower;
+        memory.edgeFadeUpper = authored.edgeFadeUpper;
+        SplitLegacyEdgeFadeKeys(&memory.keys);
+        std::erase_if(
+            memory.keys,
+            [](const TimingColouriseBoundsParameterKey& key) {
+                return !IsPerEdgeFadeBoundsParameter(key.parameter);
+            });
+        for (auto& key : memory.keys) {
+            key.position = Clamp01(key.position);
+            key.value = SanitizeBoundsParameterValue(
+                key.parameter,
+                key.value,
+                memory.mode);
+            if (!IsValidInterpolation(key.interpolation)) {
+                key.interpolation = invisible_places::water::
+                    WaterScenarioInterpolation::Smooth;
+            }
+        }
+        SortAndCoalesceBoundsParameterKeys(&memory.keys);
+        if (memory.keys.empty()) {
+            // Unkeyed modes inherit the visible values whenever they are
+            // entered; only authored tracks need inactive storage.
+            continue;
+        }
+        kept.push_back(std::move(memory));
+    }
+    std::stable_sort(
+        kept.begin(),
+        kept.end(),
+        [](const TimingColouriseEdgeFadeModeMemory& left,
+           const TimingColouriseEdgeFadeModeMemory& right) {
+            return static_cast<std::uint8_t>(left.mode) <
+                   static_cast<std::uint8_t>(right.mode);
+        });
+    *memories = std::move(kept);
 }
 
 void SortAndCoalesceEffectParameterKeys(
@@ -1100,7 +1265,7 @@ TimingColouriseBounds EvaluateLegacyTimingColouriseBounds(
     const float amount = InterpolationAmount(
         left->interpolation,
         (normalizedPosition - left->position) / span);
-    return SanitizeTimingColouriseBounds(TimingColouriseBounds{
+    return SanitizeTimingColouriseAuthoredBounds(TimingColouriseBounds{
         .lower = std::lerp(left->bounds.lower, right->bounds.lower, amount),
         .upper = std::lerp(left->bounds.upper, right->bounds.upper, amount),
         .edgeFadeLower = std::lerp(
@@ -1111,7 +1276,140 @@ TimingColouriseBounds EvaluateLegacyTimingColouriseBounds(
             left->bounds.edgeFadeUpper,
             right->bounds.edgeFadeUpper,
             amount),
-    });
+    }, effect.edgeFadeMode);
+}
+
+TimingColouriseBounds EvaluatePreparedTimingColouriseAuthoredBounds(
+    const TimingColouriseEffect& prepared,
+    float normalizedPosition) {
+    auto fallback = EvaluateLegacyTimingColouriseBounds(
+        prepared,
+        normalizedPosition);
+    // Legacy whole-bounds snapshots still provide the interval geometry,
+    // but their fade members are projected into the active mode's scalar
+    // tracks while sanitizing.
+    fallback.edgeFadeLower = prepared.baseBounds.edgeFadeLower;
+    fallback.edgeFadeUpper = prepared.baseBounds.edgeFadeUpper;
+    const auto value = [&](TimingColouriseBoundsParameter parameter) {
+        const auto evaluated = EvaluateBoundsParameterTrack(
+            prepared.boundsParameterKeys,
+            parameter,
+            normalizedPosition);
+        return evaluated.value_or(
+            TimingColouriseAuthoredBoundsParameterValue(
+                fallback,
+                parameter,
+                prepared.edgeFadeMode));
+    };
+
+    TimingColouriseBounds result{
+        .edgeFadeLower =
+            value(TimingColouriseBoundsParameter::EdgeFadeLower),
+        .edgeFadeUpper =
+            value(TimingColouriseBoundsParameter::EdgeFadeUpper),
+    };
+    switch (prepared.boundsKeyMode) {
+        case TimingColouriseBoundsKeyMode::CentreSpread: {
+            const float centre =
+                value(TimingColouriseBoundsParameter::Centre);
+            const float halfSpread =
+                0.5F * value(TimingColouriseBoundsParameter::Spread);
+            result.lower = centre - halfSpread;
+            result.upper = centre + halfSpread;
+            break;
+        }
+        case TimingColouriseBoundsKeyMode::LowerSpread:
+            result.lower = value(TimingColouriseBoundsParameter::Lower);
+            result.upper =
+                result.lower +
+                value(TimingColouriseBoundsParameter::Spread);
+            break;
+        case TimingColouriseBoundsKeyMode::UpperSpread:
+            result.upper = value(TimingColouriseBoundsParameter::Upper);
+            result.lower =
+                result.upper -
+                value(TimingColouriseBoundsParameter::Spread);
+            break;
+        case TimingColouriseBoundsKeyMode::LowerUpper:
+        default:
+            result.lower = value(TimingColouriseBoundsParameter::Lower);
+            result.upper = value(TimingColouriseBoundsParameter::Upper);
+            break;
+    }
+    if (result.lower > result.upper) {
+        // Independent endpoint curves can cross between otherwise-valid
+        // keys. Keep the visible interval collapsed at the crossing rather
+        // than exchanging the authored endpoint identities.
+        const float centre = std::midpoint(result.lower, result.upper);
+        result.lower = centre;
+        result.upper = centre;
+    }
+    return SanitizeTimingColouriseAuthoredBounds(
+        result,
+        prepared.edgeFadeMode);
+}
+
+template <typename Iterator>
+std::optional<invisible_places::water::WaterScenarioInterpolation>
+KeyInterpolationAtPosition(
+    Iterator begin,
+    Iterator end,
+    float position,
+    bool exactOnly) {
+    if (begin == end) {
+        return std::nullopt;
+    }
+    const auto exact = std::find_if(
+        begin,
+        end,
+        [&](const auto& key) {
+            return std::abs(key.position - position) <=
+                   kTimingColouriseKeyTolerance;
+        });
+    if (exact != end) {
+        return exact->interpolation;
+    }
+    if (exactOnly) {
+        return std::nullopt;
+    }
+    const auto right = std::lower_bound(
+        begin,
+        end,
+        position,
+        [](const auto& key, float candidate) {
+            return key.position < candidate;
+        });
+    if (right == begin) {
+        return begin->interpolation;
+    }
+    if (right == end) {
+        return std::prev(end)->interpolation;
+    }
+    // Interpolation belongs to the key on the left of a segment.
+    return std::prev(right)->interpolation;
+}
+
+std::optional<invisible_places::water::WaterScenarioInterpolation>
+BoundsParameterInterpolationAtPosition(
+    const std::vector<TimingColouriseBoundsParameterKey>& keys,
+    TimingColouriseBoundsParameter parameter,
+    float position,
+    bool exactOnly) {
+    const auto begin = std::find_if(
+        keys.begin(),
+        keys.end(),
+        [&](const auto& key) {
+            return key.parameter == parameter;
+        });
+    auto end = begin;
+    while (end != keys.end() && end->parameter == parameter) {
+        ++end;
+    }
+    return KeyInterpolationAtPosition(
+        begin,
+        end,
+        position,
+        exactOnly);
 }
 
 template <typename Key>
@@ -1194,22 +1492,8 @@ struct PaletteKeyPositionCluster {
     float maximum = 0.0F;
 };
 
-std::vector<PaletteKeyPositionCluster> PaletteKeyPositionClusters(
-    const TimingColouriseEffect& effect) {
-    std::vector<float> positions;
-    positions.reserve(
-        effect.paletteKeys.size() +
-        effect.paletteStopParameterKeys.size());
-    for (const auto& key : effect.paletteKeys) {
-        if (std::isfinite(key.position)) {
-            positions.push_back(Clamp01(key.position));
-        }
-    }
-    for (const auto& key : effect.paletteStopParameterKeys) {
-        if (std::isfinite(key.position)) {
-            positions.push_back(Clamp01(key.position));
-        }
-    }
+std::vector<PaletteKeyPositionCluster>
+PaletteKeyPositionClustersFromPositions(std::vector<float> positions) {
     std::stable_sort(positions.begin(), positions.end());
 
     std::vector<PaletteKeyPositionCluster> clusters;
@@ -1230,6 +1514,52 @@ std::vector<PaletteKeyPositionCluster> PaletteKeyPositionClusters(
         }
     }
     return clusters;
+}
+
+std::vector<PaletteKeyPositionCluster> PaletteKeyPositionClusters(
+    const TimingColouriseEffect& effect) {
+    std::vector<float> positions;
+    positions.reserve(
+        effect.paletteKeys.size() +
+        effect.paletteStopParameterKeys.size());
+    for (const auto& key : effect.paletteKeys) {
+        if (std::isfinite(key.position)) {
+            positions.push_back(Clamp01(key.position));
+        }
+    }
+    for (const auto& key : effect.paletteStopParameterKeys) {
+        if (std::isfinite(key.position)) {
+            positions.push_back(Clamp01(key.position));
+        }
+    }
+    return PaletteKeyPositionClustersFromPositions(
+        std::move(positions));
+}
+
+std::vector<PaletteKeyPositionCluster>
+PaletteMarkerKeyPositionClusters(
+    const TimingColouriseEffect& effect) {
+    std::vector<float> positions;
+    if (effect.paletteKeyModel ==
+        TimingColourisePaletteKeyModel::LegacySnapshots) {
+        positions.reserve(effect.paletteKeys.size());
+        for (const auto& key : effect.paletteKeys) {
+            if (std::isfinite(key.position)) {
+                positions.push_back(Clamp01(key.position));
+            }
+        }
+    } else {
+        positions.reserve(effect.paletteStopParameterKeys.size());
+        for (const auto& key : effect.paletteStopParameterKeys) {
+            if (key.parameter ==
+                    TimingColourisePaletteStopParameter::Position &&
+                std::isfinite(key.position)) {
+                positions.push_back(Clamp01(key.position));
+            }
+        }
+    }
+    return PaletteKeyPositionClustersFromPositions(
+        std::move(positions));
 }
 
 float DistanceFromPaletteKeyPositionCluster(
@@ -2875,6 +3205,13 @@ std::string AllocateTimingColourisePaletteStopId(
     }
 }
 
+float SanitizeTimingColouriseEdgeFade(float edgeFade) {
+    return std::clamp(
+        FiniteOr(edgeFade, 0.10F),
+        -kTimingColouriseMaximumOutwardEdgeFade,
+        kTimingColouriseMaximumInwardEdgeFade);
+}
+
 TimingColouriseBounds SanitizeTimingColouriseBounds(
     TimingColouriseBounds bounds) {
     bounds.lower = FiniteOr(bounds.lower, 0.0F);
@@ -2883,10 +3220,88 @@ TimingColouriseBounds SanitizeTimingColouriseBounds(
         std::swap(bounds.lower, bounds.upper);
     }
     bounds.edgeFadeLower =
-        std::clamp(FiniteOr(bounds.edgeFadeLower, 0.10F), -1.0F, 1.0F);
+        SanitizeTimingColouriseEdgeFade(bounds.edgeFadeLower);
     bounds.edgeFadeUpper =
-        std::clamp(FiniteOr(bounds.edgeFadeUpper, 0.10F), -1.0F, 1.0F);
+        SanitizeTimingColouriseEdgeFade(bounds.edgeFadeUpper);
     return bounds;
+}
+
+bool TimingColouriseEdgeFadesAreLinked(
+    TimingColouriseEdgeFadeMode mode) {
+    return mode == TimingColouriseEdgeFadeMode::RelativeLinked;
+}
+
+bool TimingColouriseEdgeFadesAreAbsolute(
+    TimingColouriseEdgeFadeMode mode) {
+    return mode == TimingColouriseEdgeFadeMode::Absolute;
+}
+
+TimingColouriseBounds SanitizeTimingColouriseAuthoredBounds(
+    TimingColouriseBounds bounds,
+    TimingColouriseEdgeFadeMode mode) {
+    bounds.lower = FiniteOr(bounds.lower, 0.0F);
+    bounds.upper = FiniteOr(bounds.upper, 1.0F);
+    if (bounds.lower > bounds.upper) {
+        std::swap(bounds.lower, bounds.upper);
+    }
+    if (!IsValidEdgeFadeMode(mode) ||
+        !TimingColouriseEdgeFadesAreAbsolute(mode)) {
+        bounds.edgeFadeLower =
+            SanitizeTimingColouriseEdgeFade(bounds.edgeFadeLower);
+        bounds.edgeFadeUpper =
+            SanitizeTimingColouriseEdgeFade(bounds.edgeFadeUpper);
+        return bounds;
+    }
+    const float span = bounds.upper - bounds.lower;
+    bounds.edgeFadeLower = std::isfinite(bounds.edgeFadeLower)
+        ? bounds.edgeFadeLower
+        : bounds.lower + span * 0.10F;
+    bounds.edgeFadeUpper = std::isfinite(bounds.edgeFadeUpper)
+        ? bounds.edgeFadeUpper
+        : bounds.upper - span * 0.10F;
+    return bounds;
+}
+
+TimingColouriseBounds ConvertTimingColouriseBoundsEdgeFadeMode(
+    TimingColouriseBounds bounds,
+    TimingColouriseEdgeFadeMode sourceMode,
+    TimingColouriseEdgeFadeMode destinationMode) {
+    if (!IsValidEdgeFadeMode(sourceMode)) {
+        sourceMode = TimingColouriseEdgeFadeMode::RelativeLinked;
+    }
+    if (!IsValidEdgeFadeMode(destinationMode)) {
+        destinationMode = TimingColouriseEdgeFadeMode::RelativeLinked;
+    }
+    bounds = SanitizeTimingColouriseAuthoredBounds(bounds, sourceMode);
+    const bool sourceAbsolute =
+        TimingColouriseEdgeFadesAreAbsolute(sourceMode);
+    const bool destinationAbsolute =
+        TimingColouriseEdgeFadesAreAbsolute(destinationMode);
+    if (sourceAbsolute == destinationAbsolute) {
+        return SanitizeTimingColouriseAuthoredBounds(
+            bounds,
+            destinationMode);
+    }
+    const float span = bounds.upper - bounds.lower;
+    if (sourceAbsolute) {
+        if (span <= std::numeric_limits<float>::epsilon()) {
+            bounds.edgeFadeLower = 0.0F;
+            bounds.edgeFadeUpper = 0.0F;
+        } else {
+            bounds.edgeFadeLower =
+                (bounds.edgeFadeLower - bounds.lower) / span;
+            bounds.edgeFadeUpper =
+                (bounds.upper - bounds.edgeFadeUpper) / span;
+        }
+    } else {
+        bounds.edgeFadeLower =
+            bounds.lower + span * bounds.edgeFadeLower;
+        bounds.edgeFadeUpper =
+            bounds.upper - span * bounds.edgeFadeUpper;
+    }
+    return SanitizeTimingColouriseAuthoredBounds(
+        bounds,
+        destinationMode);
 }
 
 bool TimingColouriseBoundsParameterIsAllowed(
@@ -2959,6 +3374,33 @@ float TimingColouriseBoundsParameterValue(
     return 0.0F;
 }
 
+float TimingColouriseAuthoredBoundsParameterValue(
+    const TimingColouriseBounds& bounds,
+    TimingColouriseBoundsParameter parameter,
+    TimingColouriseEdgeFadeMode mode) {
+    const auto sanitized =
+        SanitizeTimingColouriseAuthoredBounds(bounds, mode);
+    switch (parameter) {
+        case TimingColouriseBoundsParameter::Lower:
+            return sanitized.lower;
+        case TimingColouriseBoundsParameter::Upper:
+            return sanitized.upper;
+        case TimingColouriseBoundsParameter::Centre:
+            return std::midpoint(sanitized.lower, sanitized.upper);
+        case TimingColouriseBoundsParameter::Spread:
+            return sanitized.upper - sanitized.lower;
+        case TimingColouriseBoundsParameter::EdgeFade:
+            return std::midpoint(
+                sanitized.edgeFadeLower,
+                sanitized.edgeFadeUpper);
+        case TimingColouriseBoundsParameter::EdgeFadeLower:
+            return sanitized.edgeFadeLower;
+        case TimingColouriseBoundsParameter::EdgeFadeUpper:
+            return sanitized.edgeFadeUpper;
+    }
+    return 0.0F;
+}
+
 float RemapTimingColouriseBoundsParameterValueToRange(
     TimingColouriseBoundsParameter parameter,
     float value,
@@ -2966,7 +3408,10 @@ float RemapTimingColouriseBoundsParameterValueToRange(
     float sourceMaximum,
     float destinationMinimum,
     float destinationMaximum) {
-    value = SanitizeBoundsParameterValue(parameter, value);
+    value = SanitizeBoundsParameterValue(
+        parameter,
+        value,
+        TimingColouriseEdgeFadeMode::RelativeSeparate);
     if (parameter == TimingColouriseBoundsParameter::EdgeFade ||
         parameter == TimingColouriseBoundsParameter::EdgeFadeLower ||
         parameter == TimingColouriseBoundsParameter::EdgeFadeUpper) {
@@ -3246,18 +3691,239 @@ bool SetTimingColouriseBoundsKeyMode(
     if (effect == nullptr || !IsValidBoundsKeyMode(mode)) {
         return false;
     }
-    const bool hasConflictingTrack = std::any_of(
-        effect->boundsParameterKeys.begin(),
-        effect->boundsParameterKeys.end(),
-        [&](const TimingColouriseBoundsParameterKey& key) {
-            return !TimingColouriseBoundsParameterIsAllowed(
-                mode,
-                key.parameter);
+    if (effect->boundsKeyMode == mode) {
+        return true;
+    }
+
+    // Legacy whole-bounds snapshots already describe an interval rather than
+    // one particular coordinate pair, so changing their display/keying mode
+    // is lossless and needs no new scalar tracks.
+    const auto source = SanitizeTimingColouriseEffect(*effect);
+    const bool hasGeometricParameterKeys = std::any_of(
+        source.boundsParameterKeys.begin(),
+        source.boundsParameterKeys.end(),
+        [](const TimingColouriseBoundsParameterKey& key) {
+            return !IsEdgeFadeBoundsParameter(key.parameter);
         });
-    if (hasConflictingTrack) {
+    if (!hasGeometricParameterKeys) {
+        effect->boundsKeyMode = mode;
+        return true;
+    }
+
+    // A scalar track may fall back to a legacy whole-bounds track for its
+    // partner coordinate. Convert at the union of both scalar and legacy key
+    // times so every previously authored interval is represented exactly at
+    // its node after the coordinate change.
+    std::vector<float> positions;
+    positions.reserve(
+        source.boundsParameterKeys.size() +
+        source.boundsKeys.size());
+    for (const auto& key : source.boundsParameterKeys) {
+        if (!IsEdgeFadeBoundsParameter(key.parameter)) {
+            positions.push_back(key.position);
+        }
+    }
+    for (const auto& key : source.boundsKeys) {
+        positions.push_back(key.position);
+    }
+    std::stable_sort(positions.begin(), positions.end());
+    positions.erase(
+        std::unique(
+            positions.begin(),
+            positions.end(),
+            [](float left, float right) {
+                return std::abs(left - right) <=
+                       kTimingColouriseKeyTolerance;
+            }),
+        positions.end());
+
+    struct ConvertedBoundsSample {
+        float position = 0.0F;
+        TimingColouriseBounds bounds{};
+    };
+    std::vector<ConvertedBoundsSample> samples;
+    samples.reserve(positions.size());
+    for (const float position : positions) {
+        samples.push_back({
+            .position = position,
+            .bounds = EvaluatePreparedTimingColouriseAuthoredBounds(
+                source,
+                position),
+        });
+    }
+
+    const auto sourceParameters =
+        TimingColouriseBoundsParametersForMode(
+            source.boundsKeyMode);
+    const auto interpolationFor =
+        [&](TimingColouriseBoundsParameter destinationParameter,
+            float position) {
+            using invisible_places::water::WaterScenarioInterpolation;
+
+            // A coordinate present in both representations retains its own
+            // curve style, including the style of the segment containing a
+            // generated union key.
+            if (const auto retained =
+                    BoundsParameterInterpolationAtPosition(
+                        source.boundsParameterKeys,
+                        destinationParameter,
+                        position,
+                        false);
+                retained.has_value()) {
+                return *retained;
+            }
+            // A derived coordinate has no unique interpolation when its two
+            // source curves differ. Prefer an authored style at this exact
+            // instant, then the legacy snapshot style, then the source
+            // segment styles in their visible pair order.
+            for (const auto parameter : sourceParameters) {
+                if (const auto exact =
+                        BoundsParameterInterpolationAtPosition(
+                            source.boundsParameterKeys,
+                            parameter,
+                            position,
+                            true);
+                    exact.has_value()) {
+                    return *exact;
+                }
+            }
+            if (const auto legacyExact = KeyInterpolationAtPosition(
+                    source.boundsKeys.begin(),
+                    source.boundsKeys.end(),
+                    position,
+                    true);
+                legacyExact.has_value()) {
+                return *legacyExact;
+            }
+            for (const auto parameter : sourceParameters) {
+                if (const auto segment =
+                        BoundsParameterInterpolationAtPosition(
+                            source.boundsParameterKeys,
+                            parameter,
+                            position,
+                            false);
+                    segment.has_value()) {
+                    return *segment;
+                }
+            }
+            if (const auto legacySegment = KeyInterpolationAtPosition(
+                    source.boundsKeys.begin(),
+                    source.boundsKeys.end(),
+                    position,
+                    false);
+                legacySegment.has_value()) {
+                return *legacySegment;
+            }
+            return WaterScenarioInterpolation::SmoothVelocity;
+        };
+
+    auto updated = *effect;
+    std::erase_if(
+        updated.boundsParameterKeys,
+        [](const TimingColouriseBoundsParameterKey& key) {
+            return !IsEdgeFadeBoundsParameter(key.parameter);
+        });
+    updated.boundsKeyMode = mode;
+    const auto destinationParameters =
+        TimingColouriseBoundsParametersForMode(mode);
+    updated.boundsParameterKeys.reserve(
+        updated.boundsParameterKeys.size() +
+        samples.size() * destinationParameters.size());
+    for (const auto parameter : destinationParameters) {
+        for (const auto& sample : samples) {
+            updated.boundsParameterKeys.push_back({
+                .parameter = parameter,
+                .position = sample.position,
+                .value = TimingColouriseAuthoredBoundsParameterValue(
+                    sample.bounds,
+                    parameter,
+                    source.edgeFadeMode),
+                .interpolation = interpolationFor(
+                    parameter,
+                    sample.position),
+            });
+        }
+    }
+    SortAndCoalesceBoundsParameterKeys(
+        &updated.boundsParameterKeys);
+    *effect = std::move(updated);
+    return true;
+}
+
+bool SetTimingColouriseEdgeFadeMode(
+    TimingColouriseEffect* effect,
+    TimingColouriseEdgeFadeMode mode,
+    float normalizedPosition,
+    bool cyclic) {
+    if (effect == nullptr || !IsValidEdgeFadeMode(mode)) {
         return false;
     }
-    effect->boundsKeyMode = mode;
+    auto source = SanitizeTimingColouriseEffect(*effect);
+    if (source.edgeFadeMode == mode) {
+        *effect = std::move(source);
+        return true;
+    }
+
+    const auto visibleAtSwitch = EvaluateTimingColouriseAuthoredBounds(
+        source,
+        normalizedPosition,
+        cyclic);
+    auto updated = source;
+
+    TimingColouriseEdgeFadeModeMemory sourceMemory{
+        .mode = source.edgeFadeMode,
+        .edgeFadeLower = source.baseBounds.edgeFadeLower,
+        .edgeFadeUpper = source.baseBounds.edgeFadeUpper,
+        .keys = ExtractEdgeFadeBoundsParameterKeys(
+            source.boundsParameterKeys),
+    };
+    const auto existingSource = std::find_if(
+        updated.edgeFadeModeMemories.begin(),
+        updated.edgeFadeModeMemories.end(),
+        [&](const TimingColouriseEdgeFadeModeMemory& memory) {
+            return memory.mode == source.edgeFadeMode;
+        });
+    if (!sourceMemory.keys.empty()) {
+        if (existingSource == updated.edgeFadeModeMemories.end()) {
+            updated.edgeFadeModeMemories.push_back(
+                std::move(sourceMemory));
+        } else {
+            *existingSource = std::move(sourceMemory);
+        }
+    } else if (existingSource != updated.edgeFadeModeMemories.end()) {
+        updated.edgeFadeModeMemories.erase(existingSource);
+    }
+    RemoveEdgeFadeBoundsParameterKeys(&updated.boundsParameterKeys);
+
+    const auto destination = std::find_if(
+        updated.edgeFadeModeMemories.begin(),
+        updated.edgeFadeModeMemories.end(),
+        [&](const TimingColouriseEdgeFadeModeMemory& memory) {
+            return memory.mode == mode;
+        });
+    if (destination != updated.edgeFadeModeMemories.end() &&
+        !destination->keys.empty()) {
+        const auto restored = *destination;
+        updated.edgeFadeModeMemories.erase(destination);
+        updated.baseBounds.edgeFadeLower = restored.edgeFadeLower;
+        updated.baseBounds.edgeFadeUpper = restored.edgeFadeUpper;
+        updated.boundsParameterKeys.insert(
+            updated.boundsParameterKeys.end(),
+            restored.keys.begin(),
+            restored.keys.end());
+    } else {
+        if (destination != updated.edgeFadeModeMemories.end()) {
+            updated.edgeFadeModeMemories.erase(destination);
+        }
+        const auto seeded = ConvertTimingColouriseBoundsEdgeFadeMode(
+            visibleAtSwitch,
+            source.edgeFadeMode,
+            mode);
+        updated.baseBounds.edgeFadeLower = seeded.edgeFadeLower;
+        updated.baseBounds.edgeFadeUpper = seeded.edgeFadeUpper;
+    }
+    updated.edgeFadeMode = mode;
+    *effect = SanitizeTimingColouriseEffect(std::move(updated));
     return true;
 }
 
@@ -3367,7 +4033,13 @@ TimingColouriseEffect SanitizeTimingColouriseEffect(
     }
     effect.basePalette =
         SanitizeTimingColourisePalette(std::move(effect.basePalette));
-    effect.baseBounds = SanitizeTimingColouriseBounds(effect.baseBounds);
+    if (!IsValidEdgeFadeMode(effect.edgeFadeMode)) {
+        effect.edgeFadeMode =
+            TimingColouriseEdgeFadeMode::RelativeLinked;
+    }
+    effect.baseBounds = SanitizeTimingColouriseAuthoredBounds(
+        effect.baseBounds,
+        effect.edgeFadeMode);
     if (!IsValidPaletteKeyModel(effect.paletteKeyModel)) {
         effect.paletteKeyModel = effect.paletteKeys.empty()
                                      ? TimingColourisePaletteKeyModel::
@@ -3667,7 +4339,9 @@ TimingColouriseEffect SanitizeTimingColouriseEffect(
     }
     for (auto& key : effect.boundsKeys) {
         key.position = Clamp01(key.position);
-        key.bounds = SanitizeTimingColouriseBounds(key.bounds);
+        key.bounds = SanitizeTimingColouriseAuthoredBounds(
+            key.bounds,
+            effect.edgeFadeMode);
         if (!IsValidInterpolation(key.interpolation)) {
             key.interpolation = invisible_places::water::
                 WaterScenarioInterpolation::Smooth;
@@ -3677,6 +4351,10 @@ TimingColouriseEffect SanitizeTimingColouriseEffect(
         effect.boundsKeyMode =
             TimingColouriseBoundsKeyMode::LowerUpper;
     }
+    const bool edgeFadeModeIsolationAlreadyActive =
+        HasInactiveEdgeFadeModeMemory(
+            effect.edgeFadeModeMemories,
+            effect.edgeFadeMode);
     SplitLegacyEdgeFadeKeys(&effect.boundsParameterKeys);
     std::erase_if(
         effect.boundsParameterKeys,
@@ -3686,15 +4364,27 @@ TimingColouriseEffect SanitizeTimingColouriseEffect(
                        effect.boundsKeyMode,
                        key.parameter);
         });
+    SeedActiveEdgeFadeKeysFromLegacyBoundsKeys(
+        &effect.boundsParameterKeys,
+        effect.boundsKeys,
+        effect.edgeFadeMode,
+        edgeFadeModeIsolationAlreadyActive);
     for (auto& key : effect.boundsParameterKeys) {
         key.position = Clamp01(key.position);
         key.value =
-            SanitizeBoundsParameterValue(key.parameter, key.value);
+            SanitizeBoundsParameterValue(
+                key.parameter,
+                key.value,
+                effect.edgeFadeMode);
         if (!IsValidInterpolation(key.interpolation)) {
             key.interpolation = invisible_places::water::
                 WaterScenarioInterpolation::Smooth;
         }
     }
+    SanitizeInactiveEdgeFadeModeMemories(
+        effect.baseBounds,
+        effect.edgeFadeMode,
+        &effect.edgeFadeModeMemories);
     SortAndCoalesceKeys(&effect.paletteKeys);
     SortAndCoalescePaletteStopParameterKeys(
         &effect.paletteStopParameterKeys);
@@ -3719,11 +4409,21 @@ TimingColouriseEffect SanitizeTimingColouriseEffect(
         if (duplicate) {
             continue;
         }
-        memory.bounds = SanitizeTimingColouriseBounds(memory.bounds);
+        if (!IsValidEdgeFadeMode(memory.edgeFadeMode)) {
+            memory.edgeFadeMode =
+                TimingColouriseEdgeFadeMode::RelativeLinked;
+        }
+        memory.bounds = SanitizeTimingColouriseAuthoredBounds(
+            memory.bounds,
+            memory.edgeFadeMode);
         if (!IsValidBoundsKeyMode(memory.boundsKeyMode)) {
             memory.boundsKeyMode =
                 TimingColouriseBoundsKeyMode::LowerUpper;
         }
+        const bool memoryFadeModeIsolationAlreadyActive =
+            HasInactiveEdgeFadeModeMemory(
+                memory.edgeFadeModeMemories,
+                memory.edgeFadeMode);
         SplitLegacyEdgeFadeKeys(&memory.boundsParameterKeys);
         std::erase_if(
             memory.boundsParameterKeys,
@@ -3735,21 +4435,35 @@ TimingColouriseEffect SanitizeTimingColouriseEffect(
             });
         for (auto& key : memory.boundsKeys) {
             key.position = Clamp01(key.position);
-            key.bounds = SanitizeTimingColouriseBounds(key.bounds);
+            key.bounds = SanitizeTimingColouriseAuthoredBounds(
+                key.bounds,
+                memory.edgeFadeMode);
             if (!IsValidInterpolation(key.interpolation)) {
                 key.interpolation = invisible_places::water::
                     WaterScenarioInterpolation::Smooth;
             }
         }
+        SeedActiveEdgeFadeKeysFromLegacyBoundsKeys(
+            &memory.boundsParameterKeys,
+            memory.boundsKeys,
+            memory.edgeFadeMode,
+            memoryFadeModeIsolationAlreadyActive);
         for (auto& key : memory.boundsParameterKeys) {
             key.position = Clamp01(key.position);
             key.value =
-                SanitizeBoundsParameterValue(key.parameter, key.value);
+                SanitizeBoundsParameterValue(
+                    key.parameter,
+                    key.value,
+                    memory.edgeFadeMode);
             if (!IsValidInterpolation(key.interpolation)) {
                 key.interpolation = invisible_places::water::
                     WaterScenarioInterpolation::Smooth;
             }
         }
+        SanitizeInactiveEdgeFadeModeMemories(
+            memory.bounds,
+            memory.edgeFadeMode,
+            &memory.edgeFadeModeMemories);
         SortAndCoalesceKeys(&memory.boundsKeys);
         SortAndCoalesceBoundsParameterKeys(&memory.boundsParameterKeys);
         fieldBoundsMemory.push_back(std::move(memory));
@@ -5684,12 +6398,73 @@ void MergeTimingTakeSceneStateKeepingFirst(
                 return left.stopId == right.stopId &&
                        left.parameter == right.parameter;
             });
+        std::vector<TimingColouriseBoundsParameterKey>
+            sourceGeometryKeys;
+        sourceGeometryKeys.reserve(
+            sourceEffect.boundsParameterKeys.size());
+        for (const auto& key : sourceEffect.boundsParameterKeys) {
+            if (!IsEdgeFadeBoundsParameter(key.parameter)) {
+                sourceGeometryKeys.push_back(key);
+            }
+        }
         MergeTimingKeysKeepingFirst(
             &destinationEffect->boundsParameterKeys,
-            sourceEffect.boundsParameterKeys,
+            sourceGeometryKeys,
             [](const auto& left, const auto& right) {
                 return left.parameter == right.parameter;
             });
+        const auto mergeFadeModeKeepingFirst =
+            [&](TimingColouriseEdgeFadeMode mode,
+                float edgeFadeLower,
+                float edgeFadeUpper,
+                const std::vector<
+                    TimingColouriseBoundsParameterKey>& keys) {
+                if (mode == destinationEffect->edgeFadeMode) {
+                    MergeTimingKeysKeepingFirst(
+                        &destinationEffect->boundsParameterKeys,
+                        keys,
+                        [](const auto& left, const auto& right) {
+                            return left.parameter == right.parameter;
+                        });
+                    return;
+                }
+                const auto destinationMemory = std::find_if(
+                    destinationEffect->edgeFadeModeMemories.begin(),
+                    destinationEffect->edgeFadeModeMemories.end(),
+                    [&](const auto& memory) {
+                        return memory.mode == mode;
+                    });
+                if (destinationMemory ==
+                    destinationEffect->edgeFadeModeMemories.end()) {
+                    destinationEffect->edgeFadeModeMemories.push_back({
+                        .mode = mode,
+                        .edgeFadeLower = edgeFadeLower,
+                        .edgeFadeUpper = edgeFadeUpper,
+                        .keys = keys,
+                    });
+                    return;
+                }
+                MergeTimingKeysKeepingFirst(
+                    &destinationMemory->keys,
+                    keys,
+                    [](const auto& left, const auto& right) {
+                        return left.parameter == right.parameter;
+                    });
+            };
+        mergeFadeModeKeepingFirst(
+            sourceEffect.edgeFadeMode,
+            sourceEffect.baseBounds.edgeFadeLower,
+            sourceEffect.baseBounds.edgeFadeUpper,
+            ExtractEdgeFadeBoundsParameterKeys(
+                sourceEffect.boundsParameterKeys));
+        for (const auto& sourceFadeMemory :
+             sourceEffect.edgeFadeModeMemories) {
+            mergeFadeModeKeepingFirst(
+                sourceFadeMemory.mode,
+                sourceFadeMemory.edgeFadeLower,
+                sourceFadeMemory.edgeFadeUpper,
+                sourceFadeMemory.keys);
+        }
         MergeTimingKeysKeepingFirst(
             &destinationEffect->boundsKeys,
             sourceEffect.boundsKeys,
@@ -5723,6 +6498,27 @@ void MergeTimingTakeSceneStateKeepingFirst(
                 &destinationMemory->boundsKeys,
                 sourceMemory.boundsKeys,
                 [](const auto&, const auto&) { return true; });
+            for (const auto& sourceFadeMemory :
+                 sourceMemory.edgeFadeModeMemories) {
+                const auto destinationFadeMemory = std::find_if(
+                    destinationMemory->edgeFadeModeMemories.begin(),
+                    destinationMemory->edgeFadeModeMemories.end(),
+                    [&](const auto& memory) {
+                        return memory.mode == sourceFadeMemory.mode;
+                    });
+                if (destinationFadeMemory ==
+                    destinationMemory->edgeFadeModeMemories.end()) {
+                    destinationMemory->edgeFadeModeMemories.push_back(
+                        sourceFadeMemory);
+                    continue;
+                }
+                MergeTimingKeysKeepingFirst(
+                    &destinationFadeMemory->keys,
+                    sourceFadeMemory.keys,
+                    [](const auto& left, const auto& right) {
+                        return left.parameter == right.parameter;
+                    });
+            }
         }
     }
     destination->waterFeatureTimingRunSequence = std::max(
@@ -5762,7 +6558,8 @@ void StashTimingColouriseFieldBounds(TimingColouriseEffect* effect) {
     entry->boundsParameterKeys = effect->boundsParameterKeys;
     entry->boundsKeys = effect->boundsKeys;
     entry->edited = effect->boundsEdited;
-    entry->edgeFadesLinked = effect->edgeFadesLinked;
+    entry->edgeFadeMode = effect->edgeFadeMode;
+    entry->edgeFadeModeMemories = effect->edgeFadeModeMemories;
     entry->adoptedGlobalRevision = effect->boundsAdoptedGlobalRevision;
 }
 
@@ -5879,7 +6676,9 @@ void ApplyTimingColouriseFieldSelection(
         effect->boundsParameterKeys = entry->boundsParameterKeys;
         effect->boundsKeys = entry->boundsKeys;
         effect->boundsEdited = entry->edited;
-        effect->edgeFadesLinked = entry->edgeFadesLinked;
+        effect->edgeFadeMode = entry->edgeFadeMode;
+        effect->edgeFadeModeMemories =
+            entry->edgeFadeModeMemories;
         effect->boundsAdoptedGlobalRevision =
             entry->adoptedGlobalRevision;
     } else {
@@ -5891,13 +6690,18 @@ void ApplyTimingColouriseFieldSelection(
         effect->boundsParameterKeys.clear();
         effect->boundsKeys.clear();
         effect->boundsEdited = false;
-        effect->edgeFadesLinked = true;
+        effect->edgeFadeMode =
+            TimingColouriseEdgeFadeMode::RelativeLinked;
+        effect->edgeFadeModeMemories.clear();
         effect->boundsAdoptedGlobalRevision =
             globalStore != nullptr ? globalStore->revision : 0U;
     }
     if (!effect->boundsEdited && globalStore != nullptr &&
         globalStore->revision > effect->boundsAdoptedGlobalRevision) {
-        effect->baseBounds = globalStore->globalBounds;
+        effect->baseBounds = ConvertTimingColouriseBoundsEdgeFadeMode(
+            globalStore->globalBounds,
+            TimingColouriseEdgeFadeMode::RelativeSeparate,
+            effect->edgeFadeMode);
         effect->boundsAdoptedGlobalRevision = globalStore->revision;
     }
     *effect = SanitizeTimingColouriseEffect(std::move(*effect));
@@ -5946,7 +6750,10 @@ void RecordTimingScalarBoundsEdit(
         store = &stores->back();
         store->selector = effect->field;
     }
-    store->globalBounds = SanitizeTimingColouriseBounds(effect->baseBounds);
+    store->globalBounds = ConvertTimingColouriseBoundsEdgeFadeMode(
+        effect->baseBounds,
+        effect->edgeFadeMode,
+        TimingColouriseEdgeFadeMode::RelativeSeparate);
     ++store->revision;
     effect->boundsAdoptedGlobalRevision = store->revision;
 }
@@ -5962,7 +6769,10 @@ bool RefreshTimingColouriseBoundsFromGlobal(
         store->revision <= effect->boundsAdoptedGlobalRevision) {
         return false;
     }
-    effect->baseBounds = store->globalBounds;
+    effect->baseBounds = ConvertTimingColouriseBoundsEdgeFadeMode(
+        store->globalBounds,
+        TimingColouriseEdgeFadeMode::RelativeSeparate,
+        effect->edgeFadeMode);
     effect->boundsAdoptedGlobalRevision = store->revision;
     return true;
 }
@@ -7061,71 +7871,33 @@ TimingColouriseLut EvaluateTimingColourisePaletteLut(
     return finalize(std::move(result));
 }
 
-TimingColouriseBounds EvaluateTimingColouriseBounds(
+TimingColouriseBounds EvaluateTimingColouriseAuthoredBounds(
     const TimingColouriseEffect& effect,
     float normalizedPosition,
     bool cyclic) {
-    const auto sanitized = PrepareTimingColouriseEffectForEvaluation(
+    const auto prepared = PrepareTimingColouriseEffectForEvaluation(
         effect,
         cyclic);
     normalizedPosition = cyclic
         ? WrapTimingColouriseLoopPosition(normalizedPosition)
         : Clamp01(normalizedPosition);
-    const auto fallback = EvaluateLegacyTimingColouriseBounds(
-        sanitized,
+    return EvaluatePreparedTimingColouriseAuthoredBounds(
+        prepared,
         normalizedPosition);
-    const auto value = [&](TimingColouriseBoundsParameter parameter) {
-        const auto evaluated = EvaluateBoundsParameterTrack(
-            sanitized.boundsParameterKeys,
-            parameter,
-            normalizedPosition);
-        return evaluated.value_or(
-            TimingColouriseBoundsParameterValue(fallback, parameter));
-    };
+}
 
-    TimingColouriseBounds result{
-        .edgeFadeLower =
-            value(TimingColouriseBoundsParameter::EdgeFadeLower),
-        .edgeFadeUpper =
-            value(TimingColouriseBoundsParameter::EdgeFadeUpper),
-    };
-    switch (sanitized.boundsKeyMode) {
-        case TimingColouriseBoundsKeyMode::CentreSpread: {
-            const float centre =
-                value(TimingColouriseBoundsParameter::Centre);
-            const float halfSpread =
-                0.5F * value(TimingColouriseBoundsParameter::Spread);
-            result.lower = centre - halfSpread;
-            result.upper = centre + halfSpread;
-            break;
-        }
-        case TimingColouriseBoundsKeyMode::LowerSpread:
-            result.lower = value(TimingColouriseBoundsParameter::Lower);
-            result.upper =
-                result.lower +
-                value(TimingColouriseBoundsParameter::Spread);
-            break;
-        case TimingColouriseBoundsKeyMode::UpperSpread:
-            result.upper = value(TimingColouriseBoundsParameter::Upper);
-            result.lower =
-                result.upper -
-                value(TimingColouriseBoundsParameter::Spread);
-            break;
-        case TimingColouriseBoundsKeyMode::LowerUpper:
-        default:
-            result.lower = value(TimingColouriseBoundsParameter::Lower);
-            result.upper = value(TimingColouriseBoundsParameter::Upper);
-            break;
-    }
-    if (result.lower > result.upper) {
-        // Independent endpoint curves can cross between otherwise-valid keys.
-        // Collapse at the crossing instead of swapping endpoint identities,
-        // which would make the authored Lower curve suddenly drive Upper.
-        const float centre = std::midpoint(result.lower, result.upper);
-        result.lower = centre;
-        result.upper = centre;
-    }
-    return SanitizeTimingColouriseBounds(result);
+TimingColouriseBounds EvaluateTimingColouriseBounds(
+    const TimingColouriseEffect& effect,
+    float normalizedPosition,
+    bool cyclic) {
+    const auto authored = EvaluateTimingColouriseAuthoredBounds(
+        effect,
+        normalizedPosition,
+        cyclic);
+    return ConvertTimingColouriseBoundsEdgeFadeMode(
+        authored,
+        effect.edgeFadeMode,
+        TimingColouriseEdgeFadeMode::RelativeSeparate);
 }
 
 TimingColouriseLayerSample SampleTimingColouriseLut(
@@ -7357,6 +8129,111 @@ bool AddOrUpdateTimingColourisePaletteStopColourKey(
     return true;
 }
 
+bool AddOrUpdateTimingColourisePaletteMarkerKeys(
+    TimingColouriseEffect* effect,
+    float position,
+    TimingColourisePalette palette) {
+    if (effect == nullptr || !std::isfinite(position)) {
+        return false;
+    }
+    const float keyPosition = Clamp01(position);
+    palette = SanitizeTimingColourisePalette(std::move(palette));
+
+    const auto interpolationAt =
+        [&](std::string_view stopId,
+            TimingColourisePaletteStopParameter parameter) {
+            using invisible_places::water::WaterScenarioInterpolation;
+            const TimingColourisePaletteStopParameterKey* first = nullptr;
+            const TimingColourisePaletteStopParameterKey* previous = nullptr;
+            for (const auto& key : effect->paletteStopParameterKeys) {
+                if (key.stopId != stopId || key.parameter != parameter) {
+                    continue;
+                }
+                if (first == nullptr) {
+                    first = &key;
+                }
+                if (std::abs(key.position - keyPosition) <=
+                    kTimingColouriseKeyTolerance) {
+                    return key.interpolation;
+                }
+                if (key.position < keyPosition) {
+                    previous = &key;
+                }
+            }
+            if (previous != nullptr) {
+                return previous->interpolation;
+            }
+            return first != nullptr
+                       ? first->interpolation
+                       : WaterScenarioInterpolation::SmoothVelocity;
+        };
+
+    auto updated = *effect;
+    if (updated.paletteKeyModel ==
+        TimingColourisePaletteKeyModel::LegacySnapshots) {
+        using invisible_places::water::WaterScenarioInterpolation;
+        WaterScenarioInterpolation interpolation =
+            WaterScenarioInterpolation::SmoothVelocity;
+        const TimingColourisePaletteKey* first = nullptr;
+        const TimingColourisePaletteKey* previous = nullptr;
+        for (const auto& key : updated.paletteKeys) {
+            if (first == nullptr) {
+                first = &key;
+            }
+            if (std::abs(key.position - keyPosition) <=
+                kTimingColouriseKeyTolerance) {
+                interpolation = key.interpolation;
+                previous = nullptr;
+                first = nullptr;
+                break;
+            }
+            if (key.position < keyPosition) {
+                previous = &key;
+            }
+        }
+        if (first != nullptr || previous != nullptr) {
+            interpolation = previous != nullptr
+                                ? previous->interpolation
+                                : first->interpolation;
+        }
+        AddOrUpdateTimingColourisePaletteKey(
+            &updated,
+            keyPosition,
+            std::move(palette),
+            interpolation);
+        *effect = std::move(updated);
+        return true;
+    }
+
+    updated.basePalette =
+        SanitizeTimingColourisePalette(std::move(updated.basePalette));
+    if (palette.stops.size() != updated.basePalette.stops.size()) {
+        return false;
+    }
+    for (const auto& baseStop : updated.basePalette.stops) {
+        const auto stop = std::find_if(
+            palette.stops.begin(),
+            palette.stops.end(),
+            [&](const TimingColourisePaletteStop& candidate) {
+                return candidate.id == baseStop.id;
+            });
+        if (stop == palette.stops.end() ||
+            !AddOrUpdateTimingColourisePaletteStopScalarKey(
+                &updated,
+                stop->id,
+                TimingColourisePaletteStopParameter::Position,
+                keyPosition,
+                stop->position,
+                interpolationAt(
+                    stop->id,
+                    TimingColourisePaletteStopParameter::Position))) {
+            return false;
+        }
+    }
+    *effect = std::move(updated);
+    return true;
+}
+
 void AddOrUpdateTimingColouriseBoundsKey(
     TimingColouriseEffect* effect,
     float position,
@@ -7373,7 +8250,9 @@ void AddOrUpdateTimingColouriseBoundsKey(
             ? interpolation
             : invisible_places::water::
                   WaterScenarioInterpolation::Smooth,
-        SanitizeTimingColouriseBounds);
+        [mode = effect->edgeFadeMode](TimingColouriseBounds value) {
+            return SanitizeTimingColouriseAuthoredBounds(value, mode);
+        });
 }
 
 bool AddOrUpdateTimingColouriseBoundsParameterKey(
@@ -7395,7 +8274,13 @@ bool AddOrUpdateTimingColouriseBoundsParameterKey(
         [&](const TimingColouriseBoundsParameterKey& candidate) {
             return candidate.parameter == parameter;
         });
-    if (firstKeyForParameter && !effect->boundsKeys.empty()) {
+    const bool activeFadeModeIsIsolated =
+        IsPerEdgeFadeBoundsParameter(parameter) &&
+        HasInactiveEdgeFadeModeMemory(
+            effect->edgeFadeModeMemories,
+            effect->edgeFadeMode);
+    if (firstKeyForParameter && !effect->boundsKeys.empty() &&
+        !activeFadeModeIsIsolated) {
         // Project the legacy snapshot track into this scalar track before
         // adding its first independently authored key. Without this seeding,
         // first/last hold semantics would replace the entire legacy component
@@ -7407,9 +8292,10 @@ bool AddOrUpdateTimingColouriseBoundsParameterKey(
             effect->boundsParameterKeys.push_back({
                 .parameter = parameter,
                 .position = legacy.position,
-                .value = TimingColouriseBoundsParameterValue(
+                .value = TimingColouriseAuthoredBoundsParameterValue(
                     legacy.bounds,
-                    parameter),
+                    parameter,
+                    effect->edgeFadeMode),
                 .interpolation =
                     IsValidInterpolation(legacy.interpolation)
                         ? legacy.interpolation
@@ -7421,7 +8307,10 @@ bool AddOrUpdateTimingColouriseBoundsParameterKey(
     TimingColouriseBoundsParameterKey key{
         .parameter = parameter,
         .position = Clamp01(position),
-        .value = SanitizeBoundsParameterValue(parameter, value),
+        .value = SanitizeBoundsParameterValue(
+            parameter,
+            value,
+            effect->edgeFadeMode),
         .interpolation = IsValidInterpolation(interpolation)
                              ? interpolation
                              : invisible_places::water::
@@ -8113,6 +9002,50 @@ std::size_t RemoveTimingColourisePaletteKeysAtPosition(
                effect->paletteStopParameterKeys.size();
 }
 
+std::size_t RemoveTimingColourisePaletteMarkerKeysAtPosition(
+    TimingColouriseEffect* effect,
+    float position) {
+    if (effect == nullptr || !std::isfinite(position)) {
+        return 0U;
+    }
+    const auto clusters = PaletteMarkerKeyPositionClusters(*effect);
+    const auto clusterIndex =
+        PaletteKeyPositionClusterIndexAtPosition(clusters, position);
+    if (!clusterIndex.has_value()) {
+        return 0U;
+    }
+    const auto cluster = clusters[*clusterIndex];
+    const bool legacyModel =
+        effect->paletteKeyModel ==
+        TimingColourisePaletteKeyModel::LegacySnapshots;
+    const auto previousLegacySize = effect->paletteKeys.size();
+    if (legacyModel) {
+        std::erase_if(
+            effect->paletteKeys,
+            [&](const TimingColourisePaletteKey& key) {
+                return PaletteKeyPositionBelongsToCluster(
+                    key.position,
+                    cluster);
+            });
+    }
+    const auto previousParameterSize =
+        effect->paletteStopParameterKeys.size();
+    if (!legacyModel) {
+        std::erase_if(
+            effect->paletteStopParameterKeys,
+            [&](const TimingColourisePaletteStopParameterKey& key) {
+                return key.parameter ==
+                           TimingColourisePaletteStopParameter::Position &&
+                       PaletteKeyPositionBelongsToCluster(
+                           key.position,
+                           cluster);
+            });
+    }
+    return previousLegacySize - effect->paletteKeys.size() +
+           previousParameterSize -
+               effect->paletteStopParameterKeys.size();
+}
+
 std::size_t RemoveTimingColourisePaletteStopParameterKeysAtPosition(
     TimingColouriseEffect* effect,
     std::string_view stopId,
@@ -8333,6 +9266,168 @@ std::vector<float> TimingColourisePaletteKeyPositions(
         positions.push_back(cluster.representative);
     }
     return positions;
+}
+
+std::size_t TimingColourisePaletteMarkerKeyCountAtPosition(
+    const TimingColouriseEffect& effect,
+    float position) {
+    const auto clusters = PaletteMarkerKeyPositionClusters(effect);
+    const auto clusterIndex =
+        PaletteKeyPositionClusterIndexAtPosition(clusters, position);
+    if (!clusterIndex.has_value()) {
+        return 0U;
+    }
+    const auto& cluster = clusters[*clusterIndex];
+    const auto belongs = [&](const auto& key) {
+        return PaletteKeyPositionBelongsToCluster(
+            key.position,
+            cluster);
+    };
+    if (effect.paletteKeyModel ==
+        TimingColourisePaletteKeyModel::LegacySnapshots) {
+        return static_cast<std::size_t>(std::count_if(
+            effect.paletteKeys.begin(),
+            effect.paletteKeys.end(),
+            belongs));
+    }
+    return static_cast<std::size_t>(std::count_if(
+        effect.paletteStopParameterKeys.begin(),
+        effect.paletteStopParameterKeys.end(),
+        [&](const TimingColourisePaletteStopParameterKey& key) {
+            return key.parameter ==
+                       TimingColourisePaletteStopParameter::Position &&
+                   belongs(key);
+        }));
+}
+
+std::optional<float> PreviousTimingColourisePaletteMarkerKeyPosition(
+    const TimingColouriseEffect& effect,
+    float position) {
+    if (!std::isfinite(position)) {
+        return std::nullopt;
+    }
+    const auto clusters = PaletteMarkerKeyPositionClusters(effect);
+    if (const auto current =
+            PaletteKeyPositionClusterIndexAtPosition(clusters, position);
+        current.has_value()) {
+        return *current == 0U
+                   ? std::nullopt
+                   : std::optional<float>{
+                         clusters[*current - 1U].representative};
+    }
+    for (auto cluster = clusters.rbegin();
+         cluster != clusters.rend();
+         ++cluster) {
+        if (cluster->maximum <
+            position - kTimingColouriseKeyTolerance) {
+            return cluster->representative;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<float> NextTimingColourisePaletteMarkerKeyPosition(
+    const TimingColouriseEffect& effect,
+    float position) {
+    if (!std::isfinite(position)) {
+        return std::nullopt;
+    }
+    const auto clusters = PaletteMarkerKeyPositionClusters(effect);
+    if (const auto current =
+            PaletteKeyPositionClusterIndexAtPosition(clusters, position);
+        current.has_value()) {
+        return *current + 1U >= clusters.size()
+                   ? std::nullopt
+                   : std::optional<float>{
+                         clusters[*current + 1U].representative};
+    }
+    for (const auto& cluster : clusters) {
+        if (cluster.minimum >
+            position + kTimingColouriseKeyTolerance) {
+            return cluster.representative;
+        }
+    }
+    return std::nullopt;
+}
+
+std::vector<float> TimingColourisePaletteMarkerKeyPositions(
+    const TimingColouriseEffect& effect) {
+    const auto clusters = PaletteMarkerKeyPositionClusters(effect);
+    std::vector<float> positions;
+    positions.reserve(clusters.size());
+    for (const auto& cluster : clusters) {
+        positions.push_back(cluster.representative);
+    }
+    return positions;
+}
+
+std::optional<std::pair<float, float>>
+TimingColouriseAnimatedPaletteMarkerRange(
+    const TimingColouriseEffect& effect) {
+    std::optional<std::pair<float, float>> range;
+    const auto includeVaryingTrack =
+        [&](std::span<const float> values) {
+            if (values.size() < 2U) {
+                return;
+            }
+            const auto [minimum, maximum] =
+                std::minmax_element(values.begin(), values.end());
+            if (!std::isfinite(*minimum) || !std::isfinite(*maximum) ||
+                *maximum - *minimum <= 1.0e-7F) {
+                return;
+            }
+            if (!range.has_value()) {
+                range = std::pair{*minimum, *maximum};
+                return;
+            }
+            range->first = std::min(range->first, *minimum);
+            range->second = std::max(range->second, *maximum);
+        };
+
+    for (std::size_t stopIndex = 0U;
+         stopIndex < effect.basePalette.stops.size();
+         ++stopIndex) {
+        const auto& baseStop = effect.basePalette.stops[stopIndex];
+        std::vector<float> values;
+        if (effect.paletteKeyModel ==
+            TimingColourisePaletteKeyModel::StopParameters) {
+            for (const auto& key : effect.paletteStopParameterKeys) {
+                if (key.stopId == baseStop.id &&
+                    key.parameter ==
+                        TimingColourisePaletteStopParameter::Position &&
+                    std::isfinite(key.scalarValue)) {
+                    values.push_back(
+                        std::clamp(key.scalarValue, 0.0F, 1.0F));
+                }
+            }
+        } else {
+            for (const auto& key : effect.paletteKeys) {
+                const auto keyedStop = std::find_if(
+                    key.palette.stops.begin(),
+                    key.palette.stops.end(),
+                    [&](const TimingColourisePaletteStop& candidate) {
+                        return candidate.id == baseStop.id;
+                    });
+                if (keyedStop != key.palette.stops.end() &&
+                    std::isfinite(keyedStop->position)) {
+                    values.push_back(
+                        std::clamp(keyedStop->position, 0.0F, 1.0F));
+                } else if (
+                    stopIndex < key.palette.stops.size() &&
+                    std::isfinite(
+                        key.palette.stops[stopIndex].position)) {
+                    // Old snapshots may predate stable stop ids. Their sorted
+                    // ordinal remains the only compatible marker identity.
+                    values.push_back(std::clamp(
+                        key.palette.stops[stopIndex].position,
+                        0.0F,
+                        1.0F));
+                }
+            }
+        }
+        includeVaryingTrack(values);
+    }
+    return range;
 }
 
 bool CanRemoveTimingColourisePaletteStop(

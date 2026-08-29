@@ -84,6 +84,7 @@ set(INVISIBLE_PLACES_SHADER_SOURCES
     shaders/edl_export.comp
 )
 set(INVISIBLE_PLACES_SHADER_INCLUDES
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_adaptive_density.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_coverage.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_colormaps.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_timing_colourise.glsl"
@@ -582,6 +583,24 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
                 RUN_SERIAL TRUE
                 WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
                 TIMEOUT 1800
+        )
+        add_test(
+            NAME adaptive-hq-surface05-performance
+            COMMAND
+                $<TARGET_FILE:invisible_places>
+                "${CMAKE_CURRENT_SOURCE_DIR}/Data"
+                --gui-smoke adaptive-hq-surface05-performance
+                --smoke-output
+                "${CMAKE_CURRENT_BINARY_DIR}/adaptive-hq-surface05-performance"
+        )
+        set_tests_properties(
+            adaptive-hq-surface05-performance
+            PROPERTIES
+                LABELS
+                "gui_smoke;renderer_timing;adaptive_hq;full_site"
+                RUN_SERIAL TRUE
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                TIMEOUT 2400
         )
         if(INVISIBLE_PLACES_ENABLE_FULL_SITE_WATER_STRESS_TESTS)
             add_test(

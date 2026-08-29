@@ -1,5 +1,6 @@
 #include "app/LinkedHighQualityPreview.hpp"
 
+#include "io/AdaptiveHqCache.hpp"
 #include "io/SceneDisplayDensityCache.hpp"
 
 #include <algorithm>
@@ -7,8 +8,11 @@
 #include <cmath>
 #include <limits>
 #include <system_error>
+#include <unordered_set>
 
 #include <glm/vec4.hpp>
+#include <glm/geometric.hpp>
+#include <glm/matrix.hpp>
 
 namespace invisible_places::app {
 
@@ -50,11 +54,111 @@ float LinkedHqPatchKeepFraction(std::uint32_t spacingMicrometres) {
     return 1.0F / std::max(1.0F, ratio * ratio);
 }
 
+LinkedHqPatchDrawPolicy ResolveLinkedHqPatchDrawPolicy(
+    bool linkedHqEnabled,
+    bool adaptiveHqEnabled,
+    bool adaptiveGuardCoversView,
+    bool adaptiveTransitionValid) {
+    if (!linkedHqEnabled) {
+        return {};
+    }
+    if (!adaptiveHqEnabled) {
+        return {
+            .renderFinePatches = true,
+        };
+    }
+
+    return {
+        .renderFinePatches = true,
+        .applyFineAdaptiveDensity = adaptiveTransitionValid,
+        .applyCoarseAdaptiveDensity =
+            adaptiveTransitionValid && adaptiveGuardCoversView,
+        .retainingFineDuringRefresh = !adaptiveGuardCoversView,
+    };
+}
+
+std::uint64_t AdaptiveHqResidentBlockPayloadBytes(
+    const invisible_places::io::AdaptiveHqResidentBlock& block) {
+    if (block.points == nullptr) {
+        return 0U;
+    }
+    const auto& subset = *block.points;
+    const auto& cloud = subset.cloud;
+    return
+        static_cast<std::uint64_t>(cloud.positions.size()) *
+            sizeof(invisible_places::io::Float3) +
+        static_cast<std::uint64_t>(cloud.normals.size()) *
+            sizeof(invisible_places::io::Float3) +
+        static_cast<std::uint64_t>(cloud.packedColors.size()) *
+            sizeof(std::uint32_t) +
+        static_cast<std::uint64_t>(cloud.scalarFieldValues.size()) *
+            sizeof(float) +
+        static_cast<std::uint64_t>(subset.sourcePointIndices.size()) *
+            sizeof(std::uint32_t);
+}
+
+AdaptiveHqResidentRetention RetainAdaptiveHqResidentBlocks(
+    std::span<const invisible_places::io::AdaptiveHqResidentBlock> candidates,
+    std::span<const std::uint32_t> activeBlockIndices,
+    std::uint64_t inactiveByteBudget) {
+    AdaptiveHqResidentRetention retained;
+    retained.blocks.reserve(candidates.size());
+
+    std::unordered_set<std::uint32_t> activeSet;
+    activeSet.reserve(activeBlockIndices.size());
+    for (const auto blockIndex : activeBlockIndices) {
+        activeSet.insert(blockIndex);
+        const auto found = std::find_if(
+            candidates.begin(),
+            candidates.end(),
+            [&](const auto& candidate) {
+                return candidate.blockIndex == blockIndex &&
+                    candidate.points != nullptr;
+            });
+        if (found == candidates.end()) {
+            continue;
+        }
+        retained.activePayloadBytes +=
+            AdaptiveHqResidentBlockPayloadBytes(*found);
+        retained.blocks.push_back(*found);
+    }
+
+    std::vector<const invisible_places::io::AdaptiveHqResidentBlock*> fringe;
+    fringe.reserve(candidates.size());
+    for (const auto& candidate : candidates) {
+        if (candidate.points != nullptr &&
+            !activeSet.contains(candidate.blockIndex)) {
+            fringe.push_back(&candidate);
+        }
+    }
+    std::sort(
+        fringe.begin(),
+        fringe.end(),
+        [](const auto* left, const auto* right) {
+            if (left->lastUsedSerial != right->lastUsedSerial) {
+                return left->lastUsedSerial > right->lastUsedSerial;
+            }
+            return left->blockIndex < right->blockIndex;
+        });
+    for (const auto* candidate : fringe) {
+        const auto payloadBytes =
+            AdaptiveHqResidentBlockPayloadBytes(*candidate);
+        if (payloadBytes >
+            inactiveByteBudget - retained.inactivePayloadBytes) {
+            continue;
+        }
+        retained.inactivePayloadBytes += payloadBytes;
+        ++retained.inactiveBlockCount;
+        retained.blocks.push_back(*candidate);
+    }
+    return retained;
+}
+
 bool LinkedHqFrustumUnion::Contains(
     const invisible_places::io::Float3& point) const {
     const float safeBorder = std::max(0.0F, borderFraction);
     const float lateralLimit = 1.0F + (2.0F * safeBorder);
-    for (const auto& viewProjection : midpointViewProjections) {
+    for (const auto& viewProjection : viewProjections) {
         const glm::vec4 clip = viewProjection * glm::vec4{
             point.x,
             point.y,
@@ -64,6 +168,11 @@ bool LinkedHqFrustumUnion::Contains(
         if (!std::isfinite(clip.x) || !std::isfinite(clip.y) ||
             !std::isfinite(clip.z) || !std::isfinite(clip.w) ||
             clip.w <= 1.0e-7F) {
+            continue;
+        }
+        if (std::isfinite(maximumViewDepthMeters) &&
+            maximumViewDepthMeters > 0.0F &&
+            clip.w > maximumViewDepthMeters) {
             continue;
         }
         const float paddedW = lateralLimit * clip.w;
@@ -76,20 +185,261 @@ bool LinkedHqFrustumUnion::Contains(
     return false;
 }
 
+bool LinkedHqFrustumUnion::IntersectsBounds(
+    const invisible_places::io::Bounds3f& bounds) const {
+    if (!bounds.valid || viewProjections.empty()) {
+        return false;
+    }
+    const std::array<glm::vec4, 8U> corners{
+        glm::vec4{bounds.minimum.x, bounds.minimum.y, bounds.minimum.z, 1.0F},
+        glm::vec4{bounds.maximum.x, bounds.minimum.y, bounds.minimum.z, 1.0F},
+        glm::vec4{bounds.minimum.x, bounds.maximum.y, bounds.minimum.z, 1.0F},
+        glm::vec4{bounds.maximum.x, bounds.maximum.y, bounds.minimum.z, 1.0F},
+        glm::vec4{bounds.minimum.x, bounds.minimum.y, bounds.maximum.z, 1.0F},
+        glm::vec4{bounds.maximum.x, bounds.minimum.y, bounds.maximum.z, 1.0F},
+        glm::vec4{bounds.minimum.x, bounds.maximum.y, bounds.maximum.z, 1.0F},
+        glm::vec4{bounds.maximum.x, bounds.maximum.y, bounds.maximum.z, 1.0F},
+    };
+    const float lateralLimit =
+        1.0F + (2.0F * std::max(0.0F, borderFraction));
+    for (const auto& viewProjection : viewProjections) {
+        std::array<glm::vec4, 8U> clipCorners;
+        for (std::size_t corner = 0U; corner < corners.size(); ++corner) {
+            clipCorners[corner] = viewProjection * corners[corner];
+        }
+        const auto allOutside = [&](const auto& signedDistance) {
+            return std::all_of(
+                clipCorners.begin(),
+                clipCorners.end(),
+                [&](const glm::vec4& clip) {
+                    return !std::isfinite(clip.x) ||
+                           !std::isfinite(clip.y) ||
+                           !std::isfinite(clip.z) ||
+                           !std::isfinite(clip.w) ||
+                           signedDistance(clip) < 0.0F;
+                });
+        };
+        if (allOutside([&](const glm::vec4& clip) {
+                return clip.x + lateralLimit * clip.w;
+            }) ||
+            allOutside([&](const glm::vec4& clip) {
+                return lateralLimit * clip.w - clip.x;
+            }) ||
+            allOutside([&](const glm::vec4& clip) {
+                return clip.y + lateralLimit * clip.w;
+            }) ||
+            allOutside([&](const glm::vec4& clip) {
+                return lateralLimit * clip.w - clip.y;
+            }) ||
+            allOutside([](const glm::vec4& clip) {
+                return clip.z + clip.w;
+            }) ||
+            allOutside([](const glm::vec4& clip) {
+                return clip.w - clip.z;
+            }) ||
+            allOutside([](const glm::vec4& clip) {
+                return clip.w - 1.0e-7F;
+            })) {
+            continue;
+        }
+        if (std::isfinite(maximumViewDepthMeters) &&
+            maximumViewDepthMeters > 0.0F &&
+            allOutside([&](const glm::vec4& clip) {
+                return maximumViewDepthMeters - clip.w;
+            })) {
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
 LinkedHqFrustumUnion BuildAnimationHqFrustumUnion(
-    std::span<const glm::mat4> midpointViewProjections,
+    std::span<const glm::mat4> viewProjections,
     float borderFraction) {
     LinkedHqFrustumUnion result;
     result.borderFraction = std::max(0.0F, borderFraction);
-    if (midpointViewProjections.empty()) {
-        return result;
+    result.viewProjections.reserve(viewProjections.size());
+    const auto matricesEqual = [](const glm::mat4& left,
+                                  const glm::mat4& right) {
+        for (std::size_t column = 0U; column < 4U; ++column) {
+            for (std::size_t row = 0U; row < 4U; ++row) {
+                if (left[column][row] != right[column][row]) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+    for (const auto& viewProjection : viewProjections) {
+        const bool duplicate = std::any_of(
+            result.viewProjections.begin(),
+            result.viewProjections.end(),
+            [&](const glm::mat4& existing) {
+                return matricesEqual(existing, viewProjection);
+            });
+        if (!duplicate) {
+            result.viewProjections.push_back(viewProjection);
+        }
     }
-    result.midpointViewProjections[0U] = midpointViewProjections[0U];
-    result.midpointViewProjections[1U] =
-        midpointViewProjections.size() > 1U
-            ? midpointViewProjections[1U]
-            : midpointViewProjections[0U];
     return result;
+}
+
+bool LinkedHqFrustumUnionCoversView(
+    const LinkedHqFrustumUnion& frustumUnion,
+    const glm::mat4& view,
+    const glm::mat4& projection,
+    float requiredDepthMeters,
+    float requiredBorderFraction) {
+    if (frustumUnion.viewProjections.empty() ||
+        !std::isfinite(requiredDepthMeters) || requiredDepthMeters <= 0.0F) {
+        return false;
+    }
+    const glm::mat4 inverseProjection = glm::inverse(projection);
+    const glm::mat4 inverseView = glm::inverse(view);
+    const float requiredLateralLimit =
+        1.0F + 2.0F * std::max(0.0F, requiredBorderFraction);
+    const std::array<float, 3U> coordinates{
+        -requiredLateralLimit,
+        0.0F,
+        requiredLateralLimit,
+    };
+    const std::array<float, 2U> depths{
+        std::max(0.01F, requiredDepthMeters * 0.20F),
+        requiredDepthMeters,
+    };
+    for (const float depth : depths) {
+        for (const float ndcY : coordinates) {
+            for (const float ndcX : coordinates) {
+                glm::vec4 nearView =
+                    inverseProjection * glm::vec4{ndcX, ndcY, -1.0F, 1.0F};
+                glm::vec4 farView =
+                    inverseProjection * glm::vec4{ndcX, ndcY, 1.0F, 1.0F};
+                if (std::abs(nearView.w) <= 1.0e-7F ||
+                    std::abs(farView.w) <= 1.0e-7F) {
+                    return false;
+                }
+                nearView /= nearView.w;
+                farView /= farView.w;
+                const glm::vec3 ray = glm::vec3{farView - nearView};
+                if (!std::isfinite(ray.z) || std::abs(ray.z) <= 1.0e-7F) {
+                    return false;
+                }
+                const float distanceAlongRay =
+                    (-depth - nearView.z) / ray.z;
+                const glm::vec3 viewPoint =
+                    glm::vec3{nearView} + ray * distanceAlongRay;
+                const glm::vec4 world =
+                    inverseView * glm::vec4{viewPoint, 1.0F};
+                if (std::abs(world.w) <= 1.0e-7F ||
+                    !frustumUnion.Contains({
+                        world.x / world.w,
+                        world.y / world.w,
+                        world.z / world.w,
+                    })) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+std::vector<float> BuildUnlinkedAnimationHqSampleTimes(
+    std::span<const float> authoredKeyTimesSeconds,
+    float durationSeconds) {
+    const float duration = std::isfinite(durationSeconds)
+        ? std::max(0.0F, durationSeconds)
+        : 0.0F;
+    std::vector<float> times;
+    times.reserve(
+        kUnlinkedAnimationHqUniformViewCount +
+        authoredKeyTimesSeconds.size());
+    if (duration <= 0.0F) {
+        times.push_back(0.0F);
+        return times;
+    }
+    for (std::size_t sample = 0U;
+         sample < kUnlinkedAnimationHqUniformViewCount;
+         ++sample) {
+        const float position = static_cast<float>(sample) /
+            static_cast<float>(kUnlinkedAnimationHqUniformViewCount - 1U);
+        times.push_back(duration * position);
+    }
+    for (const float keyTime : authoredKeyTimesSeconds) {
+        if (std::isfinite(keyTime)) {
+            times.push_back(std::clamp(keyTime, 0.0F, duration));
+        }
+    }
+    std::sort(times.begin(), times.end());
+    const float duplicateTolerance = std::max(1.0e-6F, duration * 1.0e-6F);
+    times.erase(
+        std::unique(
+            times.begin(),
+            times.end(),
+            [duplicateTolerance](float left, float right) {
+                return std::abs(left - right) <= duplicateTolerance;
+            }),
+        times.end());
+    return times;
+}
+
+std::vector<float> BuildAnimationSectionFrustumSampleTimes(
+    float durationSeconds,
+    float normalizedStart,
+    float normalizedEnd,
+    std::uint32_t framesPerSecond,
+    std::uint32_t paddingFrames) {
+    const float duration = std::isfinite(durationSeconds)
+        ? std::max(0.0F, durationSeconds)
+        : 0.0F;
+    const std::uint32_t rate = std::max(1U, framesPerSecond);
+    float start = std::isfinite(normalizedStart)
+        ? std::clamp(normalizedStart, 0.0F, 1.0F)
+        : 0.0F;
+    float end = std::isfinite(normalizedEnd)
+        ? std::clamp(normalizedEnd, 0.0F, 1.0F)
+        : 1.0F;
+    if (end < start) {
+        std::swap(start, end);
+    }
+    if (duration <= 0.0F) {
+        return {0.0F};
+    }
+
+    const double totalFrames =
+        static_cast<double>(duration) * static_cast<double>(rate);
+    const auto firstFrame = static_cast<std::int64_t>(std::max(
+        0.0,
+        std::floor(static_cast<double>(start) * totalFrames) -
+            static_cast<double>(paddingFrames)));
+    const auto lastFrame = static_cast<std::int64_t>(std::min(
+        std::ceil(totalFrames),
+        std::ceil(static_cast<double>(end) * totalFrames) +
+            static_cast<double>(paddingFrames)));
+
+    std::vector<float> times;
+    times.reserve(static_cast<std::size_t>(
+        std::max<std::int64_t>(1, lastFrame - firstFrame + 3)));
+    times.push_back(duration * start);
+    for (std::int64_t frame = firstFrame; frame <= lastFrame; ++frame) {
+        times.push_back(std::clamp(
+            static_cast<float>(frame) / static_cast<float>(rate),
+            0.0F,
+            duration));
+    }
+    times.push_back(duration * end);
+    std::sort(times.begin(), times.end());
+    const float duplicateTolerance = std::max(1.0e-6F, duration * 1.0e-7F);
+    times.erase(
+        std::unique(
+            times.begin(),
+            times.end(),
+            [duplicateTolerance](float left, float right) {
+                return std::abs(left - right) <= duplicateTolerance;
+            }),
+        times.end());
+    return times;
 }
 
 LinkedHqIndexPartition PartitionLinkedHqIndices(
@@ -143,33 +493,24 @@ bool TryFingerprintLinkedHqSource(
     }
     const auto payloadPath =
         invisible_places::io::ResolveSceneDisplayDensityPayloadPath(path);
-    std::error_code error;
-    const auto byteSize = std::filesystem::file_size(payloadPath, error);
-    if (error) {
+    const auto inspected = invisible_places::io::InspectAdaptiveHqSource(
+        payloadPath);
+    if (!inspected.success) {
         if (errorMessage != nullptr) {
-            *errorMessage =
-                "Unable to read HQ source size: " + error.message();
-        }
-        return false;
-    }
-    const auto writeTime =
-        std::filesystem::last_write_time(payloadPath, error);
-    if (error) {
-        if (errorMessage != nullptr) {
-            *errorMessage =
-                "Unable to read HQ source timestamp: " + error.message();
+            *errorMessage = "Unable to fingerprint HQ source: " +
+                inspected.errorMessage;
         }
         return false;
     }
     *fingerprint = {
-        .path = std::filesystem::weakly_canonical(payloadPath, error),
-        .byteSize = byteSize,
-        .writeTimeTicks = static_cast<std::int64_t>(
-            writeTime.time_since_epoch().count()),
+        .path = inspected.identity.path,
+        .byteSize = inspected.identity.byteSize,
+        .writeTimeTicks = inspected.identity.writeTimeTicks,
+        .schemaFingerprint = inspected.identity.schemaFingerprint,
+        .contentFingerprint = inspected.identity.contentFingerprint,
+        .pointCount = inspected.identity.pointCount,
+        .recordSize = inspected.identity.recordSize,
     };
-    if (error) {
-        fingerprint->path = payloadPath.lexically_normal();
-    }
     return true;
 }
 
@@ -180,7 +521,9 @@ std::uint64_t BuildLinkedHqSelectionFingerprint(
     std::uint64_t hash = 1469598103934665603ULL;
     HashBytes(&hash, pairKey.data(), pairKey.size());
     HashValue(&hash, frustumUnion.borderFraction);
-    for (const auto& matrix : frustumUnion.midpointViewProjections) {
+    HashValue(&hash, frustumUnion.maximumViewDepthMeters);
+    HashValue(&hash, frustumUnion.viewProjections.size());
+    for (const auto& matrix : frustumUnion.viewProjections) {
         for (std::size_t column = 0U; column < 4U; ++column) {
             for (std::size_t row = 0U; row < 4U; ++row) {
                 HashValue(&hash, matrix[column][row]);
@@ -192,6 +535,16 @@ std::uint64_t BuildLinkedHqSelectionFingerprint(
         HashBytes(&hash, path.data(), path.size());
         HashValue(&hash, source.byteSize);
         HashValue(&hash, source.writeTimeTicks);
+        HashBytes(
+            &hash,
+            source.schemaFingerprint.data(),
+            source.schemaFingerprint.size());
+        HashBytes(
+            &hash,
+            source.contentFingerprint.data(),
+            source.contentFingerprint.size());
+        HashValue(&hash, source.pointCount);
+        HashValue(&hash, source.recordSize);
     }
     return hash;
 }

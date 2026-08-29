@@ -1,10 +1,12 @@
 #pragma once
 
+#include "io/AdaptiveHqCache.hpp"
 #include "io/PointCloudData.hpp"
 
 #include <glm/mat4x4.hpp>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <span>
@@ -16,9 +18,79 @@
 namespace invisible_places::app {
 
 constexpr float kLinkedHqViewportBorderFraction = 0.05F;
+// Full-data Surface_05 profiling found that a 20% guard cuts the initial
+// cached payload by roughly 43% versus the old whole-path union while still
+// leaving several seconds of ordinary animation travel between refreshes.
+constexpr float kAdaptiveHqViewportGuardFraction = 0.20F;
+// Start preparing the next guard while the old patch still covers an extra
+// 10% viewport border. Rendering itself uses a zero-border coverage check,
+// so the complete 5 mm fallback is only exposed if I/O loses that headroom.
+constexpr float kAdaptiveHqRefreshBorderFraction = 0.10F;
+// Per role, excluding the blocks in the current guard (which are never
+// evicted). The original 32-block fringe was only about 128 MiB and caused
+// recently visited camera regions to be decoded repeatedly. Site3's largest
+// complete 1 mm geometry role plus a few live scalar columns fits within this
+// 6 GiB working set, while the limit still prevents an unbounded session.
+constexpr std::uint64_t kAdaptiveHqRetainedFringeByteBudgetPerRole =
+    6ULL * 1024ULL * 1024ULL * 1024ULL;
+// Cache blocks parse independently. Eight readers match the M1 Max worker
+// cap used by patch assembly while retaining deterministic commit order.
+constexpr std::size_t kAdaptiveHqBlockReadWorkerCount = 8U;
+// Conservative coarse-layer visibility mask. Cells, rather than individual
+// frustum planes at draw time, keep the CPU scan fast while the guard border
+// prevents ordinary camera motion from exposing an edge.
+constexpr std::uint32_t kAdaptiveHqFiveMillimeterGuardGridDimension = 64U;
+constexpr double kAdaptiveHqFiveMillimeterGuardUsefulFraction = 0.90;
+
+// Fine-patch visibility during an aHQ guard refresh is deliberately separate
+// from coarse-layer masking. Once the camera leaves the published guard, the
+// complete 5 mm cloud must return so newly exposed pixels cannot become holes,
+// but the last fine patch can remain useful wherever it still intersects the
+// new view. Keeping its depth transition active avoids drawing distant stale
+// fine points at full density while the replacement is assembled.
+struct LinkedHqPatchDrawPolicy {
+    bool renderFinePatches = false;
+    bool applyFineAdaptiveDensity = false;
+    bool applyCoarseAdaptiveDensity = false;
+    bool retainingFineDuringRefresh = false;
+};
+
+struct AdaptiveHqResidentRetention {
+    std::vector<invisible_places::io::AdaptiveHqResidentBlock> blocks;
+    std::uint64_t activePayloadBytes = 0U;
+    std::uint64_t inactivePayloadBytes = 0U;
+    std::size_t inactiveBlockCount = 0U;
+};
+
+// Counts the decoded vector payload retained by a block. This is intentionally
+// based on resident geometry, source IDs, and selected scalar columns rather
+// than compressed/on-disk bytes, so the LRU policy reflects application RAM.
+[[nodiscard]] std::uint64_t AdaptiveHqResidentBlockPayloadBytes(
+    const invisible_places::io::AdaptiveHqResidentBlock& block);
+
+// Active blocks always survive in the selector's deterministic order. The
+// most recently used inactive blocks then fill a bounded per-role RAM working
+// set, allowing orbiting and back-and-forth animation work to reuse decoded
+// blocks without re-reading or re-parsing the local cache.
+[[nodiscard]] AdaptiveHqResidentRetention RetainAdaptiveHqResidentBlocks(
+    std::span<const invisible_places::io::AdaptiveHqResidentBlock> candidates,
+    std::span<const std::uint32_t> activeBlockIndices,
+    std::uint64_t inactiveByteBudget);
+
+[[nodiscard]] LinkedHqPatchDrawPolicy ResolveLinkedHqPatchDrawPolicy(
+    bool linkedHqEnabled,
+    bool adaptiveHqEnabled,
+    bool adaptiveGuardCoversView,
+    bool adaptiveTransitionValid);
+
+// An unlinked animation covers its complete camera path rather than borrowing
+// the linked pair's midpoint-only policy. Uniform samples keep curved motion
+// represented between authored keys, while every authored key time is added
+// separately by BuildUnlinkedAnimationHqSampleTimes.
+constexpr std::size_t kUnlinkedAnimationHqUniformViewCount = 9U;
 
 // Patch densities the HQ control offers. 1 mm keeps every source point
-// inside the midpoint union; coarser choices thin the 1 mm scan with the
+// inside the selected view union; coarser choices thin the 1 mm scan with the
 // density-preserving cell stratification of the display-density cache
 // (cells of the chosen spacing, keeping (1 mm / spacing)^2 of the parents)
 // and declare that nominal spacing so density compensation restores the
@@ -37,29 +109,66 @@ constexpr std::array<std::uint32_t, 3U> kLinkedHqPatchSpacingChoicesMicrometres{
 [[nodiscard]] float LinkedHqPatchKeepFraction(
     std::uint32_t spacingMicrometres);
 
-// The two authored midpoint cameras define a union. BorderFraction is a
-// fraction of the complete viewport dimension on every side: 0.05 extends
-// the normalized X/Y clip limits from +/-1.0 to +/-1.1. Near/far clipping is
-// intentionally never padded.
+// The supplied cameras define a union. Linked animations supply their two
+// authored midpoint cameras; an unlinked animation supplies views spanning
+// its complete path. BorderFraction is a fraction of the complete viewport
+// dimension on every side: 0.05 extends the normalized X/Y clip limits from
+// +/-1.0 to +/-1.1. Near/far clipping is intentionally never padded.
 struct LinkedHqFrustumUnion {
-    std::array<glm::mat4, 2U> midpointViewProjections{
-        glm::mat4{1.0F},
-        glm::mat4{1.0F},
-    };
+    std::vector<glm::mat4> viewProjections;
     float borderFraction = kLinkedHqViewportBorderFraction;
+    // Positive finite values limit accepted perspective view depth (clip.w).
+    // Fixed HQ leaves this unlimited; aHQ only prepares fine data a little
+    // beyond its GPU transition instead of scanning the complete far plane.
+    float maximumViewDepthMeters = 0.0F;
 
     [[nodiscard]] bool Contains(
         const invisible_places::io::Float3& point) const;
+
+    // Conservative block test used by the aHQ sidecar index. False means
+    // every corner is outside at least one plane for every guarded view;
+    // true may include a boundary block, which the exact point test trims.
+    [[nodiscard]] bool IntersectsBounds(
+        const invisible_places::io::Bounds3f& bounds) const;
 };
 
-// Builds the two-slot union used by the compact patch pipeline. An unlinked
-// animation supplies one midpoint matrix, which is duplicated exactly; a
-// linked pair supplies its two matrices. Empty input keeps the identity
-// defaults, and additional matrices are ignored deliberately because the
-// runtime supports at most one reciprocal pair.
+// Builds the view union used by the compact patch pipeline. Exact duplicate
+// matrices are discarded, but every distinct supplied view is retained so an
+// unlinked animation can cover its complete path. Empty input produces an
+// empty union that contains no points.
 [[nodiscard]] LinkedHqFrustumUnion BuildAnimationHqFrustumUnion(
-    std::span<const glm::mat4> midpointViewProjections,
+    std::span<const glm::mat4> viewProjections,
     float borderFraction = kLinkedHqViewportBorderFraction);
+
+// Tests whether a complete current view, through requiredDepthMeters, remains
+// inside an already prepared guarded union. aHQ uses this to retain its patch
+// while navigating and to request a background replacement before exposing a
+// patch edge. Fixed HQ does not use this policy.
+[[nodiscard]] bool LinkedHqFrustumUnionCoversView(
+    const LinkedHqFrustumUnion& frustumUnion,
+    const glm::mat4& view,
+    const glm::mat4& projection,
+    float requiredDepthMeters,
+    float requiredBorderFraction = 0.0F);
+
+// Returns complete-path sample times in seconds. The schedule always includes
+// the start, midpoint, end, and every finite authored key time, with at least
+// kUnlinkedAnimationHqUniformViewCount evenly spaced samples for a non-zero
+// duration. Results are sorted and near-duplicates are removed.
+[[nodiscard]] std::vector<float> BuildUnlinkedAnimationHqSampleTimes(
+    std::span<const float> authoredKeyTimesSeconds,
+    float durationSeconds);
+
+// Full-density live culling uses the focused Feature Run View as one stable
+// camera section. Sampling every 30 fps frame (plus a small boundary pad)
+// keeps the mask unchanged throughout that section, avoiding density or
+// visibility pops while playback is running.
+[[nodiscard]] std::vector<float> BuildAnimationSectionFrustumSampleTimes(
+    float durationSeconds,
+    float normalizedStart,
+    float normalizedEnd,
+    std::uint32_t framesPerSecond = 30U,
+    std::uint32_t paddingFrames = 2U);
 
 struct LinkedHqIndexPartition {
     std::vector<std::uint32_t> inside;
@@ -80,6 +189,10 @@ struct LinkedHqSourceFingerprint {
     std::filesystem::path path;
     std::uintmax_t byteSize = 0U;
     std::int64_t writeTimeTicks = 0;
+    std::string schemaFingerprint;
+    std::string contentFingerprint;
+    std::uint64_t pointCount = 0U;
+    std::uint32_t recordSize = 0U;
 
     [[nodiscard]] bool operator==(
         const LinkedHqSourceFingerprint&) const = default;

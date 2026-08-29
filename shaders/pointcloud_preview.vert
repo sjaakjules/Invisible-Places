@@ -32,6 +32,7 @@ layout(set = 0, binding = 0) uniform FrameUniforms {
     vec4 depthParameters;
     vec4 viewportParameters;
     vec4 depthOfFieldParameters;
+    vec4 adaptiveDensityParameters;
 } uniforms;
 
 layout(set = 0, binding = 1, std430) readonly buffer ScalarFieldValues {
@@ -112,6 +113,8 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 additionalShorelineParams5[4];
     vec4 additionalShorelineTint[4];
 } styleData;
+
+#include "pointcloud_adaptive_density.glsl"
 
 #include "pointcloud_sparse_ripple.glsl"
 #include "pointcloud_rain_impact.glsl"
@@ -1023,6 +1026,18 @@ void main() {
     vec4 viewPosition = uniforms.view * worldPosition;
     const float viewDepth = -viewPosition.z;
     gl_Position = uniforms.viewProjection * worldPosition;
+    if (!AdaptiveDensityKeepsPoint(
+            worldPosition.xyz,
+            pointIndex,
+            viewDepth)) {
+        gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+        gl_PointSize = 0.0;
+        outOpacity = 0.0;
+        outDepthFade = 0.0;
+        outViewDepth = viewDepth;
+        outPointIndex = pointIndex;
+        return;
+    }
     // Point primitives are clipped by their centre, so a centre outside the
     // clip volume never rasterises and its effect resolution is
     // unobservable. Skip the whole procedural stack for those points: with

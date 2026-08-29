@@ -118,6 +118,59 @@ int main(int argc, char** argv) {
                     BackgroundRenderStatusMonitorOptions{
                         .statusPath = argv[++index],
                     };
+        } else if (argument == "--build-adaptive-hq-cache") {
+            if (index + 1 >= argc || argv[index + 1] == nullptr) {
+                std::cerr
+                    << "--build-adaptive-hq-cache requires a source PLY path.\n";
+                return 2;
+            }
+            if (!options.adaptiveHqCacheBuild.has_value()) {
+                options.adaptiveHqCacheBuild.emplace();
+            }
+            options.adaptiveHqCacheBuild->sourcePaths.emplace_back(
+                argv[++index]);
+        } else if (argument == "--adaptive-hq-cache-report") {
+            if (index + 1 >= argc || argv[index + 1] == nullptr) {
+                std::cerr
+                    << "--adaptive-hq-cache-report requires a JSON path.\n";
+                return 2;
+            }
+            if (!options.adaptiveHqCacheBuild.has_value()) {
+                options.adaptiveHqCacheBuild.emplace();
+            }
+            options.adaptiveHqCacheBuild->reportPath = argv[++index];
+        } else if (argument == "--adaptive-hq-profile-animation") {
+            if (index + 1 >= argc || argv[index + 1] == nullptr) {
+                std::cerr
+                    << "--adaptive-hq-profile-animation requires an animation path.\n";
+                return 2;
+            }
+            if (!options.adaptiveHqCacheBuild.has_value()) {
+                options.adaptiveHqCacheBuild.emplace();
+            }
+            options.adaptiveHqCacheBuild->profileAnimationPath =
+                argv[++index];
+        } else if (argument == "--build-point-cloud-field-cache") {
+            if (index + 1 >= argc || argv[index + 1] == nullptr) {
+                std::cerr
+                    << "--build-point-cloud-field-cache requires a source PLY path.\n";
+                return 2;
+            }
+            if (!options.pointCloudFieldCacheBuild.has_value()) {
+                options.pointCloudFieldCacheBuild.emplace();
+            }
+            options.pointCloudFieldCacheBuild->sourcePaths.emplace_back(
+                argv[++index]);
+        } else if (argument == "--point-cloud-field-cache-report") {
+            if (index + 1 >= argc || argv[index + 1] == nullptr) {
+                std::cerr
+                    << "--point-cloud-field-cache-report requires a JSON path.\n";
+                return 2;
+            }
+            if (!options.pointCloudFieldCacheBuild.has_value()) {
+                options.pointCloudFieldCacheBuild.emplace();
+            }
+            options.pointCloudFieldCacheBuild->reportPath = argv[++index];
         } else if (!argument.starts_with("--") && dataRoot.empty()) {
             dataRoot = argument;
         } else {

@@ -21,6 +21,7 @@ layout(set = 0, binding = 0) uniform FrameUniforms {
     vec4 depthParameters;
     vec4 viewportParameters;
     vec4 depthOfFieldParameters;
+    vec4 adaptiveDensityParameters;
 } uniforms;
 
 layout(set = 0, binding = 1, std430) readonly buffer ScalarFieldValues {
@@ -101,6 +102,8 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 additionalShorelineParams5[4];
     vec4 additionalShorelineTint[4];
 } styleData;
+
+#include "pointcloud_adaptive_density.glsl"
 
 #include "pointcloud_sparse_ripple.glsl"
 #include "pointcloud_rain_impact.glsl"
@@ -477,6 +480,23 @@ void main() {
     vec4 worldPosition = vec4(resolvedPosition, 1.0);
     vec4 viewPosition = uniforms.view * worldPosition;
     gl_Position = uniforms.viewProjection * worldPosition;
+    const float viewDepth = -viewPosition.z;
+    if (!AdaptiveDensityKeepsPoint(
+            worldPosition.xyz,
+            pointIndex,
+            viewDepth)) {
+        gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+        gl_PointSize = 0.0;
+        outSourceColor = inColor;
+        outViewDepth = viewDepth;
+        outPointIndex = pointIndex;
+        outWorldPosition = resolvedPosition;
+        outPointNormal = vec3(0.0);
+        outFlowCoverage = 0.0;
+        outTimingColouriseTransform = vec4(0.0);
+        outTimingColouriseScale = vec4(1.0, 1.0, 1.0, 0.0);
+        return;
+    }
     const vec3 pointNormal =
         styleData.pointMeta.z != 0u && pointIndex < styleData.pointMeta.x
             ? pointNormals.normals[pointIndex].xyz
@@ -527,7 +547,7 @@ void main() {
               ? clamp(resolvedPointSize, minPointSize, maxPointSize)
               : minPointSize;
     outSourceColor = inColor;
-    outViewDepth = -viewPosition.z;
+    outViewDepth = viewDepth;
     outPointIndex = pointIndex;
     outWorldPosition = resolvedPosition;
     outPointNormal =

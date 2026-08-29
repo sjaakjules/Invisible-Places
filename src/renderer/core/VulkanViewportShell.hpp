@@ -63,6 +63,8 @@ struct ViewportDiagnostics {
     std::uint32_t pointUnifiedDrawCalls = 0;
     std::uint32_t pointFastBasicDrawCalls = 0;
     std::uint64_t pointFastBasicDrawnPoints = 0;
+    bool previewPerformanceModeEnabled = false;
+    std::uint32_t previewPerformanceEligibleLayerCount = 0;
     bool sceneRenderedThisFrame = false;
     bool sceneCacheActive = false;
     double pointCommandRecordMs = 0.0;
@@ -213,6 +215,10 @@ struct SceneRenderState {
     glm::vec3 rainSpawnCentre{0.0F, 0.0F, 0.0F};
     renderer::pointcloud::PointCloudRendererMode pointCloudRendererMode =
         renderer::pointcloud::PointCloudRendererMode::Beauty;
+    // Live aHQ depth band shared by the fine/coarse point layers. Invalid is
+    // the ordinary path and leaves every point untouched.
+    renderer::pointcloud::PointCloudAdaptiveDensityTransition
+        adaptiveDensityTransition{};
 
     struct PointCloudLayerState {
         std::size_t layerId = 0;
@@ -242,6 +248,8 @@ struct SceneRenderState {
         float worldMaxZ = 0.0F;
         std::uint32_t drawPointCount = 0;
         renderer::pointcloud::PointCloudDensityCompensation densityCompensation{};
+        renderer::pointcloud::PointCloudAdaptiveDensityRole adaptiveDensityRole =
+            renderer::pointcloud::PointCloudAdaptiveDensityRole::Disabled;
         invisible_places::water::WaterSurfaceRole rainCollisionRole =
             invisible_places::water::WaterSurfaceRole::None;
     };
@@ -567,11 +575,15 @@ class VulkanViewportShell {
     [[nodiscard]] std::uint64_t WaterSeepageParamsUploadRevision(std::size_t layerId) const;
     [[nodiscard]] WaterEffectFramePublicationDiagnostics WaterSeepageParamsPublicationState(
         std::size_t layerId) const;
-    void UpdatePointBudget(std::size_t layerId, const std::vector<std::uint32_t>& sampledIndices);
+    void UpdatePointBudget(
+        std::size_t layerId,
+        const std::vector<std::uint32_t>& sampledIndices,
+        bool indicesAlreadySortedUnique = false);
     void UpdateInteractivePointSampleBuffer(
         std::size_t layerId,
         const std::vector<std::uint32_t>& sampledIndices,
-        bool includeSurfelIndices = true);
+        bool includeSurfelIndices = true,
+        bool indicesAlreadySortedUnique = false);
     void UploadPointHighlightIndices(
         std::size_t layerId,
         std::uint64_t key,

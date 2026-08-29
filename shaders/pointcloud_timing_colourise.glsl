@@ -9,6 +9,9 @@ const uint kTimingColouriseNormalY = 2u;
 const uint kTimingColouriseNormalZ = 3u;
 const uint kTimingColouriseColouriseOutput = 0u;
 const uint kTimingColouriseEmissiveOutput = 1u;
+// Keep in lockstep with the authored and renderer-side edge-fade guards.
+const float kTimingColouriseMaximumInwardEdgeFade = 1.0;
+const float kTimingColouriseMaximumOutwardEdgeFade = 1000000.0;
 
 #ifdef POINTCLOUD_TIMING_COLOURISE_VERTEX
 
@@ -58,10 +61,16 @@ vec4 ResolveTimingColouriseEffect(uint effectIndex, uint pointIndex) {
     const vec4 range = styleData.timingColouriseRanges[effectIndex];
     const vec4 fades = styleData.timingColouriseFades[effectIndex];
     const float span = range.y - range.x;
-    // Each edge owns a signed fade fraction of the span (positive inward,
-    // negative outward), independently clamped to a whole span.
-    const float lowerFade = clamp(fades.x, -1.0, 1.0);
-    const float upperFade = clamp(fades.y, -1.0, 1.0);
+    // Each edge owns a signed fade fraction of the span. Inward fades stop
+    // at one span; outward fades may extend across many spans.
+    const float lowerFade = clamp(
+        fades.x,
+        -kTimingColouriseMaximumOutwardEdgeFade,
+        kTimingColouriseMaximumInwardEdgeFade);
+    const float upperFade = clamp(
+        fades.y,
+        -kTimingColouriseMaximumOutwardEdgeFade,
+        kTimingColouriseMaximumInwardEdgeFade);
     const float lowerOutward = span * max(-lowerFade, 0.0);
     const float upperOutward = span * max(-upperFade, 0.0);
     if (!(span > 1.0e-12) ||

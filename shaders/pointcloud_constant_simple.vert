@@ -1,4 +1,5 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 
 layout(location = 0) in vec3 inPosition;
 layout(location = 1) in vec4 inColor;
@@ -17,6 +18,7 @@ layout(set = 0, binding = 0) uniform FrameUniforms {
     vec4 depthParameters;
     vec4 viewportParameters;
     vec4 depthOfFieldParameters;
+    vec4 adaptiveDensityParameters;
 } uniforms;
 
 struct RenderParameterBindingGpu {
@@ -47,6 +49,8 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 stylisationParams1;
     vec4 stylisationParams2;
 } styleData;
+
+#include "pointcloud_adaptive_density.glsl"
 
 layout(set = 0, binding = 6, std430) readonly buffer PointNormals {
     vec4 normals[];
@@ -88,6 +92,19 @@ void main() {
     vec4 viewPosition = uniforms.view * worldPosition;
     const float viewDepth = -viewPosition.z;
     gl_Position = uniforms.viewProjection * worldPosition;
+    if (!AdaptiveDensityKeepsPoint(
+            worldPosition.xyz,
+            pointIndex,
+            viewDepth)) {
+        gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+        gl_PointSize = 0.0;
+        outSourceColor = inColor;
+        outViewDepth = viewDepth;
+        outAovNormal = vec3(0.0);
+        outKernelEnergy = 0.0;
+        outKernelSpriteRatio = 1.0;
+        return;
+    }
 
     const bool worldSizedScreenSprites = styleData.renderParams2.w > 0.5;
     const float footprintScale = max(1.0e-6, styleData.renderParams1.y);

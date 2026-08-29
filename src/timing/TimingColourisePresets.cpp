@@ -41,7 +41,7 @@ TimingColourisePaletteDefinition Preset(
 }
 
 const std::vector<TimingColourisePaletteDefinition>& PresetCatalog() {
-    // These intentionally use only five representative stops. The small
+    // These intentionally use at most five representative stops. The small
     // topology keeps marker editing approachable while the compiled 64-sample
     // LUT provides a smooth rendered gradient between them.
     static const std::vector<TimingColourisePaletteDefinition> kPresets{
@@ -53,6 +53,14 @@ const std::vector<TimingColourisePaletteDefinition>& PresetCatalog() {
              Stop(0.5F, 49, 90, 116),
              Stop(0.75F, 55, 163, 156),
              Stop(1.0F, 222, 245, 229)}),
+        Preset(
+            "seaborn-rocket",
+            "Rocket",
+            {Stop(0.0F, 3, 5, 26),
+             Stop(0.25F, 97, 31, 83),
+             Stop(0.5F, 203, 27, 79),
+             Stop(0.75F, 245, 136, 96),
+             Stop(1.0F, 250, 235, 221)}),
         Preset(
             "seaborn-crest",
             "Crest",
@@ -94,12 +102,34 @@ const std::vector<TimingColourisePaletteDefinition>& PresetCatalog() {
              Stop(0.75F, 164, 179, 100),
              Stop(1.0F, 255, 255, 255)}),
         Preset(
+            "matplotlib-inferno",
+            "Inferno",
+            {Stop(0.0F, 0, 0, 4),
+             Stop(0.25F, 87, 16, 110),
+             Stop(0.5F, 188, 55, 84),
+             Stop(0.75F, 249, 142, 9),
+             Stop(1.0F, 252, 255, 164)}),
+        Preset(
             "matplotlib-twilight",
             "Twilight",
             {Stop(0.0F, 226, 217, 226),
              Stop(0.25F, 100, 116, 186),
              Stop(0.5F, 31, 37, 69),
              Stop(0.75F, 153, 46, 104),
+             Stop(1.0F, 226, 217, 226)}),
+        // Stretch each side of the compact Twilight preset across the full
+        // range so both halves retain exactly the colours already shown.
+        Preset(
+            "matplotlib-twilight-blue",
+            "Twilight Blue",
+            {Stop(0.0F, 226, 217, 226),
+             Stop(0.5F, 100, 116, 186),
+             Stop(1.0F, 31, 37, 69)}),
+        Preset(
+            "matplotlib-twilight-red",
+            "Twilight Red",
+            {Stop(0.0F, 31, 37, 69),
+             Stop(0.5F, 153, 46, 104),
              Stop(1.0F, 226, 217, 226)}),
         Preset(
             "matplotlib-twilight-shifted",
@@ -125,6 +155,73 @@ const std::vector<TimingColourisePaletteDefinition>& PresetCatalog() {
              Stop(0.5F, 0, 119, 164),
              Stop(0.75F, 82, 186, 194),
              Stop(1.0F, 235, 255, 255)}),
+        // "Earth" is the concise UI name for Matplotlib's gist_earth map.
+        Preset(
+            "matplotlib-gist-earth",
+            "Earth",
+            {Stop(0.0F, 0, 0, 0),
+             Stop(0.25F, 43, 115, 126),
+             Stop(0.5F, 94, 160, 75),
+             Stop(0.75F, 189, 171, 98),
+             Stop(1.0F, 253, 251, 251)}),
+        Preset(
+            "colorbrewer-ylgnbu",
+            "YlGnBu",
+            {Stop(0.0F, 255, 255, 217),
+             Stop(0.25F, 199, 233, 180),
+             Stop(0.5F, 65, 182, 196),
+             Stop(0.75F, 34, 94, 168),
+             Stop(1.0F, 8, 29, 88)}),
+        Preset(
+            "colorbrewer-purd",
+            "PuRd",
+            {Stop(0.0F, 247, 244, 249),
+             Stop(0.25F, 212, 185, 218),
+             Stop(0.5F, 223, 101, 176),
+             Stop(0.75F, 206, 18, 86),
+             Stop(1.0F, 103, 0, 31)}),
+        Preset(
+            "colorbrewer-blues",
+            "Blues",
+            {Stop(0.0F, 247, 251, 255),
+             Stop(0.25F, 198, 219, 239),
+             Stop(0.5F, 107, 174, 214),
+             Stop(0.75F, 33, 113, 181),
+             Stop(1.0F, 8, 48, 107)}),
+        Preset(
+            "crameri-batlow",
+            "Batlow",
+            {Stop(0.0F, 1, 25, 89),
+             Stop(0.25F, 34, 96, 97),
+             Stop(0.5F, 130, 130, 49),
+             Stop(0.75F, 242, 157, 109),
+             Stop(1.0F, 250, 204, 250)}),
+        Preset(
+            "crameri-lipari",
+            "Lipari",
+            {Stop(0.0F, 3, 19, 38),
+             Stop(0.25F, 82, 91, 122),
+             Stop(0.5F, 165, 98, 103),
+             Stop(0.75F, 233, 155, 116),
+             Stop(1.0F, 253, 245, 218)}),
+        // Repeat the opening colours after quantization so the two cyclic
+        // Scientific Colour Maps close with no visible renderer seam.
+        Preset(
+            "crameri-romao",
+            "RomaO",
+            {Stop(0.0F, 115, 57, 87),
+             Stop(0.25F, 170, 117, 47),
+             Stop(0.5F, 203, 225, 179),
+             Stop(0.75F, 83, 147, 191),
+             Stop(1.0F, 115, 57, 87)}),
+        Preset(
+            "crameri-corko",
+            "CorkO",
+            {Stop(0.0F, 63, 62, 58),
+             Stop(0.25F, 95, 122, 159),
+             Stop(0.5F, 175, 203, 188),
+             Stop(0.75F, 84, 125, 68),
+             Stop(1.0F, 63, 62, 58)}),
         Preset(
             "cmocean-haline",
             "Haline",

@@ -347,16 +347,38 @@ TEST_CASE("Timeline camera following preserves an orbited inspection view",
     invisible_places::camera::OrbitCamera liveCamera;
     liveCamera.ApplyState(evaluation.camera);
     const auto attached = liveCamera.CaptureState();
+    const auto prepared =
+        invisible_places::camera::PrepareAnimationPathEvaluation(path);
 
     CHECK(invisible_places::camera::AnimationCameraMatchesFrame(
         attached,
         path,
+        kPosition));
+    CHECK(invisible_places::camera::PreparedAnimationCameraMatchesFrame(
+        attached,
+        prepared,
         kPosition));
     CHECK(invisible_places::camera::AnimationPlaybackShouldFollowCamera(
         attached,
         path,
         kPosition,
         true));
+    CHECK(invisible_places::camera::PreparedAnimationPlaybackShouldFollowCamera(
+        attached,
+        prepared,
+        kPosition,
+        true));
+
+    auto changedClip = attached;
+    changedClip.farPlane *= 0.5F;
+    CHECK_FALSE(invisible_places::camera::AnimationCameraMatchesFrame(
+        changedClip,
+        path,
+        kPosition));
+    CHECK_FALSE(invisible_places::camera::PreparedAnimationCameraMatchesFrame(
+        changedClip,
+        prepared,
+        kPosition));
     CHECK(invisible_places::camera::
               FeatureTimelineScrubShouldMoveCamera(
                   attached,
@@ -370,6 +392,10 @@ TEST_CASE("Timeline camera following preserves an orbited inspection view",
         orbited,
         path,
         kPosition));
+    CHECK_FALSE(invisible_places::camera::PreparedAnimationCameraMatchesFrame(
+        orbited,
+        prepared,
+        kPosition));
     CHECK_FALSE(invisible_places::camera::AnimationPlaybackShouldFollowCamera(
         orbited,
         path,
@@ -378,6 +404,11 @@ TEST_CASE("Timeline camera following preserves an orbited inspection view",
     CHECK_FALSE(invisible_places::camera::AnimationPlaybackShouldFollowCamera(
         attached,
         path,
+        kPosition,
+        false));
+    CHECK_FALSE(invisible_places::camera::PreparedAnimationPlaybackShouldFollowCamera(
+        attached,
+        prepared,
         kPosition,
         false));
     CHECK_FALSE(invisible_places::camera::

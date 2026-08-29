@@ -70,6 +70,8 @@ struct alignas(16) FrameUniforms {
     glm::vec4 depthParameters{0.0F, 0.05F, 1000.0F, 0.0F};
     glm::vec4 viewportParameters{1.0F, 1.0F, 2.0F, 2.0F};
     glm::vec4 depthOfFieldParameters{0.0F, 1.0F, 8.0F, 24.0F};
+    // xyz: aHQ start/switch/end view depth; w: prepared fine depth.
+    glm::vec4 adaptiveDensityParameters{0.0F};
     glm::mat4 inverseViewProjection{1.0F};
 };
 
@@ -169,8 +171,9 @@ struct alignas(16) PointCloudStyleGpu {
     // emissive/darkening level.
     std::array<glm::vec4, renderer::pointcloud::kTimingColouriseMaxEffects>
         timingColouriseRanges{};
-    // x/y: signed lower/upper edge-fade fractions (positive inward,
-    // negative outward, up to a whole span each); z/w: spare.
+    // x/y: signed lower/upper edge-fade fractions. Positive inward values
+    // stop at one span; negative outward values may cover many spans. z/w:
+    // spare.
     std::array<glm::vec4, renderer::pointcloud::kTimingColouriseMaxEffects>
         timingColouriseFades{};
     // Effect-major 64-sample RGBA lookup tables. RGB is tint; A is mix only.
@@ -2621,6 +2624,17 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
             // gap-fill layer dry while every scanned cloud keeps shading.
             (!layer.waterFillLayer || renderState_.rainAppliesToWaterFill);
     }
+    diagnostics_.previewPerformanceModeEnabled =
+        renderState_.previewPerformanceMode;
+    diagnostics_.previewPerformanceEligibleLayerCount =
+        static_cast<std::uint32_t>(std::count_if(
+            renderState_.pointCloudLayers.begin(),
+            renderState_.pointCloudLayers.end(),
+            [&](const auto& layer) {
+                return LayerUsesDepthTestedAccumulation(
+                    layer,
+                    ResolvePointCloudLayerMaterialVariant(layer));
+            }));
     ++sceneRevision_;
 
     std::uint64_t pointCount = 0;
@@ -5248,7 +5262,8 @@ VulkanViewportShell::WaterSeepageParamsPublicationState(std::size_t layerId) con
 
 void VulkanViewportShell::UpdatePointBudget(
     std::size_t layerId,
-    const std::vector<std::uint32_t>& sampledIndices) {
+    const std::vector<std::uint32_t>& sampledIndices,
+    bool indicesAlreadySortedUnique) {
     SettlePointCloudMutation();
 
     auto* resources = FindPointCloudResources(layerId);
@@ -5267,25 +5282,39 @@ void VulkanViewportShell::UpdatePointBudget(
     resources->activePointCount = validPointCount;
     resources->interactiveSampledIndexCount = 0;
 
-    const auto sanitized = SanitizePointIndices(sampledIndices, validPointCount);
+    const bool trustedIndicesValid =
+        indicesAlreadySortedUnique &&
+        (sampledIndices.empty() ||
+         (sampledIndices.back() < validPointCount &&
+          std::is_sorted(sampledIndices.begin(), sampledIndices.end()) &&
+          std::adjacent_find(
+              sampledIndices.begin(),
+              sampledIndices.end()) == sampledIndices.end()));
+    std::vector<std::uint32_t> sanitizedStorage;
+    const std::vector<std::uint32_t>* sanitized = &sampledIndices;
+    if (!trustedIndicesValid) {
+        sanitizedStorage =
+            SanitizePointIndices(sampledIndices, validPointCount);
+        sanitized = &sanitizedStorage;
+    }
     if (validPointCount == 0 ||
-        sanitized.empty() ||
-        sanitized.size() >= validPointCount) {
+        sanitized->empty() ||
+        sanitized->size() >= validPointCount) {
         return;
     }
 
     resources->sampledIndexBuffer = CreateHostVisibleBuffer(
-        static_cast<VkDeviceSize>(sanitized.size() * sizeof(std::uint32_t)),
+        static_cast<VkDeviceSize>(sanitized->size() * sizeof(std::uint32_t)),
         VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
     UploadBufferData(
         resources->sampledIndexBuffer,
-        sanitized.data(),
+        sanitized->data(),
         resources->sampledIndexBuffer.size);
     resources->usingSampledIndices = true;
-    resources->activePointCount = static_cast<std::uint32_t>(sanitized.size());
+    resources->activePointCount = static_cast<std::uint32_t>(sanitized->size());
 
     const auto surfelIndices =
-        invisible_places::renderer::pointcloud::GenerateSurfelEncodedSampleIndices(sanitized);
+        invisible_places::renderer::pointcloud::GenerateSurfelEncodedSampleIndices(*sanitized);
     if (!surfelIndices.empty()) {
         resources->sampledSurfelIndexBuffer = CreateHostVisibleBuffer(
             static_cast<VkDeviceSize>(surfelIndices.size() * sizeof(std::uint32_t)),
@@ -5300,7 +5329,8 @@ void VulkanViewportShell::UpdatePointBudget(
 void VulkanViewportShell::UpdateInteractivePointSampleBuffer(
     std::size_t layerId,
     const std::vector<std::uint32_t>& sampledIndices,
-    bool includeSurfelIndices) {
+    bool includeSurfelIndices,
+    bool indicesAlreadySortedUnique) {
     SettlePointCloudMutation();
 
     auto* resources = FindPointCloudResources(layerId);
@@ -5315,23 +5345,38 @@ void VulkanViewportShell::UpdateInteractivePointSampleBuffer(
     const std::uint32_t validPointCount = resources->waterFlowSourceActive
                                               ? resources->waterFlowSettledPointCount
                                               : resources->pointCount;
-    const auto sanitized = SanitizePointIndices(sampledIndices, validPointCount);
-    if (sanitized.empty() || sanitized.size() >= validPointCount) {
+    const bool trustedIndicesValid =
+        indicesAlreadySortedUnique &&
+        (sampledIndices.empty() ||
+         (sampledIndices.back() < validPointCount &&
+          std::is_sorted(sampledIndices.begin(), sampledIndices.end()) &&
+          std::adjacent_find(
+              sampledIndices.begin(),
+              sampledIndices.end()) == sampledIndices.end()));
+    std::vector<std::uint32_t> sanitizedStorage;
+    const std::vector<std::uint32_t>* sanitized = &sampledIndices;
+    if (!trustedIndicesValid) {
+        sanitizedStorage =
+            SanitizePointIndices(sampledIndices, validPointCount);
+        sanitized = &sanitizedStorage;
+    }
+    if (sanitized->empty() || sanitized->size() >= validPointCount) {
         return;
     }
 
     resources->interactiveSampledIndexBuffer = CreateHostVisibleBuffer(
-        static_cast<VkDeviceSize>(sanitized.size() * sizeof(std::uint32_t)),
+        static_cast<VkDeviceSize>(sanitized->size() * sizeof(std::uint32_t)),
         VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
     UploadBufferData(
         resources->interactiveSampledIndexBuffer,
-        sanitized.data(),
+        sanitized->data(),
         resources->interactiveSampledIndexBuffer.size);
-    resources->interactiveSampledIndexCount = static_cast<std::uint32_t>(sanitized.size());
+    resources->interactiveSampledIndexCount =
+        static_cast<std::uint32_t>(sanitized->size());
 
     if (includeSurfelIndices) {
         const auto surfelIndices =
-            invisible_places::renderer::pointcloud::GenerateSurfelEncodedSampleIndices(sanitized);
+            invisible_places::renderer::pointcloud::GenerateSurfelEncodedSampleIndices(*sanitized);
         if (!surfelIndices.empty()) {
             resources->interactiveSurfelIndexBuffer = CreateHostVisibleBuffer(
                 static_cast<VkDeviceSize>(surfelIndices.size() * sizeof(std::uint32_t)),
@@ -14024,15 +14069,18 @@ bool VulkanViewportShell::LayerUsesDepthTestedAccumulation(
             layer.style) ||
         (layer.shorelineInstancesEligible &&
          !renderState_.additionalShorelines.empty());
+    // Density compensation normally keeps coarse display sources on weighted
+    // accumulation so their coverage matches the 1 mm reference. Performance
+    // mode does not replace that material: it only adds a matching read-only
+    // depth test. Classify the authored style with neutral compensation so an
+    // otherwise opaque 5 mm layer can benefit too. This is the preview-only
+    // blending trade-off advertised by the setting.
     return renderState_.previewPerformanceMode &&
            !hasShorelineWaves &&
            materialVariant ==
                renderer::pointcloud::PointCloudMaterialVariant::Unified &&
-           renderer::pointcloud::ResolvePointCloudMaterialVariant(
-               layer.style,
-               layer.densityCompensation,
-               false) ==
-               renderer::pointcloud::PointCloudMaterialVariant::OpaqueHardDisc;
+           renderer::pointcloud::PointCloudStyleSupportsPreviewDepthCulling(
+               layer.style);
 }
 
 bool VulkanViewportShell::UploadPointCloudLayerStyle(
@@ -14143,14 +14191,18 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
                 std::isfinite(effect.edgeFadeLowerFraction)
                     ? effect.edgeFadeLowerFraction
                     : 0.10F,
-                -1.0F,
-                1.0F),
+                -renderer::pointcloud::
+                    kTimingColouriseMaximumOutwardEdgeFade,
+                renderer::pointcloud::
+                    kTimingColouriseMaximumInwardEdgeFade),
             std::clamp(
                 std::isfinite(effect.edgeFadeUpperFraction)
                     ? effect.edgeFadeUpperFraction
                     : 0.10F,
-                -1.0F,
-                1.0F),
+                -renderer::pointcloud::
+                    kTimingColouriseMaximumOutwardEdgeFade,
+                renderer::pointcloud::
+                    kTimingColouriseMaximumInwardEdgeFade),
             0.0F,
             0.0F,
         };
@@ -14236,7 +14288,7 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
                           : 0U));
     styleGpu.pointMeta = glm::uvec4{
         resources->pointCount,
-        plan.drawPointCount,
+        static_cast<std::uint32_t>(layer.adaptiveDensityRole),
         resources->hasNormals ? 1U : 0U,
         waterContentKind,
     };
@@ -16346,6 +16398,15 @@ void VulkanViewportShell::UploadFrameUniformsToBuffer(
         std::max(0.0F, renderState_.depthOfFieldMaxBlurPixels),
     };
     uniforms.inverseViewProjection = glm::inverse(renderState_.viewProjection);
+    const auto& adaptive = renderState_.adaptiveDensityTransition;
+    uniforms.adaptiveDensityParameters = adaptive.Valid()
+        ? glm::vec4{
+              adaptive.startDepthMeters,
+              adaptive.switchDepthMeters,
+              adaptive.endDepthMeters,
+              adaptive.preparedFineDepthMeters,
+          }
+        : glm::vec4{0.0F};
 
     UploadBufferData(buffer, &uniforms, sizeof(uniforms));
 }

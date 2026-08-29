@@ -29,6 +29,7 @@ layout(set = 0, binding = 0) uniform FrameUniforms {
     vec4 depthParameters;
     vec4 viewportParameters;
     vec4 depthOfFieldParameters;
+    vec4 adaptiveDensityParameters;
 } uniforms;
 
 layout(set = 0, binding = 1, std430) readonly buffer ScalarFieldValues {
@@ -101,6 +102,8 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 additionalShorelineParams5[4];
     vec4 additionalShorelineTint[4];
 } styleData;
+
+#include "pointcloud_adaptive_density.glsl"
 
 #include "pointcloud_sparse_ripple.glsl"
 #include "pointcloud_rain_impact.glsl"
@@ -1122,13 +1125,26 @@ void main() {
         waterTrailRole,
         waterTrailPhase);
     const vec3 center = ResolveSurfaceMotionPosition(flowPosition, pointIndex);
+    const vec4 centerViewPosition = uniforms.view * vec4(center, 1.0);
+    const float centerDepth = -centerViewPosition.z;
+    if (!AdaptiveDensityKeepsPoint(center, pointIndex, centerDepth)) {
+        gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+        outOpacity = 0.0;
+        outDepthFade = 0.0;
+        outViewDepth = centerDepth;
+        outPointIndex = pointIndex;
+        return;
+    }
     vec3 tangent;
     vec3 bitangent;
     float surfaceAngleMask;
-    ResolveBasis(center, pointIndex, waterTrailPhase, tangent, bitangent, surfaceAngleMask);
-
-    const vec4 centerViewPosition = uniforms.view * vec4(center, 1.0);
-    const float centerDepth = -centerViewPosition.z;
+    ResolveBasis(
+        center,
+        pointIndex,
+        waterTrailPhase,
+        tangent,
+        bitangent,
+        surfaceAngleMask);
     vec3 rippleNormal =
         styleData.pointMeta.z != 0u && pointIndex < styleData.pointMeta.x
             ? surfelNormals.normals[pointIndex].xyz

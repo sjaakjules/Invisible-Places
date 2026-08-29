@@ -169,12 +169,34 @@ constexpr std::uint32_t kSceneScopedTimingTakesProjectSchemaVersion = 84U;
 // only "edge_fade" loads it into both edges and sanitize splits legacy
 // shared-fade keys, so no version gate is needed.
 constexpr std::uint32_t kSplitEdgeFadeProjectSchemaVersion = 85U;
+// Schema 87 widens only the negative (outward) side of the existing signed,
+// span-relative edge-fade representation. Loading is an identity migration:
+// schema <=86 base values, legacy bounds snapshots, split parameter keys,
+// and field memories already carry the correct units and remain unchanged.
+constexpr std::uint32_t kExtendedOutwardEdgeFadeProjectSchemaVersion = 87U;
+// Schema 88 gives Visual Feature fade ends an explicit authoring mode.
+// Existing linked/separate documents remain span-relative; Absolute stores
+// scalar fade-end coordinates in the existing per-edge value slots.
+constexpr std::uint32_t kEdgeFadeModeProjectSchemaVersion = 88U;
+// Schema 89 keeps each fade representation's base values and animation keys
+// independently, so switching modes never converts or co-mingles tracks.
+constexpr std::uint32_t kIndependentEdgeFadeModeTracksProjectSchemaVersion =
+    89U;
 static_assert(
     kProjectDocumentSchemaVersion >=
     kSceneScopedTimingTakesProjectSchemaVersion);
 static_assert(
     kProjectDocumentSchemaVersion >=
     kSplitEdgeFadeProjectSchemaVersion);
+static_assert(
+    kProjectDocumentSchemaVersion >=
+    kExtendedOutwardEdgeFadeProjectSchemaVersion);
+static_assert(
+    kProjectDocumentSchemaVersion >=
+    kEdgeFadeModeProjectSchemaVersion);
+static_assert(
+    kProjectDocumentSchemaVersion >=
+    kIndependentEdgeFadeModeTracksProjectSchemaVersion);
 static_assert(
     kProjectDocumentSchemaVersion >=
     kSmoothVelocityProjectSchemaVersion);
@@ -4959,9 +4981,20 @@ ParseTimingColourisePalette(const json& paletteJson) {
 }
 
 json SerializeTimingColouriseBounds(
-    const invisible_places::timing::TimingColouriseBounds& bounds) {
+    const invisible_places::timing::TimingColouriseBounds& bounds,
+    invisible_places::timing::TimingColouriseEdgeFadeMode mode =
+        invisible_places::timing::TimingColouriseEdgeFadeMode::
+            RelativeSeparate) {
     const auto sanitized =
-        invisible_places::timing::SanitizeTimingColouriseBounds(bounds);
+        invisible_places::timing::SanitizeTimingColouriseAuthoredBounds(
+            bounds,
+            mode);
+    const auto relative = invisible_places::timing::
+        ConvertTimingColouriseBoundsEdgeFadeMode(
+            sanitized,
+            mode,
+            invisible_places::timing::TimingColouriseEdgeFadeMode::
+                RelativeSeparate);
     return {
         {"lower", sanitized.lower},
         {"upper", sanitized.upper},
@@ -4971,8 +5004,8 @@ json SerializeTimingColouriseBounds(
         {"edge_fade",
          std::clamp(
              std::midpoint(
-                 sanitized.edgeFadeLower,
-                 sanitized.edgeFadeUpper),
+                 relative.edgeFadeLower,
+                 relative.edgeFadeUpper),
              -0.5F,
              0.5F)},
         {"edge_fade_lower", sanitized.edgeFadeLower},
@@ -4981,7 +5014,11 @@ json SerializeTimingColouriseBounds(
 }
 
 invisible_places::timing::TimingColouriseBounds
-ParseTimingColouriseBounds(const json& boundsJson) {
+ParseTimingColouriseBounds(
+    const json& boundsJson,
+    invisible_places::timing::TimingColouriseEdgeFadeMode mode =
+        invisible_places::timing::TimingColouriseEdgeFadeMode::
+            RelativeSeparate) {
     invisible_places::timing::TimingColouriseBounds bounds;
     bounds.lower = boundsJson.value("lower", bounds.lower);
     bounds.upper = boundsJson.value("upper", bounds.upper);
@@ -4991,7 +5028,9 @@ ParseTimingColouriseBounds(const json& boundsJson) {
         boundsJson.value("edge_fade_lower", legacyEdgeFade);
     bounds.edgeFadeUpper =
         boundsJson.value("edge_fade_upper", legacyEdgeFade);
-    return invisible_places::timing::SanitizeTimingColouriseBounds(bounds);
+    return invisible_places::timing::SanitizeTimingColouriseAuthoredBounds(
+        bounds,
+        mode);
 }
 
 std::string TimingColouriseColourSpaceName(
@@ -5217,6 +5256,40 @@ ParseTimingColouriseBoundsKeyMode(const json& modeJson) {
     return TimingColouriseBoundsKeyMode::LowerUpper;
 }
 
+std::string TimingColouriseEdgeFadeModeName(
+    invisible_places::timing::TimingColouriseEdgeFadeMode mode) {
+    using invisible_places::timing::TimingColouriseEdgeFadeMode;
+    switch (mode) {
+        case TimingColouriseEdgeFadeMode::RelativeLinked:
+            return "relative_linked";
+        case TimingColouriseEdgeFadeMode::RelativeSeparate:
+            return "relative_separate";
+        case TimingColouriseEdgeFadeMode::Absolute:
+            return "absolute";
+    }
+    return "relative_linked";
+}
+
+invisible_places::timing::TimingColouriseEdgeFadeMode
+ParseTimingColouriseEdgeFadeMode(
+    const json& modeJson,
+    bool legacyLinked = true) {
+    using invisible_places::timing::TimingColouriseEdgeFadeMode;
+    if (!modeJson.is_string()) {
+        return legacyLinked
+                   ? TimingColouriseEdgeFadeMode::RelativeLinked
+                   : TimingColouriseEdgeFadeMode::RelativeSeparate;
+    }
+    const auto name = modeJson.get<std::string>();
+    if (name == "relative_separate") {
+        return TimingColouriseEdgeFadeMode::RelativeSeparate;
+    }
+    if (name == "absolute") {
+        return TimingColouriseEdgeFadeMode::Absolute;
+    }
+    return TimingColouriseEdgeFadeMode::RelativeLinked;
+}
+
 std::string TimingColouriseBoundsParameterName(
     invisible_places::timing::TimingColouriseBoundsParameter parameter) {
     using invisible_places::timing::TimingColouriseBoundsParameter;
@@ -5318,14 +5391,62 @@ ParseTimingColouriseBoundsParameterKeys(const json& keysJson) {
     return keys;
 }
 
+json SerializeTimingColouriseEdgeFadeModeMemories(
+    const std::vector<invisible_places::timing::
+        TimingColouriseEdgeFadeModeMemory>& memories) {
+    json memoriesJson = json::array();
+    for (const auto& memory : memories) {
+        memoriesJson.push_back({
+            {"mode", TimingColouriseEdgeFadeModeName(memory.mode)},
+            {"edge_fade_lower", memory.edgeFadeLower},
+            {"edge_fade_upper", memory.edgeFadeUpper},
+            {"keys",
+             SerializeTimingColouriseBoundsParameterKeys(memory.keys)},
+        });
+    }
+    return memoriesJson;
+}
+
+std::vector<invisible_places::timing::TimingColouriseEdgeFadeModeMemory>
+ParseTimingColouriseEdgeFadeModeMemories(const json& memoriesJson) {
+    std::vector<invisible_places::timing::
+        TimingColouriseEdgeFadeModeMemory> memories;
+    if (!memoriesJson.is_array()) {
+        return memories;
+    }
+    for (const auto& memoryJson : memoriesJson) {
+        if (!memoryJson.is_object() ||
+            !memoryJson.contains("mode")) {
+            continue;
+        }
+        invisible_places::timing::TimingColouriseEdgeFadeModeMemory
+            memory;
+        memory.mode = ParseTimingColouriseEdgeFadeMode(
+            memoryJson.at("mode"));
+        memory.edgeFadeLower = memoryJson.value(
+            "edge_fade_lower",
+            memory.edgeFadeLower);
+        memory.edgeFadeUpper = memoryJson.value(
+            "edge_fade_upper",
+            memory.edgeFadeUpper);
+        if (memoryJson.contains("keys")) {
+            memory.keys = ParseTimingColouriseBoundsParameterKeys(
+                memoryJson.at("keys"));
+        }
+        memories.push_back(std::move(memory));
+    }
+    return memories;
+}
+
 json SerializeTimingColouriseBoundsKeys(
     const std::vector<
-        invisible_places::timing::TimingColouriseBoundsKey>& keys) {
+        invisible_places::timing::TimingColouriseBoundsKey>& keys,
+    invisible_places::timing::TimingColouriseEdgeFadeMode mode) {
     json keysJson = json::array();
     for (const auto& key : keys) {
         keysJson.push_back({
             {"position", key.position},
-            {"bounds", SerializeTimingColouriseBounds(key.bounds)},
+            {"bounds", SerializeTimingColouriseBounds(key.bounds, mode)},
             {"interpolation",
              WaterScenarioInterpolationName(key.interpolation)},
         });
@@ -5334,7 +5455,11 @@ json SerializeTimingColouriseBoundsKeys(
 }
 
 std::vector<invisible_places::timing::TimingColouriseBoundsKey>
-ParseTimingColouriseBoundsKeys(const json& keysJson) {
+ParseTimingColouriseBoundsKeys(
+    const json& keysJson,
+    invisible_places::timing::TimingColouriseEdgeFadeMode mode =
+        invisible_places::timing::TimingColouriseEdgeFadeMode::
+            RelativeSeparate) {
     std::vector<invisible_places::timing::TimingColouriseBoundsKey> keys;
     if (!keysJson.is_array()) {
         return keys;
@@ -5348,7 +5473,7 @@ ParseTimingColouriseBoundsKeys(const json& keysJson) {
         }
         if (keyJson.contains("bounds")) {
             key.bounds =
-                ParseTimingColouriseBounds(keyJson.at("bounds"));
+                ParseTimingColouriseBounds(keyJson.at("bounds"), mode);
         }
         keys.push_back(std::move(key));
     }
@@ -5693,7 +5818,10 @@ json SerializeTimingColouriseEffect(
             {"position", key.position},
             {"interpolation",
              WaterScenarioInterpolationName(key.interpolation)},
-            {"bounds", SerializeTimingColouriseBounds(key.bounds)},
+            {"bounds",
+             SerializeTimingColouriseBounds(
+                 key.bounds,
+                 sanitized.edgeFadeMode)},
         });
     }
     json boundsParameterKeysJson = json::array();
@@ -5735,7 +5863,9 @@ json SerializeTimingColouriseEffect(
         {"base_palette",
          SerializeTimingColourisePalette(sanitized.basePalette)},
         {"base_bounds",
-         SerializeTimingColouriseBounds(sanitized.baseBounds)},
+         SerializeTimingColouriseBounds(
+             sanitized.baseBounds,
+             sanitized.edgeFadeMode)},
         {"palette_key_model",
          TimingColourisePaletteKeyModelName(
              sanitized.paletteKeyModel)},
@@ -5783,7 +5913,9 @@ json SerializeTimingColouriseEffect(
                            memory.selector.scalarFieldName},
                       }},
                      {"bounds",
-                      SerializeTimingColouriseBounds(memory.bounds)},
+                      SerializeTimingColouriseBounds(
+                          memory.bounds,
+                          memory.edgeFadeMode)},
                      {"bounds_key_mode",
                       TimingColouriseBoundsKeyModeName(
                           memory.boundsKeyMode)},
@@ -5792,13 +5924,24 @@ json SerializeTimingColouriseEffect(
                           memory.boundsParameterKeys)},
                      {"bounds_keys",
                       SerializeTimingColouriseBoundsKeys(
-                          memory.boundsKeys)},
+                          memory.boundsKeys,
+                          memory.edgeFadeMode)},
                      {"edited", memory.edited},
                      {"adopted_global_revision",
                       memory.adoptedGlobalRevision},
                  });
-                 if (!memory.edgeFadesLinked) {
+                 if (memory.edgeFadeMode !=
+                     invisible_places::timing::
+                         TimingColouriseEdgeFadeMode::RelativeLinked) {
+                     memoryJson.back()["edge_fade_mode"] =
+                         TimingColouriseEdgeFadeModeName(
+                             memory.edgeFadeMode);
                      memoryJson.back()["edge_fades_linked"] = false;
+                 }
+                 if (!memory.edgeFadeModeMemories.empty()) {
+                     memoryJson.back()["edge_fade_mode_memories"] =
+                         SerializeTimingColouriseEdgeFadeModeMemories(
+                             memory.edgeFadeModeMemories);
                  }
              }
              return memoryJson;
@@ -5809,9 +5952,20 @@ json SerializeTimingColouriseEffect(
     if (!sanitized.applyToWaterFill) {
         effectJson["apply_to_water_fill"] = false;
     }
-    // Linked fade handles are the norm; only the split is written.
-    if (!sanitized.edgeFadesLinked) {
+    // Relative Joined is the historical default. Keep that shape compact;
+    // other modes also write the old split flag as a graceful hint to
+    // pre-schema-88 readers.
+    if (sanitized.edgeFadeMode !=
+        invisible_places::timing::
+            TimingColouriseEdgeFadeMode::RelativeLinked) {
+        effectJson["edge_fade_mode"] =
+            TimingColouriseEdgeFadeModeName(sanitized.edgeFadeMode);
         effectJson["edge_fades_linked"] = false;
+    }
+    if (!sanitized.edgeFadeModeMemories.empty()) {
+        effectJson["edge_fade_mode_memories"] =
+            SerializeTimingColouriseEdgeFadeModeMemories(
+                sanitized.edgeFadeModeMemories);
     }
     // Field-linked visual settings are the norm; only the Global opt-out
     // and non-empty memories are written.
@@ -6009,6 +6163,17 @@ ParseTimingColouriseEffect(
         effect.emissiveEnabled = false;
     }
     effect.id = effectJson.value("id", std::string{});
+    const bool legacyEdgeFadesLinked =
+        effectJson.value("edge_fades_linked", true);
+    effect.edgeFadeMode = effectJson.contains("edge_fade_mode")
+        ? ParseTimingColouriseEdgeFadeMode(
+              effectJson.at("edge_fade_mode"),
+              legacyEdgeFadesLinked)
+        : legacyEdgeFadesLinked
+            ? invisible_places::timing::
+                  TimingColouriseEdgeFadeMode::RelativeLinked
+            : invisible_places::timing::
+                  TimingColouriseEdgeFadeMode::RelativeSeparate;
     effect.applyToWaterFill =
         effectJson.value("apply_to_water_fill", true);
     effect.name = effectJson.value("name", effect.name);
@@ -6040,7 +6205,9 @@ ParseTimingColouriseEffect(
     }
     if (effectJson.contains("base_bounds")) {
         effect.baseBounds =
-            ParseTimingColouriseBounds(effectJson.at("base_bounds"));
+            ParseTimingColouriseBounds(
+                effectJson.at("base_bounds"),
+                effect.edgeFadeMode);
     }
     const auto parsedPaletteKeyModel =
         effectJson.contains("palette_key_model")
@@ -6250,15 +6417,20 @@ ParseTimingColouriseEffect(
             }
             if (keyJson.contains("bounds")) {
                 key.bounds =
-                    ParseTimingColouriseBounds(keyJson.at("bounds"));
+                    ParseTimingColouriseBounds(
+                        keyJson.at("bounds"),
+                        effect.edgeFadeMode);
             }
             effect.boundsKeys.push_back(std::move(key));
         }
     }
+    if (effectJson.contains("edge_fade_mode_memories")) {
+        effect.edgeFadeModeMemories =
+            ParseTimingColouriseEdgeFadeModeMemories(
+                effectJson.at("edge_fade_mode_memories"));
+    }
     effect.boundsEdited =
         effectJson.value("bounds_edited", effect.boundsEdited);
-    effect.edgeFadesLinked =
-        effectJson.value("edge_fades_linked", true);
     effect.boundsAdoptedGlobalRevision = effectJson.value(
         "bounds_adopted_global_revision",
         effect.boundsAdoptedGlobalRevision);
@@ -6273,6 +6445,17 @@ ParseTimingColouriseEffect(
             }
             invisible_places::timing::TimingColouriseFieldBoundsMemory
                 memory;
+            const bool legacyMemoryFadesLinked =
+                memoryJson.value("edge_fades_linked", true);
+            memory.edgeFadeMode = memoryJson.contains("edge_fade_mode")
+                ? ParseTimingColouriseEdgeFadeMode(
+                      memoryJson.at("edge_fade_mode"),
+                      legacyMemoryFadesLinked)
+                : legacyMemoryFadesLinked
+                    ? invisible_places::timing::
+                          TimingColouriseEdgeFadeMode::RelativeLinked
+                    : invisible_places::timing::
+                          TimingColouriseEdgeFadeMode::RelativeSeparate;
             const auto& fieldJson = memoryJson.at("field");
             if (fieldJson.contains("source")) {
                 memory.selector.source = ParseTimingColouriseFieldSource(
@@ -6283,7 +6466,8 @@ ParseTimingColouriseEffect(
                 memory.selector.scalarFieldName);
             if (memoryJson.contains("bounds")) {
                 memory.bounds = ParseTimingColouriseBounds(
-                    memoryJson.at("bounds"));
+                    memoryJson.at("bounds"),
+                    memory.edgeFadeMode);
             }
             if (memoryJson.contains("bounds_key_mode")) {
                 memory.boundsKeyMode = ParseTimingColouriseBoundsKeyMode(
@@ -6296,11 +6480,15 @@ ParseTimingColouriseEffect(
             }
             if (memoryJson.contains("bounds_keys")) {
                 memory.boundsKeys = ParseTimingColouriseBoundsKeys(
-                    memoryJson.at("bounds_keys"));
+                    memoryJson.at("bounds_keys"),
+                    memory.edgeFadeMode);
+            }
+            if (memoryJson.contains("edge_fade_mode_memories")) {
+                memory.edgeFadeModeMemories =
+                    ParseTimingColouriseEdgeFadeModeMemories(
+                        memoryJson.at("edge_fade_mode_memories"));
             }
             memory.edited = memoryJson.value("edited", memory.edited);
-            memory.edgeFadesLinked =
-                memoryJson.value("edge_fades_linked", true);
             memory.adoptedGlobalRevision = memoryJson.value(
                 "adopted_global_revision",
                 memory.adoptedGlobalRevision);
@@ -9946,6 +10134,7 @@ bool SaveProjectDocument(
         {"live_visual_effects", document.liveVisualEffects},
         {"preview_performance_mode", document.previewPerformanceMode},
         {"linked_hq_patch_spacing_um", document.linkedHqPatchSpacingMicrometres},
+        {"linked_hq_include_sand", document.linkedHqIncludeSand},
         {"load_all_scalar_fields", document.loadAllScalarFields},
         {"scalar_field_budget_gb", document.scalarFieldBudgetGigabytes},
         {"side_panel_pinned", document.sidePanelPinned},
@@ -10262,6 +10451,8 @@ std::optional<ProjectDocument> LoadProjectDocument(
     document.previewPerformanceMode = projectJson->value("preview_performance_mode", false);
     document.linkedHqPatchSpacingMicrometres =
         projectJson->value("linked_hq_patch_spacing_um", 1000U);
+    document.linkedHqIncludeSand =
+        projectJson->value("linked_hq_include_sand", false);
     document.loadAllScalarFields = projectJson->value("load_all_scalar_fields", false);
     document.scalarFieldBudgetGigabytes =
         std::max(0.0F, projectJson->value("scalar_field_budget_gb", 0.0F));

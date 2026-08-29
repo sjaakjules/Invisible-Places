@@ -22,7 +22,7 @@
 
 namespace invisible_places::serialization {
 
-inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 86U;
+inline constexpr std::uint32_t kProjectDocumentSchemaVersion = 89U;
 inline constexpr std::uint32_t kWaterSourcesDocumentSchemaVersion = 32U;
 inline constexpr std::uint32_t kWaterRainProfilesSourcesSchemaVersion = 31U;
 inline constexpr std::uint32_t kWaterOwnedShorelineProjectSchemaVersion = 66U;
@@ -209,10 +209,13 @@ struct ProjectDocument {
     bool constantUpdateView = false;
     bool liveVisualEffects = false;
     bool previewPerformanceMode = false;
-    // Linked A/B HQ patch density: 1000 keeps every 1 mm point inside the
-    // midpoint union, 2000/3000 thin them to one centred point per cell of
-    // that spacing with matching density compensation. Preview only.
+    // Animation HQ patch density: 1000 keeps every 1 mm point inside the
+    // selected view union, 2000/3000 thin them to one centred point per cell
+    // of that spacing with matching density compensation. Preview only.
     std::uint32_t linkedHqPatchSpacingMicrometres = 1000U;
+    // Opts the large 1 mm SAND source into the animation HQ patch/mask set.
+    // Off preserves the complete 5 mm SAND baseline and avoids opening it.
+    bool linkedHqIncludeSand = false;
     // Bypasses scalar-field residency so loads keep every on-disk field
     // (the pre-schema-65 behaviour). Off = filtered loads with on-demand
     // field streaming.

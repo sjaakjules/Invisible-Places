@@ -8,7 +8,7 @@
 
 namespace invisible_places::timing {
 
-inline constexpr std::size_t kBuiltInTimingColourisePalettePresetCount = 25U;
+inline constexpr std::size_t kBuiltInTimingColourisePalettePresetCount = 37U;
 
 // Built-in palettes are deliberately compact approximations of familiar
 // scientific colour maps. The returned catalog has static lifetime and is

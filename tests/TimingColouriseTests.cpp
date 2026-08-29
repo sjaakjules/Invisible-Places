@@ -2,6 +2,7 @@
 #include "serialization/ProjectDocument.hpp"
 #include "serialization/ProjectDocumentJson.hpp"
 #include "timing/TimingColourise.hpp"
+#include "ui/VisualFeatureTimeline.hpp"
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -13,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
+#include <iterator>
 #include <limits>
 #include <string>
 #include <utility>
@@ -25,8 +27,10 @@ using invisible_places::timing::TimingColouriseBounds;
 using invisible_places::timing::TimingColouriseBoundsHandle;
 using invisible_places::timing::TimingColouriseBoundsKeyMode;
 using invisible_places::timing::TimingColouriseBoundsParameter;
+using invisible_places::timing::TimingColouriseBoundsParameterKey;
 using invisible_places::timing::TimingColouriseAmountOverrideMode;
 using invisible_places::timing::TimingColouriseEffect;
+using invisible_places::timing::TimingColouriseEdgeFadeMode;
 using invisible_places::timing::TimingColouriseEffectParameter;
 using invisible_places::timing::TimingColouriseFieldBoundsMemory;
 using invisible_places::timing::TimingColouriseLocalPaletteEdit;
@@ -70,6 +74,65 @@ TimingColourisePalette Solid(
 }
 
 }  // namespace
+
+TEST_CASE(
+    "Visual Feature timeline isolates every visible key group while snapping",
+    "[timing][colourise][ui]") {
+    using invisible_places::ui::VisualFeatureTimelineKeysCanSnap;
+    using invisible_places::ui::VisualFeatureTimelineSnapDomain;
+    using invisible_places::ui::VisualFeatureTimelineSnapDomainsCanSnap;
+
+    CHECK(VisualFeatureTimelineKeysCanSnap(
+        TimingColouriseBoundsParameter::Lower,
+        std::nullopt,
+        TimingColouriseBoundsParameter::Upper,
+        std::nullopt));
+    CHECK(VisualFeatureTimelineKeysCanSnap(
+        TimingColouriseBoundsParameter::EdgeFadeLower,
+        std::nullopt,
+        TimingColouriseBoundsParameter::EdgeFadeUpper,
+        std::nullopt));
+    CHECK(VisualFeatureTimelineKeysCanSnap(
+        std::nullopt,
+        TimingColouriseEffectParameter::PaletteSkewCentre,
+        std::nullopt,
+        TimingColouriseEffectParameter::EmissiveSkewSpread));
+    CHECK(VisualFeatureTimelineKeysCanSnap(
+        std::nullopt,
+        TimingColouriseEffectParameter::PalettePhase,
+        std::nullopt,
+        TimingColouriseEffectParameter::AmountOverride));
+    CHECK(VisualFeatureTimelineSnapDomainsCanSnap(
+        VisualFeatureTimelineSnapDomain::Palette,
+        VisualFeatureTimelineSnapDomain::Palette));
+    CHECK(VisualFeatureTimelineSnapDomainsCanSnap(
+        VisualFeatureTimelineSnapDomain::Intensity,
+        VisualFeatureTimelineSnapDomain::Intensity));
+
+    CHECK_FALSE(VisualFeatureTimelineKeysCanSnap(
+        TimingColouriseBoundsParameter::Centre,
+        std::nullopt,
+        TimingColouriseBoundsParameter::EdgeFadeLower,
+        std::nullopt));
+    CHECK_FALSE(VisualFeatureTimelineKeysCanSnap(
+        TimingColouriseBoundsParameter::EdgeFadeUpper,
+        std::nullopt,
+        std::nullopt,
+        TimingColouriseEffectParameter::PaletteSkewSpread));
+    CHECK_FALSE(VisualFeatureTimelineKeysCanSnap(
+        std::nullopt,
+        TimingColouriseEffectParameter::EmissiveSkewCentre,
+        std::nullopt,
+        TimingColouriseEffectParameter::PalettePhase));
+    CHECK_FALSE(VisualFeatureTimelineKeysCanSnap(
+        std::nullopt,
+        TimingColouriseEffectParameter::AmountOverride,
+        std::nullopt,
+        TimingColouriseEffectParameter::EmissiveLevel));
+    CHECK_FALSE(VisualFeatureTimelineSnapDomainsCanSnap(
+        VisualFeatureTimelineSnapDomain::Palette,
+        VisualFeatureTimelineSnapDomain::Intensity));
+}
 
 TEST_CASE(
     "Timing Colourise sanitizes palettes and produces deterministic LUTs",
@@ -2468,6 +2531,87 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Timing Colourise scalar key insertion preserves existing authored tracks",
+    "[timing][colourise][keys][insertion]") {
+    TimingColouriseEffect effect;
+    REQUIRE(invisible_places::timing::
+                AddOrUpdateTimingColouriseEffectParameterKey(
+                    &effect,
+                    TimingColouriseEffectParameter::AmountOverride,
+                    0.2F,
+                    0.25F,
+                    WaterScenarioInterpolation::Linear));
+    REQUIRE(invisible_places::timing::
+                AddOrUpdateTimingColouriseEffectParameterKey(
+                    &effect,
+                    TimingColouriseEffectParameter::AmountOverride,
+                    0.8F,
+                    0.75F,
+                    WaterScenarioInterpolation::
+                        CentripetalCatmullRom));
+    const float insertedValue = invisible_places::timing::
+        EvaluateTimingColouriseEffectParameter(
+            effect,
+            TimingColouriseEffectParameter::AmountOverride,
+            0.5F);
+    REQUIRE(invisible_places::timing::
+                AddOrUpdateTimingColouriseEffectParameterKey(
+                    &effect,
+                    TimingColouriseEffectParameter::AmountOverride,
+                    0.5F,
+                    insertedValue,
+                    WaterScenarioInterpolation::Linear));
+
+    const auto amountKeys = [&]() {
+        std::vector<invisible_places::timing::
+                        TimingColouriseEffectParameterKey>
+            keys;
+        std::copy_if(
+            effect.effectParameterKeys.begin(),
+            effect.effectParameterKeys.end(),
+            std::back_inserter(keys),
+            [](const auto& key) {
+                return key.parameter ==
+                       TimingColouriseEffectParameter::AmountOverride;
+            });
+        return keys;
+    }();
+    REQUIRE(amountKeys.size() == 3U);
+    CHECK(amountKeys[0].position == Approx(0.2F));
+    CHECK(amountKeys[0].value == Approx(0.25F));
+    CHECK(amountKeys[0].interpolation ==
+          WaterScenarioInterpolation::Linear);
+    CHECK(amountKeys[1].position == Approx(0.5F));
+    CHECK(amountKeys[1].value == Approx(insertedValue));
+    CHECK(amountKeys[1].interpolation ==
+          WaterScenarioInterpolation::Linear);
+    CHECK(amountKeys[2].position == Approx(0.8F));
+    CHECK(amountKeys[2].value == Approx(0.75F));
+    CHECK(amountKeys[2].interpolation ==
+          WaterScenarioInterpolation::CentripetalCatmullRom);
+
+    REQUIRE(invisible_places::timing::
+                AddOrUpdateTimingColouriseEffectParameterKey(
+                    &effect,
+                    TimingColouriseEffectParameter::PaletteSkewCentre,
+                    0.5F,
+                    0.35F,
+                    WaterScenarioInterpolation::SmoothVelocity));
+    CHECK(std::count_if(
+              effect.effectParameterKeys.begin(),
+              effect.effectParameterKeys.end(),
+              [](const auto& key) {
+                  return key.parameter ==
+                         TimingColouriseEffectParameter::AmountOverride;
+              }) == 3);
+    CHECK(invisible_places::timing::
+              EvaluateTimingColouriseEffectParameter(
+                  effect,
+                  TimingColouriseEffectParameter::PaletteSkewCentre,
+                  0.5F) == Approx(0.35F));
+}
+
+TEST_CASE(
     "Timing Colourise stop tracks honour spline curve styles",
     "[timing][colourise][palette][keys][spline]") {
     TimingColouriseEffect effect;
@@ -3273,6 +3417,160 @@ TEST_CASE(
                 "drifting-stop",
                 TimingColourisePaletteStopParameter::Colour,
                 0.5F) == 1U);
+}
+
+TEST_CASE(
+    "Timing Colourise groups palette marker keys and ranges only moving markers",
+    "[timing][colourise][palette][parameters][markers]") {
+    TimingColouriseEffect effect;
+    effect.basePalette = invisible_places::timing::
+        SanitizeTimingColourisePalette({
+            .stops = {
+                {.id = "stop-1", .position = 0.0F},
+                {.id = "stop-2", .position = 0.25F},
+                {.id = "stop-3", .position = 0.5F},
+                {.id = "stop-4", .position = 0.75F},
+                {.id = "stop-5", .position = 1.0F},
+            },
+        });
+    auto palette = effect.basePalette;
+
+    REQUIRE(
+        invisible_places::timing::
+            AddOrUpdateTimingColourisePaletteMarkerKeys(
+                &effect,
+                0.1F,
+                palette));
+    CHECK(
+        invisible_places::timing::
+            TimingColourisePaletteMarkerKeyCountAtPosition(
+                effect,
+                0.1F) == 5U);
+    CHECK_FALSE(
+        invisible_places::timing::
+            TimingColouriseAnimatedPaletteMarkerRange(effect)
+                .has_value());
+
+    // Every marker is keyed again, but only stop 3 has moved. Invariant
+    // markers at 0, .25, .75, and 1 must not expand the shared graph axis.
+    palette.stops[2].position = 0.6F;
+    REQUIRE(
+        invisible_places::timing::
+            AddOrUpdateTimingColourisePaletteMarkerKeys(
+                &effect,
+                0.5F,
+                palette));
+    CHECK(
+        invisible_places::timing::
+            TimingColourisePaletteMarkerKeyCountAtPosition(
+                effect,
+                0.5F) == 5U);
+    auto markerRange = invisible_places::timing::
+        TimingColouriseAnimatedPaletteMarkerRange(effect);
+    REQUIRE(markerRange.has_value());
+    CHECK(markerRange->first == Approx(0.5F));
+    CHECK(markerRange->second == Approx(0.6F));
+
+    // Moving the end marker from 1 to .9 contributes both of its authored
+    // extremes, so the common range now reaches exactly 1.
+    palette.stops[4].position = 0.9F;
+    REQUIRE(
+        invisible_places::timing::
+            AddOrUpdateTimingColourisePaletteMarkerKeys(
+                &effect,
+                0.9F,
+                palette));
+    markerRange = invisible_places::timing::
+        TimingColouriseAnimatedPaletteMarkerRange(effect);
+    REQUIRE(markerRange.has_value());
+    CHECK(markerRange->first == Approx(0.5F));
+    CHECK(markerRange->second == Approx(1.0F));
+
+    const auto positionKeyCount = [&]() {
+        return static_cast<std::size_t>(std::count_if(
+            effect.paletteStopParameterKeys.begin(),
+            effect.paletteStopParameterKeys.end(),
+            [](const auto& key) {
+                return key.parameter ==
+                       TimingColourisePaletteStopParameter::Position;
+            }));
+    };
+    CHECK(positionKeyCount() == 15U);
+
+    // Colour remains independent: marker navigation ignores its time and the
+    // grouped X operation removes Positions without deleting it.
+    REQUIRE(
+        invisible_places::timing::
+            AddOrUpdateTimingColourisePaletteStopColourKey(
+                &effect,
+                "stop-2",
+                0.7F,
+                {0.8F, 0.2F, 0.1F}));
+    CHECK(
+        invisible_places::timing::
+            NextTimingColourisePaletteMarkerKeyPosition(
+                effect,
+                0.5F) == Approx(0.9F));
+    CHECK(
+        invisible_places::timing::
+            PreviousTimingColourisePaletteMarkerKeyPosition(
+                effect,
+                0.9F) == Approx(0.5F));
+    CHECK(
+        invisible_places::timing::
+            TimingColourisePaletteMarkerKeyCountAtPosition(
+                effect,
+                0.7F) == 0U);
+    CHECK(
+        invisible_places::timing::
+            RemoveTimingColourisePaletteMarkerKeysAtPosition(
+                &effect,
+                0.5F) == 5U);
+    CHECK(positionKeyCount() == 10U);
+    CHECK(
+        invisible_places::timing::
+            TimingColourisePaletteStopParameterKeyCountAtPosition(
+                effect,
+                "stop-2",
+                TimingColourisePaletteStopParameter::Colour,
+                0.7F) == 1U);
+
+    TimingColouriseEffect legacy;
+    legacy.basePalette = effect.basePalette;
+    REQUIRE(
+        invisible_places::timing::
+            AddOrUpdateTimingColourisePaletteStopScalarKey(
+                &legacy,
+                "stop-1",
+                TimingColourisePaletteStopParameter::Position,
+                0.2F,
+                0.1F));
+    invisible_places::timing::AddOrUpdateTimingColourisePaletteKey(
+        &legacy,
+        0.3F,
+        legacy.basePalette);
+    REQUIRE(
+        legacy.paletteKeyModel ==
+        TimingColourisePaletteKeyModel::LegacySnapshots);
+    REQUIRE(
+        invisible_places::timing::
+            AddOrUpdateTimingColourisePaletteMarkerKeys(
+                &legacy,
+                0.4F,
+                legacy.basePalette));
+    CHECK(legacy.paletteKeys.size() == 2U);
+    CHECK(legacy.paletteStopParameterKeys.size() == 1U);
+    const auto legacyMarkerPositions = invisible_places::timing::
+        TimingColourisePaletteMarkerKeyPositions(legacy);
+    REQUIRE(legacyMarkerPositions.size() == 2U);
+    CHECK(legacyMarkerPositions[0] == Approx(0.3F));
+    CHECK(legacyMarkerPositions[1] == Approx(0.4F));
+    CHECK(
+        invisible_places::timing::
+            RemoveTimingColourisePaletteMarkerKeysAtPosition(
+                &legacy,
+                0.4F) == 1U);
+    CHECK(legacy.paletteStopParameterKeys.size() == 1U);
 }
 
 TEST_CASE(
@@ -5383,13 +5681,22 @@ TEST_CASE(
 TEST_CASE(
     "Timing Colourise signed edge fade works inward and outward",
     "[timing][colourise][bounds]") {
+    STATIC_CHECK(
+        invisible_places::timing::kTimingColouriseMaximumInwardEdgeFade ==
+        invisible_places::renderer::pointcloud::
+            kTimingColouriseMaximumInwardEdgeFade);
+    STATIC_CHECK(
+        invisible_places::timing::kTimingColouriseMaximumOutwardEdgeFade ==
+        invisible_places::renderer::pointcloud::
+            kTimingColouriseMaximumOutwardEdgeFade);
     CHECK(TimingColouriseBounds{}.edgeFadeLower == Approx(0.10F));
     CHECK(TimingColouriseBounds{}.edgeFadeUpper == Approx(0.10F));
-    // Each edge clamps independently to the whole-span [-1, 1] range.
+    // Each edge clamps independently. Inward fades stop at one span while
+    // outward fades retain multi-span values.
     CHECK(
         invisible_places::timing::SanitizeTimingColouriseBounds(
             {.edgeFadeLower = -1.5F, .edgeFadeUpper = 0.75F})
-            .edgeFadeLower == Approx(-1.0F));
+            .edgeFadeLower == Approx(-1.5F));
     CHECK(
         invisible_places::timing::SanitizeTimingColouriseBounds(
             {.edgeFadeLower = -1.5F, .edgeFadeUpper = 0.75F})
@@ -5400,12 +5707,43 @@ TEST_CASE(
             .edgeFadeLower == Approx(1.0F));
     CHECK(
         invisible_places::timing::SanitizeTimingColouriseBounds(
+            {.edgeFadeLower = -2'000'000.0F, .edgeFadeUpper = 0.0F})
+            .edgeFadeLower ==
+        Approx(-invisible_places::timing::
+                   kTimingColouriseMaximumOutwardEdgeFade));
+    CHECK(
+        invisible_places::timing::SanitizeTimingColouriseBounds(
             {.edgeFadeLower = 0.0F, .edgeFadeUpper = 0.0F})
             .edgeFadeLower == Approx(0.0F));
     CHECK(
         invisible_places::timing::SanitizeTimingColouriseBounds(
             {.edgeFadeLower = std::numeric_limits<float>::quiet_NaN(), .edgeFadeUpper = std::numeric_limits<float>::quiet_NaN()})
             .edgeFadeLower == Approx(0.10F));
+
+    // A narrow 0..0.1 focus may feather its upper edge over the remaining
+    // 0.9 of a 0..1 field. That is nine selected spans, stored as -900%.
+    const TimingColouriseBounds longUpperFade{
+        .lower = 0.0F,
+        .upper = 0.1F,
+        .edgeFadeLower = 0.0F,
+        .edgeFadeUpper = -9.0F,
+    };
+    CHECK(
+        invisible_places::timing::TimingColouriseBoundsMask(
+            longUpperFade,
+            0.1F) == Approx(1.0F));
+    CHECK(
+        invisible_places::timing::TimingColouriseBoundsMask(
+            longUpperFade,
+            0.55F) == Approx(0.5F));
+    CHECK(
+        invisible_places::timing::TimingColouriseBoundsMask(
+            longUpperFade,
+            1.0F) == Approx(0.0F).margin(1.0e-6F));
+    CHECK(
+        invisible_places::timing::TimingColouriseBoundsMask(
+            longUpperFade,
+            1.01F) == Approx(0.0F));
 
     TimingColouriseEffect effect;
     invisible_places::timing::AddOrUpdateTimingColouriseBoundsKey(
@@ -5493,6 +5831,238 @@ TEST_CASE(
     CHECK(
         invisible_places::timing::TimingColouriseBoundsMask(mixed, 22.1F) ==
         Approx(0.0F));
+}
+
+TEST_CASE(
+    "Timing Colourise absolute fade endpoints stay fixed as keyed bounds move",
+    "[timing][colourise][bounds][fade-mode]") {
+    TimingColouriseEffect effect;
+    effect.edgeFadeMode = TimingColouriseEdgeFadeMode::Absolute;
+    effect.baseBounds = {
+        .lower = 0.0F,
+        .upper = 10.0F,
+        .edgeFadeLower = 2.0F,
+        .edgeFadeUpper = 8.0F,
+    };
+    REQUIRE(invisible_places::timing::
+                AddOrUpdateTimingColouriseBoundsParameterKey(
+                    &effect,
+                    TimingColouriseBoundsParameter::Lower,
+                    0.0F,
+                    0.0F,
+                    WaterScenarioInterpolation::Linear));
+    REQUIRE(invisible_places::timing::
+                AddOrUpdateTimingColouriseBoundsParameterKey(
+                    &effect,
+                    TimingColouriseBoundsParameter::Lower,
+                    1.0F,
+                    4.0F,
+                    WaterScenarioInterpolation::Linear));
+    REQUIRE(invisible_places::timing::
+                AddOrUpdateTimingColouriseBoundsParameterKey(
+                    &effect,
+                    TimingColouriseBoundsParameter::Upper,
+                    0.0F,
+                    10.0F,
+                    WaterScenarioInterpolation::Linear));
+    REQUIRE(invisible_places::timing::
+                AddOrUpdateTimingColouriseBoundsParameterKey(
+                    &effect,
+                    TimingColouriseBoundsParameter::Upper,
+                    1.0F,
+                    18.0F,
+                    WaterScenarioInterpolation::Linear));
+
+    const auto authored = invisible_places::timing::
+        EvaluateTimingColouriseAuthoredBounds(effect, 0.5F);
+    CHECK(authored.lower == Approx(2.0F));
+    CHECK(authored.upper == Approx(14.0F));
+    CHECK(authored.edgeFadeLower == Approx(2.0F));
+    CHECK(authored.edgeFadeUpper == Approx(8.0F));
+
+    const auto render = invisible_places::timing::
+        EvaluateTimingColouriseBounds(effect, 0.5F);
+    CHECK(render.lower == Approx(2.0F));
+    CHECK(render.upper == Approx(14.0F));
+    CHECK(render.edgeFadeLower == Approx(0.0F));
+    CHECK(render.edgeFadeUpper == Approx(0.5F));
+
+    // A representation visited for the first time starts unkeyed from the
+    // endpoints visible at the switch position. It then follows its own
+    // representation as the keyed bounds move.
+    REQUIRE(invisible_places::timing::SetTimingColouriseEdgeFadeMode(
+        &effect,
+        TimingColouriseEdgeFadeMode::RelativeSeparate,
+        0.0F));
+    CHECK(effect.edgeFadeMode ==
+          TimingColouriseEdgeFadeMode::RelativeSeparate);
+    const auto relativeStart = invisible_places::timing::
+        EvaluateTimingColouriseBounds(effect, 0.0F);
+    CHECK(relativeStart.lower +
+              (relativeStart.upper - relativeStart.lower) *
+                  relativeStart.edgeFadeLower ==
+          Approx(2.0F));
+    CHECK(relativeStart.upper -
+              (relativeStart.upper - relativeStart.lower) *
+                  relativeStart.edgeFadeUpper ==
+          Approx(8.0F));
+    const auto relativeEnd = invisible_places::timing::
+        EvaluateTimingColouriseBounds(effect, 1.0F);
+    CHECK(relativeEnd.lower +
+              (relativeEnd.upper - relativeEnd.lower) *
+                  relativeEnd.edgeFadeLower ==
+          Approx(6.8F));
+    CHECK(relativeEnd.upper -
+              (relativeEnd.upper - relativeEnd.lower) *
+                  relativeEnd.edgeFadeUpper ==
+          Approx(15.2F));
+
+    // Absolute had no keyed frames, so entering it again seeds from the
+    // Relative endpoints visible at this new switch position.
+    REQUIRE(invisible_places::timing::SetTimingColouriseEdgeFadeMode(
+        &effect,
+        TimingColouriseEdgeFadeMode::Absolute,
+        1.0F));
+    const auto restoredAbsolute = invisible_places::timing::
+        EvaluateTimingColouriseAuthoredBounds(effect, 1.0F);
+    CHECK(restoredAbsolute.edgeFadeLower == Approx(6.8F));
+    CHECK(restoredAbsolute.edgeFadeUpper == Approx(15.2F));
+}
+
+TEST_CASE(
+    "Timing Colourise fade modes retain independent keyed tracks",
+    "[timing][colourise][bounds][fade-mode][mode-memory]") {
+    TimingColouriseEffect effect;
+    effect.baseBounds = {
+        .lower = 0.0F,
+        .upper = 10.0F,
+        .edgeFadeLower = 0.1F,
+        .edgeFadeUpper = 0.1F,
+    };
+    REQUIRE(invisible_places::timing::
+                AddOrUpdateTimingColouriseBoundsParameterKey(
+                    &effect,
+                    TimingColouriseBoundsParameter::EdgeFadeLower,
+                    0.0F,
+                    0.1F,
+                    WaterScenarioInterpolation::Linear));
+    REQUIRE(invisible_places::timing::
+                AddOrUpdateTimingColouriseBoundsParameterKey(
+                    &effect,
+                    TimingColouriseBoundsParameter::EdgeFadeLower,
+                    1.0F,
+                    0.3F,
+                    WaterScenarioInterpolation::Linear));
+    REQUIRE(invisible_places::timing::
+                AddOrUpdateTimingColouriseBoundsParameterKey(
+                    &effect,
+                    TimingColouriseBoundsParameter::EdgeFadeUpper,
+                    0.0F,
+                    0.1F,
+                    WaterScenarioInterpolation::Linear));
+    REQUIRE(invisible_places::timing::
+                AddOrUpdateTimingColouriseBoundsParameterKey(
+                    &effect,
+                    TimingColouriseBoundsParameter::EdgeFadeUpper,
+                    1.0F,
+                    0.3F,
+                    WaterScenarioInterpolation::Linear));
+
+    // Keep a legacy whole-bounds key present to reproduce the original
+    // auto-key trigger. A newly activated fade mode must not project this
+    // snapshot into its private fade tracks.
+    effect.boundsKeys = {{
+        .position = 0.6F,
+        .bounds = effect.baseBounds,
+        .interpolation = WaterScenarioInterpolation::Linear,
+    }};
+
+    REQUIRE(invisible_places::timing::SetTimingColouriseEdgeFadeMode(
+        &effect,
+        TimingColouriseEdgeFadeMode::RelativeSeparate,
+        0.5F));
+    CHECK(effect.edgeFadeMode ==
+          TimingColouriseEdgeFadeMode::RelativeSeparate);
+    CHECK(effect.boundsParameterKeys.empty());
+    CHECK(effect.baseBounds.edgeFadeLower == Approx(0.2F));
+    CHECK(effect.baseBounds.edgeFadeUpper == Approx(0.2F));
+    REQUIRE(effect.edgeFadeModeMemories.size() == 1U);
+    CHECK(effect.edgeFadeModeMemories[0].mode ==
+          TimingColouriseEdgeFadeMode::RelativeLinked);
+    REQUIRE(effect.edgeFadeModeMemories[0].keys.size() == 4U);
+
+    REQUIRE(invisible_places::timing::
+                AddOrUpdateTimingColouriseBoundsParameterKey(
+                    &effect,
+                    TimingColouriseBoundsParameter::EdgeFadeLower,
+                    0.25F,
+                    0.45F,
+                    WaterScenarioInterpolation::Hold));
+    REQUIRE(invisible_places::timing::
+                AddOrUpdateTimingColouriseBoundsParameterKey(
+                    &effect,
+                    TimingColouriseBoundsParameter::EdgeFadeUpper,
+                    0.75F,
+                    -0.2F,
+                    WaterScenarioInterpolation::Smooth));
+
+    REQUIRE(invisible_places::timing::SetTimingColouriseEdgeFadeMode(
+        &effect,
+        TimingColouriseEdgeFadeMode::Absolute,
+        0.5F));
+    CHECK(effect.boundsParameterKeys.empty());
+    REQUIRE(effect.boundsKeys.size() == 1U);
+    CHECK(effect.baseBounds.edgeFadeLower == Approx(4.5F));
+    CHECK(effect.baseBounds.edgeFadeUpper == Approx(12.0F));
+    REQUIRE(invisible_places::timing::
+                AddOrUpdateTimingColouriseBoundsParameterKey(
+                    &effect,
+                    TimingColouriseBoundsParameter::EdgeFadeLower,
+                    0.5F,
+                    3.25F,
+                    WaterScenarioInterpolation::Linear));
+
+    REQUIRE(invisible_places::timing::SetTimingColouriseEdgeFadeMode(
+        &effect,
+        TimingColouriseEdgeFadeMode::RelativeLinked,
+        0.5F));
+    REQUIRE(effect.boundsParameterKeys.size() == 4U);
+    CHECK(effect.boundsParameterKeys[0].position == Approx(0.0F));
+    CHECK(effect.boundsParameterKeys[1].position == Approx(1.0F));
+    CHECK(effect.boundsParameterKeys[2].position == Approx(0.0F));
+    CHECK(effect.boundsParameterKeys[3].position == Approx(1.0F));
+
+    // Editing the restored Joined mode changes only its live track.
+    REQUIRE(invisible_places::timing::
+                AddOrUpdateTimingColouriseBoundsParameterKey(
+                    &effect,
+                    TimingColouriseBoundsParameter::EdgeFadeLower,
+                    0.5F,
+                    0.6F,
+                    WaterScenarioInterpolation::Linear));
+    REQUIRE(invisible_places::timing::SetTimingColouriseEdgeFadeMode(
+        &effect,
+        TimingColouriseEdgeFadeMode::RelativeSeparate,
+        0.5F));
+    REQUIRE(effect.boundsParameterKeys.size() == 2U);
+    CHECK(effect.boundsParameterKeys[0].parameter ==
+          TimingColouriseBoundsParameter::EdgeFadeLower);
+    CHECK(effect.boundsParameterKeys[0].position == Approx(0.25F));
+    CHECK(effect.boundsParameterKeys[0].value == Approx(0.45F));
+    CHECK(effect.boundsParameterKeys[1].parameter ==
+          TimingColouriseBoundsParameter::EdgeFadeUpper);
+    CHECK(effect.boundsParameterKeys[1].position == Approx(0.75F));
+    CHECK(effect.boundsParameterKeys[1].value == Approx(-0.2F));
+
+    REQUIRE(invisible_places::timing::SetTimingColouriseEdgeFadeMode(
+        &effect,
+        TimingColouriseEdgeFadeMode::Absolute,
+        0.5F));
+    REQUIRE(effect.boundsParameterKeys.size() == 1U);
+    CHECK(effect.boundsParameterKeys[0].parameter ==
+          TimingColouriseBoundsParameter::EdgeFadeLower);
+    CHECK(effect.boundsParameterKeys[0].position == Approx(0.5F));
+    CHECK(effect.boundsParameterKeys[0].value == Approx(3.25F));
 }
 
 TEST_CASE(
@@ -5759,10 +6329,18 @@ TEST_CASE(
         // The keyed lower fade never disturbs the independent upper fade.
         CHECK(halfway.edgeFadeLower == Approx(0.75F));
         CHECK(halfway.edgeFadeUpper == Approx(0.10F));
-        CHECK_FALSE(
+        REQUIRE(
             invisible_places::timing::SetTimingColouriseBoundsKeyMode(
                 &effect,
                 TimingColouriseBoundsKeyMode::LowerSpread));
+        const auto convertedHalfway =
+            invisible_places::timing::EvaluateTimingColouriseBounds(
+                effect,
+                0.5F);
+        CHECK(convertedHalfway.lower == Approx(17.0F));
+        CHECK(convertedHalfway.upper == Approx(23.0F));
+        CHECK(convertedHalfway.edgeFadeLower == Approx(0.75F));
+        CHECK(convertedHalfway.edgeFadeUpper == Approx(0.10F));
     }
 
     SECTION("Lower plus Spread and Upper plus Spread") {
@@ -5816,6 +6394,288 @@ TEST_CASE(
                 0.25F);
         CHECK(upperSpread.lower == Approx(16.0F));
         CHECK(upperSpread.upper == Approx(16.0F));
+    }
+}
+
+TEST_CASE(
+    "Timing Colourise converts keyed bounds parameterisations without losing authored intervals",
+    "[timing][colourise][bounds][parameters][mode-conversion]") {
+    TimingColouriseEffect effect;
+    effect.edgeFadeMode =
+        TimingColouriseEdgeFadeMode::RelativeSeparate;
+    effect.baseBounds = {
+        .lower = 2.0F,
+        .upper = 12.0F,
+        .edgeFadeLower = 0.15F,
+        .edgeFadeUpper = 0.35F,
+    };
+    effect.boundsKeys = {
+        {
+            .position = 0.4F,
+            .bounds = {
+                .lower = 4.0F,
+                .upper = 16.0F,
+                .edgeFadeLower = 0.2F,
+                .edgeFadeUpper = 0.3F,
+            },
+            .interpolation = WaterScenarioInterpolation::Smooth,
+        },
+    };
+    effect.boundsParameterKeys = {
+        {
+            .parameter = TimingColouriseBoundsParameter::Lower,
+            .position = 0.1F,
+            .value = 1.0F,
+            .interpolation = WaterScenarioInterpolation::Linear,
+        },
+        {
+            .parameter = TimingColouriseBoundsParameter::Lower,
+            .position = 0.7F,
+            .value = 5.0F,
+            .interpolation = WaterScenarioInterpolation::Hold,
+        },
+        {
+            .parameter = TimingColouriseBoundsParameter::Upper,
+            .position = 0.25F,
+            .value = 11.0F,
+            .interpolation = WaterScenarioInterpolation::Smooth,
+        },
+        {
+            .parameter = TimingColouriseBoundsParameter::Upper,
+            .position = 0.9F,
+            .value = 19.0F,
+            .interpolation =
+                WaterScenarioInterpolation::SmoothVelocity,
+        },
+        {
+            .parameter =
+                TimingColouriseBoundsParameter::EdgeFadeLower,
+            .position = 0.2F,
+            .value = 0.3F,
+            .interpolation = WaterScenarioInterpolation::Linear,
+        },
+        {
+            .parameter =
+                TimingColouriseBoundsParameter::EdgeFadeUpper,
+            .position = 0.8F,
+            .value = 0.4F,
+            .interpolation = WaterScenarioInterpolation::Hold,
+        },
+    };
+
+    const std::vector<float> authoredPositions{
+        0.1F,
+        0.25F,
+        0.4F,
+        0.7F,
+        0.9F,
+    };
+    std::vector<TimingColouriseBounds> authoredBounds;
+    authoredBounds.reserve(authoredPositions.size());
+    for (const float position : authoredPositions) {
+        authoredBounds.push_back(
+            invisible_places::timing::
+                EvaluateTimingColouriseAuthoredBounds(
+                    effect,
+                    position));
+    }
+
+    const auto isFadeParameter =
+        [](TimingColouriseBoundsParameter parameter) {
+            return parameter ==
+                       TimingColouriseBoundsParameter::EdgeFade ||
+                   parameter == TimingColouriseBoundsParameter::
+                                    EdgeFadeLower ||
+                   parameter == TimingColouriseBoundsParameter::
+                                    EdgeFadeUpper;
+        };
+    const auto fadeKeys = [&](const TimingColouriseEffect& candidate) {
+        std::vector<TimingColouriseBoundsParameterKey> result;
+        for (const auto& key : candidate.boundsParameterKeys) {
+            if (isFadeParameter(key.parameter)) {
+                result.push_back(key);
+            }
+        }
+        return result;
+    };
+    const auto originalFadeKeys = fadeKeys(effect);
+    const auto originalLegacyKeys = effect.boundsKeys;
+
+    const auto checkConversion =
+        [&](TimingColouriseBoundsKeyMode expectedMode) {
+            CHECK(effect.boundsKeyMode == expectedMode);
+            const auto parameters =
+                invisible_places::timing::
+                    TimingColouriseBoundsParametersForMode(
+                        expectedMode);
+            for (const auto parameter : parameters) {
+                std::vector<float> positions;
+                for (const auto& key : effect.boundsParameterKeys) {
+                    if (key.parameter == parameter) {
+                        positions.push_back(key.position);
+                    }
+                }
+                REQUIRE(positions.size() == authoredPositions.size());
+                for (std::size_t index = 0U;
+                     index < positions.size();
+                     ++index) {
+                    CHECK(positions[index] ==
+                          Approx(authoredPositions[index]));
+                }
+            }
+            for (const auto& key : effect.boundsParameterKeys) {
+                if (!isFadeParameter(key.parameter)) {
+                    CHECK((key.parameter == parameters[0] ||
+                           key.parameter == parameters[1]));
+                }
+            }
+            for (std::size_t index = 0U;
+                 index < authoredPositions.size();
+                 ++index) {
+                const auto converted =
+                    invisible_places::timing::
+                        EvaluateTimingColouriseAuthoredBounds(
+                            effect,
+                            authoredPositions[index]);
+                CHECK(converted.lower ==
+                      Approx(authoredBounds[index].lower).margin(1.0e-5F));
+                CHECK(converted.upper ==
+                      Approx(authoredBounds[index].upper).margin(1.0e-5F));
+                CHECK(converted.edgeFadeLower ==
+                      Approx(authoredBounds[index].edgeFadeLower));
+                CHECK(converted.edgeFadeUpper ==
+                      Approx(authoredBounds[index].edgeFadeUpper));
+            }
+
+            const auto convertedFadeKeys = fadeKeys(effect);
+            REQUIRE(convertedFadeKeys.size() == originalFadeKeys.size());
+            for (std::size_t index = 0U;
+                 index < originalFadeKeys.size();
+                 ++index) {
+                CHECK(convertedFadeKeys[index].parameter ==
+                      originalFadeKeys[index].parameter);
+                CHECK(convertedFadeKeys[index].position ==
+                      Approx(originalFadeKeys[index].position));
+                CHECK(convertedFadeKeys[index].value ==
+                      Approx(originalFadeKeys[index].value));
+                CHECK(convertedFadeKeys[index].interpolation ==
+                      originalFadeKeys[index].interpolation);
+            }
+            REQUIRE(effect.boundsKeys.size() == originalLegacyKeys.size());
+            for (std::size_t index = 0U;
+                 index < originalLegacyKeys.size();
+                 ++index) {
+                CHECK(effect.boundsKeys[index].position ==
+                      Approx(originalLegacyKeys[index].position));
+                CHECK(effect.boundsKeys[index].bounds.lower ==
+                      Approx(originalLegacyKeys[index].bounds.lower));
+                CHECK(effect.boundsKeys[index].bounds.upper ==
+                      Approx(originalLegacyKeys[index].bounds.upper));
+                CHECK(effect.boundsKeys[index].interpolation ==
+                      originalLegacyKeys[index].interpolation);
+            }
+        };
+
+    REQUIRE(invisible_places::timing::SetTimingColouriseBoundsKeyMode(
+        &effect,
+        TimingColouriseBoundsKeyMode::LowerSpread));
+    checkConversion(TimingColouriseBoundsKeyMode::LowerSpread);
+    const auto retainedLowerAt =
+        [&](float position) {
+            return std::find_if(
+                effect.boundsParameterKeys.begin(),
+                effect.boundsParameterKeys.end(),
+                [&](const TimingColouriseBoundsParameterKey& key) {
+                    return key.parameter ==
+                               TimingColouriseBoundsParameter::Lower &&
+                           std::abs(key.position - position) <= 1.0e-6F;
+                });
+        };
+    const auto lowerStart = retainedLowerAt(0.1F);
+    const auto lowerEnd = retainedLowerAt(0.7F);
+    REQUIRE(lowerStart != effect.boundsParameterKeys.end());
+    REQUIRE(lowerEnd != effect.boundsParameterKeys.end());
+    CHECK(lowerStart->interpolation ==
+          WaterScenarioInterpolation::Linear);
+    CHECK(lowerEnd->interpolation ==
+          WaterScenarioInterpolation::Hold);
+
+    for (const auto mode : {
+             TimingColouriseBoundsKeyMode::CentreSpread,
+             TimingColouriseBoundsKeyMode::UpperSpread,
+             TimingColouriseBoundsKeyMode::LowerUpper}) {
+        REQUIRE(
+            invisible_places::timing::
+                SetTimingColouriseBoundsKeyMode(&effect, mode));
+        checkConversion(mode);
+    }
+}
+
+TEST_CASE(
+    "Timing Colourise legacy bounds snapshots change keying mode without materialization",
+    "[timing][colourise][bounds][parameters][mode-conversion][legacy]") {
+    TimingColouriseEffect effect;
+    effect.baseBounds = {
+        .lower = 0.0F,
+        .upper = 10.0F,
+        .edgeFadeLower = 0.1F,
+        .edgeFadeUpper = 0.2F,
+    };
+    effect.boundsKeys = {
+        {
+            .position = 0.2F,
+            .bounds = {
+                .lower = 2.0F,
+                .upper = 14.0F,
+                .edgeFadeLower = 0.2F,
+                .edgeFadeUpper = 0.3F,
+            },
+            .interpolation = WaterScenarioInterpolation::Linear,
+        },
+        {
+            .position = 0.8F,
+            .bounds = {
+                .lower = 6.0F,
+                .upper = 20.0F,
+                .edgeFadeLower = 0.4F,
+                .edgeFadeUpper = 0.5F,
+            },
+            .interpolation = WaterScenarioInterpolation::Hold,
+        },
+    };
+    const std::array positions{0.0F, 0.2F, 0.5F, 0.8F, 1.0F};
+    std::array<TimingColouriseBounds, positions.size()> expected{};
+    for (std::size_t index = 0U; index < positions.size(); ++index) {
+        expected[index] = invisible_places::timing::
+            EvaluateTimingColouriseAuthoredBounds(
+                effect,
+                positions[index]);
+    }
+
+    for (const auto mode : {
+             TimingColouriseBoundsKeyMode::CentreSpread,
+             TimingColouriseBoundsKeyMode::LowerSpread,
+             TimingColouriseBoundsKeyMode::UpperSpread,
+             TimingColouriseBoundsKeyMode::LowerUpper}) {
+        REQUIRE(
+            invisible_places::timing::
+                SetTimingColouriseBoundsKeyMode(&effect, mode));
+        CHECK(effect.boundsParameterKeys.empty());
+        REQUIRE(effect.boundsKeys.size() == 2U);
+        for (std::size_t index = 0U;
+             index < positions.size();
+             ++index) {
+            const auto converted = invisible_places::timing::
+                EvaluateTimingColouriseAuthoredBounds(
+                    effect,
+                    positions[index]);
+            CHECK(converted.lower == Approx(expected[index].lower));
+            CHECK(converted.upper == Approx(expected[index].upper));
+            CHECK(converted.edgeFadeLower ==
+                  Approx(expected[index].edgeFadeLower));
+            CHECK(converted.edgeFadeUpper ==
+                  Approx(expected[index].edgeFadeUpper));
+        }
     }
 }
 
@@ -6789,7 +7649,7 @@ TEST_CASE(
             TimingColouriseBoundsKeyMode::CentreSpread);
     REQUIRE(
         loadedState.colouriseEffects.front()
-            .boundsParameterKeys.size() == 6U);
+            .boundsParameterKeys.size() == 7U);
     CHECK(
         loadedState.colouriseEffects.front()
             .boundsParameterKeys.front()
@@ -7353,7 +8213,9 @@ TEST_CASE(
     CHECK(savedMemory.at("field").at("scalar_field_name") == "Heat");
     CHECK(savedMemory.at("bounds").at("lower") == Approx(0.15F));
     CHECK(savedMemory.at("bounds_key_mode") == "centre_spread");
-    REQUIRE(savedMemory.at("bounds_parameter_keys").size() == 1U);
+    // Schema 89 projects the legacy snapshot's two fade members into the
+    // active fade mode before snapshots become geometry-only fallback.
+    REQUIRE(savedMemory.at("bounds_parameter_keys").size() == 3U);
     REQUIRE(savedMemory.at("bounds_keys").size() == 1U);
     CHECK(savedMemory.at("edited") == true);
     CHECK(savedMemory.at("adopted_global_revision") == 3U);
@@ -7412,11 +8274,16 @@ TEST_CASE(
     CHECK(loadedMemory.bounds.edgeFadeLower == Approx(0.05F));
     CHECK(loadedMemory.boundsKeyMode ==
           TimingColouriseBoundsKeyMode::CentreSpread);
-    REQUIRE(loadedMemory.boundsParameterKeys.size() == 1U);
-    CHECK(loadedMemory.boundsParameterKeys.front().parameter ==
-          TimingColouriseBoundsParameter::Centre);
-    CHECK(loadedMemory.boundsParameterKeys.front().value ==
-          Approx(0.4F));
+    REQUIRE(loadedMemory.boundsParameterKeys.size() == 3U);
+    const auto loadedCentre = std::find_if(
+        loadedMemory.boundsParameterKeys.begin(),
+        loadedMemory.boundsParameterKeys.end(),
+        [](const auto& key) {
+            return key.parameter ==
+                   TimingColouriseBoundsParameter::Centre;
+        });
+    REQUIRE(loadedCentre != loadedMemory.boundsParameterKeys.end());
+    CHECK(loadedCentre->value == Approx(0.4F));
     REQUIRE(loadedMemory.boundsKeys.size() == 1U);
     CHECK(loadedMemory.boundsKeys.front().bounds.upper == Approx(0.6F));
     CHECK(loadedMemory.edited);
@@ -7518,10 +8385,16 @@ TEST_CASE(
     CHECK(effect.baseBounds.edgeFadeLower == Approx(0.2F));
     CHECK(effect.boundsKeyMode ==
           TimingColouriseBoundsKeyMode::CentreSpread);
-    REQUIRE(effect.boundsParameterKeys.size() == 1U);
-    CHECK(effect.boundsParameterKeys.front().parameter ==
-          TimingColouriseBoundsParameter::Centre);
-    CHECK(effect.boundsParameterKeys.front().value == Approx(1.25F));
+    REQUIRE(effect.boundsParameterKeys.size() == 3U);
+    const auto restoredCentre = std::find_if(
+        effect.boundsParameterKeys.begin(),
+        effect.boundsParameterKeys.end(),
+        [](const auto& key) {
+            return key.parameter ==
+                   TimingColouriseBoundsParameter::Centre;
+        });
+    REQUIRE(restoredCentre != effect.boundsParameterKeys.end());
+    CHECK(restoredCentre->value == Approx(1.25F));
     REQUIRE(effect.boundsKeys.size() == 1U);
     CHECK(effect.boundsKeys.front().bounds.upper == Approx(2.0F));
     CHECK(effect.boundsEdited);

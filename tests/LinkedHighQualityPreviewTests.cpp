@@ -5,6 +5,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <glm/ext/matrix_transform.hpp>
+#include <glm/ext/matrix_clip_space.hpp>
 
 #include <algorithm>
 #include <array>
@@ -99,39 +100,92 @@ std::vector<float> FieldValues(
 }  // namespace
 
 TEST_CASE(
-    "Animation HQ duplicates one unlinked midpoint and retains a linked pair",
+    "Animation HQ retains a full unlinked view set and a linked pair",
     "[pointcloud][linked-hq]") {
-    const auto localMatrix = glm::translate(
-        glm::mat4{1.0F},
-        glm::vec3{-2.0F, 0.0F, 0.0F});
-    const std::array localMidpoints{localMatrix};
-    const auto local = invisible_places::app::BuildAnimationHqFrustumUnion(
-        localMidpoints);
-    CHECK(local.midpointViewProjections[0U] == localMatrix);
-    CHECK(local.midpointViewProjections[1U] == localMatrix);
-    CHECK(local.Contains({2.0F, 0.0F, 0.0F}));
-    CHECK_FALSE(local.Contains({0.0F, 0.0F, 0.0F}));
+    const auto viewAt = [](float x) {
+        return glm::translate(
+            glm::mat4{1.0F},
+            glm::vec3{-x, 0.0F, 0.0F});
+    };
+    const std::array fullPathViews{
+        viewAt(0.0F),
+        viewAt(3.0F),
+        viewAt(6.0F),
+        viewAt(9.0F),
+        viewAt(12.0F),
+        viewAt(0.0F),
+    };
+    const auto fullPath =
+        invisible_places::app::BuildAnimationHqFrustumUnion(
+            fullPathViews);
+    REQUIRE(fullPath.viewProjections.size() == 5U);
+    CHECK(fullPath.viewProjections.front() == fullPathViews.front());
+    CHECK(fullPath.viewProjections.back() == fullPathViews[4U]);
+    CHECK(fullPath.Contains({0.0F, 0.0F, 0.0F}));
+    CHECK(fullPath.Contains({6.0F, 0.0F, 0.0F}));
+    // This point is visible only in a view beyond the old fixed two slots.
+    CHECK(fullPath.Contains({12.0F, 0.0F, 0.0F}));
 
-    const auto partnerMatrix = glm::translate(
-        glm::mat4{1.0F},
-        glm::vec3{3.0F, 0.0F, 0.0F});
-    const std::array linkedMidpoints{localMatrix, partnerMatrix};
+    const std::array linkedMidpoints{viewAt(2.0F), viewAt(-3.0F)};
     const auto linked = invisible_places::app::BuildAnimationHqFrustumUnion(
         linkedMidpoints);
-    CHECK(linked.midpointViewProjections[0U] == localMatrix);
-    CHECK(linked.midpointViewProjections[1U] == partnerMatrix);
+    REQUIRE(linked.viewProjections.size() == 2U);
+    CHECK(linked.viewProjections[0U] == linkedMidpoints[0U]);
+    CHECK(linked.viewProjections[1U] == linkedMidpoints[1U]);
     CHECK(linked.Contains({-3.0F, 0.0F, 0.0F}));
     CHECK(linked.Contains({2.0F, 0.0F, 0.0F}));
+}
+
+TEST_CASE(
+    "Unlinked animation HQ samples the complete path and authored keys",
+    "[pointcloud][linked-hq][unlinked-hq]") {
+    const std::array authoredKeyTimes{0.1F, 0.5F, 0.9F};
+    const auto times =
+        invisible_places::app::BuildUnlinkedAnimationHqSampleTimes(
+            authoredKeyTimes,
+            1.0F);
+    REQUIRE(times.size() ==
+            invisible_places::app::kUnlinkedAnimationHqUniformViewCount +
+                2U);
+    CHECK(std::is_sorted(times.begin(), times.end()));
+    CHECK(times.front() == Catch::Approx(0.0F));
+    CHECK(times.back() == Catch::Approx(1.0F));
+    CHECK(std::count_if(
+              times.begin(),
+              times.end(),
+              [](float time) {
+                  return time == Catch::Approx(0.1F);
+              }) == 1);
+    CHECK(std::count_if(
+              times.begin(),
+              times.end(),
+              [](float time) {
+                  return time == Catch::Approx(0.5F);
+              }) == 1);
+    CHECK(std::count_if(
+              times.begin(),
+              times.end(),
+              [](float time) {
+                  return time == Catch::Approx(0.9F);
+              }) == 1);
+
+    const auto still =
+        invisible_places::app::BuildUnlinkedAnimationHqSampleTimes(
+            authoredKeyTimes,
+            0.0F);
+    CHECK(still == std::vector<float>{0.0F});
 }
 
 TEST_CASE(
     "Linked HQ midpoint union pads only the viewport and partitions exactly",
     "[pointcloud][linked-hq]") {
     invisible_places::app::LinkedHqFrustumUnion frustums;
-    frustums.midpointViewProjections[0U] = glm::mat4{1.0F};
-    frustums.midpointViewProjections[1U] = glm::translate(
+    frustums.viewProjections = {
         glm::mat4{1.0F},
-        glm::vec3{-3.0F, 0.0F, 0.0F});
+        glm::translate(
+            glm::mat4{1.0F},
+            glm::vec3{-3.0F, 0.0F, 0.0F}),
+    };
 
     CHECK(frustums.Contains({1.0F, 0.0F, 0.0F}));
     CHECK(frustums.Contains({1.099F, 0.0F, 0.0F}));
@@ -181,6 +235,193 @@ TEST_CASE(
     CHECK(interrupted.inside.empty());
     CHECK(interrupted.outside.empty());
     CHECK(cancelledProgress == std::vector<std::uint64_t>{0U, 0U});
+}
+
+TEST_CASE(
+    "Adaptive HQ guard covers its camera and limits fine view depth",
+    "[pointcloud][adaptive-hq]") {
+    const glm::mat4 view = glm::lookAt(
+        glm::vec3{0.0F, 0.0F, 0.0F},
+        glm::vec3{0.0F, 0.0F, -1.0F},
+        glm::vec3{0.0F, 1.0F, 0.0F});
+    const glm::mat4 projection = glm::perspective(
+        glm::radians(60.0F),
+        1.0F,
+        0.1F,
+        100.0F);
+    auto guard = invisible_places::app::BuildAnimationHqFrustumUnion(
+        std::array{projection * view},
+        invisible_places::app::kAdaptiveHqViewportGuardFraction);
+    guard.maximumViewDepthMeters = 10.0F;
+
+    CHECK(invisible_places::app::LinkedHqFrustumUnionCoversView(
+        guard,
+        view,
+        projection,
+        8.0F));
+    CHECK(invisible_places::app::LinkedHqFrustumUnionCoversView(
+        guard,
+        view,
+        projection,
+        8.0F,
+        invisible_places::app::kAdaptiveHqRefreshBorderFraction));
+    CHECK_FALSE(invisible_places::app::LinkedHqFrustumUnionCoversView(
+        guard,
+        view,
+        projection,
+        8.0F,
+        invisible_places::app::kAdaptiveHqViewportGuardFraction + 0.01F));
+    CHECK(guard.Contains({0.0F, 0.0F, -5.0F}));
+    CHECK_FALSE(guard.Contains({0.0F, 0.0F, -11.0F}));
+    CHECK(guard.IntersectsBounds({
+        .minimum = {-0.5F, -0.5F, -5.5F},
+        .maximum = {0.5F, 0.5F, -4.5F},
+        .valid = true,
+    }));
+    CHECK(guard.IntersectsBounds({
+        .minimum = {-0.5F, -0.5F, -10.5F},
+        .maximum = {0.5F, 0.5F, -9.5F},
+        .valid = true,
+    }));
+    CHECK_FALSE(guard.IntersectsBounds({
+        .minimum = {50.0F, -0.5F, -5.5F},
+        .maximum = {51.0F, 0.5F, -4.5F},
+        .valid = true,
+    }));
+    CHECK_FALSE(guard.IntersectsBounds({
+        .minimum = {-0.5F, -0.5F, -12.0F},
+        .maximum = {0.5F, 0.5F, -11.0F},
+        .valid = true,
+    }));
+
+    const glm::mat4 movedView = glm::lookAt(
+        glm::vec3{20.0F, 0.0F, 0.0F},
+        glm::vec3{20.0F, 0.0F, -1.0F},
+        glm::vec3{0.0F, 1.0F, 0.0F});
+    CHECK_FALSE(invisible_places::app::LinkedHqFrustumUnionCoversView(
+        guard,
+        movedView,
+        projection,
+        8.0F));
+}
+
+TEST_CASE(
+    "Adaptive HQ retains the prior fine patch over complete coarse fallback",
+    "[pointcloud][adaptive-hq]") {
+    using invisible_places::app::ResolveLinkedHqPatchDrawPolicy;
+
+    const auto hidden = ResolveLinkedHqPatchDrawPolicy(
+        false,
+        true,
+        false,
+        true);
+    CHECK_FALSE(hidden.renderFinePatches);
+    CHECK_FALSE(hidden.applyFineAdaptiveDensity);
+    CHECK_FALSE(hidden.applyCoarseAdaptiveDensity);
+    CHECK_FALSE(hidden.retainingFineDuringRefresh);
+
+    const auto fixed = ResolveLinkedHqPatchDrawPolicy(
+        true,
+        false,
+        false,
+        false);
+    CHECK(fixed.renderFinePatches);
+    CHECK_FALSE(fixed.applyFineAdaptiveDensity);
+    CHECK_FALSE(fixed.applyCoarseAdaptiveDensity);
+    CHECK_FALSE(fixed.retainingFineDuringRefresh);
+
+    const auto paired = ResolveLinkedHqPatchDrawPolicy(
+        true,
+        true,
+        true,
+        true);
+    CHECK(paired.renderFinePatches);
+    CHECK(paired.applyFineAdaptiveDensity);
+    CHECK(paired.applyCoarseAdaptiveDensity);
+    CHECK_FALSE(paired.retainingFineDuringRefresh);
+
+    const auto refreshing = ResolveLinkedHqPatchDrawPolicy(
+        true,
+        true,
+        false,
+        true);
+    CHECK(refreshing.renderFinePatches);
+    CHECK(refreshing.applyFineAdaptiveDensity);
+    CHECK_FALSE(refreshing.applyCoarseAdaptiveDensity);
+    CHECK(refreshing.retainingFineDuringRefresh);
+
+    const auto invalidTransition = ResolveLinkedHqPatchDrawPolicy(
+        true,
+        true,
+        false,
+        false);
+    CHECK(invalidTransition.renderFinePatches);
+    CHECK_FALSE(invalidTransition.applyFineAdaptiveDensity);
+    CHECK_FALSE(invalidTransition.applyCoarseAdaptiveDensity);
+    CHECK(invalidTransition.retainingFineDuringRefresh);
+}
+
+TEST_CASE(
+    "Adaptive HQ resident retention uses a byte-bounded LRU working set",
+    "[pointcloud][adaptive-hq][retention]") {
+    const auto makeBlock = [](
+        std::uint32_t index,
+        std::uint64_t serial,
+        std::size_t pointCount,
+        std::size_t scalarCount = 0U) {
+        invisible_places::io::PointCloudSubsetLoadResult subset;
+        subset.cloud.positions.resize(pointCount);
+        subset.cloud.normals.resize(pointCount);
+        subset.cloud.packedColors.resize(pointCount);
+        subset.sourcePointIndices.resize(pointCount);
+        subset.cloud.scalarFieldValues.resize(pointCount * scalarCount);
+        return invisible_places::io::AdaptiveHqResidentBlock{
+            .blockIndex = index,
+            .points = std::make_shared<const
+                invisible_places::io::PointCloudSubsetLoadResult>(
+                    std::move(subset)),
+            .lastUsedSerial = serial,
+        };
+    };
+
+    std::vector<invisible_places::io::AdaptiveHqResidentBlock> candidates;
+    candidates.push_back(makeBlock(4U, 1U, 10U));
+    candidates.push_back(makeBlock(1U, 5U, 10U, 1U));
+    candidates.push_back(makeBlock(3U, 4U, 10U));
+    candidates.push_back(makeBlock(2U, 3U, 10U));
+    const std::array<std::uint32_t, 1U> active{4U};
+    const auto oneScalarBytes =
+        invisible_places::app::AdaptiveHqResidentBlockPayloadBytes(
+            candidates[1U]);
+    const auto geometryBytes =
+        invisible_places::app::AdaptiveHqResidentBlockPayloadBytes(
+            candidates[2U]);
+    CHECK(oneScalarBytes == 360U);
+    CHECK(geometryBytes == 320U);
+
+    const auto retained =
+        invisible_places::app::RetainAdaptiveHqResidentBlocks(
+            candidates,
+            active,
+            oneScalarBytes + geometryBytes);
+    REQUIRE(retained.blocks.size() == 3U);
+    CHECK(retained.blocks[0U].blockIndex == 4U);
+    CHECK(retained.blocks[1U].blockIndex == 1U);
+    CHECK(retained.blocks[2U].blockIndex == 3U);
+    CHECK(retained.inactiveBlockCount == 2U);
+    CHECK(retained.inactivePayloadBytes ==
+          oneScalarBytes + geometryBytes);
+    CHECK(retained.activePayloadBytes == geometryBytes);
+
+    // Active data is never evicted even when the inactive budget is zero.
+    const auto activeOnly =
+        invisible_places::app::RetainAdaptiveHqResidentBlocks(
+            candidates,
+            active,
+            0U);
+    REQUIRE(activeOnly.blocks.size() == 1U);
+    CHECK(activeOnly.blocks.front().blockIndex == 4U);
+    CHECK(activeOnly.inactivePayloadBytes == 0U);
 }
 
 TEST_CASE(
@@ -528,6 +769,15 @@ TEST_CASE(
             "pair-a-b",
             frustums,
             sources);
+    auto viewsChanged = frustums;
+    viewsChanged.viewProjections.push_back(glm::translate(
+        glm::mat4{1.0F},
+        glm::vec3{-3.0F, 0.0F, 0.0F}));
+    CHECK(first !=
+          invisible_places::app::BuildLinkedHqSelectionFingerprint(
+              "pair-a-b",
+              viewsChanged,
+              sources));
     frustums.borderFraction = 0.06F;
     const auto borderChanged =
         invisible_places::app::BuildLinkedHqSelectionFingerprint(
@@ -590,4 +840,49 @@ TEST_CASE(
         CHECK(displayed >= prior);
     }
     CHECK(displayed == Catch::Approx(1.0F));
+}
+
+TEST_CASE(
+    "Animation section frustum samples cover every playback frame with boundary padding",
+    "[pointcloud][animation][frustum-culling]") {
+    const auto times = invisible_places::app::
+        BuildAnimationSectionFrustumSampleTimes(
+            10.0F,
+            0.40F,
+            0.50F,
+            30U,
+            2U);
+    REQUIRE_FALSE(times.empty());
+    CHECK(std::is_sorted(times.begin(), times.end()));
+    CHECK(times.front() == Catch::Approx(118.0F / 30.0F));
+    CHECK(times.back() == Catch::Approx(152.0F / 30.0F));
+    CHECK(std::find_if(
+              times.begin(),
+              times.end(),
+              [](float time) {
+                  return std::abs(time - 4.0F) <= 1.0e-6F;
+              }) != times.end());
+    CHECK(std::find_if(
+              times.begin(),
+              times.end(),
+              [](float time) {
+                  return std::abs(time - 5.0F) <= 1.0e-6F;
+              }) != times.end());
+
+    const auto reversed = invisible_places::app::
+        BuildAnimationSectionFrustumSampleTimes(
+            10.0F,
+            0.50F,
+            0.40F,
+            30U,
+            2U);
+    CHECK(reversed == times);
+
+    const auto degenerate = invisible_places::app::
+        BuildAnimationSectionFrustumSampleTimes(
+            0.0F,
+            0.25F,
+            0.75F);
+    REQUIRE(degenerate.size() == 1U);
+    CHECK(degenerate.front() == 0.0F);
 }

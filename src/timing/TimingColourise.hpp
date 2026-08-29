@@ -9,6 +9,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace invisible_places::timing {
@@ -21,6 +22,12 @@ inline constexpr std::size_t kTimingColouriseSoftActiveEffectLimit = 5U;
 inline constexpr std::size_t kMaximumTimingColourisePaletteStops = 8U;
 inline constexpr std::size_t kTimingColouriseLutSampleCount = 64U;
 inline constexpr float kTimingColouriseKeyTolerance = 1.0e-4F;
+// Positive fades consume the selected interval and therefore stop at one
+// span. Negative fades extend away from it and may cover many spans. The
+// large outward guard keeps hostile/corrupt documents numerically finite
+// while allowing even a very narrow interval to feather across its field.
+inline constexpr float kTimingColouriseMaximumInwardEdgeFade = 1.0F;
+inline constexpr float kTimingColouriseMaximumOutwardEdgeFade = 1'000'000.0F;
 
 enum class TimingColouriseFieldSource : std::uint8_t {
     Scalar = 0,
@@ -244,12 +251,26 @@ using TimingColouriseLut =
 struct TimingColouriseBounds {
     float lower = 0.0F;
     float upper = 1.0F;
-    // Signed fraction of the selected span faded at each edge, in [-1, 1].
-    // Positive values fade inward; negative values fade outward. The two
-    // edges are independent; the editor links them by default and documents
-    // authored before the split load the shared legacy value into both.
+    // Signed fraction of the selected span faded at each edge. Positive
+    // values fade inward and are capped at one span; negative values fade
+    // outward and may exceed one span (for example -9 is 900% outward). The
+    // two edges are independent; the editor links them by default and
+    // documents authored before the split load the shared legacy value into
+    // both.
     float edgeFadeLower = 0.10F;
     float edgeFadeUpper = 0.10F;
+};
+
+// Relative fades store signed fractions of the live bounds span. Absolute
+// fades store the two scalar positions at which the fade reaches its inner
+// edge, so changing Lower/Upper does not move those authored endpoints.
+// Joined is an editor grouping: both relative tracks are written together;
+// existing projects that already contain unequal tracks still evaluate
+// exactly as authored until the user edits them.
+enum class TimingColouriseEdgeFadeMode : std::uint8_t {
+    RelativeLinked = 0,
+    RelativeSeparate,
+    Absolute,
 };
 
 // An effect chooses exactly one bounds parameterisation. This makes the two
@@ -334,6 +355,20 @@ struct TimingColouriseBoundsKey {
         invisible_places::water::WaterScenarioInterpolation::Smooth;
 };
 
+// Inactive fade authoring for one representation. The active mode continues
+// to use baseBounds and the fade entries in boundsParameterKeys, so every
+// existing editor/evaluator sees only one mode at a time. Switching modes
+// stashes keyed active data here and restores the destination verbatim. A
+// destination without stored keys is seeded from the visible fade ends at the
+// switch position.
+struct TimingColouriseEdgeFadeModeMemory {
+    TimingColouriseEdgeFadeMode mode =
+        TimingColouriseEdgeFadeMode::RelativeLinked;
+    float edgeFadeLower = 0.10F;
+    float edgeFadeUpper = 0.10F;
+    std::vector<TimingColouriseBoundsParameterKey> keys;
+};
+
 struct TimingColouriseActivationRange {
     // Inclusive normalized animation positions. This window controls only
     // whether the effect contributes to rendering; authored tracks remain
@@ -371,7 +406,10 @@ struct TimingColouriseFieldBoundsMemory {
     std::vector<TimingColouriseBoundsParameterKey> boundsParameterKeys;
     std::vector<TimingColouriseBoundsKey> boundsKeys;
     bool edited = false;
-    bool edgeFadesLinked = true;
+    TimingColouriseEdgeFadeMode edgeFadeMode =
+        TimingColouriseEdgeFadeMode::RelativeLinked;
+    std::vector<TimingColouriseEdgeFadeModeMemory>
+        edgeFadeModeMemories;
     // Global-store revision this entry last adopted; unedited entries with
     // an older revision refresh from the shared store.
     std::uint64_t adoptedGlobalRevision = 0U;
@@ -529,11 +567,16 @@ struct TimingColouriseEffect {
     // Whether the live bounds above were locally edited for the current
     // field selector (detaching them from the shared Global bounds).
     bool boundsEdited = false;
-    // While linked (the default) the histogram fade handles and the fade
-    // editors write both per-edge tracks together; double-clicking a fade
-    // handle separates them. Purely an authoring convenience: evaluation
-    // always reads the two tracks independently.
-    bool edgeFadesLinked = true;
+    // Relative Joined writes the two fade tracks together; Relative
+    // Separate exposes both percentage tracks; Absolute exposes two fixed
+    // scalar endpoints. Evaluation always resolves the authored form to the
+    // span-relative representation consumed by the renderer.
+    TimingColouriseEdgeFadeMode edgeFadeMode =
+        TimingColouriseEdgeFadeMode::RelativeLinked;
+    // Only inactive modes live here. The active mode's values and keys are
+    // baseBounds.edgeFade* and the fade tracks in boundsParameterKeys.
+    std::vector<TimingColouriseEdgeFadeModeMemory>
+        edgeFadeModeMemories;
     std::uint64_t boundsAdoptedGlobalRevision = 0U;
     // Per-selector authoring memory for every field this feature visited.
     std::vector<TimingColouriseFieldBoundsMemory> fieldBoundsMemory;
@@ -917,8 +960,20 @@ bool DuplicateTimingTakeRainProfileAssignment(
     float position);
 [[nodiscard]] std::string AllocateTimingColourisePaletteStopId(
     const TimingColourisePalette& palette);
+[[nodiscard]] float SanitizeTimingColouriseEdgeFade(float edgeFade);
 [[nodiscard]] TimingColouriseBounds SanitizeTimingColouriseBounds(
     TimingColouriseBounds bounds);
+[[nodiscard]] TimingColouriseBounds SanitizeTimingColouriseAuthoredBounds(
+    TimingColouriseBounds bounds,
+    TimingColouriseEdgeFadeMode mode);
+[[nodiscard]] TimingColouriseBounds ConvertTimingColouriseBoundsEdgeFadeMode(
+    TimingColouriseBounds bounds,
+    TimingColouriseEdgeFadeMode sourceMode,
+    TimingColouriseEdgeFadeMode destinationMode);
+[[nodiscard]] bool TimingColouriseEdgeFadesAreLinked(
+    TimingColouriseEdgeFadeMode mode);
+[[nodiscard]] bool TimingColouriseEdgeFadesAreAbsolute(
+    TimingColouriseEdgeFadeMode mode);
 [[nodiscard]] bool TimingColouriseBoundsParameterIsAllowed(
     TimingColouriseBoundsKeyMode mode,
     TimingColouriseBoundsParameter parameter);
@@ -927,6 +982,10 @@ TimingColouriseBoundsParametersForMode(TimingColouriseBoundsKeyMode mode);
 [[nodiscard]] float TimingColouriseBoundsParameterValue(
     const TimingColouriseBounds& bounds,
     TimingColouriseBoundsParameter parameter);
+[[nodiscard]] float TimingColouriseAuthoredBoundsParameterValue(
+    const TimingColouriseBounds& bounds,
+    TimingColouriseBoundsParameter parameter,
+    TimingColouriseEdgeFadeMode mode);
 // Transfers a scalar-bounds key between fields with different numeric
 // domains. Absolute coordinates preserve their normalized percentile,
 // Spread preserves its fraction of the full field range, and Edge Fade is
@@ -955,11 +1014,23 @@ ResolveTimingColouriseBoundsHandleEdit(
     float targetValue,
     float rangeMinimum,
     float rangeMaximum);
-// Refuses a mode change while it would invalidate an existing geometric
-// parameter track. Edge Fade is independent and never blocks a mode change.
+// Converts existing geometric scalar tracks to the requested coordinate pair
+// at the union of their authored key times. Interval values at every existing
+// node are preserved; a derived coordinate inherits the closest available
+// source interpolation, so its shape between nodes can change. Legacy
+// whole-bounds keys and every Edge Fade track remain untouched.
 [[nodiscard]] bool SetTimingColouriseBoundsKeyMode(
     TimingColouriseEffect* effect,
     TimingColouriseBoundsKeyMode mode);
+// Stashes the active mode's base values and keys, then restores the requested
+// mode's private keyed authoring. A mode with no stored keys starts unkeyed
+// from the visible fade endpoints at normalizedPosition; switches never
+// rewrite or clear stored tracks.
+[[nodiscard]] bool SetTimingColouriseEdgeFadeMode(
+    TimingColouriseEffect* effect,
+    TimingColouriseEdgeFadeMode mode,
+    float normalizedPosition = 0.0F,
+    bool cyclic = false);
 // Palette phase and amount override belong to the colourise aspect; the
 // emissive level belongs to the emissive aspect. Keys for a disabled
 // aspect's parameters stay stored but are never counted, moved, or
@@ -1243,6 +1314,12 @@ RemoveTimingColouriseEmissiveFalloffKeysAtPosition(
     const TimingColouriseEffect& effect,
     float normalizedPosition,
     bool cyclic = false);
+// Authoring/UI form. In Absolute mode edgeFadeLower/Upper are scalar fade
+// endpoint positions; in either Relative mode they are signed fractions.
+[[nodiscard]] TimingColouriseBounds EvaluateTimingColouriseAuthoredBounds(
+    const TimingColouriseEffect& effect,
+    float normalizedPosition,
+    bool cyclic = false);
 [[nodiscard]] TimingColouriseLayerSample SampleTimingColouriseLut(
     const TimingColouriseLut& lut,
     float normalizedFieldValue);
@@ -1281,6 +1358,13 @@ void AddOrUpdateTimingColourisePaletteKey(
     std::array<float, 3> colour,
     invisible_places::water::WaterScenarioInterpolation interpolation =
         invisible_places::water::WaterScenarioInterpolation::SmoothVelocity);
+// Keys every colour marker's Position at one animation moment. Stop colour
+// and Colourise Amount remain independent tracks. Existing per-marker curve
+// styles are retained, and legacy snapshot palettes remain whole-palette keys.
+[[nodiscard]] bool AddOrUpdateTimingColourisePaletteMarkerKeys(
+    TimingColouriseEffect* effect,
+    float position,
+    TimingColourisePalette palette);
 void AddOrUpdateTimingColouriseBoundsKey(
     TimingColouriseEffect* effect,
     float position,
@@ -1372,6 +1456,9 @@ TimingColouriseEffectParameterUnionKeyCountAtPosition(
 [[nodiscard]] std::size_t RemoveTimingColourisePaletteKeysAtPosition(
     TimingColouriseEffect* effect,
     float position);
+[[nodiscard]] std::size_t RemoveTimingColourisePaletteMarkerKeysAtPosition(
+    TimingColouriseEffect* effect,
+    float position);
 [[nodiscard]] std::size_t
 RemoveTimingColourisePaletteStopParameterKeysAtPosition(
     TimingColouriseEffect* effect,
@@ -1406,6 +1493,25 @@ PreviousTimingColourisePaletteKeyPosition(
     const TimingColouriseEffect& effect,
     float position);
 [[nodiscard]] std::vector<float> TimingColourisePaletteKeyPositions(
+    const TimingColouriseEffect& effect);
+[[nodiscard]] std::size_t TimingColourisePaletteMarkerKeyCountAtPosition(
+    const TimingColouriseEffect& effect,
+    float position);
+[[nodiscard]] std::optional<float>
+PreviousTimingColourisePaletteMarkerKeyPosition(
+    const TimingColouriseEffect& effect,
+    float position);
+[[nodiscard]] std::optional<float>
+NextTimingColourisePaletteMarkerKeyPosition(
+    const TimingColouriseEffect& effect,
+    float position);
+[[nodiscard]] std::vector<float> TimingColourisePaletteMarkerKeyPositions(
+    const TimingColouriseEffect& effect);
+// One shared graph range derived only from Position tracks whose authored
+// values actually vary. Invariant markers may be group-keyed but do not
+// widen the range.
+[[nodiscard]] std::optional<std::pair<float, float>>
+TimingColouriseAnimatedPaletteMarkerRange(
     const TimingColouriseEffect& effect);
 // Stop topology is static for independent property tracks. Removing a stop
 // is refused while it has keys, preserving dormant animation data.

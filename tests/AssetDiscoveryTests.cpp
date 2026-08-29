@@ -2082,6 +2082,28 @@ TEST_CASE(
     }
 }
 
+TEST_CASE("Frustum union point mask honours cancellation", "[budget][frustum][cancel]") {
+    const std::vector<invisible_places::io::Float3> positions{
+        {-1.0F, 0.0F, 0.0F},
+        {1.0F, 0.0F, 0.0F},
+    };
+    invisible_places::io::Bounds3f bounds;
+    for (const auto& point : positions) {
+        bounds.Expand(point);
+    }
+    const std::array views{glm::mat4{1.0F}};
+    std::stop_source cancellation;
+    cancellation.request_stop();
+
+    CHECK(invisible_places::renderer::pointcloud::GenerateFrustumUnionPointIndices(
+              positions,
+              bounds,
+              views,
+              48U,
+              cancellation.get_token())
+              .empty());
+}
+
 TEST_CASE("Orbit camera can move its pivot without changing the current view", "[camera][pivot]") {
     invisible_places::io::Bounds3f bounds;
     bounds.Expand({-1.0F, -1.0F, -1.0F});

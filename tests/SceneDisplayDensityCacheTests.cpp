@@ -403,6 +403,27 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Scene3 display-density cache accepts circular-field algorithm v3",
+    "[pointcloud][density][cache]") {
+    TemporaryDirectory temporary;
+    const auto bundle = WriteSyntheticBundle(
+        temporary.path,
+        "renderer-byte-mean",
+        invisible_places::io::
+            kSceneDisplayDensityCacheCircularFieldAlgorithmVersion,
+        kGeneratorQ1CentroidPositionPolicy);
+    auto catalog = invisible_places::io::DiscoverAssets(bundle.dataRoot);
+
+    const auto activation =
+        invisible_places::io::ActivateScene3DisplayDensityCache(
+            bundle.cacheRoot,
+            &catalog);
+    INFO(activation.message);
+    REQUIRE(activation.Activated());
+    CHECK(activation.bundleFingerprint == bundle.fingerprint);
+}
+
+TEST_CASE(
     "Scene3 display-density cache rejects crossed or unknown position policies",
     "[pointcloud][density][cache]") {
     struct UnsupportedPolicy {
@@ -422,7 +443,7 @@ TEST_CASE(
             kGeneratorQ1CentroidAlgorithmVersion,
             "real-parent-q1-centroid-medoid-qN-stable-hash-unknown"},
         UnsupportedPolicy{
-            3U,
+            4U,
             kGeneratorQ1CentroidPositionPolicy},
     };
 

@@ -1,4 +1,5 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 
 layout(location = 0) out vec4 outSourceColor;
 layout(location = 1) out float outViewDepth;
@@ -13,6 +14,7 @@ layout(set = 0, binding = 0) uniform FrameUniforms {
     vec4 depthParameters;
     vec4 viewportParameters;
     vec4 depthOfFieldParameters;
+    vec4 adaptiveDensityParameters;
 } uniforms;
 
 struct RenderParameterBindingGpu {
@@ -43,6 +45,8 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 stylisationParams1;
     vec4 stylisationParams2;
 } styleData;
+
+#include "pointcloud_adaptive_density.glsl"
 
 layout(set = 0, binding = 4, std430) readonly buffer SurfelPositions {
     vec4 positions[];
@@ -151,12 +155,18 @@ void main() {
     const vec2 corner = kSurfelCorners[int(cornerIndex)];
 
     const vec3 center = surfelPositions.positions[pointIndex].xyz;
+    const vec4 centerViewPosition = uniforms.view * vec4(center, 1.0);
+    const float centerDepth = -centerViewPosition.z;
+    if (!AdaptiveDensityKeepsPoint(center, pointIndex, centerDepth)) {
+        gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+        outViewDepth = centerDepth;
+        outDiscCoord = corner;
+        outAovNormal = vec3(0.0);
+        return;
+    }
     vec3 tangent;
     vec3 bitangent;
     ResolveBasis(center, pointIndex, tangent, bitangent);
-
-    const vec4 centerViewPosition = uniforms.view * vec4(center, 1.0);
-    const float centerDepth = -centerViewPosition.z;
     // The antialias support is a fixed screen-space margin; only the
     // authored kernel scales with the density footprint. Camera blur is
     // deliberately independent of point density.

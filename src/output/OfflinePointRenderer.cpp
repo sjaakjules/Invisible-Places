@@ -919,14 +919,18 @@ std::optional<ResolvedTimingColouriseMask> ResolveTimingColouriseMask(
         std::isfinite(effect.edgeFadeLowerFraction)
             ? effect.edgeFadeLowerFraction
             : 0.10F,
-        -1.0F,
-        1.0F);
+        -invisible_places::renderer::pointcloud::
+            kTimingColouriseMaximumOutwardEdgeFade,
+        invisible_places::renderer::pointcloud::
+            kTimingColouriseMaximumInwardEdgeFade);
     const float upperFade = std::clamp(
         std::isfinite(effect.edgeFadeUpperFraction)
             ? effect.edgeFadeUpperFraction
             : 0.10F,
-        -1.0F,
-        1.0F);
+        -invisible_places::renderer::pointcloud::
+            kTimingColouriseMaximumOutwardEdgeFade,
+        invisible_places::renderer::pointcloud::
+            kTimingColouriseMaximumInwardEdgeFade);
     const float lowerOutward = span * std::max(-lowerFade, 0.0F);
     const float upperOutward = span * std::max(-upperFade, 0.0F);
     if (value.value() < effect.lowerBound - lowerOutward ||

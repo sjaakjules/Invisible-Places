@@ -10777,9 +10777,23 @@ bool AnimationCameraMatchesFrame(
         return false;
     }
 
-    const auto expected = EvaluateAnimationPath(
+    return PreparedAnimationCameraMatchesFrame(
+        liveCamera,
+        PrepareAnimationPathEvaluation(path),
+        normalizedPosition);
+}
+
+bool PreparedAnimationCameraMatchesFrame(
+    const CameraState& liveCamera,
+    const PreparedAnimationPathEvaluationContext& path,
+    float normalizedPosition) {
+    if (!path.valid || path.singleKey) {
+        return false;
+    }
+
+    const auto expected = EvaluatePreparedAnimationPath(
         path,
-        AnimationPathDurationSeconds(path) *
+        path.durationSeconds *
             std::clamp(normalizedPosition, 0.0F, 1.0F));
     const auto distance = [](const auto& left, const auto& right) {
         const float x = left[0U] - right[0U];
@@ -10792,6 +10806,10 @@ bool AnimationCameraMatchesFrame(
         distance(
             expected.camera.position,
             expected.focusPoint));
+    const auto scalarMatches = [](float live, float authored) {
+        return std::abs(live - authored) <=
+               std::max(1.0e-5F, std::abs(authored) * 1.0e-5F);
+    };
     const auto orientationMatches = [&]() {
         float dot = 0.0F;
         float liveLengthSquared = 0.0F;
@@ -10825,7 +10843,13 @@ bool AnimationCameraMatchesFrame(
            std::abs(
                liveCamera.fovDegrees -
                expected.camera.fovDegrees) <=
-               1.0e-3F;
+               1.0e-3F &&
+           scalarMatches(
+               liveCamera.nearPlane,
+               expected.camera.nearPlane) &&
+           scalarMatches(
+               liveCamera.farPlane,
+               expected.camera.farPlane);
 }
 
 bool FeatureTimelineScrubShouldMoveCamera(
@@ -10848,6 +10872,17 @@ bool AnimationPlaybackShouldFollowCamera(
     float normalizedPosition,
     bool cameraFollowWasActive) {
     return cameraFollowWasActive && AnimationCameraMatchesFrame(
+        liveCamera,
+        path,
+        normalizedPosition);
+}
+
+bool PreparedAnimationPlaybackShouldFollowCamera(
+    const CameraState& liveCamera,
+    const PreparedAnimationPathEvaluationContext& path,
+    float normalizedPosition,
+    bool cameraFollowWasActive) {
+    return cameraFollowWasActive && PreparedAnimationCameraMatchesFrame(
         liveCamera,
         path,
         normalizedPosition);

@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -25,6 +26,11 @@ inline constexpr float kInactiveDepthFadeDefault = 0.0F;
 inline constexpr float kInactiveColormapPositionDefault = 0.5F;
 inline constexpr std::size_t kTimingColouriseMaxEffects = 8U;
 inline constexpr std::size_t kTimingColouriseLutSamples = 64U;
+// Keep these renderer payload limits in lockstep with the authored timing
+// model and pointcloud_timing_colourise.glsl. Inward fades cannot exceed the
+// selected span; outward fades may cover many selected spans.
+inline constexpr float kTimingColouriseMaximumInwardEdgeFade = 1.0F;
+inline constexpr float kTimingColouriseMaximumOutwardEdgeFade = 1'000'000.0F;
 
 // Renderer-facing timing colourise data is deliberately independent from the
 // authored timing model. Callers resolve field names to each layer's local
@@ -149,8 +155,8 @@ struct ResolvedTimingColouriseEffect {
     float lowerBound = 0.0F;
     float upperBound = 1.0F;
     // Signed fraction of the selected [lower, upper] span used by each edge
-    // fade, independently per edge. Positive values fade inward and negative
-    // values fade outward.
+    // fade, independently per edge. Positive values fade inward up to one
+    // span; negative values fade outward and may exceed one span.
     float edgeFadeLowerFraction = 0.10F;
     float edgeFadeUpperFraction = 0.10F;
     // A signed scalar applied after the field bounds/fade mask. Positive
@@ -365,6 +371,32 @@ struct PointCloudDensityCompensation {
     float coverageCorrection = 1.0F;
 };
 
+// Live-preview-only density roles used by adaptive HQ. The complete coarse
+// layer and its compact fine companion share one depth transition, but each
+// applies the opposite stable point-selection policy on the GPU. Disabled is
+// the default for every ordinary/export layer.
+enum class PointCloudAdaptiveDensityRole : std::uint32_t {
+    Disabled = 0U,
+    Fine = 1U,
+    Coarse = 2U,
+};
+
+struct PointCloudAdaptiveDensityTransition {
+    float startDepthMeters = 0.0F;
+    float switchDepthMeters = 0.0F;
+    float endDepthMeters = 0.0F;
+    // Fine source data is prepared slightly beyond the visible transition so
+    // resize jitter and the cache guard cannot reveal an unloaded edge.
+    float preparedFineDepthMeters = 0.0F;
+
+    [[nodiscard]] bool Valid() const {
+        return startDepthMeters > 0.0F &&
+               switchDepthMeters >= startDepthMeters &&
+               endDepthMeters > switchDepthMeters &&
+               preparedFineDepthMeters >= endDepthMeters;
+    }
+};
+
 struct WaterFlowActivityScales {
     float activity = 1.0F;
     // A continuous whole-population fade; trail seeds never threshold it.
@@ -500,6 +532,8 @@ std::uint64_t ClampPointBudget(std::uint64_t totalPoints, std::uint64_t requeste
     PointCloudStyleState style,
     std::string_view sceneRole);
 [[nodiscard]] bool PointCloudStyleHasActiveShorelineWaves(const PointCloudStyleState& style);
+[[nodiscard]] bool PointCloudShorelineWaveSettingsHasActiveMotion(
+    const PointCloudShorelineWaveSettings& settings);
 [[nodiscard]] PointCloudShorelineWaveSettings ExtractPointCloudShorelineWaveSettings(
     const PointCloudStyleState& style);
 void ApplyPointCloudShorelineWaveSettings(
@@ -550,6 +584,22 @@ void ApplyPointCloudShorelineWaveSettings(
     std::uint64_t referencePointCount);
 [[nodiscard]] PointCloudDensityCompensation SanitizePointCloudDensityCompensation(
     PointCloudDensityCompensation compensation);
+// Chooses the depth at which a 5 mm sample projects to targetCoarsePixels.
+// Fine points remain complete before the blend band, the complete 5 mm layer
+// takes over after it, and a stable stochastic transition avoids a hard ring.
+[[nodiscard]] PointCloudAdaptiveDensityTransition
+ResolvePointCloudAdaptiveDensityTransition(
+    float projectionScaleY,
+    float viewportHeightPixels,
+    float coarseSpacingMeters = 0.005F,
+    float targetCoarsePixels = 1.0F);
+[[nodiscard]] float PointCloudAdaptiveDensityCoarseWeight(
+    float viewDepthMeters,
+    const PointCloudAdaptiveDensityTransition& transition);
+[[nodiscard]] float PointCloudAdaptiveDensityKeepProbability(
+    PointCloudAdaptiveDensityRole role,
+    float viewDepthMeters,
+    const PointCloudAdaptiveDensityTransition& transition);
 // Density scaling applies to the signed, composed authored geometry only.
 // The antialias support is a fixed screen-space margin added after the scale
 // (identical across display densities), and camera depth-of-field is a
@@ -571,6 +621,10 @@ void ApplyPointCloudShorelineWaveSettings(
     const PointCloudStyleState& style,
     PointCloudDensityCompensation densityCompensation,
     bool requiresUnifiedProceduralEffects);
+// Preview performance mode may retain weighted density compensation while
+// depth-culling an authored style that is otherwise fully opaque.
+[[nodiscard]] bool PointCloudStyleSupportsPreviewDepthCulling(
+    const PointCloudStyleState& style);
 [[nodiscard]] const char* PointCloudMaterialVariantName(PointCloudMaterialVariant variant);
 PointBudgetState MakePointBudgetState(std::uint64_t totalPoints, std::uint64_t requestedPoints);
 PointBudgetState MakePointBudgetState(
@@ -597,7 +651,8 @@ std::vector<std::uint32_t> GenerateFrustumUnionPointIndices(
     const std::vector<invisible_places::io::Float3>& positions,
     const invisible_places::io::Bounds3f& bounds,
     std::span<const glm::mat4> viewProjections,
-    std::uint32_t gridDimension = 64U);
+    std::uint32_t gridDimension = 64U,
+    std::stop_token stopToken = {});
 std::vector<std::uint32_t> GenerateSurfelEncodedSampleIndices(
     const std::vector<std::uint32_t>& sampledPointIndices);
 

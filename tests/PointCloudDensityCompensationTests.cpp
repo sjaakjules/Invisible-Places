@@ -293,6 +293,74 @@ TEST_CASE("Density compensation resolves spacing and count-aware coverage", "[po
     const auto standaloneFiveMillimeter = ResolvePointCloudDensityCompensation(0.005F, 0U, 0.0F, 0U);
     CHECK(standaloneFiveMillimeter.footprintScale == Catch::Approx(5.0F));
     CHECK(standaloneFiveMillimeter.coverageCorrection == Catch::Approx(1.0F));
+
+    // Site1 WATER uses its finest 2 mm sibling as the family reference. The
+    // 2 mm export therefore keeps a 2x footprint at identity alpha/emission,
+    // while the 5 mm live variant keeps a 5x footprint and attenuates its
+    // measured over-coverage so the two densities integrate consistently.
+    const auto site1WaterTwoMillimeter =
+        ResolvePointCloudDensityCompensation(
+            0.002F,
+            35'528'278U,
+            0.002F,
+            35'528'278U);
+    const auto site1WaterFiveMillimeter =
+        ResolvePointCloudDensityCompensation(
+            0.005F,
+            6'456'640U,
+            0.002F,
+            35'528'278U);
+    CHECK(site1WaterTwoMillimeter.footprintScale == Catch::Approx(2.0F));
+    CHECK(site1WaterTwoMillimeter.coverageCorrection == Catch::Approx(1.0F));
+    CHECK(site1WaterFiveMillimeter.footprintScale == Catch::Approx(5.0F));
+    CHECK(site1WaterFiveMillimeter.coverageCorrection ==
+          Catch::Approx(0.8806F).epsilon(1.0e-3));
+}
+
+TEST_CASE(
+    "Adaptive HQ derives a projected-spacing transition and safe keep weights",
+    "[pointcloud][density][adaptive-hq]") {
+    using namespace invisible_places::renderer::pointcloud;
+
+    const auto transition = ResolvePointCloudAdaptiveDensityTransition(
+        2.0F,
+        1000.0F,
+        0.005F,
+        1.0F);
+    REQUIRE(transition.Valid());
+    CHECK(transition.switchDepthMeters == Catch::Approx(5.0F));
+    CHECK(transition.startDepthMeters == Catch::Approx(3.25F));
+    CHECK(transition.endDepthMeters == Catch::Approx(6.75F));
+    CHECK(transition.preparedFineDepthMeters >
+          transition.endDepthMeters);
+
+    CHECK(PointCloudAdaptiveDensityCoarseWeight(3.0F, transition) ==
+          Catch::Approx(0.0F));
+    CHECK(PointCloudAdaptiveDensityCoarseWeight(5.0F, transition) ==
+          Catch::Approx(0.5F));
+    CHECK(PointCloudAdaptiveDensityCoarseWeight(7.0F, transition) ==
+          Catch::Approx(1.0F));
+    CHECK(PointCloudAdaptiveDensityKeepProbability(
+              PointCloudAdaptiveDensityRole::Fine,
+              5.0F,
+              transition) == Catch::Approx(0.25F));
+    CHECK(PointCloudAdaptiveDensityKeepProbability(
+              PointCloudAdaptiveDensityRole::Coarse,
+              5.0F,
+              transition) == Catch::Approx(0.5F));
+    CHECK(PointCloudAdaptiveDensityKeepProbability(
+              PointCloudAdaptiveDensityRole::Disabled,
+              5.0F,
+              transition) == Catch::Approx(1.0F));
+
+    const auto invalid = ResolvePointCloudAdaptiveDensityTransition(
+        0.0F,
+        1000.0F);
+    CHECK_FALSE(invalid.Valid());
+    CHECK(PointCloudAdaptiveDensityKeepProbability(
+              PointCloudAdaptiveDensityRole::Fine,
+              5.0F,
+              invalid) == Catch::Approx(1.0F));
 }
 
 TEST_CASE("Density compensation preserves reference coverage without shrinking the footprint", "[pointcloud][density]") {
@@ -506,6 +574,40 @@ TEST_CASE("Density compensation forces the unified Beauty material", "[pointclou
             style,
             ResolvePointCloudDensityCompensation(0.005F, 80U, 0.001F, 1000U)) ==
         PointCloudMaterialVariant::Unified);
+}
+
+TEST_CASE("Preview depth culling follows the authored opaque style", "[pointcloud][preview][performance]") {
+    using invisible_places::renderer::pointcloud::PointCloudStyleState;
+    using invisible_places::renderer::pointcloud::PointCloudStyleSupportsPreviewDepthCulling;
+
+    PointCloudStyleState style;
+    CHECK(PointCloudStyleSupportsPreviewDepthCulling(style));
+
+    invisible_places::style::SetScalarConstant(&style.opacity, 0.5F);
+    CHECK_FALSE(PointCloudStyleSupportsPreviewDepthCulling(style));
+
+    invisible_places::style::SetScalarConstant(&style.opacity, 1.0F);
+    invisible_places::style::SetScalarConstant(&style.emissiveStrength, 0.25F);
+    CHECK_FALSE(PointCloudStyleSupportsPreviewDepthCulling(style));
+}
+
+TEST_CASE("Paused shoreline settings do not require animated redraws", "[pointcloud][shoreline][cache]") {
+    using invisible_places::renderer::pointcloud::PointCloudShorelineWaveAlgorithm;
+    using invisible_places::renderer::pointcloud::PointCloudShorelineWaveSettings;
+    using invisible_places::renderer::pointcloud::PointCloudShorelineWaveSettingsHasActiveMotion;
+
+    PointCloudShorelineWaveSettings settings;
+    CHECK_FALSE(PointCloudShorelineWaveSettingsHasActiveMotion(settings));
+
+    settings.enabled = true;
+    CHECK(PointCloudShorelineWaveSettingsHasActiveMotion(settings));
+    settings.foamFronts.speed = 0.0F;
+    CHECK_FALSE(PointCloudShorelineWaveSettingsHasActiveMotion(settings));
+
+    settings.algorithm = PointCloudShorelineWaveAlgorithm::HeightFoam;
+    CHECK(PointCloudShorelineWaveSettingsHasActiveMotion(settings));
+    settings.heightFoam.speed = 0.0F;
+    CHECK_FALSE(PointCloudShorelineWaveSettingsHasActiveMotion(settings));
 }
 
 TEST_CASE("Offline density compensation scales footprint before alpha and emission", "[output][offline][density]") {
@@ -814,6 +916,8 @@ TEST_CASE(
     const auto fastHalfFade = render(0.625F, 0.5F, true);
     const auto fastOutwardHalfFade =
         render(0.375F, 0.5F, true, true, false, -0.25F);
+    const auto fastLongOutwardHalfFade =
+        render(-0.5F, 0.5F, true, true, false, -2.0F);
     const auto fastCapped = render(1.0F, 2.0F, true);
     const auto fastDarkened = render(1.0F, -0.5F, true);
     const auto fastHalfDarkened = render(0.625F, -0.5F, true);
@@ -827,6 +931,10 @@ TEST_CASE(
         Catch::Approx(1.0875F).margin(1.0e-5F));
     CHECK(
         fastOutwardHalfFade.beautyR[kCenter] /
+            fastOff.beautyR[kCenter] ==
+        Catch::Approx(1.0875F).margin(1.0e-5F));
+    CHECK(
+        fastLongOutwardHalfFade.beautyR[kCenter] /
             fastOff.beautyR[kCenter] ==
         Catch::Approx(1.0875F).margin(1.0e-5F));
     CHECK(

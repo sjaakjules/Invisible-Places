@@ -1226,11 +1226,22 @@ AnimationPathEvaluation EvaluateAnimationPath(
     const CameraState& liveCamera,
     const AnimationPath& path,
     float normalizedPosition);
+// Prepared overloads keep live playback and section-culling checks from
+// rebuilding the complete camera/focus/lens spline on every displayed frame.
+[[nodiscard]] bool PreparedAnimationCameraMatchesFrame(
+    const CameraState& liveCamera,
+    const PreparedAnimationPathEvaluationContext& path,
+    float normalizedPosition);
 // Playback may acquire follow at start, but a run that has detached must not
 // unexpectedly reattach when the playhead later crosses a similar pose.
 [[nodiscard]] bool AnimationPlaybackShouldFollowCamera(
     const CameraState& liveCamera,
     const AnimationPath& path,
+    float normalizedPosition,
+    bool cameraFollowWasActive);
+[[nodiscard]] bool PreparedAnimationPlaybackShouldFollowCamera(
+    const CameraState& liveCamera,
+    const PreparedAnimationPathEvaluationContext& path,
     float normalizedPosition,
     bool cameraFollowWasActive);
 // Feature timelines share the animation playhead but normally preserve an
