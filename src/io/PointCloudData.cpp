@@ -37,6 +37,7 @@ enum class PropertySemantic {
     PositionX,
     PositionY,
     PositionZ,
+    SourcePointIndex,
     ColorR,
     ColorG,
     ColorB,
@@ -270,6 +271,15 @@ std::optional<PointCloudLayout> BuildPointCloudLayout(const PlyHeader& header, s
         } else if (property.name == "z") {
             layoutEntry.semantic = PropertySemantic::PositionZ;
             sawZ = true;
+        } else if (property.name == kPointCloudSourceIndexPropertyName) {
+            if (layoutEntry.type != ScalarType::UInt32) {
+                if (errorMessage != nullptr) {
+                    *errorMessage =
+                        "The reserved point-cloud source-index property must be uint32.";
+                }
+                return std::nullopt;
+            }
+            layoutEntry.semantic = PropertySemantic::SourcePointIndex;
         } else if (property.name == "red") {
             layoutEntry.semantic = PropertySemantic::ColorR;
         } else if (property.name == "green") {
@@ -332,6 +342,50 @@ Float3 NormalizeNormal(Float3 normal) {
 std::size_t RecommendedPointsPerChunk(std::uint32_t recordSize) {
     constexpr std::size_t targetChunkBytes = 8U * 1024U * 1024U;
     return std::max<std::size_t>(1, targetChunkBytes / std::max<std::uint32_t>(1, recordSize));
+}
+
+std::vector<PointCloudSourceRange> NormalizePointCloudSourceRanges(
+    std::span<const PointCloudSourceRange> requested,
+    std::uint64_t vertexCount) {
+    if (requested.empty()) {
+        return {{.firstPoint = 0U, .pointCount = vertexCount}};
+    }
+    std::vector<PointCloudSourceRange> ranges;
+    ranges.reserve(requested.size());
+    for (const auto& range : requested) {
+        if (range.pointCount == 0U || range.firstPoint >= vertexCount) {
+            continue;
+        }
+        ranges.push_back({
+            .firstPoint = range.firstPoint,
+            .pointCount = std::min(
+                range.pointCount,
+                vertexCount - range.firstPoint),
+        });
+    }
+    std::sort(
+        ranges.begin(),
+        ranges.end(),
+        [](const auto& left, const auto& right) {
+            return left.firstPoint < right.firstPoint;
+        });
+    std::vector<PointCloudSourceRange> merged;
+    merged.reserve(ranges.size());
+    for (const auto& range : ranges) {
+        if (merged.empty()) {
+            merged.push_back(range);
+            continue;
+        }
+        auto& tail = merged.back();
+        const auto tailEnd = tail.firstPoint + tail.pointCount;
+        const auto rangeEnd = range.firstPoint + range.pointCount;
+        if (range.firstPoint <= tailEnd) {
+            tail.pointCount = std::max(tailEnd, rangeEnd) - tail.firstPoint;
+        } else {
+            merged.push_back(range);
+        }
+    }
+    return merged;
 }
 
 float MedianComponent(std::vector<float>* values) {
@@ -633,6 +687,10 @@ PointCloudLoadResult LoadPointCloud(
                             break;
                         case PropertySemantic::PositionZ:
                             position.z = readFloat(propertyBytes, property.type);
+                            break;
+                        case PropertySemantic::SourcePointIndex:
+                            // Full-cloud loads do not expose source-order
+                            // indices; the adaptive cache uses subset loads.
                             break;
                         case PropertySemantic::ColorR:
                             red = ReadScalarAsByte(propertyBytes, property.type);
@@ -1077,6 +1135,14 @@ PointCloudSubsetLoadResult LoadPointCloudSubset(
             .errorMessage = layoutError,
         };
     }
+    const auto normalizedSourceRanges =
+        NormalizePointCloudSourceRanges(
+            options.sourceRanges,
+            header.vertexCount);
+    std::uint64_t scanPointCount = 0U;
+    for (const auto& range : normalizedSourceRanges) {
+        scanPointCount += range.pointCount;
+    }
 
     PointCloudSubsetLoadResult result;
     result.sourcePointCount = header.vertexCount;
@@ -1194,11 +1260,11 @@ PointCloudSubsetLoadResult LoadPointCloudSubset(
     std::uint64_t reportedPoints = 0U;
     const auto reportProgress = [&]() {
         const auto scanned = std::min(
-            header.vertexCount,
+            scanPointCount,
             scannedPoints.load(std::memory_order_relaxed));
         if (options.progress && scanned > reportedPoints) {
             reportedPoints = scanned;
-            options.progress(scanned, header.vertexCount);
+            options.progress(scanned, scanPointCount);
         }
     };
     const auto parseRange = [&](std::uint64_t rangeBegin,
@@ -1278,6 +1344,8 @@ PointCloudSubsetLoadResult LoadPointCloudSubset(
                     ++out->includedCount;
 
                     Float3 normal{};
+                    std::uint32_t sourcePointIndex =
+                        static_cast<std::uint32_t>(globalIndex);
                     std::uint8_t red = 255U;
                     std::uint8_t green = 255U;
                     std::uint8_t blue = 255U;
@@ -1319,6 +1387,10 @@ PointCloudSubsetLoadResult LoadPointCloudSubset(
                                     propertyBytes,
                                     property.type);
                                 break;
+                            case PropertySemantic::SourcePointIndex:
+                                sourcePointIndex =
+                                    ReadScalar<std::uint32_t>(propertyBytes);
+                                break;
                             case PropertySemantic::ScalarField: {
                                 const auto slot = static_cast<std::size_t>(
                                     property.residentSlot);
@@ -1339,7 +1411,7 @@ PointCloudSubsetLoadResult LoadPointCloudSubset(
                     out->packedColors.push_back(
                         PackRgba8(red, green, blue));
                     out->sourceIndices.push_back(
-                        static_cast<std::uint32_t>(globalIndex));
+                        sourcePointIndex);
                     out->bounds.Expand(position);
                     if (out->focusSamples.size() < kMaxFocusSamples) {
                         out->focusSamples.push_back(position);
@@ -1367,9 +1439,9 @@ PointCloudSubsetLoadResult LoadPointCloudSubset(
         }
     };
 
-    // One range per worker, sized so small sources stay single-threaded; the
-    // calling thread parses the first range and then reports progress on
-    // behalf of the others.
+    // Split requested intervals into ordered work ranges. Workers claim
+    // ranges dynamically, while results are merged by range index so cached
+    // Morton order remains deterministic regardless of scheduling.
     constexpr std::uint64_t kMinimumPointsPerParseThread = 1'000'000ULL;
     const auto hardwareThreads =
         std::max(1U, std::thread::hardware_concurrency());
@@ -1379,50 +1451,73 @@ PointCloudSubsetLoadResult LoadPointCloudSubset(
               std::min(hardwareThreads, 8U),
               std::max<std::uint64_t>(
                   1ULL,
-                  header.vertexCount / kMinimumPointsPerParseThread)));
+                  scanPointCount / kMinimumPointsPerParseThread)));
     effectiveThreads = static_cast<unsigned>(std::min<std::uint64_t>(
         std::max(1U, effectiveThreads),
-        std::max<std::uint64_t>(1ULL, header.vertexCount)));
+        std::max<std::uint64_t>(1ULL, scanPointCount)));
+
+    std::vector<PointCloudSourceRange> workRanges;
+    if (scanPointCount > 0U) {
+        const auto targetPointsPerRange = std::max<std::uint64_t>(
+            1U,
+            (scanPointCount + effectiveThreads - 1U) /
+                effectiveThreads);
+        for (const auto& range : normalizedSourceRanges) {
+            std::uint64_t first = range.firstPoint;
+            std::uint64_t remaining = range.pointCount;
+            while (remaining > 0U) {
+                const auto count =
+                    std::min(remaining, targetPointsPerRange);
+                workRanges.push_back({
+                    .firstPoint = first,
+                    .pointCount = count,
+                });
+                first += count;
+                remaining -= count;
+            }
+        }
+        effectiveThreads = std::min<unsigned>(
+            effectiveThreads,
+            static_cast<unsigned>(workRanges.size()));
+    }
 
     if (options.progress) {
-        options.progress(0U, header.vertexCount);
+        options.progress(0U, scanPointCount);
     }
-    std::vector<RangeOutput> outputs(effectiveThreads);
-    {
+    std::vector<RangeOutput> outputs(workRanges.size());
+    if (!workRanges.empty()) {
         std::vector<std::jthread> workers;
         workers.reserve(effectiveThreads - 1U);
         std::atomic<unsigned> finishedWorkers{0U};
-        const auto pointsPerRange =
-            (header.vertexCount + effectiveThreads - 1U) / effectiveThreads;
+        std::atomic<std::size_t> nextRange{0U};
+        const auto runWorker = [&](bool reportsProgress) {
+            while (true) {
+                const auto rangeIndex =
+                    nextRange.fetch_add(1U, std::memory_order_relaxed);
+                if (rangeIndex >= workRanges.size()) {
+                    return;
+                }
+                const auto& range = workRanges[rangeIndex];
+                parseRange(
+                    range.firstPoint,
+                    range.firstPoint + range.pointCount,
+                    &outputs[rangeIndex],
+                    reportsProgress);
+            }
+        };
         for (unsigned workerIndex = 1U;
              workerIndex < effectiveThreads;
              ++workerIndex) {
-            const auto rangeBegin = std::min<std::uint64_t>(
-                header.vertexCount,
-                static_cast<std::uint64_t>(workerIndex) * pointsPerRange);
-            const auto rangeEnd = std::min<std::uint64_t>(
-                header.vertexCount,
-                rangeBegin + pointsPerRange);
             workers.emplace_back(
-                [&parseRange,
-                 rangeBegin,
-                 rangeEnd,
-                 &outputs,
+                [&runWorker,
                  &finishedWorkers,
                  workerIndex]() {
-                    parseRange(
-                        rangeBegin,
-                        rangeEnd,
-                        &outputs[workerIndex],
-                        false);
+                    (void)workerIndex;
+                    runWorker(false);
                     finishedWorkers.fetch_add(1U, std::memory_order_release);
                 });
         }
-        parseRange(
-            0U,
-            std::min<std::uint64_t>(header.vertexCount, pointsPerRange),
-            &outputs[0],
-            true);
+        runWorker(true);
         // Workers also leave early on error or cancellation, which the
         // finished count covers.
         reportProgress();
@@ -1450,9 +1545,9 @@ PointCloudSubsetLoadResult LoadPointCloudSubset(
         if (options.progress) {
             options.progress(
                 std::min(
-                    header.vertexCount,
+                    scanPointCount,
                     scannedPoints.load(std::memory_order_relaxed)),
-                header.vertexCount);
+                scanPointCount);
         }
         return result;
     }
@@ -1554,7 +1649,7 @@ PointCloudSubsetLoadResult LoadPointCloudSubset(
         return result;
     }
     if (options.progress) {
-        options.progress(header.vertexCount, header.vertexCount);
+        options.progress(scanPointCount, scanPointCount);
     }
     result.success = true;
     return result;

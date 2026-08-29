@@ -164,6 +164,7 @@ add_library(
     src/camera/AnimationPath.cpp
     src/camera/CameraPath.cpp
     src/camera/OrbitCamera.cpp
+    src/io/AdaptiveHqCache.cpp
     src/io/AssetDiscovery.cpp
     src/io/GaussianSplatData.cpp
     src/io/MeshData.cpp
@@ -329,6 +330,7 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
             invisible_places_tests
             tests/AnimationRegistryOrderTests.cpp
             tests/AnimationFocusTests.cpp
+            tests/AdaptiveHqCacheTests.cpp
             tests/AssetDiscoveryTests.cpp
             tests/CompositionGuideTests.cpp
             tests/LinkedHighQualityPreviewTests.cpp

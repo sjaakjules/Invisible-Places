@@ -13,6 +13,12 @@
 
 namespace invisible_places::io {
 
+// Reserved property written only by local spatial caches. Canonical/export
+// PLY files are never modified. When present, subset loads report this value
+// in sourcePointIndices instead of the cache file's reordered vertex index.
+inline constexpr std::string_view kPointCloudSourceIndexPropertyName =
+    "__invisible_places_source_index";
+
 struct Float3 {
     float x = 0.0F;
     float y = 0.0F;
@@ -137,6 +143,15 @@ struct PointCloudGridDecimation {
     float keepFraction = 1.0F;
 };
 
+// A contiguous fixed-record vertex interval. Empty sourceRanges retains the
+// historical full-file scan. Non-empty ranges are normalized, merged and
+// sought directly, which lets the adaptive-HQ cache read only intersecting
+// Morton blocks.
+struct PointCloudSourceRange {
+    std::uint64_t firstPoint = 0U;
+    std::uint64_t pointCount = 0U;
+};
+
 struct PointCloudSubsetLoadOptions {
     PointCloudScalarFieldFilter fieldFilter{};
     PointCloudSubsetPredicate includePoint{};
@@ -146,6 +161,7 @@ struct PointCloudSubsetLoadOptions {
     // hardware thread, at most eight, at least one million points each).
     unsigned threadCount = 0U;
     PointCloudGridDecimation gridDecimation{};
+    std::vector<PointCloudSourceRange> sourceRanges;
 };
 
 struct PointCloudSubsetLoadResult {
