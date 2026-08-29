@@ -6,6 +6,7 @@
 #include <glm/mat4x4.hpp>
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -81,6 +82,47 @@ enum class AdaptiveHqInteractionProfile : std::uint8_t {
     Navigation = 0,
     Timeline,
 };
+
+// Superseded CPU patches are retired into a bounded warm pool rather than
+// freed on a fixed grace. Reclaiming an exact-selection return from that pool
+// skips the multi-hundred-millisecond reassembly entirely; the pool budget
+// plus farthest-first release under pressure bounds the retained bytes.
+constexpr std::uint64_t kAdaptiveHqRetiredPatchPoolByteBudget =
+    4ULL * 1024ULL * 1024ULL * 1024ULL;
+
+// The per-role decoded-block fringe and the retired-patch pool are sized for
+// a 64 GiB unified-memory Mac. Smaller machines scale both down so the aHQ
+// working set stays near a quarter of physical memory, leaving the remainder
+// for the resident 5 mm baseline, scalar fields, and the GPU share of
+// unified memory.
+struct AdaptiveHqMemoryBudget {
+    std::uint64_t retainedFringeBytesPerRole =
+        kAdaptiveHqRetainedFringeByteBudgetPerRole;
+    std::uint64_t retiredPatchPoolBytes =
+        kAdaptiveHqRetiredPatchPoolByteBudget;
+};
+
+// Physical RAM in bytes, or 0 when it cannot be determined.
+[[nodiscard]] std::uint64_t DetectPhysicalMemoryBytes();
+
+[[nodiscard]] AdaptiveHqMemoryBudget ResolveAdaptiveHqMemoryBudget(
+    std::uint64_t physicalMemoryBytes);
+
+// Warm-pool retention tiers by guard displacement. Subtle movement within an
+// area keeps superseded patches reusable for minutes; a section move keeps
+// them briefly for an immediate return; a teleport far outside the prepared
+// depth demotes them soonest. Memory pressure always overrides the holds by
+// releasing the farthest retired patch first.
+struct AdaptiveHqRetiredPatchHold {
+    std::chrono::milliseconds minimumHold{250};
+    std::chrono::milliseconds maximumHold{std::chrono::minutes{5}};
+};
+
+[[nodiscard]] AdaptiveHqRetiredPatchHold
+ResolveAdaptiveHqRetiredPatchHold(
+    AdaptiveHqInteractionProfile interactionProfile,
+    float guardDisplacementMeters,
+    float preparedGuardDepthMeters);
 
 struct AdaptiveHqFiveMillimeterGuardRetention {
     std::vector<std::uint32_t> indices;

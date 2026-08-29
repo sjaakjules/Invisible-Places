@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <set>
 #include <stop_token>
 #include <string>
@@ -957,4 +958,99 @@ TEST_CASE(
             0.75F);
     REQUIRE(degenerate.size() == 1U);
     CHECK(degenerate.front() == 0.0F);
+}
+
+TEST_CASE(
+    "Adaptive HQ memory budget scales with physical memory",
+    "[pointcloud][linked-hq][adaptive-hq-policy]") {
+    constexpr std::uint64_t kGiB = 1024ULL * 1024ULL * 1024ULL;
+
+    // Unknown physical memory keeps the validated 64 GiB-class defaults.
+    const auto unknown =
+        invisible_places::app::ResolveAdaptiveHqMemoryBudget(0U);
+    CHECK(unknown.retainedFringeBytesPerRole == 6ULL * kGiB);
+    CHECK(unknown.retiredPatchPoolBytes ==
+          invisible_places::app::kAdaptiveHqRetiredPatchPoolByteBudget);
+
+    // A 64 GiB machine keeps the defaults: the fringe-plus-pool working set
+    // is exactly a quarter of physical memory there.
+    const auto large =
+        invisible_places::app::ResolveAdaptiveHqMemoryBudget(64ULL * kGiB);
+    CHECK(large.retainedFringeBytesPerRole == 6ULL * kGiB);
+    CHECK(large.retiredPatchPoolBytes == 4ULL * kGiB);
+
+    // A 32 GiB machine halves both budgets so the working set stays near a
+    // quarter of physical memory.
+    const auto medium =
+        invisible_places::app::ResolveAdaptiveHqMemoryBudget(32ULL * kGiB);
+    CHECK(medium.retainedFringeBytesPerRole == 3ULL * kGiB);
+    CHECK(medium.retiredPatchPoolBytes == 2ULL * kGiB);
+
+    // Small machines keep functional floors instead of thrashing caches.
+    const auto tiny =
+        invisible_places::app::ResolveAdaptiveHqMemoryBudget(4ULL * kGiB);
+    CHECK(tiny.retainedFringeBytesPerRole == kGiB);
+    CHECK(tiny.retiredPatchPoolBytes == kGiB / 2ULL);
+
+    // Budgets never exceed the defaults on very large machines.
+    const auto huge =
+        invisible_places::app::ResolveAdaptiveHqMemoryBudget(256ULL * kGiB);
+    CHECK(huge.retainedFringeBytesPerRole == 6ULL * kGiB);
+    CHECK(huge.retiredPatchPoolBytes == 4ULL * kGiB);
+
+    // The running machine reports some physical memory on every supported
+    // platform this suite runs on.
+    CHECK(invisible_places::app::DetectPhysicalMemoryBytes() > 0U);
+}
+
+TEST_CASE(
+    "Adaptive HQ retired patch holds follow guard displacement tiers",
+    "[pointcloud][linked-hq][adaptive-hq-policy]") {
+    using invisible_places::app::AdaptiveHqInteractionProfile;
+    using invisible_places::app::ResolveAdaptiveHqRetiredPatchHold;
+
+    // Dwell: subtle movement within the prepared depth keeps the superseded
+    // patch reclaimable for minutes.
+    const auto dwell = ResolveAdaptiveHqRetiredPatchHold(
+        AdaptiveHqInteractionProfile::Timeline,
+        2.0F,
+        10.0F);
+    CHECK(dwell.minimumHold == std::chrono::milliseconds{1500});
+    CHECK(dwell.maximumHold == std::chrono::minutes{5});
+
+    const auto dwellNavigation = ResolveAdaptiveHqRetiredPatchHold(
+        AdaptiveHqInteractionProfile::Navigation,
+        2.0F,
+        10.0F);
+    CHECK(dwellNavigation.minimumHold == std::chrono::milliseconds{250});
+    CHECK(dwellNavigation.maximumHold == std::chrono::minutes{5});
+
+    // Section move: a couple of guard depths away still supports a quick
+    // return.
+    const auto section = ResolveAdaptiveHqRetiredPatchHold(
+        AdaptiveHqInteractionProfile::Timeline,
+        30.0F,
+        10.0F);
+    CHECK(section.maximumHold == std::chrono::minutes{2});
+
+    // Teleport: far outside the prepared depth demotes soonest.
+    const auto teleport = ResolveAdaptiveHqRetiredPatchHold(
+        AdaptiveHqInteractionProfile::Navigation,
+        100.0F,
+        10.0F);
+    CHECK(teleport.maximumHold == std::chrono::minutes{1});
+
+    // Degenerate depth and displacement values stay well-defined: an unknown
+    // displacement is treated as a dwell so a fresh publish is never rushed
+    // out of the pool, and a missing depth falls back to a 1 m scale.
+    const auto degenerate = ResolveAdaptiveHqRetiredPatchHold(
+        AdaptiveHqInteractionProfile::Timeline,
+        std::numeric_limits<float>::quiet_NaN(),
+        0.0F);
+    CHECK(degenerate.maximumHold == std::chrono::minutes{5});
+    const auto missingDepth = ResolveAdaptiveHqRetiredPatchHold(
+        AdaptiveHqInteractionProfile::Timeline,
+        5.0F,
+        std::numeric_limits<float>::quiet_NaN());
+    CHECK(missingDepth.maximumHold == std::chrono::minutes{1});
 }

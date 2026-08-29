@@ -2278,6 +2278,20 @@ PointCloudSubsetLoadResult AssembleAdaptiveHqCacheSubset(
     }
 
     nextBlock.store(0U, std::memory_order_release);
+    // Bounds and per-field ranges are folded into the parallel copy while the
+    // block payloads are already hot in cache. The former dedicated serial
+    // passes re-walked every position and every field column of a
+    // multi-million-point patch and dominated warm assembly time.
+    struct SlotFieldRange {
+        float minimum = 0.0F;
+        float maximum = 0.0F;
+        std::uint64_t count = 0U;
+        bool valid = false;
+    };
+    const auto fieldCount = reference.scalarFields.size();
+    std::vector<Bounds3f> slotBounds(activeBlockIndices.size());
+    std::vector<SlotFieldRange> slotFieldRanges(
+        activeBlockIndices.size() * fieldCount);
     const auto copyBlocks = [&]() {
         while (!cancelled.load(std::memory_order_acquire)) {
             const auto slot = nextBlock.fetch_add(
@@ -2290,6 +2304,7 @@ PointCloudSubsetLoadResult AssembleAdaptiveHqCacheSubset(
             const auto& blockResult = *residentByIndex[blockIndex]->points;
             const auto& blockCloud = blockResult.cloud;
             const auto& included = includedByBlock[slot];
+            auto& bounds = slotBounds[slot];
             std::size_t destination = blockOffsets[slot];
             for (const auto& range : included) {
                 if (stopToken.stop_requested()) {
@@ -2304,6 +2319,21 @@ PointCloudSubsetLoadResult AssembleAdaptiveHqCacheSubset(
                     blockCloud.positions.begin() + source,
                     count,
                     result.cloud.positions.begin() + destination);
+                for (std::size_t local = 0U; local < count; ++local) {
+                    const auto& point = blockCloud.positions[source + local];
+                    if (!bounds.valid) {
+                        bounds.minimum = point;
+                        bounds.maximum = point;
+                        bounds.valid = true;
+                        continue;
+                    }
+                    bounds.minimum.x = std::min(bounds.minimum.x, point.x);
+                    bounds.minimum.y = std::min(bounds.minimum.y, point.y);
+                    bounds.minimum.z = std::min(bounds.minimum.z, point.z);
+                    bounds.maximum.x = std::max(bounds.maximum.x, point.x);
+                    bounds.maximum.y = std::max(bounds.maximum.y, point.y);
+                    bounds.maximum.z = std::max(bounds.maximum.z, point.z);
+                }
                 std::copy_n(
                     blockCloud.packedColors.begin() + source,
                     count,
@@ -2319,18 +2349,36 @@ PointCloudSubsetLoadResult AssembleAdaptiveHqCacheSubset(
                         result.cloud.normals.begin() + destination);
                 }
                 for (std::size_t field = 0U;
-                     field < reference.scalarFields.size();
+                     field < fieldCount;
                      ++field) {
+                    const auto* values = blockCloud.scalarFieldValues.data() +
+                        blockCloud.ScalarFieldValueIndex(field, source);
                     std::copy_n(
-                        blockCloud.scalarFieldValues.begin() +
-                            static_cast<std::ptrdiff_t>(
-                                blockCloud.ScalarFieldValueIndex(
-                                    field,
-                                    source)),
+                        values,
                         count,
                         result.cloud.scalarFieldValues.begin() +
                             static_cast<std::ptrdiff_t>(
                                 field * includedCount + destination));
+                    auto& fieldRange =
+                        slotFieldRanges[slot * fieldCount + field];
+                    for (std::size_t local = 0U; local < count; ++local) {
+                        const float value = values[local];
+                        if (!std::isfinite(value)) {
+                            continue;
+                        }
+                        if (!fieldRange.valid) {
+                            fieldRange.minimum = value;
+                            fieldRange.maximum = value;
+                            fieldRange.count = 1U;
+                            fieldRange.valid = true;
+                            continue;
+                        }
+                        fieldRange.minimum =
+                            std::min(fieldRange.minimum, value);
+                        fieldRange.maximum =
+                            std::max(fieldRange.maximum, value);
+                        ++fieldRange.count;
+                    }
                 }
                 destination += count;
             }
@@ -2388,8 +2436,12 @@ PointCloudSubsetLoadResult AssembleAdaptiveHqCacheSubset(
     }
 
     result.cloud.bounds = {};
-    for (const auto& point : result.cloud.positions) {
-        result.cloud.bounds.Expand(point);
+    for (const auto& bounds : slotBounds) {
+        if (!bounds.valid) {
+            continue;
+        }
+        result.cloud.bounds.Expand(bounds.minimum);
+        result.cloud.bounds.Expand(bounds.maximum);
     }
     if (result.cloud.bounds.valid) {
         result.cloud.focusPoint = {
@@ -2410,14 +2462,24 @@ PointCloudSubsetLoadResult AssembleAdaptiveHqCacheSubset(
         stats.maximum = 0.0F;
         stats.count = 0U;
         stats.valid = false;
-        const auto valuesBegin =
-            result.cloud.scalarFieldValues.begin() +
-            static_cast<std::ptrdiff_t>(
-                field * result.cloud.PointCount());
-        const auto valuesEnd = valuesBegin +
-            static_cast<std::ptrdiff_t>(result.cloud.PointCount());
-        for (auto value = valuesBegin; value != valuesEnd; ++value) {
-            stats.Include(*value);
+        for (std::size_t slot = 0U;
+             slot < activeBlockIndices.size();
+             ++slot) {
+            const auto& fieldRange =
+                slotFieldRanges[slot * fieldCount + field];
+            if (!fieldRange.valid) {
+                continue;
+            }
+            if (!stats.valid) {
+                stats.minimum = fieldRange.minimum;
+                stats.maximum = fieldRange.maximum;
+                stats.count = fieldRange.count;
+                stats.valid = true;
+                continue;
+            }
+            stats.minimum = std::min(stats.minimum, fieldRange.minimum);
+            stats.maximum = std::max(stats.maximum, fieldRange.maximum);
+            stats.count += fieldRange.count;
         }
     }
     if (!DecimatePointCloudSubsetByGrid(

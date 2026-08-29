@@ -77,6 +77,44 @@ void WriteAdaptiveFixture(const std::filesystem::path& path) {
     REQUIRE(output.good());
 }
 
+// Reference recomputation for the assembled subset's derived metadata. The
+// assembly path folds these into its parallel copy, so the tests re-derive
+// them naively from the final point data.
+void CheckAssembledDerivedMetadata(
+    const invisible_places::io::PointCloudSubsetLoadResult& assembled) {
+    invisible_places::io::Bounds3f expectedBounds;
+    for (const auto& point : assembled.cloud.positions) {
+        expectedBounds.Expand(point);
+    }
+    REQUIRE(assembled.cloud.bounds.valid == expectedBounds.valid);
+    if (expectedBounds.valid) {
+        CHECK(assembled.cloud.bounds.minimum.x == expectedBounds.minimum.x);
+        CHECK(assembled.cloud.bounds.minimum.y == expectedBounds.minimum.y);
+        CHECK(assembled.cloud.bounds.minimum.z == expectedBounds.minimum.z);
+        CHECK(assembled.cloud.bounds.maximum.x == expectedBounds.maximum.x);
+        CHECK(assembled.cloud.bounds.maximum.y == expectedBounds.maximum.y);
+        CHECK(assembled.cloud.bounds.maximum.z == expectedBounds.maximum.z);
+    }
+    for (std::size_t field = 0U;
+         field < assembled.cloud.scalarFields.size();
+         ++field) {
+        invisible_places::io::ScalarFieldStats expected;
+        for (std::size_t point = 0U;
+             point < assembled.cloud.PointCount();
+             ++point) {
+            expected.Include(assembled.cloud.scalarFieldValues[
+                assembled.cloud.ScalarFieldValueIndex(field, point)]);
+        }
+        const auto& stats = assembled.cloud.scalarFields[field];
+        REQUIRE(stats.valid == expected.valid);
+        CHECK(stats.count == expected.count);
+        if (expected.valid) {
+            CHECK(stats.minimum == expected.minimum);
+            CHECK(stats.maximum == expected.maximum);
+        }
+    }
+}
+
 std::vector<float> FieldValues(
     const invisible_places::io::LoadedPointCloud& cloud,
     std::string_view name) {
@@ -268,6 +306,7 @@ TEST_CASE(
             });
     REQUIRE(assembled.success);
     REQUIRE_FALSE(assembled.sourcePointIndices.empty());
+    CheckAssembledDerivedMetadata(assembled);
     CHECK(std::is_sorted(
         assembled.sourcePointIndices.begin(),
         assembled.sourcePointIndices.end()));
@@ -310,6 +349,7 @@ TEST_CASE(
             {},
             false);
     REQUIRE(mortonAssembled.success);
+    CheckAssembledDerivedMetadata(mortonAssembled);
     CHECK(mortonAssembled.sourcePointIndices == expectedMortonOrder);
     const auto mortonHeat = FieldValues(
         mortonAssembled.cloud,
@@ -347,6 +387,7 @@ TEST_CASE(
                 return bounds.minimum.y < 5.0F;
             });
     REQUIRE(microBlockAssembled.success);
+    CheckAssembledDerivedMetadata(microBlockAssembled);
     CHECK(pointPredicateCalls.load() == 0U);
     CHECK(microBlockAssembled.cloud.PointCount() >=
           mortonAssembled.cloud.PointCount());

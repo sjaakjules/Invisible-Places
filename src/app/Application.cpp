@@ -3837,10 +3837,18 @@ struct LinkedHqPatchJobOutput {
     std::size_t baseSessionIndex = 0U;
     std::size_t sourceSessionIndex = 0U;
     invisible_places::io::PointCloudSubsetLoadResult subset;
+    // Set instead of `subset` when an identical retired patch was reclaimed
+    // from the warm pool; publication reuses the retained CPU payload rather
+    // than moving a freshly assembled one.
+    std::shared_ptr<invisible_places::io::LoadedPointCloud> reusedWarmCloud;
+    std::shared_ptr<const std::vector<std::uint32_t>>
+        reusedWarmSourcePointIndices;
+    std::uint64_t reusedWarmIncludedPointCount = 0U;
     std::vector<std::uint32_t> fiveMillimeterOutsideIndices;
     std::optional<invisible_places::io::AdaptiveHqCacheIndex>
         adaptiveCacheIndex;
     std::uint64_t adaptiveFieldFilterFingerprint = 0U;
+    std::uint64_t adaptiveSelectionFingerprint = 0U;
     std::vector<std::uint32_t> adaptiveActiveBlockIndices;
     std::vector<invisible_places::io::AdaptiveHqResidentBlock>
         adaptiveResidentBlocks;
@@ -3910,22 +3918,25 @@ struct LinkedHqPatchRuntime {
     double adaptiveCacheOpenMilliseconds = 0.0;
     double adaptiveBlockLoadMilliseconds = 0.0;
     double adaptiveAssemblyMilliseconds = 0.0;
+    double adaptivePublishUploadMilliseconds = 0.0;
+    bool adaptiveReusedWarmPatch = false;
+    // Deterministic identity of the assembled patch: cache content, scalar
+    // filter, spacing, active blocks, and the guarded frustum union. Retired
+    // patches keep it so an exact-selection return can skip reassembly.
+    std::uint64_t adaptiveSelectionFingerprint = 0U;
     bool uploaded = false;
 };
-
-constexpr std::uint64_t kLinkedHqRetiredPatchByteBudget =
-    4ULL * 1024ULL * 1024ULL * 1024ULL;
-constexpr auto kLinkedHqNavigationRetirementGrace =
-    std::chrono::milliseconds{250};
-constexpr auto kLinkedHqTimelineRetirementGrace =
-    std::chrono::milliseconds{1500};
 
 struct LinkedHqRetiredPatchBatch {
     std::vector<LinkedHqPatchRuntime> patches;
     invisible_places::io::Float3 cameraPosition{};
     std::uint64_t estimatedBytes = 0U;
     std::uint64_t serial = 0U;
+    // Warm-pool lifetime: the batch is protected until releaseAfter, retained
+    // for exact-selection reuse until poolExpireAt, and released early only
+    // by byte-budget pressure (farthest from the current camera first).
     std::chrono::steady_clock::time_point releaseAfter{};
+    std::chrono::steady_clock::time_point poolExpireAt{};
 };
 
 struct LinkedHqPatchRetirementShared {
@@ -3935,12 +3946,18 @@ struct LinkedHqPatchRetirementShared {
     invisible_places::io::Float3 currentCameraPosition{};
     std::uint64_t queuedBytes = 0U;
     std::uint64_t nextSerial = 1U;
+    std::uint64_t poolByteBudget = kAdaptiveHqRetiredPatchPoolByteBudget;
 };
 
 struct LinkedHqAdaptiveCacheSnapshot {
     std::size_t layerId = std::numeric_limits<std::size_t>::max();
     std::string cacheFingerprint;
     std::uint64_t fieldFilterFingerprint = 0U;
+    // Parsed sidecar retained across guard refreshes. A source whose full
+    // identity (path, size, mtime, schema, sampled content, count, record
+    // size) is unchanged revalidates exactly what a disk open would check,
+    // so the block index JSON is not re-read on every camera refresh.
+    std::optional<invisible_places::io::AdaptiveHqCacheIndex> cacheIndex;
     std::vector<invisible_places::io::AdaptiveHqResidentBlock>
         residentBlocks;
 };
@@ -4006,6 +4023,13 @@ struct LinkedHqPreviewRuntime {
                invisible_places::scene::kScenePointCloudRoleCount>
         publishedFiveMillimeterSessionIndices{};
     double fiveMillimeterGuardPreparationMilliseconds = 0.0;
+    // Render-thread publication breakdown for the latest publish: GPU patch
+    // uploads, the coarse-guard history merge, mask activation (mode set and
+    // 5 mm mask/surfel install), and the complete publish window.
+    double publishUploadMilliseconds = 0.0;
+    double publishGuardRetentionMilliseconds = 0.0;
+    double publishActivationMilliseconds = 0.0;
+    double publishTotalMilliseconds = 0.0;
     bool adaptiveBaseGuardApplied = false;
     std::uint64_t fiveMillimeterMaskRevision = 0U;
     std::uint64_t appliedFiveMillimeterMaskRevision = 0U;
@@ -58259,16 +58283,19 @@ void RunLinkedHqPatchRetirementWorker(
             }
             const auto now = std::chrono::steady_clock::now();
             const bool memoryPressure =
-                shared->queuedBytes > kLinkedHqRetiredPatchByteBudget;
+                shared->queuedBytes > shared->poolByteBudget;
             std::size_t selected = shared->batches.size();
             double selectedDistance = -1.0;
-            auto nextRelease = shared->batches.front().releaseAfter;
+            auto nextRelease = shared->batches.front().poolExpireAt;
             for (std::size_t batch = 0U;
                  batch < shared->batches.size();
                  ++batch) {
                 const auto& candidate = shared->batches[batch];
-                nextRelease = std::min(nextRelease, candidate.releaseAfter);
-                if (!memoryPressure && candidate.releaseAfter > now) {
+                nextRelease = std::min(nextRelease, candidate.poolExpireAt);
+                // Under budget, a batch stays reclaimable for its complete
+                // warm-pool hold; pressure releases the farthest batch first
+                // regardless of holds.
+                if (!memoryPressure && candidate.poolExpireAt > now) {
                     continue;
                 }
                 const double distance = distanceSquared(
@@ -58331,18 +58358,59 @@ void RunLinkedHqPatchRetirementWorker(
     remaining.clear();
 }
 
-void QueueLinkedHqPatchRetirement(
-    LinkedHqPreviewRuntime* hq,
-    std::vector<LinkedHqPatchRuntime> patches,
-    const invisible_places::io::Float3& retiredCameraPosition,
-    AdaptiveHqInteractionProfile retiredInteractionProfile,
-    const invisible_places::io::Float3& currentCameraPosition) {
-    if (hq == nullptr || patches.empty()) {
+// Physical memory is stable for the process lifetime, so the derived aHQ
+// budgets are resolved once and shared by the preparation worker (decoded
+// fringe) and the retirement worker (warm patch pool).
+const AdaptiveHqMemoryBudget& ResolvedAdaptiveHqMemoryBudget() {
+    static const AdaptiveHqMemoryBudget budget =
+        ResolveAdaptiveHqMemoryBudget(DetectPhysicalMemoryBytes());
+    return budget;
+}
+
+// Deterministic identity of an assembled adaptive patch. Everything that can
+// change the assembled payload participates: the validated cache content,
+// the scalar-column selection, the patch spacing (decimation), the guarded
+// frustum union, and the exact active block set.
+std::uint64_t ComputeAdaptiveHqSelectionFingerprint(
+    const std::string& cacheFingerprint,
+    std::uint64_t fieldFilterFingerprint,
+    std::uint32_t patchSpacingMicrometres,
+    const LinkedHqFrustumUnion& frustums,
+    std::span<const std::uint32_t> activeBlocks) {
+    constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
+    std::uint64_t hash = 1469598103934665603ULL;
+    const auto hashBytes = [&](const void* bytes, std::size_t byteCount) {
+        const auto* data = static_cast<const unsigned char*>(bytes);
+        for (std::size_t index = 0U; index < byteCount; ++index) {
+            hash ^= static_cast<std::uint64_t>(data[index]);
+            hash *= kFnvPrime;
+        }
+    };
+    hashBytes(cacheFingerprint.data(), cacheFingerprint.size());
+    hashBytes(&fieldFilterFingerprint, sizeof(fieldFilterFingerprint));
+    hashBytes(&patchSpacingMicrometres, sizeof(patchSpacingMicrometres));
+    hashBytes(&frustums.borderFraction, sizeof(frustums.borderFraction));
+    hashBytes(
+        &frustums.maximumViewDepthMeters,
+        sizeof(frustums.maximumViewDepthMeters));
+    for (const auto& matrix : frustums.viewProjections) {
+        hashBytes(&matrix, sizeof(matrix));
+    }
+    hashBytes(
+        activeBlocks.data(),
+        activeBlocks.size() * sizeof(std::uint32_t));
+    return hash == 0U ? 1U : hash;
+}
+
+void EnsureLinkedHqPatchRetirementWorker(LinkedHqPreviewRuntime* hq) {
+    if (hq == nullptr) {
         return;
     }
     if (hq->patchRetirementShared == nullptr) {
         hq->patchRetirementShared =
             std::make_shared<LinkedHqPatchRetirementShared>();
+        hq->patchRetirementShared->poolByteBudget =
+            ResolvedAdaptiveHqMemoryBudget().retiredPatchPoolBytes;
     }
     if (!hq->patchRetirementWorker.joinable()) {
         const auto shared = hq->patchRetirementShared;
@@ -58351,6 +58419,71 @@ void QueueLinkedHqPatchRetirement(
                 RunLinkedHqPatchRetirementWorker(shared, stopToken);
             }};
     }
+}
+
+// Reclaims one retired patch whose deterministic selection fingerprint
+// matches the new request, transferring its CPU payload out of the warm pool
+// so the preparation worker can skip block classification and reassembly.
+std::optional<LinkedHqPatchRuntime> TryReclaimRetiredLinkedHqPatch(
+    const std::shared_ptr<LinkedHqPatchRetirementShared>& shared,
+    std::size_t layerId,
+    std::uint64_t selectionFingerprint) {
+    if (shared == nullptr || selectionFingerprint == 0U) {
+        return std::nullopt;
+    }
+    std::scoped_lock lock{shared->mutex};
+    for (std::size_t batch = 0U; batch < shared->batches.size(); ++batch) {
+        auto& candidate = shared->batches[batch];
+        for (std::size_t patch = 0U;
+             patch < candidate.patches.size();
+             ++patch) {
+            auto& retired = candidate.patches[patch];
+            if (retired.layerId != layerId ||
+                retired.adaptiveSelectionFingerprint !=
+                    selectionFingerprint ||
+                retired.cloud == nullptr) {
+                continue;
+            }
+            LinkedHqPatchRuntime reclaimed = std::move(retired);
+            candidate.patches.erase(
+                candidate.patches.begin() +
+                static_cast<std::ptrdiff_t>(patch));
+            const auto reclaimedBytes =
+                LinkedHqPatchPayloadBytes(reclaimed);
+            candidate.estimatedBytes =
+                reclaimedBytes > candidate.estimatedBytes
+                    ? 0U
+                    : candidate.estimatedBytes - reclaimedBytes;
+            shared->queuedBytes =
+                reclaimedBytes > shared->queuedBytes
+                    ? 0U
+                    : shared->queuedBytes - reclaimedBytes;
+            if (candidate.patches.empty()) {
+                shared->queuedBytes =
+                    candidate.estimatedBytes > shared->queuedBytes
+                        ? 0U
+                        : shared->queuedBytes - candidate.estimatedBytes;
+                shared->batches.erase(
+                    shared->batches.begin() +
+                    static_cast<std::ptrdiff_t>(batch));
+            }
+            return reclaimed;
+        }
+    }
+    return std::nullopt;
+}
+
+void QueueLinkedHqPatchRetirement(
+    LinkedHqPreviewRuntime* hq,
+    std::vector<LinkedHqPatchRuntime> patches,
+    const invisible_places::io::Float3& retiredCameraPosition,
+    AdaptiveHqInteractionProfile retiredInteractionProfile,
+    const invisible_places::io::Float3& currentCameraPosition,
+    float preparedGuardDepthMeters) {
+    if (hq == nullptr || patches.empty()) {
+        return;
+    }
+    EnsureLinkedHqPatchRetirementWorker(hq);
     std::uint64_t estimatedBytes = 0U;
     for (const auto& patch : patches) {
         const auto patchBytes = LinkedHqPatchPayloadBytes(patch);
@@ -58361,11 +58494,34 @@ void QueueLinkedHqPatchRetirement(
                 ? std::numeric_limits<std::uint64_t>::max()
                 : estimatedBytes + patchBytes;
     }
-    const auto grace =
-        retiredInteractionProfile ==
-                AdaptiveHqInteractionProfile::Timeline
-            ? kLinkedHqTimelineRetirementGrace
-            : kLinkedHqNavigationRetirementGrace;
+    const auto displacement = [&]() {
+        const double dx = static_cast<double>(retiredCameraPosition.x) -
+            currentCameraPosition.x;
+        const double dy = static_cast<double>(retiredCameraPosition.y) -
+            currentCameraPosition.y;
+        const double dz = static_cast<double>(retiredCameraPosition.z) -
+            currentCameraPosition.z;
+        return static_cast<float>(
+            std::sqrt(dx * dx + dy * dy + dz * dz));
+    }();
+    auto hold = ResolveAdaptiveHqRetiredPatchHold(
+        retiredInteractionProfile,
+        displacement,
+        preparedGuardDepthMeters);
+    // Only adaptive patches carry a deterministic selection fingerprint, so
+    // only they can ever be reclaimed from the warm pool. Fixed-HQ patches
+    // (potentially several GiB of full-path union) keep the original short
+    // release grace instead of idling in the pool.
+    const bool warmPoolEligible = std::any_of(
+        patches.begin(),
+        patches.end(),
+        [](const LinkedHqPatchRuntime& patch) {
+            return patch.adaptiveSelectionFingerprint != 0U &&
+                patch.cloud != nullptr;
+        });
+    if (!warmPoolEligible) {
+        hold.maximumHold = hold.minimumHold;
+    }
     std::uint64_t queuedBytes = 0U;
     {
         std::scoped_lock lock{hq->patchRetirementShared->mutex};
@@ -58380,12 +58536,14 @@ void QueueLinkedHqPatchRetirement(
                 ? std::numeric_limits<std::uint64_t>::max()
                 : hq->patchRetirementShared->queuedBytes + estimatedBytes;
         queuedBytes = hq->patchRetirementShared->queuedBytes;
+        const auto now = std::chrono::steady_clock::now();
         hq->patchRetirementShared->batches.push_back({
             .patches = std::move(patches),
             .cameraPosition = retiredCameraPosition,
             .estimatedBytes = estimatedBytes,
             .serial = serial,
-            .releaseAfter = std::chrono::steady_clock::now() + grace,
+            .releaseAfter = now + hold.minimumHold,
+            .poolExpireAt = now + hold.maximumHold,
         });
     }
     hq->patchRetirementShared->condition.notify_one();
@@ -58395,8 +58553,12 @@ void QueueLinkedHqPatchRetirement(
                       ? "timeline"
                       : "navigation")
               << " retirement (about " << FormatByteCount(estimatedBytes)
-              << ", queue " << FormatByteCount(queuedBytes) << ")."
-              << std::endl;
+              << ", queue " << FormatByteCount(queuedBytes)
+              << ", warm for "
+              << std::chrono::duration_cast<std::chrono::seconds>(
+                     hold.maximumHold)
+                     .count()
+              << " s)." << std::endl;
 }
 
 void ResetLinkedHqPreview(
@@ -58536,6 +58698,12 @@ void StartLinkedHqPreparation(
         request.mode == LinkedHqPreviewMode::Adaptive
             ? hq.nextAdaptiveBlockUseSerial++
             : 0U;
+    if (request.mode == LinkedHqPreviewMode::Adaptive) {
+        // The preparation worker consults the warm retired-patch pool, so
+        // the pool must exist before the job starts.
+        EnsureLinkedHqPatchRetirementWorker(&hq);
+    }
+    const auto retirementShared = hq.patchRetirementShared;
     std::vector<LinkedHqAdaptiveCacheSnapshot> priorAdaptiveCaches;
     if (request.mode == LinkedHqPreviewMode::Adaptive) {
         priorAdaptiveCaches.reserve(hq.patches.size());
@@ -58549,6 +58717,7 @@ void StartLinkedHqPreparation(
                     patch.adaptiveCacheIndex->cacheFingerprint,
                 .fieldFilterFingerprint =
                     patch.adaptiveFieldFilterFingerprint,
+                .cacheIndex = patch.adaptiveCacheIndex,
                 .residentBlocks = patch.adaptiveResidentBlocks,
             });
         }
@@ -58642,7 +58811,8 @@ void StartLinkedHqPreparation(
              std::move(fiveMillimeterGridLookups),
          sourcePaths,
          priorAdaptiveCaches = std::move(priorAdaptiveCaches),
-         adaptiveUseSerial](std::stop_token stopToken) mutable {
+         adaptiveUseSerial,
+         retirementShared](std::stop_token stopToken) mutable {
 #ifdef __APPLE__
             (void)pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
 #endif
@@ -58709,22 +58879,41 @@ void StartLinkedHqPreparation(
                             };
                         const auto cacheOpenStarted =
                             std::chrono::steady_clock::now();
-                        const auto opened = invisible_places::io::
-                            OpenOrBuildAdaptiveHqCache(
-                                request.adaptiveCacheRoot,
-                                sourceIdentity,
-                                stopToken,
-                                [shared,
-                                 patch,
-                                 patchCount = patchRoles.size()](
-                                    float cacheProgress) {
-                                    PublishLinkedHqStageProgress(
-                                        shared,
-                                        LinkedHqPreparationStage::Scanning,
-                                        (static_cast<float>(patch) +
-                                         0.55F * cacheProgress) /
-                                            static_cast<float>(patchCount));
-                                });
+                        invisible_places::io::AdaptiveHqCacheOpenResult
+                            opened;
+                        const auto priorIndex = std::find_if(
+                            priorAdaptiveCaches.begin(),
+                            priorAdaptiveCaches.end(),
+                            [&](const LinkedHqAdaptiveCacheSnapshot& cache) {
+                                return cache.layerId ==
+                                           patchLayerIds[patch] &&
+                                       cache.cacheIndex.has_value() &&
+                                       cache.cacheIndex->source ==
+                                           sourceIdentity;
+                            });
+                        if (priorIndex != priorAdaptiveCaches.end()) {
+                            opened.index = *priorIndex->cacheIndex;
+                            opened.success = true;
+                        } else {
+                            opened = invisible_places::io::
+                                OpenOrBuildAdaptiveHqCache(
+                                    request.adaptiveCacheRoot,
+                                    sourceIdentity,
+                                    stopToken,
+                                    [shared,
+                                     patch,
+                                     patchCount = patchRoles.size()](
+                                        float cacheProgress) {
+                                        PublishLinkedHqStageProgress(
+                                            shared,
+                                            LinkedHqPreparationStage::
+                                                Scanning,
+                                            (static_cast<float>(patch) +
+                                             0.55F * cacheProgress) /
+                                                static_cast<float>(
+                                                    patchCount));
+                                    });
+                        }
                         output.adaptiveCacheOpenMilliseconds =
                             std::chrono::duration<double, std::milli>(
                                 std::chrono::steady_clock::now() -
@@ -58777,6 +58966,43 @@ void StartLinkedHqPreparation(
                             });
                         if (prior != priorAdaptiveCaches.end()) {
                             residentBlocks = prior->residentBlocks;
+                        }
+                        const auto selectionFingerprint =
+                            ComputeAdaptiveHqSelectionFingerprint(
+                                opened.index.cacheFingerprint,
+                                filterFingerprint,
+                                request.patchSpacingMicrometres,
+                                request.patchFrustums,
+                                activeBlocks);
+                        output.adaptiveSelectionFingerprint =
+                            selectionFingerprint;
+                        auto reclaimedWarmPatch =
+                            TryReclaimRetiredLinkedHqPatch(
+                                retirementShared,
+                                patchLayerIds[patch],
+                                selectionFingerprint);
+                        if (reclaimedWarmPatch.has_value()) {
+                            // The reclaimed patch's decoded blocks rejoin the
+                            // candidate set so the exact-return refresh also
+                            // restores full block residency for later moves.
+                            for (auto& block :
+                                 reclaimedWarmPatch->adaptiveResidentBlocks) {
+                                if (block.points == nullptr) {
+                                    continue;
+                                }
+                                const bool present = std::any_of(
+                                    residentBlocks.begin(),
+                                    residentBlocks.end(),
+                                    [&](const auto& existing) {
+                                        return existing.blockIndex ==
+                                                   block.blockIndex &&
+                                               existing.points != nullptr;
+                                    });
+                                if (!present) {
+                                    residentBlocks.push_back(
+                                        std::move(block));
+                                }
+                            }
                         }
 
                         std::vector<std::uint32_t> missingBlocks;
@@ -58962,9 +59188,23 @@ void StartLinkedHqPreparation(
                         auto retained = RetainAdaptiveHqResidentBlocks(
                             residentBlocks,
                             activeBlocks,
-                            kAdaptiveHqRetainedFringeByteBudgetPerRole,
+                            ResolvedAdaptiveHqMemoryBudget()
+                                .retainedFringeBytesPerRole,
                             request.interactionProfile);
 
+                        if (reclaimedWarmPatch.has_value()) {
+                            // Exact-selection return: the retired patch's
+                            // payload is byte-identical to what reassembly
+                            // would produce, so classification, copy, and
+                            // decimation are skipped entirely.
+                            output.reusedWarmCloud =
+                                std::move(reclaimedWarmPatch->cloud);
+                            output.reusedWarmSourcePointIndices =
+                                reclaimedWarmPatch->sourcePointIndices;
+                            output.reusedWarmIncludedPointCount =
+                                reclaimedWarmPatch->includedPointCount;
+                            output.adaptiveAssemblyMilliseconds = 0.0;
+                        } else {
                         invisible_places::io::PointCloudGridDecimation
                             decimation;
                         if (request.patchSpacingMicrometres > 1000U) {
@@ -59014,6 +59254,7 @@ void StartLinkedHqPreparation(
                                     : output.subset.errorMessage;
                             finish();
                             return;
+                        }
                         }
                         output.adaptiveCacheIndex = opened.index;
                         output.adaptiveFieldFilterFingerprint =
@@ -59410,8 +59651,17 @@ bool PollLinkedHqPreparation(
     const bool wasAdaptive = wasEnabled && hq.adaptiveEnabled;
     std::vector<LinkedHqPatchRuntime> published(
         completed->patches.size());
+    const auto publishStarted = std::chrono::steady_clock::now();
+    hq.publishUploadMilliseconds = 0.0;
+    hq.publishGuardRetentionMilliseconds = 0.0;
+    hq.publishActivationMilliseconds = 0.0;
+    // One depth-counted mutation batch spans the patch uploads and the mask
+    // activation below. Batches only settle the device when their depth
+    // reaches one, so this removes the second full device settle the old
+    // upload-batch-then-activation-batch publication paid per publish.
+    std::optional<PointCloudMutationBatchScope> publicationBatch;
     try {
-        PointCloudMutationBatchScope mutationBatch{viewport};
+        publicationBatch.emplace(viewport);
         for (std::size_t patch = 0U;
              patch < completed->patches.size();
              ++patch) {
@@ -59420,17 +59670,27 @@ bool PollLinkedHqPreparation(
             destination.layerId = source.layerId;
             destination.baseSessionIndex = source.baseSessionIndex;
             destination.sourceSessionIndex = source.sourceSessionIndex;
-            destination.sourcePointIndices =
-                std::make_shared<const std::vector<std::uint32_t>>(
-                    std::move(source.subset.sourcePointIndices));
+            if (source.reusedWarmCloud != nullptr) {
+                destination.sourcePointIndices =
+                    source.reusedWarmSourcePointIndices;
+                destination.includedPointCount =
+                    source.reusedWarmIncludedPointCount;
+                destination.adaptiveReusedWarmPatch = true;
+            } else {
+                destination.sourcePointIndices =
+                    std::make_shared<const std::vector<std::uint32_t>>(
+                        std::move(source.subset.sourcePointIndices));
+                destination.includedPointCount =
+                    source.subset.includedPointCount;
+            }
             destination.fiveMillimeterOutsideIndices =
                 std::move(source.fiveMillimeterOutsideIndices);
-            destination.includedPointCount =
-                source.subset.includedPointCount;
             destination.adaptiveCacheIndex =
                 std::move(source.adaptiveCacheIndex);
             destination.adaptiveFieldFilterFingerprint =
                 source.adaptiveFieldFilterFingerprint;
+            destination.adaptiveSelectionFingerprint =
+                source.adaptiveSelectionFingerprint;
             destination.adaptiveActiveBlockIndices =
                 std::move(source.adaptiveActiveBlockIndices);
             destination.adaptiveResidentBlocks =
@@ -59450,15 +59710,25 @@ bool PollLinkedHqPreparation(
                 source.adaptiveBlockLoadMilliseconds;
             destination.adaptiveAssemblyMilliseconds =
                 source.adaptiveAssemblyMilliseconds;
-            destination.cloud = std::make_shared<
-                invisible_places::io::LoadedPointCloud>(
-                    std::move(source.subset.cloud));
+            destination.cloud = source.reusedWarmCloud != nullptr
+                ? std::move(source.reusedWarmCloud)
+                : std::make_shared<
+                      invisible_places::io::LoadedPointCloud>(
+                          std::move(source.subset.cloud));
             if (destination.cloud->PointCount() > 0U) {
+                const auto uploadStarted =
+                    std::chrono::steady_clock::now();
                 viewport->UploadPointCloud(
                     destination.layerId,
                     *destination.cloud,
                     {});
                 destination.uploaded = true;
+                destination.adaptivePublishUploadMilliseconds =
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - uploadStarted)
+                        .count();
+                hq.publishUploadMilliseconds +=
+                    destination.adaptivePublishUploadMilliseconds;
             }
             hq.displayedProgress = std::max(
                 hq.displayedProgress,
@@ -59467,7 +59737,6 @@ bool PollLinkedHqPreparation(
                     static_cast<float>(patch + 1U) /
                         static_cast<float>(completed->patches.size())));
         }
-        mutationBatch.Finish();
     } catch (const std::exception& error) {
         try {
             PointCloudMutationBatchScope rollback{viewport};
@@ -59497,6 +59766,7 @@ bool PollLinkedHqPreparation(
         return false;
     }
 
+    const auto guardRetentionStarted = std::chrono::steady_clock::now();
     auto freshFiveMillimeterGuards =
         std::move(completed->fiveMillimeterGuardIndices);
     decltype(freshFiveMillimeterGuards) retainedFiveMillimeterGuards;
@@ -59535,6 +59805,10 @@ bool PollLinkedHqPreparation(
         retainedFiveMillimeterGuards[role] =
             std::move(retained.indices);
     }
+    hq.publishGuardRetentionMilliseconds =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - guardRetentionStarted)
+            .count();
 
     auto retiredPatches = std::move(hq.patches);
     hq.patches = std::move(published);
@@ -59543,7 +59817,8 @@ bool PollLinkedHqPreparation(
         std::move(retiredPatches),
         hq.publishedCameraPosition,
         hq.publishedInteractionProfile,
-        hq.request->cameraPosition);
+        hq.request->cameraPosition,
+        hq.request->adaptiveTransition.preparedFineDepthMeters);
     hq.fiveMillimeterGuardIndices =
         std::move(retainedFiveMillimeterGuards);
     hq.fiveMillimeterLatestGuardIndices =
@@ -59590,6 +59865,7 @@ bool PollLinkedHqPreparation(
     const auto publishMode = hq.request->mode;
     const bool requestedPublishedMode =
         hq.requestedMode == publishMode;
+    const auto activationStarted = std::chrono::steady_clock::now();
     if (requestedPublishedMode || wasEnabled || hq.reenableAfterPublish) {
         const auto mode = requestedPublishedMode
             ? hq.requestedMode
@@ -59598,6 +59874,18 @@ bool PollLinkedHqPreparation(
                    : LinkedHqPreviewMode::Fixed);
         (void)SetLinkedHqPreviewMode(runtimeState, viewport, mode);
     }
+    hq.publishActivationMilliseconds =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - activationStarted)
+            .count();
+    if (publicationBatch.has_value()) {
+        publicationBatch->Finish();
+        publicationBatch.reset();
+    }
+    hq.publishTotalMilliseconds =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - publishStarted)
+            .count();
     hq.reenableAfterPublish = false;
     hq.reenableAdaptiveAfterPublish = false;
     std::ostringstream patchSummary;
@@ -60136,6 +60424,13 @@ void EnsureLinkedHqPreview(
         }
     }
     constexpr auto kLinkedHqResolveInterval = std::chrono::milliseconds{500};
+    // Once the camera leaves the published refresh border a replacement is
+    // certain to be requested, so waiting out the full idle cadence only
+    // lengthens the visible-fallback window. The urgent cadence still bounds
+    // render-thread source re-fingerprinting while the camera keeps moving
+    // outside an expiring guard with no preparation running.
+    constexpr auto kLinkedHqUrgentResolveInterval =
+        std::chrono::milliseconds{100};
     const auto now = std::chrono::steady_clock::now();
     // Let a running cache build/block request finish against one immutable guard.
     // Re-targeting it every 500 ms while the user navigates would repeatedly
@@ -60145,9 +60440,27 @@ void EnsureLinkedHqPreview(
         hq.request.has_value() &&
         hq.request->mode == LinkedHqPreviewMode::Adaptive &&
         (hq.preparationShared != nullptr || hq.uploadPending.has_value());
+    const bool urgentRefreshDue = !adaptivePreparationActive &&
+        hq.ready && hq.request.has_value() &&
+        hq.request->mode == LinkedHqPreviewMode::Adaptive &&
+        hq.publishedFingerprint == hq.request->fingerprint &&
+        hq.publishedAdaptiveTransition.Valid() &&
+        !hq.publishedPatchFrustums.viewProjections.empty() &&
+        [&]() {
+            const auto matrices = runtimeState->camera.Matrices(
+                CurrentAspectRatio(*viewport));
+            return !LinkedHqFrustumUnionCoversView(
+                hq.publishedPatchFrustums,
+                matrices.view,
+                matrices.projection,
+                hq.publishedAdaptiveTransition.endDepthMeters,
+                kAdaptiveHqRefreshBorderFraction);
+        }();
     const bool resolveDue = !adaptivePreparationActive &&
         (!hq.request.has_value() || !hq.resolveTimestampValid ||
-         now - hq.lastResolveAt >= kLinkedHqResolveInterval);
+         now - hq.lastResolveAt >= kLinkedHqResolveInterval ||
+         (urgentRefreshDue &&
+          now - hq.lastResolveAt >= kLinkedHqUrgentResolveInterval));
     if (resolveDue) {
         hq.resolveTimestampValid = true;
         hq.lastResolveAt = now;
@@ -130993,6 +131306,9 @@ int RunAdaptiveHqSurfacePerformanceSmoke(
         outputDirectory / "adaptive-hq-surface05-performance.json";
     std::vector<std::string> passes;
     std::vector<std::string> failures;
+    const auto physicalMemoryBytes = DetectPhysicalMemoryBytes();
+    const auto memoryBudget =
+        ResolveAdaptiveHqMemoryBudget(physicalMemoryBytes);
     nlohmann::json report{
         {"scenario", options.scenario},
         {"passed", false},
@@ -131002,20 +131318,29 @@ int RunAdaptiveHqSurfacePerformanceSmoke(
            kAdaptiveHqRefreshBorderFraction},
           {"micro_block_point_count",
            invisible_places::io::kAdaptiveHqMicroBlockPointCount},
+          {"physical_memory_bytes", physicalMemoryBytes},
           {"retained_fringe_decoded_byte_budget_per_role",
-           kAdaptiveHqRetainedFringeByteBudgetPerRole},
+           memoryBudget.retainedFringeBytesPerRole},
           {"navigation_retained_guard_fraction",
            kAdaptiveHqNavigationRetainedGuardFraction},
           {"timeline_retained_guard_fraction",
            kAdaptiveHqTimelineRetainedGuardFraction},
           {"five_mm_guard_byte_budget_per_role",
            kAdaptiveHqFiveMillimeterGuardByteBudgetPerRole},
-          {"retired_patch_byte_budget",
-           kLinkedHqRetiredPatchByteBudget},
-          {"navigation_retirement_grace_ms",
-           kLinkedHqNavigationRetirementGrace.count()},
-          {"timeline_retirement_grace_ms",
-           kLinkedHqTimelineRetirementGrace.count()},
+          {"retired_patch_pool_byte_budget",
+           memoryBudget.retiredPatchPoolBytes},
+          {"warm_pool_dwell_hold_ms",
+           ResolveAdaptiveHqRetiredPatchHold(
+               AdaptiveHqInteractionProfile::Timeline,
+               0.0F,
+               1.0F)
+               .maximumHold.count()},
+          {"warm_pool_teleport_hold_ms",
+           ResolveAdaptiveHqRetiredPatchHold(
+               AdaptiveHqInteractionProfile::Timeline,
+               100.0F,
+               1.0F)
+               .maximumHold.count()},
           {"complete_animation_path_prefetch", false},
           {"parallel_block_readers",
            kAdaptiveHqBlockReadWorkerCount},
@@ -131271,6 +131596,9 @@ int RunAdaptiveHqSurfacePerformanceSmoke(
                  patch.adaptiveBlockLoadMilliseconds},
                 {"assembly_ms",
                  patch.adaptiveAssemblyMilliseconds},
+                {"publish_upload_ms",
+                 patch.adaptivePublishUploadMilliseconds},
+                {"reused_warm_patch", patch.adaptiveReusedWarmPatch},
             };
             if (patch.baseSessionIndex < runtimeState->sessions.size()) {
                 value["role"] = runtimeState
@@ -131284,6 +131612,19 @@ int RunAdaptiveHqSurfacePerformanceSmoke(
             patches.push_back(std::move(value));
         }
         return patches;
+    };
+    // Render-thread publication breakdown for the latest publish. Exposes
+    // the previously unattributed window between worker completion and the
+    // patch becoming visible.
+    const auto publishMetrics = [&]() {
+        const auto& hq = runtimeState->linkedHqPreview;
+        return nlohmann::json{
+            {"upload_ms", hq.publishUploadMilliseconds},
+            {"guard_retention_ms",
+             hq.publishGuardRetentionMilliseconds},
+            {"activation_ms", hq.publishActivationMilliseconds},
+            {"total_ms", hq.publishTotalMilliseconds},
+        };
     };
     const auto fiveMillimeterGuardMetrics = [&]() {
         const auto& hq = runtimeState->linkedHqPreview;
@@ -131386,6 +131727,7 @@ int RunAdaptiveHqSurfacePerformanceSmoke(
     report["initial_prepare"] = {
         {"wall_ms", initialPrepareMilliseconds},
         {"patches", patchMetrics()},
+        {"publish", publishMetrics()},
         {"five_mm_guard", fiveMillimeterGuardMetrics()},
     };
     const bool warmCache = std::all_of(
@@ -131597,6 +131939,7 @@ int RunAdaptiveHqSurfacePerformanceSmoke(
     std::vector<float> publishedJumpTargets;
     std::uint32_t warmReturnCount = 0U;
     std::uint32_t warmReturnMissingBlockCount = 0U;
+    std::uint32_t warmReturnReusedPatchCount = 0U;
     for (const float target : kJumpPositions) {
         const bool returningToPublishedTarget = std::find(
             publishedJumpTargets.begin(),
@@ -131667,13 +132010,18 @@ int RunAdaptiveHqSurfacePerformanceSmoke(
         totalJumpRetainedOverlayFrames += retainedOverlayFrames;
         totalJumpStaleFrames += staleFrames;
         std::uint32_t missingBlocks = 0U;
+        std::uint32_t reusedWarmPatches = 0U;
         for (const auto& patch :
              runtimeState->linkedHqPreview.patches) {
             missingBlocks += patch.adaptiveMissingBlockCount;
+            if (patch.adaptiveReusedWarmPatch) {
+                ++reusedWarmPatches;
+            }
         }
         if (published && returningToPublishedTarget) {
             ++warmReturnCount;
             warmReturnMissingBlockCount += missingBlocks;
+            warmReturnReusedPatchCount += reusedWarmPatches;
         }
         jumps.push_back({
             {"normalized_position", target},
@@ -131688,8 +132036,10 @@ int RunAdaptiveHqSurfacePerformanceSmoke(
             {"returning_to_warm_position",
              returningToPublishedTarget},
             {"missing_block_count", missingBlocks},
+            {"reused_warm_patch_count", reusedWarmPatches},
             {"changed_pixel_fraction", changedFraction},
             {"patches", patchMetrics()},
+            {"publish", publishMetrics()},
             {"five_mm_guard", fiveMillimeterGuardMetrics()},
         });
         if (!published) {
@@ -131715,6 +132065,8 @@ int RunAdaptiveHqSurfacePerformanceSmoke(
         {"warm_return_count", warmReturnCount},
         {"warm_return_missing_block_count",
          warmReturnMissingBlockCount},
+        {"warm_return_reused_patch_count",
+         warmReturnReusedPatchCount},
     };
     if (totalJumpStaleFrames == 0U &&
         maximumChangedPixelFraction > 0.05) {

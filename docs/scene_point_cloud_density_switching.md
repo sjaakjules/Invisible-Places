@@ -155,12 +155,18 @@ each intersecting block. The generation is published transactionally and
 never replaces the canonical/export-quality PLY or writes beside OneDrive.
 
 Later camera requests test the guarded frustum union against those block
-bounds and seek directly to only the intersecting ranges. Each decoded block
+bounds and seek directly to only the intersecting ranges. A request whose
+source identity is unchanged reuses the previously parsed block index rather
+than re-reading the sidecar JSON. Each decoded block
 is subdivided in memory into contiguous 128-point Morton micro-blocks. Their
 bounds conservatively accept intersecting ranges, replacing an exact test for
 every point while adding only a small boundary fringe; this does not change or
-invalidate existing schema-v2 disk caches. Active blocks always remain decoded.
-A 6 GiB RAM budget per role retains inactive blocks by camera distance first
+invalidate existing schema-v2 disk caches. Patch assembly folds bounds and
+per-field range computation into its parallel block copy, so no serial
+whole-patch pass remains. Active blocks always remain decoded.
+A per-role RAM budget (6 GiB on a 64 GiB machine, scaled so the aHQ working
+set stays near a quarter of physical memory on smaller machines) retains
+inactive blocks by camera distance first
 during navigation, or by recency first during animation playback and
 scrubbing, so returning to a nearby view normally reads only the new fringe.
 Cache reuse requires an exact source-path, byte-size, modification-time,
@@ -168,11 +174,28 @@ property-schema, point-count, record-size, and sampled-content identity match;
 any mismatch causes an automatic local rebuild.
 
 Replacement publication moves superseded CPU patch payloads to a retirement
-worker instead of freeing hundreds of MiB on the render thread. Navigation
-uses a 250 ms grace period; timeline work uses 1.5 seconds so nearby scrubs can
-reuse shared decoded blocks. A 4 GiB queue threshold applies memory pressure
-by releasing the farthest retired patch first. Failed replacements retain the
+worker instead of freeing hundreds of MiB on the render thread. Retired
+adaptive patches now form a warm pool keyed by a deterministic selection
+fingerprint (cache content, scalar filter, patch spacing, guarded frustums,
+and active block set): an exact-selection return reclaims the retained
+payload and skips block classification and reassembly entirely. Pool holds
+follow guard displacement — subtle movement within the prepared depth keeps a
+patch for five minutes, a section move for two, a teleport for one — while a
+RAM-scaled byte budget (4 GiB on a 64 GiB machine) always applies pressure by
+releasing the farthest retired patch first. Fixed-HQ patches keep the
+original short grace (250 ms navigation, 1.5 s timeline) because only
+adaptive patches carry a reusable fingerprint. Failed replacements retain the
 recoverable overlay and complete 5 mm coverage.
+
+Publication itself runs inside one depth-counted resource-mutation batch, so
+the patch upload and the coarse-mask activation share a single device settle.
+Once the camera leaves the published refresh border with no preparation
+running, the ordinary 500 ms re-resolve cadence tightens to 100 ms so the
+replacement request starts almost immediately. The performance smoke reports
+the render-thread publication window explicitly (`publish.upload_ms`,
+`guard_retention_ms`, `activation_ms`, `total_ms`) beside the existing
+per-patch cache/open/load/assembly stages, plus `reused_warm_patch` and the
+resolved memory budgets in its policy block.
 
 aHQ shares fixed HQ's saved patch-spacing and Sand preferences, Visual/effect
 resolution, hidden 5 mm baseline ownership, and export isolation. The selected

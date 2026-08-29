@@ -11,6 +11,15 @@
 #include <system_error>
 #include <unordered_set>
 
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#include <sys/types.h>
+#elif defined(_WIN32)
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
 #include <glm/vec4.hpp>
 #include <glm/geometric.hpp>
 #include <glm/matrix.hpp>
@@ -76,6 +85,100 @@ LinkedHqPatchDrawPolicy ResolveLinkedHqPatchDrawPolicy(
             adaptiveTransitionValid && adaptiveGuardCoversView,
         .retainingFineDuringRefresh = !adaptiveGuardCoversView,
     };
+}
+
+std::uint64_t DetectPhysicalMemoryBytes() {
+#if defined(__APPLE__)
+    std::uint64_t memoryBytes = 0U;
+    std::size_t size = sizeof(memoryBytes);
+    if (sysctlbyname("hw.memsize", &memoryBytes, &size, nullptr, 0U) == 0) {
+        return memoryBytes;
+    }
+    return 0U;
+#elif defined(_WIN32)
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    if (GlobalMemoryStatusEx(&status) != 0) {
+        return status.ullTotalPhys;
+    }
+    return 0U;
+#else
+    const long pageCount = sysconf(_SC_PHYS_PAGES);
+    const long pageSize = sysconf(_SC_PAGE_SIZE);
+    if (pageCount <= 0L || pageSize <= 0L) {
+        return 0U;
+    }
+    return static_cast<std::uint64_t>(pageCount) *
+        static_cast<std::uint64_t>(pageSize);
+#endif
+}
+
+AdaptiveHqMemoryBudget ResolveAdaptiveHqMemoryBudget(
+    std::uint64_t physicalMemoryBytes) {
+    AdaptiveHqMemoryBudget budget;
+    if (physicalMemoryBytes == 0U) {
+        return budget;
+    }
+    // The defaults were validated on a 64 GiB M1 Max, where the fringe plus
+    // pool working set is roughly a quarter of physical memory. Scale that
+    // target down proportionally on smaller machines, with floors that keep
+    // the caches functional rather than thrashing.
+    constexpr std::uint64_t kGiB = 1024ULL * 1024ULL * 1024ULL;
+    const std::uint64_t defaultWorkingSet =
+        budget.retainedFringeBytesPerRole * 2ULL +
+        budget.retiredPatchPoolBytes;
+    const std::uint64_t targetWorkingSet = std::min<std::uint64_t>(
+        defaultWorkingSet,
+        physicalMemoryBytes / 4ULL);
+    if (targetWorkingSet >= defaultWorkingSet) {
+        return budget;
+    }
+    const double scale = static_cast<double>(targetWorkingSet) /
+        static_cast<double>(defaultWorkingSet);
+    budget.retainedFringeBytesPerRole = std::max<std::uint64_t>(
+        kGiB,
+        static_cast<std::uint64_t>(
+            static_cast<double>(budget.retainedFringeBytesPerRole) * scale));
+    budget.retiredPatchPoolBytes = std::max<std::uint64_t>(
+        kGiB / 2ULL,
+        static_cast<std::uint64_t>(
+            static_cast<double>(budget.retiredPatchPoolBytes) * scale));
+    return budget;
+}
+
+AdaptiveHqRetiredPatchHold ResolveAdaptiveHqRetiredPatchHold(
+    AdaptiveHqInteractionProfile interactionProfile,
+    float guardDisplacementMeters,
+    float preparedGuardDepthMeters) {
+    AdaptiveHqRetiredPatchHold hold;
+    hold.minimumHold =
+        interactionProfile == AdaptiveHqInteractionProfile::Timeline
+            ? std::chrono::milliseconds{1500}
+            : std::chrono::milliseconds{250};
+    const float depthScale =
+        std::isfinite(preparedGuardDepthMeters) &&
+                preparedGuardDepthMeters > 0.0F
+            ? preparedGuardDepthMeters
+            : 1.0F;
+    const float displacement =
+        std::isfinite(guardDisplacementMeters) &&
+                guardDisplacementMeters >= 0.0F
+            ? guardDisplacementMeters
+            : 0.0F;
+    const float displacementRatio = displacement / depthScale;
+    if (displacementRatio <= 1.0F) {
+        // Dwell: subtle movement within the prepared area. Back-and-forth
+        // scrubbing and framing keep reusing the superseded patch.
+        hold.maximumHold = std::chrono::minutes{5};
+    } else if (displacementRatio <= 4.0F) {
+        // Section move: a nearby return stays cheap for a couple of minutes.
+        hold.maximumHold = std::chrono::minutes{2};
+    } else {
+        // Teleport: the old area was abandoned; demote it soonest while the
+        // budget-pressure path can still reclaim it earlier.
+        hold.maximumHold = std::chrono::minutes{1};
+    }
+    return hold;
 }
 
 std::uint64_t AdaptiveHqResidentBlockPayloadBytes(
