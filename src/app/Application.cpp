@@ -99071,6 +99071,98 @@ void SetNextTimingLabelledControlWidth(
             std::max(0.0F, reservedActionWidth)));
 }
 
+// Paired selectors place their labels against a shared centre divider while
+// the editable values expand towards the panel edges. The nested two-column
+// table keeps that geometry stable even when a label also owns a compact
+// second row of add/save/delete actions.
+struct TimingSelectorCellLayout {
+    bool visible = false;
+    int valueColumn = 0;
+    int labelColumn = 1;
+};
+
+TimingSelectorCellLayout BeginTimingSelectorCell(
+    const char* id,
+    bool labelOnRight,
+    float labelWidth) {
+    TimingSelectorCellLayout layout{
+        .valueColumn = labelOnRight ? 0 : 1,
+        .labelColumn = labelOnRight ? 1 : 0,
+    };
+    layout.visible = ImGui::BeginTable(
+        id,
+        2,
+        ImGuiTableFlags_NoSavedSettings |
+            ImGuiTableFlags_NoPadOuterX |
+            ImGuiTableFlags_SizingStretchProp);
+    if (!layout.visible) {
+        return layout;
+    }
+    if (labelOnRight) {
+        ImGui::TableSetupColumn(
+            "##Value",
+            ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn(
+            "##Label",
+            ImGuiTableColumnFlags_WidthFixed,
+            labelWidth);
+    } else {
+        ImGui::TableSetupColumn(
+            "##Label",
+            ImGuiTableColumnFlags_WidthFixed,
+            labelWidth);
+        ImGui::TableSetupColumn(
+            "##Value",
+            ImGuiTableColumnFlags_WidthStretch);
+    }
+    ImGui::TableNextRow();
+    ImGui::TableSetColumnIndex(layout.valueColumn);
+    return layout;
+}
+
+void SetTimingSelectorLabelColumn(
+    const TimingSelectorCellLayout& layout) {
+    if (layout.visible) {
+        ImGui::TableSetColumnIndex(layout.labelColumn);
+    }
+}
+
+void EndTimingSelectorCell(
+    const TimingSelectorCellLayout& layout) {
+    if (layout.visible) {
+        ImGui::EndTable();
+    }
+}
+
+void DrawTimingCompactSelectorLabel(
+    const char* label,
+    const char* tooltip) {
+    ImGui::PushFont(
+        nullptr,
+        ImGui::GetStyle().FontSizeBase * 0.76F);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(label);
+    DrawTimingControlTooltip(tooltip);
+    ImGui::PopFont();
+}
+
+void PushTimingCompactSelectorActionStyle() {
+    ImGui::PushFont(
+        nullptr,
+        ImGui::GetStyle().FontSizeBase * 0.68F);
+    ImGui::PushStyleVar(
+        ImGuiStyleVar_FramePadding,
+        ImVec2{1.0F, 0.0F});
+    ImGui::PushStyleVar(
+        ImGuiStyleVar_ItemSpacing,
+        ImVec2{2.0F, 0.0F});
+}
+
+void PopTimingCompactSelectorActionStyle() {
+    ImGui::PopStyleVar(2);
+    ImGui::PopFont();
+}
+
 // Draws the shared low-alpha '?' help watermark in a widget's top-right
 // corner and shows `tooltip` while the pointer rests within its radius.
 // Returns whether the mark is hovered so callers can suppress their own
@@ -100087,33 +100179,6 @@ void AddUniqueTimingColouriseKeyHandle(
     handles->push_back(std::move(handle));
 }
 
-enum class TimingColouriseBoundsKeyFamily : std::uint8_t {
-    Geometry,
-    Fade,
-};
-
-std::optional<TimingColouriseBoundsKeyFamily>
-TimingColouriseBoundsKeyFamilyFor(
-    const TimingColouriseKeyHandle& handle) {
-    if (handle.track != TimingColouriseKeyTrack::Bounds ||
-        !handle.boundsParameter.has_value()) {
-        return std::nullopt;
-    }
-    using invisible_places::timing::TimingColouriseBoundsParameter;
-    switch (handle.boundsParameter.value()) {
-        case TimingColouriseBoundsParameter::Lower:
-        case TimingColouriseBoundsParameter::Upper:
-        case TimingColouriseBoundsParameter::Centre:
-        case TimingColouriseBoundsParameter::Spread:
-            return TimingColouriseBoundsKeyFamily::Geometry;
-        case TimingColouriseBoundsParameter::EdgeFade:
-        case TimingColouriseBoundsParameter::EdgeFadeLower:
-        case TimingColouriseBoundsParameter::EdgeFadeUpper:
-            return TimingColouriseBoundsKeyFamily::Fade;
-    }
-    return std::nullopt;
-}
-
 bool TimingColouriseKeyHandlesCanSnapTogether(
     const TimingColouriseKeyHandle& dragged,
     const TimingColouriseKeyHandle& target) {
@@ -100135,138 +100200,6 @@ bool TimingColouriseKeyHandlesCanSnapTogether(
     return invisible_places::ui::VisualFeatureTimelineSnapDomainsCanSnap(
         domainFor(dragged),
         domainFor(target));
-}
-
-void AddCoincidentTimingColouriseBoundsFamilyHandles(
-    const invisible_places::timing::TimingColouriseEffect& effect,
-    const std::vector<TimingColouriseKeyHandle>& anchors,
-    std::vector<TimingColouriseKeyHandle>* handles) {
-    if (handles == nullptr) {
-        return;
-    }
-    // A Bounds graph represents two coherent pairs: the two coordinates of
-    // its selected parameterisation, and the two edge fades. Once members of
-    // a pair share an authored time, retiming either keeps that pair intact;
-    // the two families never pull one another along.
-    for (const auto& anchor : anchors) {
-        const auto family = TimingColouriseBoundsKeyFamilyFor(anchor);
-        if (!family.has_value()) {
-            continue;
-        }
-        for (const auto& key : effect.boundsParameterKeys) {
-            TimingColouriseKeyHandle candidate{
-                .track = TimingColouriseKeyTrack::Bounds,
-                .boundsParameter = key.parameter,
-                .position = key.position,
-            };
-            if (TimingColouriseBoundsKeyFamilyFor(candidate) == family &&
-                std::abs(key.position - anchor.position) <=
-                    invisible_places::timing::
-                        kTimingColouriseKeyTolerance) {
-                AddUniqueTimingColouriseKeyHandle(
-                    handles,
-                    std::move(candidate));
-            }
-        }
-    }
-}
-
-void AddCoincidentTimingColourisePaletteMarkerHandles(
-    const invisible_places::timing::TimingColouriseEffect& effect,
-    const std::vector<TimingColouriseKeyHandle>& anchors,
-    std::vector<TimingColouriseKeyHandle>* handles) {
-    if (handles == nullptr) {
-        return;
-    }
-    using invisible_places::timing::TimingColourisePaletteStopParameter;
-    for (const auto& anchor : anchors) {
-        if (anchor.track != TimingColouriseKeyTrack::Palette ||
-            anchor.stopParameter !=
-                TimingColourisePaletteStopParameter::Position) {
-            continue;
-        }
-        for (const auto& key : effect.paletteStopParameterKeys) {
-            if (key.parameter !=
-                    TimingColourisePaletteStopParameter::Position ||
-                std::abs(key.position - anchor.position) >
-                    invisible_places::timing::
-                        kTimingColouriseKeyTolerance) {
-                continue;
-            }
-            AddUniqueTimingColouriseKeyHandle(
-                handles,
-                TimingColouriseKeyHandle{
-                    .track = TimingColouriseKeyTrack::Palette,
-                    .stopId = key.stopId,
-                    .stopParameter = key.parameter,
-                    .position = key.position,
-                });
-        }
-    }
-}
-
-void AddCoincidentTimingColouriseKeyHandles(
-    const invisible_places::timing::TimingColouriseEffect& effect,
-    const std::vector<TimingColouriseKeyHandle>& anchors,
-    std::vector<TimingColouriseKeyHandle>* handles) {
-    if (handles == nullptr || anchors.empty()) {
-        return;
-    }
-    const auto matchesAnchorPosition = [&](float position) {
-        return std::any_of(
-            anchors.begin(),
-            anchors.end(),
-            [&](const auto& anchor) {
-                return std::abs(anchor.position - position) <=
-                       invisible_places::timing::
-                           kTimingColouriseKeyTolerance;
-            });
-    };
-    for (const float position : invisible_places::timing::
-             TimingColourisePaletteKeyPositions(effect)) {
-        if (matchesAnchorPosition(position)) {
-            AddUniqueTimingColouriseKeyHandle(
-                handles,
-                TimingColouriseKeyHandle{
-                    .track = TimingColouriseKeyTrack::Palette,
-                    .position = position,
-                });
-        }
-    }
-    for (const auto& key : effect.boundsParameterKeys) {
-        if (matchesAnchorPosition(key.position)) {
-            AddUniqueTimingColouriseKeyHandle(
-                handles,
-                TimingColouriseKeyHandle{
-                    .track = TimingColouriseKeyTrack::Bounds,
-                    .boundsParameter = key.parameter,
-                    .position = key.position,
-                });
-        }
-    }
-    for (const auto& key : effect.effectParameterKeys) {
-        if (matchesAnchorPosition(key.position)) {
-            AddUniqueTimingColouriseKeyHandle(
-                handles,
-                TimingColouriseKeyHandle{
-                    .track = TimingColouriseKeyTrack::EffectParameter,
-                    .effectParameter = key.parameter,
-                    .position = key.position,
-                });
-        }
-    }
-    for (const auto& key : effect.emissiveFalloffKeys) {
-        if (matchesAnchorPosition(key.position)) {
-            AddUniqueTimingColouriseKeyHandle(
-                handles,
-                TimingColouriseKeyHandle{
-                    .track = TimingColouriseKeyTrack::EmissiveFalloff,
-                    .stopId = key.nodeId,
-                    .falloffParameter = key.parameter,
-                    .position = key.position,
-                });
-        }
-    }
 }
 
 std::optional<std::pair<
@@ -101003,65 +100936,9 @@ void DrawTimingKeyLaneGroup(
             }
             if (lane.track == TimingColouriseKeyTrack::Palette &&
                 lane.stopParameter.has_value()) {
-                if (lane.stopParameter == invisible_places::timing::
-                        TimingColourisePaletteStopParameter::Position) {
-                    const float destination = std::clamp(
-                        destinationPosition,
-                        0.0F,
-                        1.0F);
-                    for (const auto& key :
-                         effect->paletteStopParameterKeys) {
-                        if (key.parameter != invisible_places::timing::
-                                TimingColourisePaletteStopParameter::
-                                    Position ||
-                            std::abs(key.position - sourcePosition) >
-                                invisible_places::timing::
-                                    kTimingColouriseKeyTolerance) {
-                            continue;
-                        }
-                        const bool occupied = std::any_of(
-                            effect->paletteStopParameterKeys.begin(),
-                            effect->paletteStopParameterKeys.end(),
-                            [&](const auto& candidate) {
-                                return candidate.stopId == key.stopId &&
-                                       candidate.parameter == key.parameter &&
-                                       std::abs(
-                                           candidate.position -
-                                           destination) <=
-                                           invisible_places::timing::
-                                               kTimingColouriseKeyTolerance &&
-                                       std::abs(
-                                           candidate.position -
-                                           sourcePosition) >
-                                           invisible_places::timing::
-                                               kTimingColouriseKeyTolerance;
-                            });
-                        if (occupied) {
-                            return false;
-                        }
-                    }
-                    auto updated = *effect;
-                    bool moved = false;
-                    for (auto& key :
-                         updated.paletteStopParameterKeys) {
-                        if (key.parameter == invisible_places::timing::
-                                TimingColourisePaletteStopParameter::
-                                    Position &&
-                            std::abs(key.position - sourcePosition) <=
-                                invisible_places::timing::
-                                    kTimingColouriseKeyTolerance) {
-                            key.position = destination;
-                            moved = true;
-                        }
-                    }
-                    if (!moved) {
-                        return false;
-                    }
-                    *effect = invisible_places::timing::
-                        SanitizeTimingColouriseEffect(std::move(updated));
-                    return true;
-                }
-                // Colour and Amount remain independent stop-property tracks.
+                // Each stop property is an independent timeline node. Marker
+                // Position keys are created as a group, but only an explicit
+                // multi-selection retimes more than the chosen stop.
                 const auto found = std::find_if(
                     effect->paletteStopParameterKeys.begin(),
                     effect->paletteStopParameterKeys.end(),
@@ -101097,72 +100974,27 @@ void DrawTimingKeyLaneGroup(
                 if (!lane.boundsParameter.has_value()) {
                     return false;
                 }
-                const auto sourceHandle =
-                    TimingColouriseKeyHandleForLane(
-                        lane,
-                        sourcePosition);
-                const auto family =
-                    TimingColouriseBoundsKeyFamilyFor(sourceHandle);
-                if (!family.has_value()) {
-                    return false;
-                }
-                std::vector<invisible_places::timing::
-                                TimingColouriseBoundsParameter>
-                    movingParameters;
-                for (const auto& key : effect->boundsParameterKeys) {
-                    TimingColouriseKeyHandle candidate{
-                        .track = TimingColouriseKeyTrack::Bounds,
-                        .boundsParameter = key.parameter,
-                        .position = key.position,
-                    };
-                    if (TimingColouriseBoundsKeyFamilyFor(candidate) ==
-                            family &&
-                        std::abs(key.position - sourcePosition) <=
-                            invisible_places::timing::
-                                kTimingColouriseKeyTolerance) {
-                        movingParameters.push_back(key.parameter);
-                    }
-                }
-                if (movingParameters.empty()) {
+                const auto parameter = lane.boundsParameter.value();
+                const auto found = std::find_if(
+                    effect->boundsParameterKeys.begin(),
+                    effect->boundsParameterKeys.end(),
+                    [&](const auto& key) {
+                        return key.parameter == parameter &&
+                               std::abs(
+                                   key.position - sourcePosition) <=
+                                   invisible_places::timing::
+                                       kTimingColouriseKeyTolerance;
+                    });
+                if (found == effect->boundsParameterKeys.end()) {
                     return false;
                 }
                 const float destination = std::clamp(
                     destinationPosition,
                     0.0F,
                     1.0F);
-                for (const auto parameter : movingParameters) {
-                    const bool occupied = std::any_of(
-                        effect->boundsParameterKeys.begin(),
-                        effect->boundsParameterKeys.end(),
-                        [&](const auto& key) {
-                            return key.parameter == parameter &&
-                                   std::abs(
-                                       key.position - destination) <=
-                                       invisible_places::timing::
-                                           kTimingColouriseKeyTolerance &&
-                                   std::abs(
-                                       key.position - sourcePosition) >
-                                       invisible_places::timing::
-                                           kTimingColouriseKeyTolerance;
-                        });
-                    if (occupied) {
-                        return false;
-                    }
-                }
-                auto updated = *effect;
-                for (auto& key : updated.boundsParameterKeys) {
-                    if (std::find(
-                            movingParameters.begin(),
-                            movingParameters.end(),
-                            key.parameter) != movingParameters.end() &&
-                        std::abs(key.position - sourcePosition) <=
-                            invisible_places::timing::
-                                kTimingColouriseKeyTolerance) {
-                        key.position = destination;
-                    }
-                }
+                found->position = destination;
                 *effect = invisible_places::timing::
-                    SanitizeTimingColouriseEffect(std::move(updated));
+                    SanitizeTimingColouriseEffect(std::move(*effect));
                 return true;
             }
             return lane.effectParameter.has_value() &&
@@ -101202,36 +101034,6 @@ void DrawTimingKeyLaneGroup(
             }
             if (lane.track == TimingColouriseKeyTrack::Palette &&
                 lane.stopParameter.has_value()) {
-                if (lane.stopParameter == invisible_places::timing::
-                        TimingColourisePaletteStopParameter::Position) {
-                    return std::any_of(
-                        effect->paletteStopParameterKeys.begin(),
-                        effect->paletteStopParameterKeys.end(),
-                        [&](const auto& source) {
-                            if (source.parameter != invisible_places::timing::
-                                    TimingColourisePaletteStopParameter::
-                                        Position ||
-                                std::abs(
-                                    source.position - sourcePosition) >
-                                    invisible_places::timing::
-                                        kTimingColouriseKeyTolerance) {
-                                return false;
-                            }
-                            return std::any_of(
-                                effect->paletteStopParameterKeys.begin(),
-                                effect->paletteStopParameterKeys.end(),
-                                [&](const auto& candidate) {
-                                    return candidate.stopId == source.stopId &&
-                                           candidate.parameter ==
-                                               source.parameter &&
-                                           std::abs(
-                                               candidate.position -
-                                               destinationPosition) <=
-                                               invisible_places::timing::
-                                                   kTimingColouriseKeyTolerance;
-                                });
-                        });
-                }
                 return invisible_places::timing::
                            TimingColourisePaletteStopParameterKeyCountAtPosition(
                                *effect,
@@ -101251,46 +101053,16 @@ void DrawTimingKeyLaneGroup(
                 if (!lane.boundsParameter.has_value()) {
                     return false;
                 }
-                const auto sourceHandle =
-                    TimingColouriseKeyHandleForLane(
-                        lane,
-                        sourcePosition);
-                const auto family =
-                    TimingColouriseBoundsKeyFamilyFor(sourceHandle);
-                return family.has_value() && std::any_of(
+                return std::any_of(
                     effect->boundsParameterKeys.begin(),
                     effect->boundsParameterKeys.end(),
-                    [&](const auto& movingKey) {
-                        TimingColouriseKeyHandle movingHandle{
-                            .track = TimingColouriseKeyTrack::Bounds,
-                            .boundsParameter = movingKey.parameter,
-                            .position = movingKey.position,
-                        };
-                        if (TimingColouriseBoundsKeyFamilyFor(
-                                movingHandle) != family ||
-                            std::abs(
-                                movingKey.position - sourcePosition) >
-                                invisible_places::timing::
-                                    kTimingColouriseKeyTolerance) {
-                            return false;
-                        }
-                        return std::any_of(
-                            effect->boundsParameterKeys.begin(),
-                            effect->boundsParameterKeys.end(),
-                            [&](const auto& destinationKey) {
-                                return destinationKey.parameter ==
-                                           movingKey.parameter &&
-                                       std::abs(
-                                           destinationKey.position -
-                                           destinationPosition) <=
-                                           invisible_places::timing::
-                                               kTimingColouriseKeyTolerance &&
-                                       std::abs(
-                                           destinationKey.position -
-                                           sourcePosition) >
-                                           invisible_places::timing::
-                                               kTimingColouriseKeyTolerance;
-                            });
+                    [&](const auto& key) {
+                        return key.parameter ==
+                                   lane.boundsParameter.value() &&
+                               std::abs(
+                                   key.position - destinationPosition) <=
+                                   invisible_places::timing::
+                                       kTimingColouriseKeyTolerance;
                     });
             }
             return lane.effectParameter.has_value() &&
@@ -101756,7 +101528,10 @@ void DrawTimingKeyLaneGroup(
             const bool command = io.KeyCtrl || io.KeySuper;
             if (io.KeyShift) {
                 std::vector<TimingColouriseKeyHandle> selected;
-                if (command && timings.colouriseKeySelection.has_value() &&
+                // Shift is additive here: it extends the anchor's lane when
+                // possible and still adds a single key from another lane.
+                // Cmd/Ctrl remains the explicit toggle gesture.
+                if (timings.colouriseKeySelection.has_value() &&
                     timings.colouriseKeySelection->effectId == effect->id) {
                     selected = timings.colouriseKeySelection->keys;
                 }
@@ -102120,8 +101895,7 @@ void DrawTimingKeyLaneGroup(
 
     const auto armKeyDrag =
         [&](const TimingColouriseKeyHandle& clicked,
-            bool requestValueDrag,
-            bool suppressTimeOnlyGather = false) {
+            bool requestValueDrag) {
             std::vector<TimingColouriseKeyHandle> handles;
             if (timings.colouriseKeySelection.has_value() &&
                 timings.colouriseKeySelection->effectId == effect->id &&
@@ -102136,28 +101910,7 @@ void DrawTimingKeyLaneGroup(
                             effect->id
                     ? timings.colouriseKeySelection->rangeAnchor
                     : std::nullopt;
-            if (timings.colouriseGraphTimeOnly &&
-                !suppressTimeOnlyGather) {
-                // Gather against the original selection positions rather than
-                // the growing result so tolerance cannot create a transitive
-                // chain into keys at neighbouring times.
-                const auto anchorHandles = handles;
-                AddCoincidentTimingColouriseKeyHandles(
-                    *effect,
-                    anchorHandles,
-                    &handles);
-                replaceSelection(handles, rangeAnchor);
-            }
             const auto selectedHandles = handles;
-            const auto semanticAnchors = handles;
-            AddCoincidentTimingColourisePaletteMarkerHandles(
-                *effect,
-                semanticAnchors,
-                &handles);
-            AddCoincidentTimingColouriseBoundsFamilyHandles(
-                *effect,
-                semanticAnchors,
-                &handles);
             TimingColouriseGraphKeyDragState drag{
                 .effectId = effect->id,
                 .laneGroupId = id,
@@ -102173,9 +101926,9 @@ void DrawTimingKeyLaneGroup(
             };
             if (drag.valueDrag) {
                 // Vertical motion belongs only to the dot under the pointer.
-                // Semantic partners above share its time offset, never its
-                // value (unless the explicit linked-fade setting mirrors it
-                // in the value update below).
+                // Other explicitly selected keys share its time offset,
+                // never its value (unless the linked-fade setting mirrors
+                // the value update below).
                 const auto graph = std::find_if(
                     valueGraphs.begin(),
                     valueGraphs.end(),
@@ -102274,10 +102027,20 @@ void DrawTimingKeyLaneGroup(
             openPositionEditor(hoveredDotHandle);
         } else if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
             const auto& io = ImGui::GetIO();
-            selectClickedHandle(
-                *hoveredDotGraph->lane,
-                hoveredDotHandle.position);
-            if (!io.KeyCtrl && !io.KeySuper && !io.KeyShift) {
+            const bool modifiedSelection =
+                io.KeyCtrl || io.KeySuper || io.KeyShift;
+            // Preserve a deliberate multi-selection when its member is
+            // pressed for dragging; an unselected node still becomes the
+            // sole selection before its drag is armed.
+            const bool preserveExplicitGroup =
+                !modifiedSelection &&
+                handleSelected(hoveredDotHandle);
+            if (!preserveExplicitGroup) {
+                selectClickedHandle(
+                    *hoveredDotGraph->lane,
+                    hoveredDotHandle.position);
+            }
+            if (!modifiedSelection) {
                 armKeyDrag(hoveredDotHandle, true);
             }
         }
@@ -102306,12 +102069,7 @@ void DrawTimingKeyLaneGroup(
                 }
             }
             replaceSelection(std::move(cluster), handle);
-            // The marker's visible cluster is exactly what should move, so
-            // the global Time-only gather stays off even when enabled.
-            armKeyDrag(
-                handle,
-                false,
-                /*suppressTimeOnlyGather=*/true);
+            armKeyDrag(handle, false);
         }
     } else if (
         itemHovered && !keyHelpHovered &&
@@ -103713,9 +103471,9 @@ void DrawTimingKeyLaneGroup(
         ImGui::TextUnformatted(
             "Left-click a curve dot to select only that key; its labelled halo shows the exact target. Drag changes its time and value.");
         ImGui::TextUnformatted(
-            "A lower time handle always selects every visible key at that time and changes time only. With Time-only drag enabled, a curve-dot drag moves every key in this Visual Feature at each selected time together.");
+            "A lower time handle selects every visible key at that time and changes time only. Time-only drag locks values but still moves only the explicitly selected keys.");
         ImGui::TextUnformatted(
-            "In Bounds graphs, coincident geometry keys retime as one pair and coincident fade keys retime as another; fades never snap to geometry.");
+            "Coincident curve keys remain independent unless selected together. Position, Fade, Skew, Palette, and Intensity still snap only within their own kind.");
         ImGui::TextUnformatted(
             "Left-drag empty space for a selection window. Cmd/Ctrl-click toggles; Shift-click selects a range.");
         ImGui::TextUnformatted(
@@ -103970,21 +103728,6 @@ void DrawTimingKeyLaneGroup(
          !ImGui::IsPopupOpen(
              "Edit Local Effect Key Position"))) {
         editor.reset();
-    }
-    if (drawsValueGraph) {
-        ImGui::Checkbox(
-            "Time-only drag",
-            &timings.colouriseGraphTimeOnly);
-        DrawTimingControlTooltip(
-            "When enabled, dragging a curve key changes only its animation position and moves every key in this Visual Feature at each selected time together. Lower rail markers always change time only.");
-        if (timings.colouriseKeySelection.has_value() &&
-            timings.colouriseKeySelection->effectId == effect->id &&
-            !timings.colouriseKeySelection->keys.empty()) {
-            ImGui::SameLine();
-            ImGui::TextDisabled(
-                "%zu selected",
-                timings.colouriseKeySelection->keys.size());
-        }
     }
     ImGui::PopID();
 }
@@ -104384,9 +104127,9 @@ bool DrawTimingColouriseBlendModeCombo(
         static_cast<int>(effect->blendMode),
         0,
         static_cast<int>(kTimingColouriseBlendModeLabels.size()) - 1);
-    SetNextTimingLabelledControlWidth("Blend");
+    ImGui::SetNextItemWidth(-FLT_MIN);
     if (!ImGui::Combo(
-            "Blend",
+            "##TimingColouriseBlendMode",
             &blendModeIndex,
             kTimingColouriseBlendModeLabels.data(),
             static_cast<int>(kTimingColouriseBlendModeLabels.size()))) {
@@ -104499,7 +104242,6 @@ bool DrawTimingColouriseEffectParameterEditor(
     invisible_places::timing::TimingColouriseEffectParameter parameter,
     const std::function<void()>& drawBelowLabel = {}) {
     using invisible_places::timing::TimingColouriseEffectParameter;
-    using invisible_places::timing::TimingColouriseAmountOverrideMode;
     using invisible_places::water::WaterScenarioInterpolation;
     if (runtimeState == nullptr || effect == nullptr) {
         return false;
@@ -104547,31 +104289,6 @@ bool DrawTimingColouriseEffectParameterEditor(
         TimingColouriseEffectParameterLabel(parameter));
     ImGui::PopStyleColor();
     bool changed = false;
-    // Authored, non-keyed choices sit between the label and the animated
-    // value so the keyable value row stays uniform across parameters.
-    if (parameter == TimingColouriseEffectParameter::AmountOverride) {
-        if (ImGui::RadioButton(
-                "Max",
-                effect->colouriseAmountOverrideMode ==
-                    TimingColouriseAmountOverrideMode::Maximum)) {
-            effect->colouriseAmountOverrideMode =
-                TimingColouriseAmountOverrideMode::Maximum;
-            changed = true;
-        }
-        DrawTimingControlTooltip(
-            "Cap each stop's Colourise Amount without increasing smaller values.");
-        ImGui::SameLine(0.0F, 4.0F);
-        if (ImGui::RadioButton(
-                "Scale",
-                effect->colouriseAmountOverrideMode ==
-                    TimingColouriseAmountOverrideMode::Scale)) {
-            effect->colouriseAmountOverrideMode =
-                TimingColouriseAmountOverrideMode::Scale;
-            changed = true;
-        }
-        DrawTimingControlTooltip(
-            "Multiply every stop's Colourise Amount by the override value.");
-    }
     if (drawBelowLabel) {
         drawBelowLabel();
     }
@@ -105486,10 +105203,6 @@ void DrawTimingColourisePaletteEditor(
         timings.requestedColourisePalettePickerStopIndex.reset();
         runtimeState->previewRenderStateSignatureValid = false;
     };
-    const auto compactButtonWidth = [](const char* label) {
-        return ImGui::CalcTextSize(label).x +
-               ImGui::GetStyle().FramePadding.x * 2.0F;
-    };
     if (part == TimingColourisePaletteEditorPart::Sources) {
         const int sourceColumns = TimingResponsiveColumnCount(
             2U,
@@ -105500,24 +105213,23 @@ void DrawTimingColourisePaletteEditor(
             sourceColumns,
             ImGuiTableFlags_NoSavedSettings |
                 ImGuiTableFlags_NoPadOuterX |
+                ImGuiTableFlags_BordersInnerV |
                 ImGuiTableFlags_SizingStretchSame);
         if (sourceTableVisible) {
             ImGui::TableNextColumn();
-        }
-        // Keep the source widths stable when a private _edited variant adds
-        // its discard button.
-        const float presetActionWidth =
-            compactButtonWidth("X") + 2.0F;
-        SetNextTimingLabelledControlWidth(
-            "Colour",
-            presetActionWidth);
+            const auto presetCell = BeginTimingSelectorCell(
+                "##TimingPalettePresetCell",
+                /*labelOnRight=*/true,
+                52.0F);
         const std::string presetPreview =
             effect->paletteSourceKind ==
                     TimingColourisePaletteSourceKind::Preset
                 ? paletteDisplayName()
                 : "Choose preset...";
+        ImGui::SetNextItemWidth(-FLT_MIN);
         ImGui::BeginDisabled(paletteSourceLocked);
-        if (ImGui::BeginCombo("Colour##TimingColourisePresetPalette",
+        if (presetCell.visible && ImGui::BeginCombo(
+                              "##TimingColourisePresetPalette",
                               presetPreview.c_str())) {
             for (const auto &preset : presets) {
                 const bool originalSelected =
@@ -105579,44 +105291,48 @@ void DrawTimingColourisePaletteEditor(
         const bool canDiscardLocalEdit = activePreset != nullptr &&
                                          activeLocalEdit != nullptr &&
                                          !hasPaletteKeys;
-        if (activeLocalEdit != nullptr) {
-            ImGui::SameLine(0.0F, 2.0F);
-            ImGui::BeginDisabled(!canDiscardLocalEdit);
-            if (ImGui::SmallButton("X##DiscardLocalPaletteEdit") &&
-                activePreset != nullptr &&
-                invisible_places::timing::
-                    DiscardTimingColouriseLocalPaletteEdit(effect,
-                                                           *activePreset)) {
-                resetPaletteInteraction();
-                runtimeState->statusMessage =
-                    "Discarded " + activePreset->name +
-                    "_edited and restored the built-in preset.";
-                runtimeState->errorMessage.clear();
-            }
-            ImGui::EndDisabled();
-            DrawTimingControlTooltip(
-                canDiscardLocalEdit
-                    ? "Discard this effect's private _edited preset and "
-                      "restore the built-in original."
-                    : "Palette keys lock this private edit. Remove its palette "
-                      "keys before discarding it.");
+        SetTimingSelectorLabelColumn(presetCell);
+        ImGui::BeginGroup();
+        PushTimingCompactSelectorActionStyle();
+        ImGui::TextUnformatted("Presets");
+        DrawTimingControlTooltip(
+            "Choose a built-in palette or this effect's private _edited version.");
+        ImGui::BeginDisabled(!canDiscardLocalEdit);
+        if (ImGui::SmallButton("X##DiscardLocalPaletteEdit") &&
+            activePreset != nullptr &&
+            invisible_places::timing::
+                DiscardTimingColouriseLocalPaletteEdit(effect,
+                                                       *activePreset)) {
+            resetPaletteInteraction();
+            runtimeState->statusMessage =
+                "Discarded " + activePreset->name +
+                "_edited and restored the built-in preset.";
+            runtimeState->errorMessage.clear();
         }
+        ImGui::EndDisabled();
+        DrawTimingControlTooltip(
+            activeLocalEdit == nullptr
+                ? "Select a preset's _edited version before deleting it."
+            : canDiscardLocalEdit
+                ? "Discard this effect's private _edited preset and restore the built-in original."
+                : "Palette keys lock this private edit. Remove its palette keys before discarding it.");
+        PopTimingCompactSelectorActionStyle();
+        ImGui::EndGroup();
+        EndTimingSelectorCell(presetCell);
 
-        if (sourceTableVisible) {
-            ImGui::TableNextColumn();
-        }
+        ImGui::TableNextColumn();
+        const auto savedCell = BeginTimingSelectorCell(
+            "##TimingPaletteSavedCell",
+            /*labelOnRight=*/false,
+            54.0F);
         const std::string savedPreview =
             effect->paletteSourceKind == TimingColourisePaletteSourceKind::Saved
                 ? paletteDisplayName()
                 : "Choose saved palette...";
-        const float savedActionWidth = compactButtonWidth("+") +
-                                       compactButtonWidth("Save") +
-                                       compactButtonWidth("X") + 6.0F;
-        SetNextTimingLabelledControlWidth(
-            "Saved",
-            savedActionWidth);
+        ImGui::SetNextItemWidth(-FLT_MIN);
         ImGui::BeginDisabled(paletteSourceLocked);
-        if (ImGui::BeginCombo("Saved##TimingColouriseSavedPalette",
+        if (savedCell.visible && ImGui::BeginCombo(
+                              "##TimingColouriseSavedPalette",
                               savedPreview.c_str())) {
             for (const auto &saved : water.savedTimingColourisePalettes) {
                 const bool originalSelected =
@@ -105687,7 +105403,14 @@ void DrawTimingColourisePaletteEditor(
             invisible_places::timing::FindTimingColouriseLocalPaletteEdit(
                 *effect, effect->paletteSourceKind, effect->paletteSourceId) !=
                 nullptr;
-        ImGui::SameLine();
+        bool requestSaveNewPalette = false;
+        bool requestDeleteSavedPalette = false;
+        SetTimingSelectorLabelColumn(savedCell);
+        ImGui::BeginGroup();
+        PushTimingCompactSelectorActionStyle();
+        ImGui::TextUnformatted("Saved");
+        DrawTimingControlTooltip(
+            "Choose, add, update, or delete an editable project palette.");
         if (ImGui::SmallButton("+")) {
             timings.paletteNameBuffer =
                 effect->paletteSourceName.empty()
@@ -105699,7 +105422,7 @@ void DrawTimingColourisePaletteEditor(
                             TimingColourisePaletteSourceKind::Preset
                     ? effect->paletteSourceName
                     : effect->paletteSourceName + " Copy";
-            ImGui::OpenPopup("Save New Colourise Palette");
+            requestSaveNewPalette = true;
         }
         DrawTimingControlTooltip(
             activeVariantSelected
@@ -105803,7 +105526,7 @@ void DrawTimingColourisePaletteEditor(
             if (deletesActiveSavedEdit) {
                 discardSelectedSavedEdit();
             } else if (savedEditExists) {
-                ImGui::OpenPopup("Delete Saved Palette");
+                requestDeleteSavedPalette = true;
             } else {
                 deleteSelectedSavedPalette();
             }
@@ -105829,6 +105552,15 @@ void DrawTimingColourisePaletteEditor(
                         "exists you will be asked whether it goes too."
                 : "Delete this saved palette. Unkeyed effects keep independent "
                   "custom snapshots.");
+        PopTimingCompactSelectorActionStyle();
+        ImGui::EndGroup();
+        EndTimingSelectorCell(savedCell);
+        if (requestDeleteSavedPalette) {
+            ImGui::OpenPopup("Delete Saved Palette");
+        }
+        if (requestSaveNewPalette) {
+            ImGui::OpenPopup("Save New Colourise Palette");
+        }
         if (ImGui::BeginPopupModal("Delete Saved Palette", nullptr,
                                    ImGuiWindowFlags_AlwaysAutoResize)) {
             ImGui::TextUnformatted(selectedSavedPalette != nullptr
@@ -105943,8 +105675,7 @@ void DrawTimingColourisePaletteEditor(
             }
             ImGui::EndPopup();
         }
-        if (sourceTableVisible) {
-            ImGui::EndTable();
+        ImGui::EndTable();
         }
         return;
     }
@@ -106029,12 +105760,12 @@ void DrawTimingColourisePaletteEditor(
         invisible_places::timing::
             TimingColourisePaletteKeyPositions(*effect);
     const auto drawKeyedPaletteVersionsCombo = [&]() {
+      ImGui::SetNextItemWidth(std::min(
+          92.0F,
+          std::max(64.0F, ImGui::GetContentRegionAvail().x)));
       if (!paletteKeyPositions.empty()) {
         std::string keyedPreview =
-            std::to_string(paletteKeyPositions.size()) +
-            (paletteKeyPositions.size() == 1U
-                 ? " keyed version"
-                 : " keyed versions");
+            std::to_string(paletteKeyPositions.size()) + " keyed";
         for (std::size_t index = 0U;
              index < paletteKeyPositions.size();
              ++index) {
@@ -106052,7 +105783,7 @@ void DrawTimingColourisePaletteEditor(
             }
         }
         if (ImGui::BeginCombo(
-                "Keyed Palettes",
+                "##TimingKeyedPalettes",
                 keyedPreview.c_str())) {
             for (std::size_t index = 0U;
                  index < paletteKeyPositions.size();
@@ -106096,9 +105827,15 @@ void DrawTimingColourisePaletteEditor(
             ImGui::EndCombo();
         }
         DrawTimingControlTooltip(
-            "These _RunNN versions belong only to this Colourise effect. Their numbers follow key order automatically.");
+            "Keyed palette versions for this Visual Feature. Choose one to scrub to its animation position; _RunNN numbers follow key order automatically.");
       } else {
-        ImGui::TextDisabled("No keyed palette versions");
+        ImGui::BeginDisabled();
+        if (ImGui::BeginCombo(
+                "##TimingKeyedPalettes",
+                "No keys")) {
+            ImGui::EndCombo();
+        }
+        ImGui::EndDisabled();
         DrawTimingControlTooltip(
             "Key all marker Positions with +, or key a stop's Colour or "
             "Colourise Amount from its editor, to create animated palette "
@@ -106455,6 +106192,37 @@ void DrawTimingColourisePaletteEditor(
             : "There is no grouped marker Position key here to remove.");
     ImGui::PopID();
 
+    // Palette-version navigation and the non-keyed amount mode belong with
+    // the marker key controls, not in the graph or numeric editor below.
+    ImGui::SameLine(0.0F, 6.0F);
+    drawKeyedPaletteVersionsCombo();
+    ImGui::SameLine(0.0F, 6.0F);
+    ImGui::PushFont(
+        nullptr,
+        ImGui::GetStyle().FontSizeBase * 0.76F);
+    if (ImGui::RadioButton(
+            "Max##TimingPaletteAmountMode",
+            effect->colouriseAmountOverrideMode ==
+                TimingColouriseAmountOverrideMode::Maximum)) {
+        effect->colouriseAmountOverrideMode =
+            TimingColouriseAmountOverrideMode::Maximum;
+        runtimeState->previewRenderStateSignatureValid = false;
+    }
+    DrawTimingControlTooltip(
+        "Cap each stop's Colourise Amount without increasing smaller values.");
+    ImGui::SameLine(0.0F, 3.0F);
+    if (ImGui::RadioButton(
+            "Scale##TimingPaletteAmountMode",
+            effect->colouriseAmountOverrideMode ==
+                TimingColouriseAmountOverrideMode::Scale)) {
+        effect->colouriseAmountOverrideMode =
+            TimingColouriseAmountOverrideMode::Scale;
+        runtimeState->previewRenderStateSignatureValid = false;
+    }
+    DrawTimingControlTooltip(
+        "Multiply every stop's Colourise Amount by the override value.");
+    ImGui::PopFont();
+
     if (markerKeysMutated) {
         hasPaletteKeys =
             TimingColouriseEffectHasPaletteKeys(*effect);
@@ -106516,7 +106284,6 @@ void DrawTimingColourisePaletteEditor(
             canEditTopology,
             paletteEditorHeight,
             "##TimingColourisePalettePreview");
-    drawKeyedPaletteVersionsCombo();
     // Colour keys can blend along different colour paths; the choice is
     // authored per effect and only matters once a stop colour is keyed.
     const bool hasColourStopKeys = std::any_of(
@@ -110234,7 +110001,8 @@ void DrawTimingColouriseBoundsEditor(
     PreviewRuntimeState* runtimeState,
     invisible_places::timing::TimingColouriseEffect* effect,
     bool drawKeyMode = true,
-    bool drawParameters = true) {
+    bool drawParameters = true,
+    bool drawFadeMode = true) {
     if (runtimeState == nullptr || effect == nullptr) {
         return;
     }
@@ -110246,10 +110014,9 @@ void DrawTimingColouriseBoundsEditor(
     const bool fadeModeSwitchCyclic =
         CurrentAnimationTimingIsCyclic(*runtimeState);
     if (drawKeyMode) {
-    const int modeColumns = TimingResponsiveColumnCount(
-        2U,
-        260.0F,
-        2);
+    const int modeColumns = drawFadeMode
+        ? TimingResponsiveColumnCount(2U, 260.0F, 2)
+        : 1;
     const bool modeTableVisible = ImGui::BeginTable(
         "##TimingColouriseBoundsModes",
         modeColumns,
@@ -110292,8 +110059,10 @@ void DrawTimingColouriseBoundsEditor(
         currentChoice != modeChoices.end()
             ? currentChoice->label
             : modeChoices.front().label;
-    SetNextTimingLabelledControlWidth("Bounds Keying");
-    if (ImGui::BeginCombo("Bounds Keying", currentLabel)) {
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::BeginCombo(
+            "##TimingColouriseBoundsKeyMode",
+            currentLabel)) {
         for (const auto& choice : modeChoices) {
             const bool selected =
                 effect->boundsKeyMode == choice.mode;
@@ -110328,13 +110097,14 @@ void DrawTimingColouriseBoundsEditor(
         }
         ImGui::EndCombo();
     }
-    DrawTimingLabelTooltip(
+    DrawTimingControlTooltip(
         "Choose the two interval coordinates this effect keys. Existing bounds tracks are converted at every authored key time, preserving the interval there; derived interpolation between keys can change.");
 
-    if (modeTableVisible) {
+    if (drawFadeMode && modeTableVisible) {
         ImGui::TableNextColumn();
     }
 
+    if (drawFadeMode) {
     struct FadeModeChoice {
         TimingColouriseEdgeFadeMode mode;
         const char* label;
@@ -110392,6 +110162,7 @@ void DrawTimingColouriseBoundsEditor(
     }
     DrawTimingLabelTooltip(
         "Choose whether fade ends follow bounds as percentages or stay at fixed scalar values. Each mode remembers its own keys. A mode without keys starts unkeyed from the fade ends visible at the switch position.");
+    }
     if (modeTableVisible) {
         ImGui::EndTable();
     }
@@ -110410,7 +110181,7 @@ void DrawTimingColouriseBoundsEditor(
     }
     // Relative Joined presents one "Ends Fade" column that drives both edge
     // tracks. Relative Separate and Absolute expose two tinted columns; the
-    // Fade Ends selector above owns that choice.
+    // histogram's fade-mode badge owns that choice without another dropdown.
     const bool linkedFades = invisible_places::timing::
         TimingColouriseEdgeFadesAreLinked(effect->edgeFadeMode);
     struct BoundsColumn {
@@ -110510,28 +110281,58 @@ void DrawTimingColouriseTopVisualControls(
             runtimeState,
             effect,
             TimingColourisePaletteEditorPart::Sources);
-        const int blendColumns = TimingResponsiveColumnCount(
-            2U,
-            260.0F,
-            2);
-        if (ImGui::BeginTable(
-                "##TimingColouriseBlendRow",
-                blendColumns,
-                ImGuiTableFlags_NoSavedSettings |
-                    ImGuiTableFlags_NoPadOuterX |
-                    ImGuiTableFlags_SizingStretchSame)) {
-            ImGui::TableNextColumn();
-            (void)DrawTimingColouriseBlendModeCombo(
-                runtimeState,
-                effect);
-            ImGui::EndTable();
-        }
     }
-    DrawTimingColouriseBoundsEditor(
-        runtimeState,
-        effect,
-        /*drawKeyMode=*/true,
-        /*drawParameters=*/false);
+    const std::size_t controlCount =
+        effect->colouriseEnabled ? 2U : 1U;
+    const int columns = TimingResponsiveColumnCount(
+        controlCount,
+        260.0F,
+        2);
+    if (ImGui::BeginTable(
+            "##TimingColouriseBlendAndBoundsRow",
+            columns,
+            ImGuiTableFlags_NoSavedSettings |
+                ImGuiTableFlags_NoPadOuterX |
+                ImGuiTableFlags_BordersInnerV |
+                ImGuiTableFlags_SizingStretchSame)) {
+        if (effect->colouriseEnabled) {
+            ImGui::TableNextColumn();
+            const auto blendCell = BeginTimingSelectorCell(
+                "##TimingBlendCell",
+                /*labelOnRight=*/true,
+                38.0F);
+            if (blendCell.visible) {
+                (void)DrawTimingColouriseBlendModeCombo(
+                    runtimeState,
+                    effect);
+                SetTimingSelectorLabelColumn(blendCell);
+                DrawTimingCompactSelectorLabel(
+                    "Blend",
+                    "How this feature's colour combines with earlier features or the cloud colour. Colourise Amount remains the layer opacity.");
+            }
+            EndTimingSelectorCell(blendCell);
+        }
+
+        ImGui::TableNextColumn();
+        const auto boundsKeyCell = BeginTimingSelectorCell(
+            "##TimingBoundsKeyModeCell",
+            /*labelOnRight=*/!effect->colouriseEnabled,
+            76.0F);
+        if (boundsKeyCell.visible) {
+            DrawTimingColouriseBoundsEditor(
+                runtimeState,
+                effect,
+                /*drawKeyMode=*/true,
+                /*drawParameters=*/false,
+                /*drawFadeMode=*/false);
+            SetTimingSelectorLabelColumn(boundsKeyCell);
+            DrawTimingCompactSelectorLabel(
+                "Bounds Keying",
+                "Choose the two interval coordinates this effect keys. Existing keys are converted at their authored times when the mode changes.");
+        }
+        EndTimingSelectorCell(boundsKeyCell);
+        ImGui::EndTable();
+    }
 }
 
 void DrawTimingColouriseUnifiedTimeline(
@@ -110545,67 +110346,6 @@ void DrawTimingColouriseUnifiedTimeline(
 
     auto& timings = runtimeState->timingsPanel;
     ImGui::PushID(effect->id.c_str());
-    ImGui::TextDisabled("Visible key groups");
-    DrawTimingControlTooltip(
-        "Choose which key families share the graph below. Hiding a family "
-        "does not remove its keys, and each family snaps only to itself.");
-    struct TimelineVisibilityChoice {
-        const char* label = "";
-        bool* visible = nullptr;
-        const char* tooltip = "";
-    };
-    std::vector<TimelineVisibilityChoice> visibilityChoices{
-        {"Position##TimelineVisibility",
-         &timings.colourisePositionTimelineVisible,
-         "Show or hide Bounds Position curves. Their authored keys stay stored while hidden."},
-        {"Fade##TimelineVisibility",
-         &timings.colouriseFadeTimelineVisible,
-         "Show or hide Bounds Fade curves. Their authored keys stay stored while hidden."},
-        {"Skew##TimelineVisibility",
-         &timings.colouriseSkewTimelineVisible,
-         "Show or hide enabled Palette and Emissive skew curves. Their authored keys stay stored while hidden."},
-    };
-    if (effect->colouriseEnabled) {
-        visibilityChoices.push_back(
-            {"Palette##TimelineVisibility",
-             &timings.colourisePaletteTimelineVisible,
-             "Show or hide Colourise Amount, Colour Phase, and keyed palette-marker curves. Their authored keys stay stored while hidden."});
-    }
-    if (effect->emissiveEnabled) {
-        visibilityChoices.push_back(
-            {"Intensity##TimelineVisibility",
-             &timings.colouriseIntensityTimelineVisible,
-             "Show or hide Emissive Level and keyed falloff-node curves. Their authored keys stay stored while hidden."});
-    }
-    bool visibilityChanged = false;
-    const int visibilityColumns = TimingResponsiveColumnCount(
-        visibilityChoices.size(),
-        104.0F,
-        static_cast<int>(visibilityChoices.size()));
-    ImGui::PushFont(
-        nullptr,
-        ImGui::GetStyle().FontSizeBase * 0.88F);
-    if (ImGui::BeginTable(
-            "##VisualFeatureTimelineVisibility",
-            visibilityColumns,
-            ImGuiTableFlags_NoSavedSettings |
-                ImGuiTableFlags_SizingStretchSame |
-                ImGuiTableFlags_NoPadOuterX)) {
-        for (const auto& choice : visibilityChoices) {
-            ImGui::TableNextColumn();
-            visibilityChanged = ImGui::Checkbox(
-                                    choice.label,
-                                    choice.visible) ||
-                                visibilityChanged;
-            DrawTimingControlTooltip(choice.tooltip);
-        }
-        ImGui::EndTable();
-    }
-    ImGui::PopFont();
-    if (visibilityChanged) {
-        timings.colouriseLocalKeyDrag.reset();
-        ClearTimingColouriseGraphInteraction(&timings);
-    }
 
     const auto appendBoundsLane =
         [&](TimingColouriseBoundsParameter parameter,
@@ -110751,6 +110491,90 @@ void DrawTimingColouriseUnifiedTimeline(
             effect,
             lanes);
     }
+
+    // Keep graph filtering next to the graph it affects. Six fixed columns
+    // stop the controls from reflowing as Colourise or Emissive is toggled;
+    // dormant groups remain visible but disabled, with their authored keys
+    // untouched.
+    struct TimelineVisibilityChoice {
+        const char* label = "";
+        bool* visible = nullptr;
+        ImU32 colour = IM_COL32_WHITE;
+        bool enabled = true;
+        const char* tooltip = "";
+    };
+    const std::array visibilityChoices{
+        TimelineVisibilityChoice{
+            "Position##TimelineVisibility",
+            &timings.colourisePositionTimelineVisible,
+            IM_COL32(255, 190, 74, 255),
+            true,
+            "Show or hide Bounds Position curves. Their authored keys stay stored while hidden."},
+        TimelineVisibilityChoice{
+            "Fade##TimelineVisibility",
+            &timings.colouriseFadeTimelineVisible,
+            kTimingLinkedFadeColour,
+            true,
+            "Show or hide Bounds Fade curves. Their authored keys stay stored while hidden."},
+        TimelineVisibilityChoice{
+            "Skew##TimelineVisibility",
+            &timings.colouriseSkewTimelineVisible,
+            TimingColouriseEffectParameterDisplayColour(
+                TimingColouriseEffectParameter::PaletteSkewCentre),
+            true,
+            "Show or hide enabled Palette and Emissive skew curves. Their authored keys stay stored while hidden."},
+        TimelineVisibilityChoice{
+            "Palette##TimelineVisibility",
+            &timings.colourisePaletteTimelineVisible,
+            TimingColouriseEffectParameterDisplayColour(
+                TimingColouriseEffectParameter::AmountOverride),
+            effect->colouriseEnabled,
+            "Show or hide Colourise Amount, Colour Phase, and keyed palette-marker curves. Their authored keys stay stored while hidden."},
+        TimelineVisibilityChoice{
+            "Intensity##TimelineVisibility",
+            &timings.colouriseIntensityTimelineVisible,
+            TimingColouriseEffectParameterDisplayColour(
+                TimingColouriseEffectParameter::EmissiveLevel),
+            effect->emissiveEnabled,
+            "Show or hide Emissive Level and keyed falloff-node curves. Their authored keys stay stored while hidden."},
+    };
+    bool visibilityChanged = false;
+    ImGui::PushFont(
+        nullptr,
+        ImGui::GetStyle().FontSizeBase * 0.80F);
+    if (ImGui::BeginTable(
+            "##VisualFeatureTimelineVisibility",
+            6,
+            ImGuiTableFlags_NoSavedSettings |
+                ImGuiTableFlags_SizingStretchSame |
+                ImGuiTableFlags_NoPadOuterX)) {
+        ImGui::TableNextColumn();
+        ImGui::Checkbox(
+            "Time-only drag##TimelineVisibility",
+            &timings.colouriseGraphTimeOnly);
+        DrawTimingControlTooltip(
+            "When enabled, dragging a curve key changes only animation time for the explicitly selected keys. Use the lower time marker, Shift/Cmd selection, or a selection window to retime several keys together.");
+        for (const auto& choice : visibilityChoices) {
+            ImGui::TableNextColumn();
+            ImGui::BeginDisabled(!choice.enabled);
+            ImGui::PushStyleColor(
+                ImGuiCol_Text,
+                ImGui::ColorConvertU32ToFloat4(choice.colour));
+            visibilityChanged = ImGui::Checkbox(
+                                    choice.label,
+                                    choice.visible) ||
+                                visibilityChanged;
+            ImGui::PopStyleColor();
+            ImGui::EndDisabled();
+            DrawTimingControlTooltip(choice.tooltip);
+        }
+        ImGui::EndTable();
+    }
+    ImGui::PopFont();
+    if (visibilityChanged) {
+        timings.colouriseLocalKeyDrag.reset();
+        ClearTimingColouriseGraphInteraction(&timings);
+    }
     ImGui::PopID();
 }
 
@@ -110791,6 +110615,12 @@ void DrawTimingColouriseCompactNumberEditors(
     ImGui::PushFont(
         nullptr,
         ImGui::GetStyle().FontSizeBase * 0.84F);
+    // Numeric sliders use the compact density of their key buttons so six
+    // animated settings can share a row without a second oversized control
+    // band beneath each label.
+    ImGui::PushStyleVar(
+        ImGuiStyleVar_FramePadding,
+        ImVec2{2.0F, 0.0F});
     if (ImGui::BeginTable(
             "##TimingVisualFeatureNumericControls",
             columns,
@@ -110806,6 +110636,7 @@ void DrawTimingColouriseCompactNumberEditors(
         }
         ImGui::EndTable();
     }
+    ImGui::PopStyleVar();
     ImGui::PopFont();
 }
 
@@ -111144,6 +110975,8 @@ void DrawTimingColouriseActivationOverview(
             "The lower half bundles every setting key: drag an edge to "
             "stretch all keys or the body to offset them; the active range "
             "stays fixed. Individual keys remain editable below.\n"
+            "Right-click or right-drag anywhere in the timeline area to "
+            "scrub the shared animation playhead.\n"
             "Red overlays mark ranges where the active features need more "
             "renderer slots than recommended. A feature with colourise and "
             "emissive output uses two of the eight slots.");
@@ -111242,7 +111075,8 @@ void DrawTimingColouriseActivationOverview(
             ImGui::InvisibleButton(
                 "##ActivationAndSettingsClip",
                 laneSize,
-                ImGuiButtonFlags_MouseButtonLeft);
+                ImGuiButtonFlags_MouseButtonLeft |
+                    ImGuiButtonFlags_MouseButtonRight);
             const bool timelineItemHovered = ImGui::IsItemHovered();
             const bool timelineItemActive = ImGui::IsItemActive();
             const ImVec2 itemMinimum =
@@ -111310,6 +111144,20 @@ void DrawTimingColouriseActivationOverview(
                     displayPositionForX(toX));
             };
             const auto mouse = ImGui::GetIO().MousePos;
+            // The overview uses the same right-button scrub convention as
+            // the detailed key graph, leaving left-drag exclusively for
+            // active-range and settings-clip edits.
+            if (timelineItemActive &&
+                ImGui::IsMouseDown(ImGuiMouseButton_Right)) {
+                const float viewFraction = std::clamp(
+                    (mouse.x - trackMinimumX) / trackWidth,
+                    0.0F,
+                    1.0F);
+                ScrubFeatureTimelineToAuthoredPosition(
+                    runtimeState,
+                    timelineCoordinates.ViewFractionToAuthored(
+                        viewFraction));
+            }
             const bool activationHovered =
                 timelineItemHovered && mouse.y < splitY;
             const bool settingsHovered =
@@ -112767,77 +112615,97 @@ void DrawTimingColouriseSection(
             scalarColumns,
             ImGuiTableFlags_NoSavedSettings |
                 ImGuiTableFlags_NoPadOuterX |
+                ImGuiTableFlags_BordersInnerV |
                 ImGuiTableFlags_SizingStretchSame);
         if (scalarTableVisible) {
             ImGui::TableNextColumn();
-        }
-        SetNextTimingLabelledControlWidth("Scalar Family");
-        if (ImGui::BeginCombo(
-                "Scalar Family",
-                catalog[familyIndex].name.c_str())) {
-            for (std::size_t index = 0U;
-                 index < catalog.size();
-                 ++index) {
-                const bool selected =
-                    index == familyIndex;
-                if (ImGui::Selectable(
-                        catalog[index].name.c_str(),
-                        selected) &&
-                    !catalog[index].variants.empty()) {
-                    const auto defaultIndex =
-                        defaultVariantIndex(catalog[index]);
-                    applyFieldSelection(
-                        catalog[index]
-                            .variants[defaultIndex]
-                            .selector);
-                    familyIndex = index;
-                    variantIndex = defaultIndex;
+            const auto familyCell = BeginTimingSelectorCell(
+                "##TimingScalarFamilyCell",
+                /*labelOnRight=*/true,
+                82.0F);
+            if (familyCell.visible) {
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::BeginCombo(
+                        "##TimingScalarFamily",
+                        catalog[familyIndex].name.c_str())) {
+                    for (std::size_t index = 0U;
+                         index < catalog.size();
+                         ++index) {
+                        const bool selected =
+                            index == familyIndex;
+                        if (ImGui::Selectable(
+                                catalog[index].name.c_str(),
+                                selected) &&
+                            !catalog[index].variants.empty()) {
+                            const auto defaultIndex =
+                                defaultVariantIndex(catalog[index]);
+                            applyFieldSelection(
+                                catalog[index]
+                                    .variants[defaultIndex]
+                                    .selector);
+                            familyIndex = index;
+                            variantIndex = defaultIndex;
+                        }
+                        if (selected) {
+                            ImGui::SetItemDefaultFocus();
+                        }
+                    }
+                    ImGui::EndCombo();
                 }
-                if (selected) {
-                    ImGui::SetItemDefaultFocus();
-                }
+                DrawTimingControlTooltip(
+                    "Choose a scalar family shared by committed SAND, ROCK, and VEG. Related scale and vector components are grouped. Switching fields keeps every field's Bounds authoring remembered.");
+                SetTimingSelectorLabelColumn(familyCell);
+                DrawTimingCompactSelectorLabel(
+                    "Scalar Family",
+                    "Choose a scalar family shared by committed SAND, ROCK, and VEG. Related scale and vector components are grouped. Switching fields keeps every field's Bounds authoring remembered.");
             }
-            ImGui::EndCombo();
-        }
-        DrawTimingLabelTooltip(
-            "Choose a scalar family shared by committed SAND, ROCK, and VEG. Related scale and vector components are grouped. Switching fields keeps every field's Bounds authoring remembered.");
-        if (scalarTableVisible) {
+            EndTimingSelectorCell(familyCell);
+
             ImGui::TableNextColumn();
-        }
-        const auto& variants =
-            catalog[familyIndex].variants;
-        variantIndex = std::min(
-            variantIndex,
-            variants.size() - 1U);
-        SetNextTimingLabelledControlWidth("Variant");
-        if (ImGui::BeginCombo(
-                "Variant",
-                variants[variantIndex].name.c_str())) {
-            for (std::size_t index = 0U;
-                 index < variants.size();
-                 ++index) {
-                const bool selected =
-                    variants[index].selector ==
-                    effect.field;
-                if (ImGui::Selectable(
-                        variants[index].name.c_str(),
-                        selected)) {
-                    applyFieldSelection(
-                        variants[index].selector);
-                    timings.lastColouriseVariantByFamily
-                        [catalog[familyIndex].id] =
-                        variants[index].id;
-                    variantIndex = index;
+            const auto& variants =
+                catalog[familyIndex].variants;
+            variantIndex = std::min(
+                variantIndex,
+                variants.size() - 1U);
+            const auto variantCell = BeginTimingSelectorCell(
+                "##TimingScalarVariantCell",
+                /*labelOnRight=*/false,
+                48.0F);
+            if (variantCell.visible) {
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::BeginCombo(
+                        "##TimingScalarVariant",
+                        variants[variantIndex].name.c_str())) {
+                    for (std::size_t index = 0U;
+                         index < variants.size();
+                         ++index) {
+                        const bool selected =
+                            variants[index].selector ==
+                            effect.field;
+                        if (ImGui::Selectable(
+                                variants[index].name.c_str(),
+                                selected)) {
+                            applyFieldSelection(
+                                variants[index].selector);
+                            timings.lastColouriseVariantByFamily
+                                [catalog[familyIndex].id] =
+                                variants[index].id;
+                            variantIndex = index;
+                        }
+                        if (selected) {
+                            ImGui::SetItemDefaultFocus();
+                        }
+                    }
+                    ImGui::EndCombo();
                 }
-                if (selected) {
-                    ImGui::SetItemDefaultFocus();
-                }
+                DrawTimingControlTooltip(
+                    "Choose Fine, Medium, Broad, Combined, X, Y, Z, Magnitude, or the available single variant. The chosen variant is remembered per family.");
+                SetTimingSelectorLabelColumn(variantCell);
+                DrawTimingCompactSelectorLabel(
+                    "Variant",
+                    "Choose Fine, Medium, Broad, Combined, X, Y, Z, Magnitude, or the available single variant. The chosen variant is remembered per family.");
             }
-            ImGui::EndCombo();
-        }
-        DrawTimingLabelTooltip(
-            "Choose Fine, Medium, Broad, Combined, X, Y, Z, Magnitude, or the available single variant. The chosen variant is remembered per family.");
-        if (scalarTableVisible) {
+            EndTimingSelectorCell(variantCell);
             ImGui::EndTable();
         }
         auto& boundsStores = water.timingScalarBoundsStores;
@@ -112878,14 +112746,6 @@ void DrawTimingColouriseSection(
             histogram != nullptr &&
             timings.spreadColouriseHistogramSignatures.contains(
                 histogram->signature);
-        const auto compactControlButtonWidth = [](const char* label) {
-            return ImGui::CalcTextSize(label).x +
-                   ImGui::GetStyle().FramePadding.x * 2.0F;
-        };
-        const float boundsProfileActionWidth =
-            compactControlButtonWidth("+") +
-            compactControlButtonWidth("Save") +
-            compactControlButtonWidth("X") + 6.0F;
         const int boundsSelectionColumns = TimingResponsiveColumnCount(
             2U,
             290.0F,
@@ -112895,15 +112755,17 @@ void DrawTimingColouriseSection(
             boundsSelectionColumns,
             ImGuiTableFlags_NoSavedSettings |
                 ImGuiTableFlags_NoPadOuterX |
+                ImGuiTableFlags_BordersInnerV |
                 ImGuiTableFlags_SizingStretchSame);
         if (boundsSelectionTableVisible) {
             ImGui::TableNextColumn();
-        }
-        SetNextTimingLabelledControlWidth(
-            "Bounds Profile",
-            boundsProfileActionWidth);
-        if (ImGui::BeginCombo(
-                "Bounds Profile",
+            const auto boundsProfileCell = BeginTimingSelectorCell(
+                "##TimingBoundsProfileCell",
+                /*labelOnRight=*/true,
+                78.0F);
+            ImGui::SetNextItemWidth(-FLT_MIN);
+        if (boundsProfileCell.visible && ImGui::BeginCombo(
+                "##TimingBoundsProfile",
                 !activeBoundsProfileName.empty()
                     ? activeBoundsProfileName.c_str()
                     : effect.boundsEdited ? "Edited" : "Global")) {
@@ -112974,9 +112836,15 @@ void DrawTimingColouriseSection(
             }
             ImGui::EndCombo();
         }
-        DrawTimingLabelTooltip(
+        DrawTimingControlTooltip(
             "Bounds provenance for this scalar field. Global follows the latest edit shared across features, Edited is this feature's detached local state, and named profiles are saved states to reapply.");
-        ImGui::SameLine(0.0F, 2.0F);
+        SetTimingSelectorLabelColumn(boundsProfileCell);
+        bool requestSaveBoundsProfile = false;
+        ImGui::BeginGroup();
+        PushTimingCompactSelectorActionStyle();
+        ImGui::TextUnformatted("Bounds Profile");
+        DrawTimingControlTooltip(
+            "Bounds provenance for this scalar field. Global follows the latest edit shared across features, Edited is this feature's detached local state, and named profiles are saved states to reapply.");
         if (ImGui::SmallButton("+##SaveBoundsProfile")) {
             timings.boundsProfileNameBuffer =
                 "Bounds " +
@@ -112985,7 +112853,7 @@ void DrawTimingColouriseSection(
                          ? boundsStore->profiles.size()
                          : 0U) +
                     1U);
-            ImGui::OpenPopup("Save Bounds Profile");
+            requestSaveBoundsProfile = true;
         }
         DrawTimingControlTooltip(
             "Save the current Bounds as a named profile for this scalar field so any feature can reapply them.");
@@ -113053,6 +112921,12 @@ void DrawTimingColouriseSection(
             activeBoundsProfileName.empty()
                 ? "Choose a named Bounds profile before deleting it."
                 : "Delete the selected named profile. This feature keeps its current values as Edited bounds.");
+        PopTimingCompactSelectorActionStyle();
+        ImGui::EndGroup();
+        EndTimingSelectorCell(boundsProfileCell);
+        if (requestSaveBoundsProfile) {
+            ImGui::OpenPopup("Save Bounds Profile");
+        }
         if (ImGui::BeginPopup("Save Bounds Profile")) {
             ImGui::SetNextItemWidth(220.0F);
             InputTextString(
@@ -113136,13 +113010,15 @@ void DrawTimingColouriseSection(
                 "Save the current Bounds under this name. An existing profile with the same name is replaced.");
             ImGui::EndPopup();
         }
-        if (boundsSelectionTableVisible) {
-            ImGui::TableNextColumn();
-        }
-        SetNextTimingLabelledControlWidth("Histogram Axis");
+        ImGui::TableNextColumn();
+        const auto histogramAxisCell = BeginTimingSelectorCell(
+            "##TimingHistogramAxisCell",
+            /*labelOnRight=*/false,
+            82.0F);
+        ImGui::SetNextItemWidth(-FLT_MIN);
         ImGui::BeginDisabled(!spreadAvailable);
-        if (ImGui::BeginCombo(
-                "Histogram Axis",
+        if (histogramAxisCell.visible && ImGui::BeginCombo(
+                "##TimingHistogramAxis",
                 useDistributionSpread
                     ? "Distribution Spread"
                     : "Raw Values")) {
@@ -113167,12 +113043,18 @@ void DrawTimingColouriseSection(
             ImGui::EndCombo();
         }
         ImGui::EndDisabled();
-        DrawTimingLabelTooltip(
+        DrawTimingControlTooltip(
             spreadAvailable
                 ? "Raw Values uses the scalar's linear range. Distribution Spread uses the cached 16,384-bin distribution to reveal concentrated detail and give it more mouse resolution. It changes only this editing graph; Bounds keys, rendering, and export stay in raw scalar units."
                 : "The editing axis becomes available when this finite, non-constant histogram is ready.");
-        if (boundsSelectionTableVisible) {
-            ImGui::EndTable();
+        SetTimingSelectorLabelColumn(histogramAxisCell);
+        DrawTimingCompactSelectorLabel(
+            "Histogram Axis",
+            spreadAvailable
+                ? "Raw Values uses the scalar's linear range. Distribution Spread uses the cached 16,384-bin distribution to reveal concentrated detail and give it more mouse resolution. It changes only this editing graph; Bounds keys, rendering, and export stay in raw scalar units."
+                : "The editing axis becomes available when this finite, non-constant histogram is ready.");
+        EndTimingSelectorCell(histogramAxisCell);
+        ImGui::EndTable();
         }
         DrawTimingColouriseTopVisualControls(
             runtimeState,
