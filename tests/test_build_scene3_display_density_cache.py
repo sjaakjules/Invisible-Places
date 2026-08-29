@@ -27,6 +27,7 @@ TEST_DTYPE = np.dtype(
         ("scalar_Intensity", "<f8"),
         ("scalar_ScanID", "<f4"),
         ("scalar_Roughness", "<f4"),
+        ("scalar_A_R_Downhill_Azimuth_deg", "<f4"),
     ]
 )
 
@@ -43,6 +44,7 @@ TEST_PROPERTIES = (
     ("double", "scalar_Intensity"),
     ("float", "scalar_ScanID"),
     ("float", "scalar_Roughness"),
+    ("float", "scalar_A_R_Downhill_Azimuth_deg"),
 )
 
 
@@ -108,6 +110,7 @@ def _filter_fixture_records() -> np.ndarray:
     records["scalar_Intensity"] = [1.0, 3.0]
     records["scalar_ScanID"] = [5.0, 3.0]
     records["scalar_Roughness"] = [np.nan, 4.0]
+    records["scalar_A_R_Downhill_Azimuth_deg"] = [179.0, -179.0]
     return records
 
 
@@ -263,6 +266,11 @@ class DisplayDensityCacheBuilderTests(unittest.TestCase):
             self.assertAlmostEqual(abs(float(byte_point["nz"])), 1.0, places=6)
             self.assertAlmostEqual(float(byte_point["scalar_ScanID"]), 3.0)
             self.assertAlmostEqual(float(byte_point["scalar_Roughness"]), 4.0)
+            self.assertAlmostEqual(
+                abs(float(byte_point["scalar_A_R_Downhill_Azimuth_deg"])),
+                180.0,
+                places=4,
+            )
             self.assertIn(
                 float(byte_point["x"]),
                 _filter_fixture_records()["x"].tolist(),

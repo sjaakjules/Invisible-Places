@@ -20,6 +20,8 @@ inline constexpr std::string_view kSceneDisplayDensityCacheLegacyPositionPolicy 
     "real-parent-stable-hash";
 inline constexpr std::uint64_t
     kSceneDisplayDensityCacheQ1CentroidMedoidAlgorithmVersion = 2U;
+inline constexpr std::uint64_t
+    kSceneDisplayDensityCacheCircularFieldAlgorithmVersion = 3U;
 inline constexpr std::string_view
     kSceneDisplayDensityCacheQ1CentroidMedoidPositionPolicy =
         "real-parent-q1-centroid-medoid-qN-stable-hash";

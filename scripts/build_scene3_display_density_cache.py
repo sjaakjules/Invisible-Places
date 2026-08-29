@@ -57,7 +57,7 @@ except ImportError as exc:  # pragma: no cover - exercised by the CLI host.
 
 SCHEMA_VERSION = 1
 ALGORITHM_ID = "scene-display-density-stratified-prefilter-v1"
-ALGORITHM_VERSION = 2
+ALGORITHM_VERSION = 3
 POSITION_POLICY = "real-parent-q1-centroid-medoid-qN-stable-hash"
 MANIFEST_NAME = "display-density-manifest.json"
 ACTIVE_POINTER_NAME = "active-bundle.json"
@@ -71,6 +71,9 @@ DEFAULT_TARGETS = {
 ROLE_ORDER = ("ROCK", "SAND", "VEG")
 RGB_FILTER_RENDERER_BYTE = "renderer-byte-mean"
 RGB_FILTER_SRGB_LINEAR = "srgb-linear-light"
+CIRCULAR_DEGREE_FIELDS = {
+    "scalarardownhillazimuthdeg",
+}
 
 _PLY_NUMPY_TYPES = {
     "char": "i1",
@@ -571,6 +574,34 @@ def _finite_group_mean(values: np.ndarray, starts: np.ndarray) -> np.ndarray:
     return means
 
 
+def _finite_group_circular_mean_degrees(
+    values: np.ndarray,
+    starts: np.ndarray,
+) -> np.ndarray:
+    """Mean signed degree angles on the unit circle, not across the seam."""
+
+    as_float = values.astype(np.float64)
+    finite = np.isfinite(as_float)
+    radians = np.deg2rad(np.where(finite, as_float, 0.0))
+    sine = np.add.reduceat(np.where(finite, np.sin(radians), 0.0), starts)
+    cosine = np.add.reduceat(np.where(finite, np.cos(radians), 0.0), starts)
+    counts = np.add.reduceat(finite.astype(np.uint64), starts)
+    means = np.rad2deg(np.arctan2(sine, cosine))
+
+    # An empty group or an exactly cancelling direction has no meaningful
+    # circular average. Fall back to its first finite parent (or the first
+    # parent when all values are non-finite), keeping the rule deterministic.
+    all_indices = np.arange(values.size, dtype=np.int64)
+    first_finite = np.minimum.reduceat(
+        np.where(finite, all_indices, values.size),
+        starts,
+    )
+    safe_first = np.where(first_finite < values.size, first_finite, starts)
+    ambiguous = (counts == 0) | (np.hypot(sine, cosine) <= 1.0e-12)
+    means[ambiguous] = as_float[safe_first[ambiguous]]
+    return means
+
+
 def _categorical_mode(
     values: np.ndarray,
     starts: np.ndarray,
@@ -717,7 +748,13 @@ def _aggregate_sorted_groups(
         if normalized_name in ("scanid", "scalarscanid"):
             output[name] = _categorical_mode(records[name], starts)
             continue
-        means = _finite_group_mean(records[name], starts)
+        if normalized_name in CIRCULAR_DEGREE_FIELDS:
+            means = _finite_group_circular_mean_degrees(
+                records[name],
+                starts,
+            )
+        else:
+            means = _finite_group_mean(records[name], starts)
         field_dtype = records.dtype[name]
         if np.issubdtype(field_dtype, np.integer):
             limits = np.iinfo(field_dtype)
@@ -1250,6 +1287,9 @@ def build_cache(config: BuildConfig) -> Path:
                 ),
                 "categorical_filter": "scanid-mode-low-value-tie",
                 "continuous_filter": "finite-arithmetic-mean",
+                "circular_degree_filter": (
+                    "finite-unit-circle-mean-first-parent-fallback"
+                ),
             },
             "scene": "Scene3",
             "complete": True,

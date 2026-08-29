@@ -63,8 +63,10 @@ constexpr std::array<std::string_view, 3U> kRequiredRoles{
         algorithmVersion == kSceneDisplayDensityCacheLegacyAlgorithmVersion &&
         positionPolicy == kSceneDisplayDensityCacheLegacyPositionPolicy;
     const bool q1CentroidMedoid =
-        algorithmVersion ==
-            kSceneDisplayDensityCacheQ1CentroidMedoidAlgorithmVersion &&
+        (algorithmVersion ==
+             kSceneDisplayDensityCacheQ1CentroidMedoidAlgorithmVersion ||
+         algorithmVersion ==
+             kSceneDisplayDensityCacheCircularFieldAlgorithmVersion) &&
         positionPolicy ==
             kSceneDisplayDensityCacheQ1CentroidMedoidPositionPolicy;
     return legacyStableHash || q1CentroidMedoid;
