@@ -1001,14 +1001,17 @@ struct TimingColouriseGraphKeyDragValue {
 struct TimingColouriseGraphKeyDragState {
     std::string effectId;
     std::string laneGroupId;
+    // A first drag on an unselected curve dot edits its value in place. Once
+    // explicitly selected, the same dot may retime as well. Lower time handles
+    // always retime and never edit values.
+    bool timeDrag = true;
     bool valueDrag = false;
     float mouseStartX = 0.0F;
     float mouseStartY = 0.0F;
     invisible_places::timing::TimingColouriseEffect originalEffect{};
-    // Keys explicitly selected by the user. `handles` may additionally
-    // contain an invisible or unselected semantic partner (the other Bounds
-    // coordinate/fade at the same time), but moving that partner must not
-    // turn a single-dot selection into a destructive multi-selection.
+    // Keys explicitly selected by the user. Keeping this snapshot separate
+    // from the live selection lets a drag update their stored positions while
+    // preserving its range anchor.
     std::vector<TimingColouriseKeyHandle> selectedHandles;
     std::vector<TimingColouriseKeyHandle> handles;
     std::optional<TimingColouriseKeyHandle> rangeAnchor;
@@ -101893,8 +101896,36 @@ void DrawTimingKeyLaneGroup(
         }
     }
 
+    const auto selectedHandleAtMarker =
+        [&](float position)
+            -> std::optional<TimingColouriseKeyHandle> {
+            if (!timings.colouriseKeySelection.has_value() ||
+                timings.colouriseKeySelection->effectId != effect->id) {
+                return std::nullopt;
+            }
+            for (const auto& selected :
+                 timings.colouriseKeySelection->keys) {
+                if (std::abs(selected.position - position) >
+                    invisible_places::timing::
+                        kTimingColouriseKeyTolerance) {
+                    continue;
+                }
+                const bool visible = std::any_of(
+                    series.begin(),
+                    series.end(),
+                    [&](const auto& lane) {
+                        return sameTrack(selected, lane);
+                    });
+                if (visible) {
+                    return selected;
+                }
+            }
+            return std::nullopt;
+        };
+
     const auto armKeyDrag =
         [&](const TimingColouriseKeyHandle& clicked,
+            bool requestTimeDrag,
             bool requestValueDrag) {
             std::vector<TimingColouriseKeyHandle> handles;
             if (timings.colouriseKeySelection.has_value() &&
@@ -101914,6 +101945,10 @@ void DrawTimingKeyLaneGroup(
             TimingColouriseGraphKeyDragState drag{
                 .effectId = effect->id,
                 .laneGroupId = id,
+                // The explicit Time-only option remains an override: it turns
+                // even a first value-only dot drag into a retime-only drag.
+                .timeDrag = requestTimeDrag ||
+                            timings.colouriseGraphTimeOnly,
                 .valueDrag = requestValueDrag &&
                              !timings.colouriseGraphTimeOnly,
                 .mouseStartX = mouse.x,
@@ -102029,19 +102064,27 @@ void DrawTimingKeyLaneGroup(
             const auto& io = ImGui::GetIO();
             const bool modifiedSelection =
                 io.KeyCtrl || io.KeySuper || io.KeyShift;
+            const bool wasSelected = handleSelected(hoveredDotHandle);
             // Preserve a deliberate multi-selection when its member is
             // pressed for dragging; an unselected node still becomes the
             // sole selection before its drag is armed.
             const bool preserveExplicitGroup =
                 !modifiedSelection &&
-                handleSelected(hoveredDotHandle);
+                wasSelected;
             if (!preserveExplicitGroup) {
                 selectClickedHandle(
                     *hoveredDotGraph->lane,
                     hoveredDotHandle.position);
             }
             if (!modifiedSelection) {
-                armKeyDrag(hoveredDotHandle, true);
+                // Direct manipulation has a two-step contract: the first
+                // drag selects the dot and edits only its value; after a
+                // click/release has selected it, the next drag may edit both
+                // its time and value.
+                armKeyDrag(
+                    hoveredDotHandle,
+                    wasSelected,
+                    true);
             }
         }
     } else if (markerHovered && nearestSeries != nullptr) {
@@ -102050,26 +102093,31 @@ void DrawTimingKeyLaneGroup(
             *nearestSeries,
             nearestPosition);
         if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-            // The lower rail is a cluster control, not another copy of a
-            // curve dot. It always selects every visible key at this time,
-            // ignores selection modifiers, and never carries value motion.
-            std::vector<TimingColouriseKeyHandle> cluster;
-            for (const auto& lane : series) {
-                for (const float lanePosition : lane.positions) {
-                    if (std::abs(
-                            lanePosition - nearestPosition) <=
-                        invisible_places::timing::
-                            kTimingColouriseKeyTolerance) {
-                        AddUniqueTimingColouriseKeyHandle(
-                            &cluster,
-                            TimingColouriseKeyHandleForLane(
-                                lane,
-                                lanePosition));
+            // An unselected lower handle forms a time-only cluster from all
+            // visible coincident keys. If a dot at this time is already
+            // selected, the handle instead retimes only the explicit
+            // selection, leaving its unselected snapped neighbours in place.
+            auto dragHandle = selectedHandleAtMarker(nearestPosition);
+            if (!dragHandle.has_value()) {
+                std::vector<TimingColouriseKeyHandle> cluster;
+                for (const auto& lane : series) {
+                    for (const float lanePosition : lane.positions) {
+                        if (std::abs(
+                                lanePosition - nearestPosition) <=
+                            invisible_places::timing::
+                                kTimingColouriseKeyTolerance) {
+                            AddUniqueTimingColouriseKeyHandle(
+                                &cluster,
+                                TimingColouriseKeyHandleForLane(
+                                    lane,
+                                    lanePosition));
+                        }
                     }
                 }
+                replaceSelection(std::move(cluster), handle);
+                dragHandle = handle;
             }
-            replaceSelection(std::move(cluster), handle);
-            armKeyDrag(handle, false);
+            armKeyDrag(dragHandle.value(), true, false);
         }
     } else if (
         itemHovered && !keyHelpHovered &&
@@ -102245,7 +102293,7 @@ void DrawTimingKeyLaneGroup(
     };
     if (dragMatches() && itemActive &&
         ImGui::IsMouseDragging(ImGuiMouseButton_Left, 2.0F)) {
-        {
+        if (timings.colouriseGraphKeyDrag->timeDrag) {
             // Shake to toggle snapping: several quick horizontal
             // direction reversals flip it off for the rest of this drag,
             // and another shake turns it back on.
@@ -102276,12 +102324,17 @@ void DrawTimingKeyLaneGroup(
         // In the linked whole-loop lens the offset is an unclamped cycle
         // fraction and moved keys wrap around the loop; unlinked keys keep
         // the bounded 0..1 timeline and pin at its ends.
-        const bool cyclicDrag = timelineCoordinates.linkedCyclic;
-        float offset = cyclicDrag
-            ? timelineCoordinates.AuthoredDeltaBetweenDisplayPositions(
-                  displayPositionForX(drag.mouseStartX),
-                  displayPositionForX(mouse.x))
-            : positionForX(mouse.x) - positionForX(drag.mouseStartX);
+        const bool cyclicDrag =
+            timelineCoordinates.linkedCyclic && drag.timeDrag;
+        float offset = 0.0F;
+        if (drag.timeDrag) {
+            offset = cyclicDrag
+                ? timelineCoordinates.AuthoredDeltaBetweenDisplayPositions(
+                      displayPositionForX(drag.mouseStartX),
+                      displayPositionForX(mouse.x))
+                : positionForX(mouse.x) -
+                      positionForX(drag.mouseStartX);
+        }
         if (!cyclicDrag) {
             float first = 1.0F;
             float last = 0.0F;
@@ -102404,7 +102457,8 @@ void DrawTimingKeyLaneGroup(
         // land on an occupied position of its own setting - then the whole
         // group keeps the raw offset. Shake while dragging to toggle
         // snapping off and on.
-        if (!cyclicDrag && !drag.snappingDisabled) {
+        if (drag.timeDrag && !cyclicDrag &&
+            !drag.snappingDisabled) {
             const float viewSpan = std::abs(
                 positionForX(maximum.x) - positionForX(minimum.x));
             const float snapTolerance =
@@ -103469,9 +103523,9 @@ void DrawTimingKeyLaneGroup(
         ImGui::TextUnformatted(
             "Right-click or right-drag to scrub the animation position.");
         ImGui::TextUnformatted(
-            "Left-click a curve dot to select only that key; its labelled halo shows the exact target. Drag changes its time and value.");
+            "First-drag an unselected curve dot to change only its value while time stays locked. Click/release to select it, then drag it again to change time and value.");
         ImGui::TextUnformatted(
-            "A lower time handle selects every visible key at that time and changes time only. Time-only drag locks values but still moves only the explicitly selected keys.");
+            "An unselected lower time handle selects and retimes every visible key snapped there. After selecting a dot, its lower handle retimes only the explicit selection. Values always stay locked.");
         ImGui::TextUnformatted(
             "Coincident curve keys remain independent unless selected together. Position, Fade, Skew, Palette, and Intensity still snap only within their own kind.");
         ImGui::TextUnformatted(
@@ -103497,28 +103551,30 @@ void DrawTimingKeyLaneGroup(
         }
         ImGui::EndTooltip();
     } else if (hoveredDotGraph != nullptr) {
+        const char* dragDescription =
+            timings.colouriseGraphTimeOnly
+                ? "Left-drag changes time only"
+                : handleSelected(hoveredDotHandle)
+                    ? "Left-drag changes time and value"
+                    : "First left-drag changes value only; time stays locked";
         if (hoveredDotGraph->wrappedPalettePhase) {
             const auto exact = TimingColouriseExactScalarKey(
                 *effect,
                 hoveredDotHandle);
             ImGui::SetTooltip(
-                "%s key\nDelta = %.6g turns; accumulated = %.6g turns\nAnimation position %.4f\nLeft-drag changes time%s; double-click enters an exact position.",
+                "%s key\nDelta = %.6g turns; accumulated = %.6g turns\nAnimation position %.4f\n%s; double-click enters an exact position.",
                 hoveredDotGraph->lane->label,
                 exact.has_value() ? exact->first : 0.0F,
                 hoveredDotValue,
                 hoveredDotHandle.position,
-                timings.colouriseGraphTimeOnly
-                    ? " only"
-                    : " and value");
+                dragDescription);
         } else {
             ImGui::SetTooltip(
-                "%s key\nValue = %.6g\nAnimation position %.4f\nLeft-drag changes time%s; double-click enters an exact position.",
+                "%s key\nValue = %.6g\nAnimation position %.4f\n%s; double-click enters an exact position.",
                 hoveredDotGraph->lane->label,
                 hoveredDotValue,
                 hoveredDotHandle.position,
-                timings.colouriseGraphTimeOnly
-                    ? " only"
-                    : " and value");
+                dragDescription);
         }
     } else if (markerHovered && nearestSeries != nullptr) {
         std::size_t clusterKeyCount = 0U;
@@ -103532,11 +103588,23 @@ void DrawTimingKeyLaneGroup(
                                kTimingColouriseKeyTolerance;
                 }));
         }
-        ImGui::SetTooltip(
-            "Time handle — %zu visible key%s\nAnimation position %.4f\nLeft-drag retimes the complete cluster; values are locked.",
-            clusterKeyCount,
-            clusterKeyCount == 1U ? "" : "s",
-            nearestPosition);
+        const bool preservesSelection =
+            selectedHandleAtMarker(nearestPosition).has_value();
+        if (preservesSelection) {
+            const auto selectionCount =
+                timings.colouriseKeySelection->keys.size();
+            ImGui::SetTooltip(
+                "Selected time handle — %zu selected key%s\nAnimation position %.4f\nLeft-drag retimes only the explicit selection; unselected snapped keys stay put and values are locked.",
+                selectionCount,
+                selectionCount == 1U ? "" : "s",
+                nearestPosition);
+        } else {
+            ImGui::SetTooltip(
+                "Time handle — %zu visible key%s\nAnimation position %.4f\nLeft-drag selects and retimes the complete snapped cluster; values are locked.",
+                clusterKeyCount,
+                clusterKeyCount == 1U ? "" : "s",
+                nearestPosition);
+        }
     } else if (itemHovered) {
         const float startDistance = positionInView(activation.start)
             ? std::abs(
@@ -110484,7 +110552,7 @@ void DrawTimingColouriseUnifiedTimeline(
     } else {
         ImGui::TextDisabled("Values over animation position");
         DrawTimingControlTooltip(
-            "All enabled Visual Feature key groups share this graph. Position, Fade, Skew, Palette, and Intensity each snap only to their own kind. Every curve keeps its existing value range and typed key behaviour. Double-click open graph space to add a key on the only or nearest visible curve; drag a dot to edit time and value, drag its lower marker to retime only, left-drag empty space to window-select, and right-drag to scrub.");
+            "All enabled Visual Feature key groups share this graph. Position, Fade, Skew, Palette, and Intensity each snap only to their own kind. Every curve keeps its existing value range and typed key behaviour. Double-click open graph space to add a key on the only or nearest visible curve. First-drag an unselected dot to edit its value with time locked; click/release and drag it again to edit time and value. An unselected lower marker retimes its snapped cluster, while a marker under an explicitly selected dot retimes only that selection. Left-drag empty space to window-select, and right-drag to scrub.");
         DrawTimingKeyLaneGroup(
             "##TimingColouriseUnifiedKeyLane",
             runtimeState,
