@@ -116,9 +116,9 @@ not another saved display density. It is available in **Point Renderer** even
 when no animation is loaded. It resolves the selected grouped-scene layer, or
 the single visible compatible scene when that choice is unambiguous, and
 always includes the current camera in its fine-data request. A loaded
-animation associated with that same scene contributes complete-path prefetch
-views only; it is never a boundary. Moving beyond the animation or beyond the
-prepared camera guard requests a replacement cache around the new view.
+animation changes the retention policy but does not contribute a full-path
+prefetch or become a boundary. Playback, section scrubbing, and movement
+beyond the animation all advance the same guarded current-camera request.
 
 Each camera view is padded by 20% of the full viewport on every side. The fine
 scan is also depth-limited: its switch depth is where the 5 mm source spacing
@@ -132,13 +132,16 @@ shimmer and ordinary animation playback does not rebuild it frame by frame.
 
 The complete 5 mm baseline stays CPU/GPU-resident throughout aHQ. While a
 valid fine patch is published, a guarded draw mask removes redundant coarse
-submissions inside the fine region; it does not destroy the baseline. If the
-camera leaves the published guard, the ordinary complete 5 mm scene returns
-immediately for newly exposed pixels, but the last published fine patch is no
-longer hidden. It remains as a depth-faded overlay wherever it still intersects
-the view until the replacement publishes atomically. A failed replacement also
-keeps that recoverable overlay and complete 5 mm coverage; moving fully away
-from it costs only ordinary frustum rejection.
+submissions inside the fine region; it does not destroy the baseline. A
+persistent 64-cell-per-axis lookup stores one compact cell ID per coarse point,
+so later guard scans avoid repeating float voxel-coordinate work. Timeline
+updates retain bounded mask history up to 20% of each full role, navigation
+retains the latest neighbour up to 30%, and a 768 MiB per-role GPU-byte cap
+always leaves the current mask complete. Point and surfel index buffers retain
+their capacity between publications. If the camera leaves the published guard,
+the ordinary complete 5 mm scene returns immediately for newly exposed pixels,
+while the last fine patch remains depth-faded wherever it still intersects the
+view until the replacement publishes atomically.
 
 The first aHQ use of an enabled 1 mm role builds a machine-local, linear-octree
 style cache under `Saved/.invisible_places/cache/adaptive_hq/`. It sorts points
@@ -152,16 +155,24 @@ each intersecting block. The generation is published transactionally and
 never replaces the canonical/export-quality PLY or writes beside OneDrive.
 
 Later camera requests test the guarded frustum union against those block
-bounds and seek directly to only the intersecting ranges. The exact per-point
-frustum predicate trims conservative boundary blocks. Active blocks always
-remain decoded. Most-recently-used inactive blocks fill a 6 GiB RAM budget per
-role (measured from their decoded geometry, source IDs, and selected scalar
-columns), so orbit returns and back-and-forth animation scrubbing normally
-reuse already decoded data and read only a new fringe. Cache reuse requires
-an exact source-path, byte-size, modification-time, property-schema,
-point-count, record-size, and sampled-content identity match; any mismatch
-causes an automatic local rebuild. Playback advances the same camera-owned
-guard and never bounds navigation or inflates the fine draw to the full path.
+bounds and seek directly to only the intersecting ranges. Each decoded block
+is subdivided in memory into contiguous 128-point Morton micro-blocks. Their
+bounds conservatively accept intersecting ranges, replacing an exact test for
+every point while adding only a small boundary fringe; this does not change or
+invalidate existing schema-v2 disk caches. Active blocks always remain decoded.
+A 6 GiB RAM budget per role retains inactive blocks by camera distance first
+during navigation, or by recency first during animation playback and
+scrubbing, so returning to a nearby view normally reads only the new fringe.
+Cache reuse requires an exact source-path, byte-size, modification-time,
+property-schema, point-count, record-size, and sampled-content identity match;
+any mismatch causes an automatic local rebuild.
+
+Replacement publication moves superseded CPU patch payloads to a retirement
+worker instead of freeing hundreds of MiB on the render thread. Navigation
+uses a 250 ms grace period; timeline work uses 1.5 seconds so nearby scrubs can
+reuse shared decoded blocks. A 4 GiB queue threshold applies memory pressure
+by releasing the farthest retired patch first. Failed replacements retain the
+recoverable overlay and complete 5 mm coverage.
 
 aHQ shares fixed HQ's saved patch-spacing and Sand preferences, Visual/effect
 resolution, hidden 5 mm baseline ownership, and export isolation. The selected
