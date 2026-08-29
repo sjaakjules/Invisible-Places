@@ -422,6 +422,78 @@ TEST_CASE(
     REQUIRE(activeOnly.blocks.size() == 1U);
     CHECK(activeOnly.blocks.front().blockIndex == 4U);
     CHECK(activeOnly.inactivePayloadBytes == 0U);
+
+    candidates[1U].requestDistanceSquared = 100.0F;
+    candidates[2U].requestDistanceSquared = 1.0F;
+    candidates[3U].requestDistanceSquared = 4.0F;
+    const auto navigationRetained =
+        invisible_places::app::RetainAdaptiveHqResidentBlocks(
+            candidates,
+            active,
+            geometryBytes,
+            invisible_places::app::AdaptiveHqInteractionProfile::Navigation);
+    REQUIRE(navigationRetained.blocks.size() == 2U);
+    CHECK(navigationRetained.blocks[0U].blockIndex == 4U);
+    CHECK(navigationRetained.blocks[1U].blockIndex == 3U);
+}
+
+TEST_CASE(
+    "Adaptive HQ coarse guards retain a bounded navigation or timeline fringe",
+    "[pointcloud][adaptive-hq][retention]") {
+    const std::vector<std::uint32_t> retained{1U, 2U, 3U, 7U};
+    const std::vector<std::uint32_t> latest{3U, 4U, 5U};
+    const std::vector<std::uint32_t> current{5U, 6U, 7U};
+
+    const auto navigation =
+        invisible_places::app::RetainAdaptiveHqFiveMillimeterGuard(
+            retained,
+            latest,
+            current,
+            30U,
+            invisible_places::app::AdaptiveHqInteractionProfile::Navigation);
+    CHECK(navigation.indices ==
+          std::vector<std::uint32_t>{3U, 4U, 5U, 6U, 7U});
+    CHECK(navigation.retainedHistoryPointCount == 2U);
+    CHECK_FALSE(navigation.historyLimited);
+
+    const auto timeline =
+        invisible_places::app::RetainAdaptiveHqFiveMillimeterGuard(
+            retained,
+            latest,
+            current,
+            30U,
+            invisible_places::app::AdaptiveHqInteractionProfile::Timeline);
+    CHECK(timeline.indices ==
+          std::vector<std::uint32_t>{1U, 2U, 3U, 5U, 6U, 7U});
+    CHECK(timeline.retainedHistoryPointCount == 3U);
+    CHECK_FALSE(timeline.historyLimited);
+
+    const std::vector<std::uint32_t> broadRetained{
+        0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 9U};
+    const std::vector<std::uint32_t> broadLatest{
+        0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U};
+    const std::vector<std::uint32_t> broadCurrent{
+        0U, 1U, 2U, 3U, 4U, 5U};
+    const auto limited =
+        invisible_places::app::RetainAdaptiveHqFiveMillimeterGuard(
+            broadRetained,
+            broadLatest,
+            broadCurrent,
+            10U,
+            invisible_places::app::AdaptiveHqInteractionProfile::Timeline);
+    CHECK(limited.indices == broadCurrent);
+    CHECK(limited.retainedHistoryPointCount == 0U);
+    CHECK(limited.historyLimited);
+
+    invisible_places::io::Bounds3f bounds;
+    bounds.Expand({-1.0F, -2.0F, -3.0F});
+    bounds.Expand({1.0F, 2.0F, 3.0F});
+    CHECK(invisible_places::app::AdaptiveHqBoundsDistanceSquared(
+              bounds,
+              {0.0F, 0.0F, 0.0F}) == Catch::Approx(0.0F));
+    CHECK(invisible_places::app::AdaptiveHqBoundsDistanceSquared(
+              bounds,
+              {4.0F, 6.0F, 3.0F}) == Catch::Approx(25.0F));
 }
 
 TEST_CASE(

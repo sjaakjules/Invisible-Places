@@ -33,6 +33,21 @@ constexpr float kAdaptiveHqRefreshBorderFraction = 0.10F;
 // 6 GiB working set, while the limit still prevents an unbounded session.
 constexpr std::uint64_t kAdaptiveHqRetainedFringeByteBudgetPerRole =
     6ULL * 1024ULL * 1024ULL * 1024ULL;
+// A retained coarse guard consumes one uint32 point index plus six uint32
+// surfel indices on the GPU. These limits keep timeline reuse broad on the
+// user's unified-memory Mac while bounding the fallback layer independently
+// of the decoded 1 mm block cache.
+constexpr std::uint64_t kAdaptiveHqFiveMillimeterGuardGpuBytesPerPoint =
+    7ULL * sizeof(std::uint32_t);
+constexpr std::uint64_t kAdaptiveHqFiveMillimeterGuardByteBudgetPerRole =
+    768ULL * 1024ULL * 1024ULL;
+// Camera navigation changes direction unpredictably, so retain only the
+// latest neighbouring guard and cap it at 30% of the complete coarse role.
+constexpr double kAdaptiveHqNavigationRetainedGuardFraction = 0.30;
+// Timeline guards overlap strongly between adjacent frames. Beyond 20% of
+// the complete coarse cloud, drawing stale coarse history costs more than
+// regenerating it helps; the current mask remains complete at every cap.
+constexpr double kAdaptiveHqTimelineRetainedGuardFraction = 0.20;
 // Cache blocks parse independently. Eight readers match the M1 Max worker
 // cap used by patch assembly while retaining deterministic commit order.
 constexpr std::size_t kAdaptiveHqBlockReadWorkerCount = 8U;
@@ -62,6 +77,34 @@ struct AdaptiveHqResidentRetention {
     std::size_t inactiveBlockCount = 0U;
 };
 
+enum class AdaptiveHqInteractionProfile : std::uint8_t {
+    Navigation = 0,
+    Timeline,
+};
+
+struct AdaptiveHqFiveMillimeterGuardRetention {
+    std::vector<std::uint32_t> indices;
+    std::size_t retainedHistoryPointCount = 0U;
+    bool historyLimited = false;
+};
+
+// Retains the newly requested 5 mm mask plus a bounded spatial-history
+// fringe. Timeline work first reuses the complete retained working set;
+// navigation keeps only the immediately prior guard. If either exceeds its
+// point/GPU-byte cap, the latest guard is tried before falling back to the
+// current request. Inputs and output are sorted unique point indices.
+[[nodiscard]] AdaptiveHqFiveMillimeterGuardRetention
+RetainAdaptiveHqFiveMillimeterGuard(
+    std::span<const std::uint32_t> retainedGuard,
+    std::span<const std::uint32_t> latestGuard,
+    std::span<const std::uint32_t> currentGuard,
+    std::uint64_t fullPointCount,
+    AdaptiveHqInteractionProfile interactionProfile);
+
+[[nodiscard]] float AdaptiveHqBoundsDistanceSquared(
+    const invisible_places::io::Bounds3f& bounds,
+    const invisible_places::io::Float3& point);
+
 // Counts the decoded vector payload retained by a block. This is intentionally
 // based on resident geometry, source IDs, and selected scalar columns rather
 // than compressed/on-disk bytes, so the LRU policy reflects application RAM.
@@ -75,7 +118,9 @@ struct AdaptiveHqResidentRetention {
 [[nodiscard]] AdaptiveHqResidentRetention RetainAdaptiveHqResidentBlocks(
     std::span<const invisible_places::io::AdaptiveHqResidentBlock> candidates,
     std::span<const std::uint32_t> activeBlockIndices,
-    std::uint64_t inactiveByteBudget);
+    std::uint64_t inactiveByteBudget,
+    AdaptiveHqInteractionProfile interactionProfile =
+        AdaptiveHqInteractionProfile::Timeline);
 
 [[nodiscard]] LinkedHqPatchDrawPolicy ResolveLinkedHqPatchDrawPolicy(
     bool linkedHqEnabled,

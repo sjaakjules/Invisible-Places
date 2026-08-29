@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <iterator>
 #include <limits>
 #include <system_error>
 #include <unordered_set>
@@ -84,7 +85,12 @@ std::uint64_t AdaptiveHqResidentBlockPayloadBytes(
     }
     const auto& subset = *block.points;
     const auto& cloud = subset.cloud;
-    return
+    const auto microBlockBytes = block.microBlocks != nullptr
+        ? static_cast<std::uint64_t>(block.microBlocks->size()) *
+              sizeof(invisible_places::io::
+                         AdaptiveHqResidentBlock::MicroBlock)
+        : 0U;
+    return microBlockBytes +
         static_cast<std::uint64_t>(cloud.positions.size()) *
             sizeof(invisible_places::io::Float3) +
         static_cast<std::uint64_t>(cloud.normals.size()) *
@@ -97,10 +103,100 @@ std::uint64_t AdaptiveHqResidentBlockPayloadBytes(
             sizeof(std::uint32_t);
 }
 
+AdaptiveHqFiveMillimeterGuardRetention
+RetainAdaptiveHqFiveMillimeterGuard(
+    std::span<const std::uint32_t> retainedGuard,
+    std::span<const std::uint32_t> latestGuard,
+    std::span<const std::uint32_t> currentGuard,
+    std::uint64_t fullPointCount,
+    AdaptiveHqInteractionProfile interactionProfile) {
+    AdaptiveHqFiveMillimeterGuardRetention result;
+    if (fullPointCount == 0U || currentGuard.empty() ||
+        currentGuard.size() >= fullPointCount) {
+        return result;
+    }
+    const double retainedFraction =
+        interactionProfile == AdaptiveHqInteractionProfile::Timeline
+            ? kAdaptiveHqTimelineRetainedGuardFraction
+            : kAdaptiveHqNavigationRetainedGuardFraction;
+    const auto fractionLimit = static_cast<std::uint64_t>(
+        std::floor(static_cast<double>(fullPointCount) * retainedFraction));
+    const auto byteLimit =
+        kAdaptiveHqFiveMillimeterGuardByteBudgetPerRole /
+        kAdaptiveHqFiveMillimeterGuardGpuBytesPerPoint;
+    const auto historyLimit = std::max<std::uint64_t>(
+        currentGuard.size(),
+        std::min(fractionLimit, byteLimit));
+
+    const auto merged = [&](std::span<const std::uint32_t> prior) {
+        std::vector<std::uint32_t> combined;
+        combined.reserve(prior.size() + currentGuard.size());
+        std::set_union(
+            prior.begin(),
+            prior.end(),
+            currentGuard.begin(),
+            currentGuard.end(),
+            std::back_inserter(combined));
+        return combined;
+    };
+    const auto preferredHistory =
+        interactionProfile == AdaptiveHqInteractionProfile::Timeline
+            ? retainedGuard
+            : latestGuard;
+    if (!preferredHistory.empty()) {
+        auto combined = merged(preferredHistory);
+        if (combined.size() <= historyLimit) {
+            result.retainedHistoryPointCount =
+                combined.size() - currentGuard.size();
+            result.indices = std::move(combined);
+            return result;
+        }
+        result.historyLimited = true;
+    }
+    if (interactionProfile == AdaptiveHqInteractionProfile::Timeline &&
+        !latestGuard.empty() && latestGuard.data() != retainedGuard.data()) {
+        auto combined = merged(latestGuard);
+        if (combined.size() <= historyLimit) {
+            result.retainedHistoryPointCount =
+                combined.size() - currentGuard.size();
+            result.indices = std::move(combined);
+            return result;
+        }
+        result.historyLimited = true;
+    }
+    result.indices.assign(currentGuard.begin(), currentGuard.end());
+    return result;
+}
+
+float AdaptiveHqBoundsDistanceSquared(
+    const invisible_places::io::Bounds3f& bounds,
+    const invisible_places::io::Float3& point) {
+    if (!bounds.valid) {
+        return std::numeric_limits<float>::infinity();
+    }
+    const auto axisDistance = [](float value, float minimum, float maximum) {
+        if (value < minimum) {
+            return minimum - value;
+        }
+        if (value > maximum) {
+            return value - maximum;
+        }
+        return 0.0F;
+    };
+    const float dx = axisDistance(
+        point.x, bounds.minimum.x, bounds.maximum.x);
+    const float dy = axisDistance(
+        point.y, bounds.minimum.y, bounds.maximum.y);
+    const float dz = axisDistance(
+        point.z, bounds.minimum.z, bounds.maximum.z);
+    return dx * dx + dy * dy + dz * dz;
+}
+
 AdaptiveHqResidentRetention RetainAdaptiveHqResidentBlocks(
     std::span<const invisible_places::io::AdaptiveHqResidentBlock> candidates,
     std::span<const std::uint32_t> activeBlockIndices,
-    std::uint64_t inactiveByteBudget) {
+    std::uint64_t inactiveByteBudget,
+    AdaptiveHqInteractionProfile interactionProfile) {
     AdaptiveHqResidentRetention retained;
     retained.blocks.reserve(candidates.size());
 
@@ -134,9 +230,25 @@ AdaptiveHqResidentRetention RetainAdaptiveHqResidentBlocks(
     std::sort(
         fringe.begin(),
         fringe.end(),
-        [](const auto* left, const auto* right) {
+        [interactionProfile](const auto* left, const auto* right) {
+            const auto leftDistance =
+                std::isfinite(left->requestDistanceSquared)
+                    ? left->requestDistanceSquared
+                    : std::numeric_limits<float>::infinity();
+            const auto rightDistance =
+                std::isfinite(right->requestDistanceSquared)
+                    ? right->requestDistanceSquared
+                    : std::numeric_limits<float>::infinity();
+            if (interactionProfile ==
+                    AdaptiveHqInteractionProfile::Navigation &&
+                leftDistance != rightDistance) {
+                return leftDistance < rightDistance;
+            }
             if (left->lastUsedSerial != right->lastUsedSerial) {
                 return left->lastUsedSerial > right->lastUsedSerial;
+            }
+            if (leftDistance != rightDistance) {
+                return leftDistance < rightDistance;
             }
             return left->blockIndex < right->blockIndex;
         });

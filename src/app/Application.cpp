@@ -3806,6 +3806,9 @@ struct LinkedHqSelectionRequest {
     bool usesFullAnimationPath = false;
     bool includeSand = false;
     LinkedHqPreviewMode mode = LinkedHqPreviewMode::Fixed;
+    AdaptiveHqInteractionProfile interactionProfile =
+        AdaptiveHqInteractionProfile::Navigation;
+    invisible_places::io::Float3 cameraPosition{};
     std::uint64_t animationPrefetchFingerprint = 0U;
     invisible_places::renderer::pointcloud::
         PointCloudAdaptiveDensityTransition adaptiveTransition{};
@@ -3843,6 +3846,11 @@ struct LinkedHqPatchJobOutput {
     double adaptiveAssemblyMilliseconds = 0.0;
 };
 
+using LinkedHqFiveMillimeterGridLookups = std::array<
+    std::shared_ptr<const invisible_places::renderer::pointcloud::
+        FrustumPointGridLookup>,
+    invisible_places::scene::kScenePointCloudRoleCount>;
+
 struct LinkedHqPreparationJobResult {
     std::uint64_t fingerprint = 0U;
     std::vector<LinkedHqPatchJobOutput> patches;
@@ -3852,6 +3860,7 @@ struct LinkedHqPreparationJobResult {
     std::array<std::uint64_t,
                invisible_places::scene::kScenePointCloudRoleCount>
         fiveMillimeterFullPointCounts{};
+    LinkedHqFiveMillimeterGridLookups fiveMillimeterGridLookups;
     double fiveMillimeterGuardPreparationMilliseconds = 0.0;
     std::string errorMessage;
     bool success = false;
@@ -3896,6 +3905,30 @@ struct LinkedHqPatchRuntime {
     bool uploaded = false;
 };
 
+constexpr std::uint64_t kLinkedHqRetiredPatchByteBudget =
+    4ULL * 1024ULL * 1024ULL * 1024ULL;
+constexpr auto kLinkedHqNavigationRetirementGrace =
+    std::chrono::milliseconds{250};
+constexpr auto kLinkedHqTimelineRetirementGrace =
+    std::chrono::milliseconds{1500};
+
+struct LinkedHqRetiredPatchBatch {
+    std::vector<LinkedHqPatchRuntime> patches;
+    invisible_places::io::Float3 cameraPosition{};
+    std::uint64_t estimatedBytes = 0U;
+    std::uint64_t serial = 0U;
+    std::chrono::steady_clock::time_point releaseAfter{};
+};
+
+struct LinkedHqPatchRetirementShared {
+    std::mutex mutex;
+    std::condition_variable condition;
+    std::deque<LinkedHqRetiredPatchBatch> batches;
+    invisible_places::io::Float3 currentCameraPosition{};
+    std::uint64_t queuedBytes = 0U;
+    std::uint64_t nextSerial = 1U;
+};
+
 struct LinkedHqAdaptiveCacheSnapshot {
     std::size_t layerId = std::numeric_limits<std::size_t>::max();
     std::string cacheFingerprint;
@@ -3920,6 +3953,8 @@ struct LinkedHqIndexedFieldJobShared {
 struct LinkedHqPreviewRuntime {
     std::optional<LinkedHqSelectionRequest> request;
     std::vector<LinkedHqPatchRuntime> patches;
+    std::shared_ptr<LinkedHqPatchRetirementShared> patchRetirementShared;
+    std::jthread patchRetirementWorker;
     std::jthread preparationWorker;
     std::shared_ptr<LinkedHqPreparationJobShared> preparationShared;
     std::optional<LinkedHqPreparationJobResult> uploadPending;
@@ -3940,17 +3975,35 @@ struct LinkedHqPreviewRuntime {
     // published patch resident for an immediate later re-enable.
     LinkedHqPreviewMode requestedMode = LinkedHqPreviewMode::Off;
     std::uint64_t publishedFingerprint = 0U;
+    AdaptiveHqInteractionProfile publishedInteractionProfile =
+        AdaptiveHqInteractionProfile::Navigation;
+    invisible_places::io::Float3 publishedCameraPosition{};
     LinkedHqFrustumUnion publishedPatchFrustums{};
     invisible_places::renderer::pointcloud::
         PointCloudAdaptiveDensityTransition publishedAdaptiveTransition{};
     std::array<std::vector<std::uint32_t>,
                invisible_places::scene::kScenePointCloudRoleCount>
         fiveMillimeterGuardIndices;
+    // Fresh mask for the most recently published request. Navigation merges
+    // only this with the next request; timeline work can reuse the broader
+    // retained guard above until its explicit point/GPU-byte limit is hit.
+    std::array<std::vector<std::uint32_t>,
+               invisible_places::scene::kScenePointCloudRoleCount>
+        fiveMillimeterLatestGuardIndices;
     std::array<std::uint64_t,
                invisible_places::scene::kScenePointCloudRoleCount>
         fiveMillimeterFullPointCounts{};
+    LinkedHqFiveMillimeterGridLookups fiveMillimeterGridLookups;
+    std::array<std::size_t,
+               invisible_places::scene::kScenePointCloudRoleCount>
+        publishedFiveMillimeterSessionIndices{};
     double fiveMillimeterGuardPreparationMilliseconds = 0.0;
     bool adaptiveBaseGuardApplied = false;
+    std::uint64_t fiveMillimeterMaskRevision = 0U;
+    std::uint64_t appliedFiveMillimeterMaskRevision = 0U;
+    LinkedHqPreviewMode appliedFiveMillimeterMode =
+        LinkedHqPreviewMode::Off;
+    bool hasAppliedFiveMillimeterMode = false;
     // Set when a selection change (spacing, cameras, sources) replaced a
     // live HQ view; the next publish re-enables HQ so the user keeps the
     // density they were looking at.
@@ -57817,6 +57870,17 @@ std::optional<LinkedHqSelectionRequest> ResolveLinkedHqSelectionRequest(
     request.mode = adaptiveRequested
         ? LinkedHqPreviewMode::Adaptive
         : LinkedHqPreviewMode::Fixed;
+    request.interactionProfile =
+        firstAnimation != nullptr &&
+                !runtimeState.cameraInteraction.navigationActive
+            ? AdaptiveHqInteractionProfile::Timeline
+            : AdaptiveHqInteractionProfile::Navigation;
+    const auto currentCameraState = runtimeState.camera.CaptureState();
+    request.cameraPosition = {
+        currentCameraState.position[0U],
+        currentCameraState.position[1U],
+        currentCameraState.position[2U],
+    };
     request.adaptiveCacheRoot = runtimeState.localSavedRoot /
         ".invisible_places" / "cache" / "adaptive_hq";
     request.pairSessionId = adaptiveRequested
@@ -58038,6 +58102,211 @@ void ApplyLinkedHqFiveMillimeterMasks(
     invisible_places::renderer::core::VulkanViewportShell* viewport,
     LinkedHqPreviewMode mode);
 
+std::uint64_t LinkedHqPatchPayloadBytes(
+    const LinkedHqPatchRuntime& patch) {
+    std::uint64_t bytes = 0U;
+    const auto add = [&](std::uint64_t value) {
+        bytes = value > std::numeric_limits<std::uint64_t>::max() - bytes
+            ? std::numeric_limits<std::uint64_t>::max()
+            : bytes + value;
+    };
+    if (patch.cloud != nullptr) {
+        add(static_cast<std::uint64_t>(patch.cloud->positions.capacity()) *
+            sizeof(invisible_places::io::Float3));
+        add(static_cast<std::uint64_t>(patch.cloud->normals.capacity()) *
+            sizeof(invisible_places::io::Float3));
+        add(static_cast<std::uint64_t>(patch.cloud->packedColors.capacity()) *
+            sizeof(std::uint32_t));
+        add(static_cast<std::uint64_t>(
+                patch.cloud->scalarFieldValues.capacity()) * sizeof(float));
+    }
+    if (patch.sourcePointIndices != nullptr) {
+        add(static_cast<std::uint64_t>(
+                patch.sourcePointIndices->capacity()) *
+            sizeof(std::uint32_t));
+    }
+    add(static_cast<std::uint64_t>(
+            patch.fiveMillimeterOutsideIndices.capacity()) *
+        sizeof(std::uint32_t));
+    add(static_cast<std::uint64_t>(
+            patch.adaptiveActiveBlockIndices.capacity()) *
+        sizeof(std::uint32_t));
+    for (const auto& block : patch.adaptiveResidentBlocks) {
+        // Reused blocks are also owned by the newly published patch. Only a
+        // uniquely held decoded block can be freed with this retired batch.
+        if (block.points != nullptr && block.points.use_count() == 1L) {
+            add(AdaptiveHqResidentBlockPayloadBytes(block));
+        }
+    }
+    return bytes;
+}
+
+void RunLinkedHqPatchRetirementWorker(
+    const std::shared_ptr<LinkedHqPatchRetirementShared>& shared,
+    std::stop_token stopToken) {
+#ifdef __APPLE__
+    (void)pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+#endif
+    const auto distanceSquared = [](
+        const invisible_places::io::Float3& left,
+        const invisible_places::io::Float3& right) {
+        const double dx = static_cast<double>(left.x) - right.x;
+        const double dy = static_cast<double>(left.y) - right.y;
+        const double dz = static_cast<double>(left.z) - right.z;
+        return dx * dx + dy * dy + dz * dz;
+    };
+    while (!stopToken.stop_requested()) {
+        LinkedHqRetiredPatchBatch releasing;
+        {
+            std::unique_lock lock{shared->mutex};
+            if (shared->batches.empty()) {
+                shared->condition.wait_for(
+                    lock,
+                    std::chrono::milliseconds{100});
+                continue;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            const bool memoryPressure =
+                shared->queuedBytes > kLinkedHqRetiredPatchByteBudget;
+            std::size_t selected = shared->batches.size();
+            double selectedDistance = -1.0;
+            auto nextRelease = shared->batches.front().releaseAfter;
+            for (std::size_t batch = 0U;
+                 batch < shared->batches.size();
+                 ++batch) {
+                const auto& candidate = shared->batches[batch];
+                nextRelease = std::min(nextRelease, candidate.releaseAfter);
+                if (!memoryPressure && candidate.releaseAfter > now) {
+                    continue;
+                }
+                const double distance = distanceSquared(
+                    candidate.cameraPosition,
+                    shared->currentCameraPosition);
+                if (selected == shared->batches.size() ||
+                    distance > selectedDistance ||
+                    (distance == selectedDistance &&
+                     candidate.serial <
+                         shared->batches[selected].serial)) {
+                    selected = batch;
+                    selectedDistance = distance;
+                }
+            }
+            if (selected == shared->batches.size()) {
+                const auto waitFor = std::min(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        nextRelease - now),
+                    std::chrono::milliseconds{100});
+                shared->condition.wait_for(
+                    lock,
+                    std::max(waitFor, std::chrono::milliseconds{1}));
+                continue;
+            }
+            releasing = std::move(shared->batches[selected]);
+            shared->batches.erase(
+                shared->batches.begin() +
+                static_cast<std::ptrdiff_t>(selected));
+            shared->queuedBytes =
+                releasing.estimatedBytes > shared->queuedBytes
+                    ? 0U
+                    : shared->queuedBytes - releasing.estimatedBytes;
+        }
+        const auto patchCount = releasing.patches.size();
+        const auto estimatedBytes = releasing.estimatedBytes;
+        const auto releaseStarted = std::chrono::steady_clock::now();
+        releasing.patches.clear();
+        const auto releaseMilliseconds =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - releaseStarted)
+                .count();
+        std::cout << "Linked HQ: asynchronously retired " << patchCount
+                  << " old CPU patch"
+                  << (patchCount == 1U ? "" : "es") << " (about "
+                  << FormatByteCount(estimatedBytes) << ") in "
+                  << FormatFixed(
+                         static_cast<float>(releaseMilliseconds),
+                         1)
+                  << " ms." << std::endl;
+    }
+
+    std::deque<LinkedHqRetiredPatchBatch> remaining;
+    {
+        std::scoped_lock lock{shared->mutex};
+        remaining.swap(shared->batches);
+        shared->queuedBytes = 0U;
+    }
+    // Destruction stays on this worker even during reset/shutdown; the stop
+    // path merely removes the normal grace period.
+    remaining.clear();
+}
+
+void QueueLinkedHqPatchRetirement(
+    LinkedHqPreviewRuntime* hq,
+    std::vector<LinkedHqPatchRuntime> patches,
+    const invisible_places::io::Float3& retiredCameraPosition,
+    AdaptiveHqInteractionProfile retiredInteractionProfile,
+    const invisible_places::io::Float3& currentCameraPosition) {
+    if (hq == nullptr || patches.empty()) {
+        return;
+    }
+    if (hq->patchRetirementShared == nullptr) {
+        hq->patchRetirementShared =
+            std::make_shared<LinkedHqPatchRetirementShared>();
+    }
+    if (!hq->patchRetirementWorker.joinable()) {
+        const auto shared = hq->patchRetirementShared;
+        hq->patchRetirementWorker = std::jthread{
+            [shared](std::stop_token stopToken) {
+                RunLinkedHqPatchRetirementWorker(shared, stopToken);
+            }};
+    }
+    std::uint64_t estimatedBytes = 0U;
+    for (const auto& patch : patches) {
+        const auto patchBytes = LinkedHqPatchPayloadBytes(patch);
+        estimatedBytes =
+            patchBytes >
+                    std::numeric_limits<std::uint64_t>::max() -
+                        estimatedBytes
+                ? std::numeric_limits<std::uint64_t>::max()
+                : estimatedBytes + patchBytes;
+    }
+    const auto grace =
+        retiredInteractionProfile ==
+                AdaptiveHqInteractionProfile::Timeline
+            ? kLinkedHqTimelineRetirementGrace
+            : kLinkedHqNavigationRetirementGrace;
+    std::uint64_t queuedBytes = 0U;
+    {
+        std::scoped_lock lock{hq->patchRetirementShared->mutex};
+        hq->patchRetirementShared->currentCameraPosition =
+            currentCameraPosition;
+        const auto serial =
+            hq->patchRetirementShared->nextSerial++;
+        hq->patchRetirementShared->queuedBytes =
+            estimatedBytes >
+                    std::numeric_limits<std::uint64_t>::max() -
+                        hq->patchRetirementShared->queuedBytes
+                ? std::numeric_limits<std::uint64_t>::max()
+                : hq->patchRetirementShared->queuedBytes + estimatedBytes;
+        queuedBytes = hq->patchRetirementShared->queuedBytes;
+        hq->patchRetirementShared->batches.push_back({
+            .patches = std::move(patches),
+            .cameraPosition = retiredCameraPosition,
+            .estimatedBytes = estimatedBytes,
+            .serial = serial,
+            .releaseAfter = std::chrono::steady_clock::now() + grace,
+        });
+    }
+    hq->patchRetirementShared->condition.notify_one();
+    std::cout << "Linked HQ: queued the old CPU patch for "
+              << (retiredInteractionProfile ==
+                          AdaptiveHqInteractionProfile::Timeline
+                      ? "timeline"
+                      : "navigation")
+              << " retirement (about " << FormatByteCount(estimatedBytes)
+              << ", queue " << FormatByteCount(queuedBytes) << ")."
+              << std::endl;
+}
+
 void ResetLinkedHqPreview(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport) {
@@ -58081,6 +58350,19 @@ void ResetLinkedHqPreview(
                 runtimeState,
                 viewport,
                 LinkedHqPreviewMode::Off);
+            if (priorRequest.has_value() &&
+                priorRequest->mode == LinkedHqPreviewMode::Adaptive) {
+                for (const auto sessionIndex :
+                     priorRequest->fiveMillimeterSessionIndices) {
+                    if (viewport->HasPointCloudResources(sessionIndex)) {
+                        viewport->UpdatePointBudget(
+                            sessionIndex,
+                            {},
+                            true,
+                            false);
+                    }
+                }
+            }
             if (priorRequest.has_value() &&
                 !runtimeState->offlineRenderJob.active) {
                 for (std::size_t role = 0U;
@@ -58195,6 +58477,19 @@ void StartLinkedHqPreparation(
         fiveMillimeterClouds[role] =
             runtimeState->sessions[baseIndex].offlinePointCloud;
     }
+    auto fiveMillimeterGridLookups = hq.fiveMillimeterGridLookups;
+    for (std::size_t role = 0U;
+         role < fiveMillimeterClouds.size();
+         ++role) {
+        const auto& cloud = fiveMillimeterClouds[role];
+        if (cloud == nullptr ||
+            fiveMillimeterGridLookups[role] == nullptr ||
+            !fiveMillimeterGridLookups[role]->Matches(
+                cloud->positions,
+                kAdaptiveHqFiveMillimeterGuardGridDimension)) {
+            fiveMillimeterGridLookups[role].reset();
+        }
+    }
     std::vector<std::filesystem::path> sourcePaths(patchRoles.size());
     for (std::size_t patch = 0U; patch < patchRoles.size(); ++patch) {
         const auto baseIndex =
@@ -58251,6 +58546,8 @@ void StartLinkedHqPreparation(
          patchLayerIds,
          baseClouds,
          fiveMillimeterClouds,
+         fiveMillimeterGridLookups =
+             std::move(fiveMillimeterGridLookups),
          sourcePaths,
          priorAdaptiveCaches = std::move(priorAdaptiveCaches),
          adaptiveUseSerial](std::stop_token stopToken) mutable {
@@ -58260,6 +58557,8 @@ void StartLinkedHqPreparation(
             LinkedHqPreparationJobResult result;
             result.fingerprint = request.fingerprint;
             result.patches.resize(patchRoles.size());
+            result.fiveMillimeterGridLookups =
+                std::move(fiveMillimeterGridLookups);
             for (std::size_t patch = 0U;
                  patch < patchRoles.size();
                  ++patch) {
@@ -58529,12 +58828,20 @@ void StartLinkedHqPreparation(
                                 finish();
                                 return;
                             }
+                            auto residentPoints = std::make_shared<const
+                                invisible_places::io::
+                                    PointCloudSubsetLoadResult>(
+                                        std::move(loaded));
+                            auto microBlocks = std::make_shared<const
+                                std::vector<invisible_places::io::
+                                    AdaptiveHqResidentBlock::MicroBlock>>(
+                                invisible_places::io::
+                                    BuildAdaptiveHqMicroBlocks(
+                                        residentPoints->cloud.positions));
                             residentBlocks.push_back({
                                 .blockIndex = missingBlocks[missing],
-                                .points = std::make_shared<const
-                                    invisible_places::io::
-                                        PointCloudSubsetLoadResult>(
-                                            std::move(loaded)),
+                                .points = std::move(residentPoints),
+                                .microBlocks = std::move(microBlocks),
                                 .lastUsedSerial = adaptiveUseSerial,
                             });
                         }
@@ -58550,11 +58857,21 @@ void StartLinkedHqPreparation(
                             if (activeSet.contains(resident.blockIndex)) {
                                 resident.lastUsedSerial = adaptiveUseSerial;
                             }
+                            if (resident.blockIndex <
+                                opened.index.blocks.size()) {
+                                resident.requestDistanceSquared =
+                                    AdaptiveHqBoundsDistanceSquared(
+                                        opened.index
+                                            .blocks[resident.blockIndex]
+                                            .bounds,
+                                        request.cameraPosition);
+                            }
                         }
                         auto retained = RetainAdaptiveHqResidentBlocks(
                             residentBlocks,
                             activeBlocks,
-                            kAdaptiveHqRetainedFringeByteBudgetPerRole);
+                            kAdaptiveHqRetainedFringeByteBudgetPerRole,
+                            request.interactionProfile);
 
                         invisible_places::io::PointCloudGridDecimation
                             decimation;
@@ -58581,7 +58898,12 @@ void StartLinkedHqPreparation(
                                 },
                                 decimation,
                                 stopToken,
-                                false);
+                                false,
+                                [frustums = request.patchFrustums](
+                                    const invisible_places::io::Bounds3f&
+                                        bounds) {
+                                    return frustums.IntersectsBounds(bounds);
+                                });
                         output.adaptiveAssemblyMilliseconds =
                             std::chrono::duration<double, std::milli>(
                                 std::chrono::steady_clock::now() -
@@ -58710,13 +59032,39 @@ void StartLinkedHqPreparation(
                         result.fiveMillimeterFullPointCounts[role] =
                             fullPointCount;
                         if (cloud != nullptr && fullPointCount > 0U) {
+                            if (result.fiveMillimeterGridLookups[role] ==
+                                nullptr) {
+                                auto lookup = invisible_places::renderer::
+                                    pointcloud::BuildFrustumPointGridLookup(
+                                        cloud->positions,
+                                        cloud->bounds,
+                                        kAdaptiveHqFiveMillimeterGuardGridDimension,
+                                        stopToken);
+                                if (stopToken.stop_requested()) {
+                                    result.cancelled = true;
+                                    finish();
+                                    return;
+                                }
+                                if (lookup.Matches(
+                                        cloud->positions,
+                                        kAdaptiveHqFiveMillimeterGuardGridDimension)) {
+                                    result.fiveMillimeterGridLookups[role] =
+                                        std::make_shared<const
+                                            invisible_places::renderer::
+                                                pointcloud::
+                                                    FrustumPointGridLookup>(
+                                            std::move(lookup));
+                                }
+                            }
                             auto indices = invisible_places::renderer::
                                 pointcloud::GenerateFrustumUnionPointIndices(
                                     cloud->positions,
                                     cloud->bounds,
                                     guardedViewProjections,
                                     kAdaptiveHqFiveMillimeterGuardGridDimension,
-                                    stopToken);
+                                    stopToken,
+                                    result.fiveMillimeterGridLookups[role]
+                                        .get());
                             const double retainedFraction =
                                 static_cast<double>(indices.size()) /
                                 static_cast<double>(fullPointCount);
@@ -58823,6 +59171,19 @@ void ApplyLinkedHqFiveMillimeterMasks(
     const bool adaptiveGuardValid =
         mode == LinkedHqPreviewMode::Adaptive &&
         LinkedHqAdaptiveGuardCoversCurrentView(*runtimeState, *viewport);
+    const auto effectiveMode =
+        mode == LinkedHqPreviewMode::Adaptive && !adaptiveGuardValid
+            ? LinkedHqPreviewMode::Off
+            : mode;
+    const bool maskRevisionMatches =
+        effectiveMode == LinkedHqPreviewMode::Off ||
+        hq.appliedFiveMillimeterMaskRevision ==
+            hq.fiveMillimeterMaskRevision;
+    if (hq.hasAppliedFiveMillimeterMode &&
+        hq.appliedFiveMillimeterMode == effectiveMode &&
+        maskRevisionMatches) {
+        return;
+    }
     bool appliedAnyAdaptiveGuard = false;
     const std::vector<std::uint32_t> completeBase;
     for (std::size_t role = 0U;
@@ -58838,7 +59199,7 @@ void ApplyLinkedHqFiveMillimeterMasks(
             continue;
         }
         const std::vector<std::uint32_t>* indices = &completeBase;
-        if (mode == LinkedHqPreviewMode::Fixed) {
+        if (effectiveMode == LinkedHqPreviewMode::Fixed) {
             const auto patch = std::find_if(
                 hq.patches.begin(),
                 hq.patches.end(),
@@ -58848,16 +59209,24 @@ void ApplyLinkedHqFiveMillimeterMasks(
             if (patch != hq.patches.end()) {
                 indices = &patch->fiveMillimeterOutsideIndices;
             }
-        } else if (adaptiveGuardValid &&
+        } else if (effectiveMode == LinkedHqPreviewMode::Adaptive &&
                    !hq.fiveMillimeterGuardIndices[role].empty()) {
             indices = &hq.fiveMillimeterGuardIndices[role];
             appliedAnyAdaptiveGuard = true;
         }
-        viewport->UpdatePointBudget(sessionIndex, *indices, true);
+        viewport->UpdatePointBudget(
+            sessionIndex,
+            *indices,
+            true,
+            hq.request->mode == LinkedHqPreviewMode::Adaptive);
     }
     hq.adaptiveBaseGuardApplied =
-        mode == LinkedHqPreviewMode::Adaptive &&
-        adaptiveGuardValid && appliedAnyAdaptiveGuard;
+        effectiveMode == LinkedHqPreviewMode::Adaptive &&
+        appliedAnyAdaptiveGuard;
+    hq.appliedFiveMillimeterMode = effectiveMode;
+    hq.appliedFiveMillimeterMaskRevision =
+        hq.fiveMillimeterMaskRevision;
+    hq.hasAppliedFiveMillimeterMode = true;
 }
 
 bool SetLinkedHqPreviewMode(
@@ -59036,11 +59405,67 @@ bool PollLinkedHqPreparation(
         return false;
     }
 
-    hq.patches = std::move(published);
-    hq.fiveMillimeterGuardIndices =
+    auto freshFiveMillimeterGuards =
         std::move(completed->fiveMillimeterGuardIndices);
+    decltype(freshFiveMillimeterGuards) retainedFiveMillimeterGuards;
+    const bool guardHistoryCompatible =
+        hq.ready && hq.request->mode == LinkedHqPreviewMode::Adaptive &&
+        hq.publishedFiveMillimeterSessionIndices ==
+            hq.request->fiveMillimeterSessionIndices &&
+        hq.fiveMillimeterFullPointCounts ==
+            completed->fiveMillimeterFullPointCounts;
+    std::size_t retainedGuardHistoryPoints = 0U;
+    bool guardHistoryLimited = false;
+    for (std::size_t role = 0U;
+         role < freshFiveMillimeterGuards.size();
+         ++role) {
+        if (hq.request->mode != LinkedHqPreviewMode::Adaptive) {
+            retainedFiveMillimeterGuards[role] =
+                freshFiveMillimeterGuards[role];
+            continue;
+        }
+        const auto retained = RetainAdaptiveHqFiveMillimeterGuard(
+            guardHistoryCompatible
+                ? std::span<const std::uint32_t>{
+                      hq.fiveMillimeterGuardIndices[role]}
+                : std::span<const std::uint32_t>{},
+            guardHistoryCompatible
+                ? std::span<const std::uint32_t>{
+                      hq.fiveMillimeterLatestGuardIndices[role]}
+                : std::span<const std::uint32_t>{},
+            freshFiveMillimeterGuards[role],
+            completed->fiveMillimeterFullPointCounts[role],
+            hq.request->interactionProfile);
+        retainedGuardHistoryPoints +=
+            retained.retainedHistoryPointCount;
+        guardHistoryLimited =
+            guardHistoryLimited || retained.historyLimited;
+        retainedFiveMillimeterGuards[role] =
+            std::move(retained.indices);
+    }
+
+    auto retiredPatches = std::move(hq.patches);
+    hq.patches = std::move(published);
+    QueueLinkedHqPatchRetirement(
+        &hq,
+        std::move(retiredPatches),
+        hq.publishedCameraPosition,
+        hq.publishedInteractionProfile,
+        hq.request->cameraPosition);
+    hq.fiveMillimeterGuardIndices =
+        std::move(retainedFiveMillimeterGuards);
+    hq.fiveMillimeterLatestGuardIndices =
+        std::move(freshFiveMillimeterGuards);
     hq.fiveMillimeterFullPointCounts =
         completed->fiveMillimeterFullPointCounts;
+    hq.fiveMillimeterGridLookups =
+        std::move(completed->fiveMillimeterGridLookups);
+    hq.publishedFiveMillimeterSessionIndices =
+        hq.request->fiveMillimeterSessionIndices;
+    ++hq.fiveMillimeterMaskRevision;
+    if (hq.fiveMillimeterMaskRevision == 0U) {
+        hq.fiveMillimeterMaskRevision = 1U;
+    }
     hq.fiveMillimeterGuardPreparationMilliseconds =
         completed->fiveMillimeterGuardPreparationMilliseconds;
     hq.adaptiveBaseGuardApplied = false;
@@ -59048,6 +59473,9 @@ bool PollLinkedHqPreparation(
     hq.enabled = false;
     hq.adaptiveEnabled = false;
     hq.publishedFingerprint = hq.request->fingerprint;
+    hq.publishedInteractionProfile =
+        hq.request->interactionProfile;
+    hq.publishedCameraPosition = hq.request->cameraPosition;
     hq.publishedPatchFrustums = hq.request->patchFrustums;
     hq.publishedAdaptiveTransition = hq.request->adaptiveTransition;
     hq.stage = LinkedHqPreparationStage::Ready;
@@ -59125,6 +59553,19 @@ bool PollLinkedHqPreparation(
                              hq.fiveMillimeterGuardPreparationMilliseconds),
                          1)
                   << " ms";
+        if (retainedGuardHistoryPoints > 0U) {
+            std::cout << "; retained "
+                      << FormatPointCount(retainedGuardHistoryPoints)
+                      << " coarse fringe points for "
+                      << (hq.request->interactionProfile ==
+                                  AdaptiveHqInteractionProfile::Timeline
+                              ? "timeline"
+                              : "navigation")
+                      << " reuse";
+        }
+        if (guardHistoryLimited) {
+            std::cout << "; coarse fringe memory cap applied";
+        }
     }
     std::cout << "." << std::endl;
     return true;
@@ -59424,12 +59865,20 @@ void EnsureLinkedHqIndexedFieldResidency(
                                         loaded.errorMessage;
                                     break;
                                 }
+                                auto residentPoints = std::make_shared<const
+                                    invisible_places::io::
+                                        PointCloudSubsetLoadResult>(
+                                            std::move(loaded));
+                                auto microBlocks = std::make_shared<const
+                                    std::vector<invisible_places::io::
+                                        AdaptiveHqResidentBlock::MicroBlock>>(
+                                    invisible_places::io::
+                                        BuildAdaptiveHqMicroBlocks(
+                                            residentPoints->cloud.positions));
                                 fieldBlocks.push_back({
                                     .blockIndex = blockIndex,
-                                    .points = std::make_shared<const
-                                        invisible_places::io::
-                                            PointCloudSubsetLoadResult>(
-                                                std::move(loaded)),
+                                    .points = std::move(residentPoints),
+                                    .microBlocks = std::move(microBlocks),
                                 });
                             }
                             if (!result.load.cancelled &&
@@ -59460,7 +59909,13 @@ void EnsureLinkedHqIndexedFieldResidency(
                                         },
                                         decimation,
                                         stopToken,
-                                        false);
+                                        false,
+                                        [adaptiveFrustums](
+                                            const invisible_places::io::
+                                                Bounds3f& bounds) {
+                                            return adaptiveFrustums
+                                                .IntersectsBounds(bounds);
+                                        });
                                 if (subset.cancelled ||
                                     stopToken.stop_requested()) {
                                     result.load.cancelled = true;
@@ -130209,12 +130664,28 @@ int RunAdaptiveHqSurfacePerformanceSmoke(
          {{"guard_fraction", kAdaptiveHqViewportGuardFraction},
           {"refresh_border_fraction",
            kAdaptiveHqRefreshBorderFraction},
+          {"micro_block_point_count",
+           invisible_places::io::kAdaptiveHqMicroBlockPointCount},
           {"retained_fringe_decoded_byte_budget_per_role",
            kAdaptiveHqRetainedFringeByteBudgetPerRole},
+          {"navigation_retained_guard_fraction",
+           kAdaptiveHqNavigationRetainedGuardFraction},
+          {"timeline_retained_guard_fraction",
+           kAdaptiveHqTimelineRetainedGuardFraction},
+          {"five_mm_guard_byte_budget_per_role",
+           kAdaptiveHqFiveMillimeterGuardByteBudgetPerRole},
+          {"retired_patch_byte_budget",
+           kLinkedHqRetiredPatchByteBudget},
+          {"navigation_retirement_grace_ms",
+           kLinkedHqNavigationRetirementGrace.count()},
+          {"timeline_retirement_grace_ms",
+           kLinkedHqTimelineRetirementGrace.count()},
           {"complete_animation_path_prefetch", false},
           {"parallel_block_readers",
            kAdaptiveHqBlockReadWorkerCount},
           {"parallel_assembly_workers", 8U},
+          {"five_mm_grid_lookup", true},
+          {"retained_gpu_index_capacity", true},
           {"five_mm_guard_grid_dimension",
            kAdaptiveHqFiveMillimeterGuardGridDimension},
           {"five_mm_guard_useful_fraction",
