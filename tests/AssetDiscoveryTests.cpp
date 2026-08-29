@@ -717,6 +717,45 @@ TEST_CASE("Point-cloud scene roles and millimetre spacing are inferred from file
     CHECK(invisible_places::io::InferPointSpacingMetersFromName("Site3-SAND-2.5mm.ply") == Catch::Approx(0.0025F));
 }
 
+TEST_CASE("Canonical WATER variants are distinguished from recovery copies", "[discovery][water-fill]") {
+    using invisible_places::io::IsArchivedWaterFillPointCloudName;
+    using invisible_places::io::IsWaterFillPointCloudName;
+
+    CHECK(IsWaterFillPointCloudName("Site1-WATER-2mm.ply"));
+    CHECK(IsWaterFillPointCloudName("Site1 WATER 5mm"));
+    CHECK_FALSE(IsWaterFillPointCloudName("Site1-WaterPreview.ply"));
+    CHECK_FALSE(IsWaterFillPointCloudName("groundwater-5mm.ply"));
+
+    CHECK(IsArchivedWaterFillPointCloudName("Site1-WATER-5mm-old01.ply"));
+    CHECK(IsArchivedWaterFillPointCloudName("Site1-WATERold.ply"));
+    CHECK(IsArchivedWaterFillPointCloudName("Site1-WATER-5mm-backup.ply"));
+    CHECK_FALSE(IsArchivedWaterFillPointCloudName("Site1-WATER-5mm.ply"));
+    CHECK_FALSE(IsArchivedWaterFillPointCloudName("Site1-waterfall-old.ply"));
+    CHECK_FALSE(IsArchivedWaterFillPointCloudName("groundwater-backup.ply"));
+}
+
+TEST_CASE("Discovery omits archived WATER copies beside canonical variants", "[discovery][water-fill]") {
+    const auto root = std::filesystem::temp_directory_path() /
+                      "invisible_places_water_fill_archive_discovery_test";
+    std::filesystem::remove_all(root);
+    WriteTinyPointCloudPly(root / "Scene1" / "Site1-WATER-2mm.ply");
+    WriteTinyPointCloudPly(root / "Scene1" / "Site1-WATER-5mm.ply");
+    WriteTinyPointCloudPly(root / "Scene1" / "Site1-WATER-5mm-old01.ply");
+
+    const auto catalog = invisible_places::io::DiscoverAssets(root);
+
+    REQUIRE(catalog.issues.empty());
+    REQUIRE(catalog.pointClouds.size() == 2U);
+    CHECK(std::none_of(
+        catalog.pointClouds.begin(),
+        catalog.pointClouds.end(),
+        [](const auto& asset) {
+            return asset.filePath.filename() == "Site1-WATER-5mm-old01.ply";
+        }));
+
+    std::filesystem::remove_all(root);
+}
+
 TEST_CASE("Discovery groups role-named sibling PLY files by folder", "[discovery][scene]") {
     const auto root = std::filesystem::temp_directory_path() / "invisible_places_scene_grouping_test";
     std::filesystem::remove_all(root);

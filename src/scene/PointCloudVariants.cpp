@@ -163,6 +163,37 @@ std::optional<PointSpacingMicrometres> QuantizePointSpacingMicrometres(double sp
     return static_cast<PointSpacingMicrometres>(std::llround(spacingMicrometres));
 }
 
+std::optional<std::size_t> SelectAuxiliaryDensityVariant(
+    std::span<const AuxiliaryDensityVariantCandidate> candidates,
+    PointSpacingMicrometres targetSpacingMicrometres) {
+    const AuxiliaryDensityVariantCandidate* selected = nullptr;
+    std::uint64_t selectedDistance = std::numeric_limits<std::uint64_t>::max();
+    for (const auto& candidate : candidates) {
+        if (candidate.spacingMicrometres == 0U) {
+            continue;
+        }
+        const auto distance = targetSpacingMicrometres == 0U
+                                  ? static_cast<std::uint64_t>(candidate.spacingMicrometres)
+                                  : candidate.spacingMicrometres > targetSpacingMicrometres
+                                        ? static_cast<std::uint64_t>(candidate.spacingMicrometres) -
+                                              targetSpacingMicrometres
+                                        : static_cast<std::uint64_t>(targetSpacingMicrometres) -
+                                              candidate.spacingMicrometres;
+        const bool prefer =
+            selected == nullptr || distance < selectedDistance ||
+            (distance == selectedDistance &&
+             std::tuple{candidate.spacingMicrometres, candidate.sourceIndex} <
+                 std::tuple{selected->spacingMicrometres, selected->sourceIndex});
+        if (prefer) {
+            selected = &candidate;
+            selectedDistance = distance;
+        }
+    }
+    return selected == nullptr
+               ? std::nullopt
+               : std::optional<std::size_t>{selected->sourceIndex};
+}
+
 const PointCloudVariant* SceneAnalysisSources::Find(ScenePointCloudRole role) const {
     const auto roleIndex = ScenePointCloudRoleIndex(role);
     if (roleIndex >= byRole.size() || !byRole[roleIndex].has_value()) {

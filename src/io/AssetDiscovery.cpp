@@ -1,6 +1,7 @@
 #include "io/AssetDiscovery.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <charconv>
 #include <map>
@@ -143,6 +144,74 @@ bool IsPrimaryPointCloudSceneRole(std::string_view role) {
     return role == "ROCK" || role == "rock" || role == "Rock";
 }
 
+bool IsWaterFillPointCloudName(std::string_view name) {
+    std::string lowerName{name};
+    lowerName = LowercaseCopy(std::move(lowerName));
+    return ContainsRoleToken(lowerName, "water");
+}
+
+bool IsArchivedWaterFillPointCloudName(std::string_view name) {
+    std::string lowerName{name};
+    lowerName = LowercaseCopy(std::move(lowerName));
+
+    constexpr std::array<std::string_view, 6> archiveTokens{
+        "old", "backup", "bak", "archive", "previous", "copy"};
+    const bool canonicalWater = ContainsRoleToken(lowerName, "water");
+    for (const auto token : archiveTokens) {
+        if (canonicalWater) {
+            std::size_t tokenCursor = 0U;
+            while (tokenCursor < lowerName.size()) {
+                const auto position = lowerName.find(token, tokenCursor);
+                if (position == std::string::npos) {
+                    break;
+                }
+                const char before = position == 0U
+                                        ? '\0'
+                                        : lowerName[position - 1U];
+                const auto afterIndex = position + token.size();
+                const char after = afterIndex >= lowerName.size()
+                                       ? '\0'
+                                       : lowerName[afterIndex];
+                // Recovery generations commonly use old01/backup2. A
+                // numeric suffix is part of the archive token, not a new
+                // semantic word.
+                if (TokenBoundary(before) &&
+                    (TokenBoundary(after) ||
+                     std::isdigit(static_cast<unsigned char>(after)) != 0)) {
+                    return true;
+                }
+                tokenCursor = position + 1U;
+            }
+        }
+
+        // Legacy recovery files sometimes concatenate the marker directly
+        // to WATER (for example WATERold01). Accept that one compound while
+        // still rejecting unrelated words such as waterfall-old.
+        const std::string compound = std::string{"water"} + std::string{token};
+        std::size_t compoundCursor = 0U;
+        while (compoundCursor < lowerName.size()) {
+            const auto position = lowerName.find(compound, compoundCursor);
+            if (position == std::string::npos) {
+                break;
+            }
+            const char before = position == 0U
+                                    ? '\0'
+                                    : lowerName[position - 1U];
+            const auto afterIndex = position + compound.size();
+            const char after = afterIndex >= lowerName.size()
+                                   ? '\0'
+                                   : lowerName[afterIndex];
+            if (TokenBoundary(before) &&
+                (TokenBoundary(after) ||
+                 std::isdigit(static_cast<unsigned char>(after)) != 0)) {
+                return true;
+            }
+            compoundCursor = position + 1U;
+        }
+    }
+    return false;
+}
+
 std::string AssetCatalog::Summary() const {
     std::ostringstream output;
     output << "Asset discovery summary\n";
@@ -213,6 +282,13 @@ AssetCatalog DiscoverAssets(const std::filesystem::path& dataRoot) {
 
     for (const auto& filePath : files) {
         if (filePath.extension() != ".ply") {
+            continue;
+        }
+
+        // Recovery copies intentionally live beside the installed WATER
+        // variants. Keeping them out of the catalog prevents an old copy
+        // from being exposed as a loadable standalone layer or export source.
+        if (IsArchivedWaterFillPointCloudName(filePath.stem().string())) {
             continue;
         }
 

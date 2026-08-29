@@ -98,6 +98,26 @@ TEST_CASE("Point-cloud density spacing is quantized to integer micrometres", "[s
     CHECK_FALSE(ParseScenePointCloudRole("MESH").has_value());
 }
 
+TEST_CASE("Auxiliary density variants match the base density with a nearest fallback", "[scene][density][water-fill]") {
+    using invisible_places::scene::AuxiliaryDensityVariantCandidate;
+    using invisible_places::scene::SelectAuxiliaryDensityVariant;
+
+    const std::array candidates{
+        AuxiliaryDensityVariantCandidate{.spacingMicrometres = 5'000U, .sourceIndex = 50U},
+        AuxiliaryDensityVariantCandidate{.spacingMicrometres = 2'000U, .sourceIndex = 20U},
+        AuxiliaryDensityVariantCandidate{.spacingMicrometres = 3'000U, .sourceIndex = 30U},
+    };
+
+    CHECK(SelectAuxiliaryDensityVariant(candidates, 5'000U).value() == 50U);
+    CHECK(SelectAuxiliaryDensityVariant(candidates, 1'000U).value() == 20U);
+    CHECK(SelectAuxiliaryDensityVariant(candidates, 4'000U).value() == 30U);
+    CHECK(SelectAuxiliaryDensityVariant(candidates, 0U).value() == 20U);
+    CHECK_FALSE(SelectAuxiliaryDensityVariant(
+                    std::span<const AuxiliaryDensityVariantCandidate>{},
+                    5'000U)
+                    .has_value());
+}
+
 TEST_CASE("Only unambiguous complete scene densities are selectable", "[scene][density]") {
     const std::filesystem::path folder{"Data/SyntheticScene"};
     std::vector<PointCloudAsset> assets;

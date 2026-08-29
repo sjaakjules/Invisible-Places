@@ -45,5 +45,10 @@ AssetCatalog DiscoverAssets(const std::filesystem::path& dataRoot);
 [[nodiscard]] std::string InferPointCloudSceneRoleFromName(std::string_view name);
 [[nodiscard]] float InferPointSpacingMetersFromName(std::string_view name);
 [[nodiscard]] bool IsPrimaryPointCloudSceneRole(std::string_view role);
+// Canonical standing-water density variants use a delimiter-bounded WATER
+// token (for example Site1-WATER-2mm). Rollback copies remain on disk for
+// recovery, but must never enter the runtime asset catalog.
+[[nodiscard]] bool IsWaterFillPointCloudName(std::string_view name);
+[[nodiscard]] bool IsArchivedWaterFillPointCloudName(std::string_view name);
 
 }  // namespace invisible_places::io

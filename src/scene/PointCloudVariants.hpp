@@ -45,6 +45,22 @@ struct PointCloudVariant {
     std::uint64_t pointCount = 0U;
 };
 
+// Density-aware auxiliary clouds (currently the standing-water fill) are not
+// primary ROCK/SAND/VEG roles, but still follow the active scene density. The
+// source index is supplied by the caller so this policy stays independent of
+// the app runtime's session type.
+struct AuxiliaryDensityVariantCandidate {
+    PointSpacingMicrometres spacingMicrometres = 0U;
+    std::size_t sourceIndex = 0U;
+};
+
+// Prefer an exact density. If it is absent, choose the nearest available
+// density and prefer the finer source on an equal-distance tie. A zero target
+// selects the finest candidate and is used as the visual reference density.
+[[nodiscard]] std::optional<std::size_t> SelectAuxiliaryDensityVariant(
+    std::span<const AuxiliaryDensityVariantCandidate> candidates,
+    PointSpacingMicrometres targetSpacingMicrometres);
+
 struct SceneAnalysisSources {
     std::array<std::optional<PointCloudVariant>, kScenePointCloudRoleCount> byRole;
 
