@@ -710,6 +710,11 @@ struct FrozenRenderSetupProvenance {
     std::size_t enabledColouriseEffectCount = 0U;
     std::size_t colouriseKeyCount = 0U;
     std::vector<std::string> editedSettingLabels;
+    // Active Field-Mapped bindings whose named column the export source does
+    // not offer at all. They render their constant fallback; the export log
+    // prints these so a source re-export that dropped or renamed fields can
+    // never silently change the output's appearance.
+    std::vector<std::string> fieldBindingWarnings;
     // Filled by render-setup persistence. Keeping it in the frozen summary
     // lets the progress UI and export log expose the exact sidecar used.
     std::filesystem::path setupDocumentPath;
@@ -7703,29 +7708,10 @@ const invisible_places::io::ScalarFieldStats* ScalarFieldStatsBySlot(
     return &scalarFields[static_cast<std::size_t>(fieldSlot)];
 }
 
-void EnsureFieldMappedBindingDefaults(
-    RenderParameterBinding* binding,
-    const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields,
-    float outputMin,
-    float outputMax) {
-    if (binding == nullptr || scalarFields.empty()) {
-        return;
-    }
-
-    invisible_places::style::SyncBindingFieldReference(binding, scalarFields);
-    if (binding->fieldMap.fieldSlot >= 0 &&
-        static_cast<std::size_t>(binding->fieldMap.fieldSlot) < scalarFields.size()) {
-        return;
-    }
-
-    invisible_places::style::ConfigureFieldMapFromStats(
-        binding,
-        0,
-        scalarFields[0].name,
-        outputMin,
-        outputMax,
-        &scalarFields[0]);
-}
+// Field-Mapped binding defaults live in invisible_places::style so the
+// authored-name retention contract stays unit-tested beside
+// SyncBindingFieldReference.
+using invisible_places::style::EnsureFieldMappedBindingDefaults;
 
 std::optional<std::int32_t> FindWaterTrailScalarFieldSlotByName(
     const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields,
@@ -8600,45 +8586,62 @@ void AppendUniqueText(std::vector<std::string>* values, std::string value) {
 void CollectMissingProjectVisualBindingFields(
     const RenderParameterBinding& binding,
     std::string_view label,
-    const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields,
+    const PreviewLayerSession& session,
     std::vector<std::string>* missingFields) {
     if (!binding.active || binding.mode != ParameterSourceMode::FieldMapped || missingFields == nullptr) {
         return;
     }
 
     auto resolved = binding;
-    invisible_places::style::SyncBindingFieldReference(&resolved, scalarFields);
-    if (resolved.fieldMap.fieldSlot < 0) {
-        AppendUniqueText(
-            missingFields,
-            !binding.fieldMap.fieldName.empty()
-                ? std::string{label} + " -> " + binding.fieldMap.fieldName
-                : std::string{label} + " -> scalar field slot " +
-                      std::to_string(binding.fieldMap.fieldSlot));
+    invisible_places::style::SyncBindingFieldReference(&resolved, session.scalarFields);
+    if (resolved.fieldMap.fieldSlot >= 0) {
+        return;
     }
+    // With selective residency, an unresolved slot usually just means the
+    // column has not streamed in yet. A field the source offers on disk is
+    // not "unavailable" — the residency sweep or on-demand loader brings it
+    // in and the binding resolves itself. Warn only for a field the source
+    // does not carry at all.
+    if (!binding.fieldMap.fieldName.empty()) {
+        const auto availableOnDisk = std::any_of(
+            session.availableScalarFields.begin(),
+            session.availableScalarFields.end(),
+            [&](const invisible_places::io::AvailableScalarField& available) {
+                return available.name == binding.fieldMap.fieldName;
+            });
+        if (availableOnDisk) {
+            return;
+        }
+    }
+    AppendUniqueText(
+        missingFields,
+        !binding.fieldMap.fieldName.empty()
+            ? std::string{label} + " -> " + binding.fieldMap.fieldName
+            : std::string{label} + " -> scalar field slot " +
+                  std::to_string(binding.fieldMap.fieldSlot));
 }
 
 std::vector<std::string> MissingProjectVisualBindingFields(
     const PointCloudStyleState& style,
     const PreviewLayerSession& session) {
     std::vector<std::string> missingFields;
-    CollectMissingProjectVisualBindingFields(style.pointSize, "Point Size", session.scalarFields, &missingFields);
+    CollectMissingProjectVisualBindingFields(style.pointSize, "Point Size", session, &missingFields);
     CollectMissingProjectVisualBindingFields(
         style.surfelDiameter,
         "Surfel Diameter",
-        session.scalarFields,
+        session,
         &missingFields);
-    CollectMissingProjectVisualBindingFields(style.opacity, "Opacity", session.scalarFields, &missingFields);
+    CollectMissingProjectVisualBindingFields(style.opacity, "Opacity", session, &missingFields);
     CollectMissingProjectVisualBindingFields(
         style.emissiveStrength,
         "Emission",
-        session.scalarFields,
+        session,
         &missingFields);
-    CollectMissingProjectVisualBindingFields(style.depthFade, "Depth Fade", session.scalarFields, &missingFields);
+    CollectMissingProjectVisualBindingFields(style.depthFade, "Depth Fade", session, &missingFields);
     CollectMissingProjectVisualBindingFields(
         style.colormapPosition,
         "Colormap",
-        session.scalarFields,
+        session,
         &missingFields);
     return missingFields;
 }
@@ -27149,7 +27152,7 @@ bool ApplyScenePointCloudGroupDocuments(
 
     bool requestedAnyDisplay = false;
     for (auto& scene : runtimeState->pointCloudScenes) {
-        const auto groupIt = std::find_if(
+        auto groupIt = std::find_if(
             document.scenePointCloudGroups.begin(),
             document.scenePointCloudGroups.end(),
             [&](const invisible_places::serialization::ScenePointCloudGroupDocument& group) {
@@ -27177,6 +27180,22 @@ bool ApplyScenePointCloudGroupDocuments(
                     });
                 return hasFolderQualifiedPath || !hasAnySourcePath;
             });
+        if (groupIt == document.scenePointCloudGroups.end()) {
+            // A saved group whose recorded source paths no longer co-locate
+            // with this machine's scene folder (a different data root, or a
+            // per-file symlink mirror whose folder identity differs) is still
+            // this scene's record: falling through to the never-recorded
+            // branch would hide the scene and reset its committed density on
+            // every cross-root open. Folder-qualified matches above keep
+            // precedence for same-name scenes under multiple roots.
+            groupIt = std::find_if(
+                document.scenePointCloudGroups.begin(),
+                document.scenePointCloudGroups.end(),
+                [&](const invisible_places::serialization::
+                        ScenePointCloudGroupDocument& group) {
+                    return group.sceneGroupName == scene.sceneGroupName;
+                });
+        }
         if (groupIt == document.scenePointCloudGroups.end()) {
             ReleaseScenePointCloudResidency(runtimeState, viewport, &scene);
             scene.displayVisible = false;
@@ -27255,6 +27274,13 @@ bool ApplyScenePointCloudGroupDocuments(
 
         const bool activeScene =
             scene.sceneGroupName == exclusiveActiveSceneGroupName;
+        std::cout << "Scene restore: '" << scene.sceneGroupName
+                  << "' active=" << activeScene
+                  << " savedLoaded=" << groupIt->displayLoaded
+                  << " savedVisible=" << groupIt->displayVisible
+                  << " savedSpacingMeters=" << groupIt->displaySpacingMeters
+                  << " bundles=" << scene.displayBundles.size()
+                  << std::endl;
         scene.displayVisible = activeScene && groupIt->displayVisible;
         if (!groupIt->displayName.empty()) {
             scene.displayName = groupIt->displayName;
@@ -27467,6 +27493,20 @@ bool ApplyProjectDocumentToRuntime(
         if (savedLoaded != document.scenePointCloudGroups.end()) {
             exclusiveActiveSceneGroupName = savedLoaded->sceneGroupName;
         }
+    }
+    {
+        std::ostringstream knownScenes;
+        for (const auto& scene : runtimeState->pointCloudScenes) {
+            knownScenes << " '" << scene.sceneGroupName << "'";
+        }
+        std::cout << "Project restore: exclusive active scene '"
+                  << exclusiveActiveSceneGroupName << "' (saved water '"
+                  << document.activeWaterSceneGroupName << "', saved '"
+                  << document.activeSceneGroupName << "'; runtime scenes"
+                  << (runtimeState->pointCloudScenes.empty()
+                          ? " none"
+                          : knownScenes.str())
+                  << ")." << std::endl;
     }
 
     // Project application is a full context switch. Clear the previous
@@ -33991,6 +34031,29 @@ std::vector<invisible_places::output::OfflinePointLayer> BuildOfflinePointLayers
             .roughnessMotionFullLayer = snapshot.style.roughnessMotionFullLayer,
             .seepageGrid = snapshot.seepageGrid,
             .rainCollisionRole = snapshot.rainCollisionRole};
+        if (!layer.generatedWaterOverlay) {
+            // The snapshot style's numeric slots were resolved against
+            // whichever resident column subset the owning session held when
+            // it was last sanitized, and a sidecar re-render installs stored
+            // slots verbatim. The offline renderer indexes this layer's
+            // cloud directly, so the durable field names are re-resolved
+            // against its columns here; a name the export cloud does not
+            // provide falls back to the binding's constant instead of a
+            // coincidental column. Generated Water overlays keep their fixed
+            // slot semantics.
+            for (auto* binding : {
+                     &layer.style.pointSize,
+                     &layer.style.surfelDiameter,
+                     &layer.style.opacity,
+                     &layer.style.emissiveStrength,
+                     &layer.style.depthFade,
+                     &layer.style.colormapPosition,
+                 }) {
+                invisible_places::style::SyncBindingFieldReference(
+                    binding,
+                    snapshot.cloud->scalarFields);
+            }
+        }
         if (invisible_places::renderer::pointcloud::PointCloudStyleHasActiveRoughnessMotion(layer.style)) {
             if (const auto roughnessSlot = FindRoughnessMotionScalarFieldSlot(snapshot.cloud->scalarFields);
                 roughnessSlot.has_value() && roughnessSlot.value() < snapshot.cloud->scalarFields.size()) {
@@ -38107,6 +38170,77 @@ FrozenRenderSetupProvenance CollectRenderSetupProvenance(
             &labels,
             effect.name + " palette_edited");
     }
+
+    // An authored Field-Mapped binding whose named column is not offered by
+    // an export source at all can never stream in; the offline renderer
+    // draws its constant fallback. That is the correct behaviour, but it
+    // must be loud: a re-exported source that dropped or renamed a field
+    // otherwise changes the output's appearance with no trace.
+    const auto lowered = [](std::string_view text) {
+        std::string result{text};
+        std::transform(
+            result.begin(),
+            result.end(),
+            result.begin(),
+            [](unsigned char character) {
+                return static_cast<char>(std::tolower(character));
+            });
+        return result;
+    };
+    for (const auto& scene : runtimeState.pointCloudScenes) {
+        if (!scene.displayLoaded || !scene.displayVisible) {
+            continue;
+        }
+        for (const auto sessionIndex :
+             SceneFullDensityExportSourceIndices(runtimeState, scene)) {
+            if (sessionIndex >= runtimeState.sessions.size()) {
+                continue;
+            }
+            const auto& session = runtimeState.sessions[sessionIndex];
+            if (session.availableScalarFields.empty()) {
+                // The available set is unknown until the source loads; the
+                // export readiness gate handles that separately.
+                continue;
+            }
+            const auto fieldAvailable = [&](const std::string& name) {
+                const auto target = lowered(name);
+                return std::any_of(
+                    session.availableScalarFields.begin(),
+                    session.availableScalarFields.end(),
+                    [&](const auto& available) {
+                        return lowered(available.name) == target;
+                    });
+            };
+            const std::array<
+                std::pair<const RenderParameterBinding*, const char*>,
+                6U>
+                bindings{{
+                    {&session.pointStyle.pointSize, "Point Size"},
+                    {&session.pointStyle.surfelDiameter, "Surfel Diameter"},
+                    {&session.pointStyle.opacity, "Opacity"},
+                    {&session.pointStyle.emissiveStrength, "Emission"},
+                    {&session.pointStyle.depthFade, "Depth Fade"},
+                    {&session.pointStyle.colormapPosition,
+                     "Colormap Position"},
+                }};
+            for (const auto& [binding, label] : bindings) {
+                if (!binding->active ||
+                    binding->mode !=
+                        invisible_places::style::ParameterSourceMode::
+                            FieldMapped ||
+                    binding->fieldMap.fieldName.empty() ||
+                    fieldAvailable(binding->fieldMap.fieldName)) {
+                    continue;
+                }
+                AppendUniqueRenderSetupEditedLabel(
+                    &summary.fieldBindingWarnings,
+                    session.sceneRole + " " + label + ": field '" +
+                        binding->fieldMap.fieldName +
+                        "' is not in the export source; its constant "
+                        "fallback renders.");
+            }
+        }
+    }
     return summary;
 }
 
@@ -39980,6 +40114,13 @@ std::string WriteExportLog(
             << renderSetup.editedSettingLabels.size() << "):\n";
         for (const auto& label : renderSetup.editedSettingLabels) {
             log << "  - " << label << '\n';
+        }
+    }
+    if (!renderSetup.fieldBindingWarnings.empty()) {
+        log << "Field binding warnings ("
+            << renderSetup.fieldBindingWarnings.size() << "):\n";
+        for (const auto& warning : renderSetup.fieldBindingWarnings) {
+            log << "  - " << warning << '\n';
         }
     }
     log << '\n';
@@ -125542,15 +125683,74 @@ int RunScene3PatchBoundarySmoke(
             BuildRenderState(*runtimeState, *viewport, 0.0F));
         viewport->DrawFrame();
     };
+    const auto describeSwitchState = [&](std::string_view where) {
+        std::ostringstream state;
+        state << "Patch-boundary switch state (" << where << "): pending="
+              << (scene.pendingDisplaySpacingMicrometres.has_value()
+                      ? std::to_string(
+                            scene.pendingDisplaySpacingMicrometres.value())
+                      : std::string{"none"})
+              << " staged=" << scene.stagedReadyCount
+              << " committed="
+              << scene.committedDisplaySpacingMicrometres.value_or(0U)
+              << " loaded=" << scene.displayLoaded
+              << " visible=" << scene.displayVisible
+              << " generation=" << scene.switchGeneration
+              << " shouldClose=" << window->ShouldClose()
+              << " pendingLoad=" << runtimeState->pendingLoad.has_value()
+              << " queuedLoads="
+              << runtimeState->persistence.queuedLoads.size();
+        for (const auto& index : scene.pendingDisplaySessionIndices) {
+            if (!index.has_value() ||
+                index.value() >= runtimeState->sessions.size()) {
+                state << " [-]";
+                continue;
+            }
+            const auto& session = runtimeState->sessions[index.value()];
+            state << " [" << index.value() << ":cpu=" << session.cpuResident
+                  << ",gpu=" << session.gpuResident << ",cloud="
+                  << (session.offlinePointCloud != nullptr) << "]";
+        }
+        for (const auto& index : scene.committedDisplaySessionIndices) {
+            state << " committed["
+                  << (index.has_value() ? std::to_string(index.value())
+                                        : std::string{"-"})
+                  << (index.has_value() &&
+                              index.value() < runtimeState->sessions.size() &&
+                              runtimeState->sessions[index.value()].gpuResident
+                          ? ":gpu"
+                          : "")
+                  << "]";
+        }
+        if (!scene.switchError.empty()) {
+            state << " switchError=" << scene.switchError;
+        }
+        if (!runtimeState->errorMessage.empty()) {
+            state << " error=" << runtimeState->errorMessage;
+        }
+        std::cout << state.str() << std::endl;
+    };
+    describeSwitchState("after-project-load");
+    // Loading the complete 1 mm bundle through the exclusive high-memory
+    // slot takes about 14 minutes for the 2026-08-29 Scene3 sources on an
+    // M1 Max, so the old 15-minute deadline left no headroom for the commit
+    // and GPU upload that follow.
     const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::minutes{15};
+        std::chrono::steady_clock::now() + std::chrono::minutes{25};
+    auto lastSettleDiagnostic = std::chrono::steady_clock::now();
     while (std::chrono::steady_clock::now() < deadline &&
            !window->ShouldClose() &&
            (scene.pendingDisplaySpacingMicrometres.has_value() ||
             scene.pendingMixedDisplay)) {
         pumpFrame();
+        if (std::chrono::steady_clock::now() - lastSettleDiagnostic >=
+            std::chrono::seconds{15}) {
+            lastSettleDiagnostic = std::chrono::steady_clock::now();
+            describeSwitchState("saved-display-settle");
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds{2});
     }
+    describeSwitchState("after-saved-display-settle");
     if (scene.pendingDisplaySpacingMicrometres.has_value() ||
         scene.pendingMixedDisplay) {
         report.Fail(
@@ -125574,6 +125774,8 @@ int RunScene3PatchBoundarySmoke(
         }
         StartQueuedLayerLoadIfIdle(runtimeState);
     }
+    describeSwitchState("after-1mm-request");
+    auto lastSwitchDiagnostic = std::chrono::steady_clock::now();
     while (std::chrono::steady_clock::now() < deadline &&
            !window->ShouldClose()) {
         pumpFrame();
@@ -125591,8 +125793,14 @@ int RunScene3PatchBoundarySmoke(
         if (displayReady) {
             break;
         }
+        if (std::chrono::steady_clock::now() - lastSwitchDiagnostic >=
+            std::chrono::seconds{15}) {
+            lastSwitchDiagnostic = std::chrono::steady_clock::now();
+            describeSwitchState("1mm-ready-wait");
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds{2});
     }
+    describeSwitchState("after-1mm-ready-wait");
     const bool displayReady =
         scene.displayLoaded && scene.displayVisible &&
         scene.committedDisplaySpacingMicrometres == kValidationSpacingMicrometres;
@@ -125672,12 +125880,43 @@ int RunScene3PatchBoundarySmoke(
                 return field.name == name;
             });
     };
+    // Selective residency streams the Visual's referenced columns in on
+    // demand after the apply, so pump the load loop until they are resident
+    // instead of expecting the bundle load to have carried them eagerly.
+    const auto fieldDeadline =
+        std::chrono::steady_clock::now() + std::chrono::minutes{5};
+    while (std::chrono::steady_clock::now() < fieldDeadline &&
+           !window->ShouldClose() &&
+           !std::all_of(
+               requiredFields.begin(),
+               requiredFields.end(),
+               hasField)) {
+        pumpFrame();
+        PollPendingScalarFieldLoad(runtimeState, viewport);
+        EnsureRequiredScalarFieldsResident(runtimeState, viewport);
+        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    }
     if (!std::all_of(
             requiredFields.begin(),
             requiredFields.end(),
             hasField)) {
         report.Fail(
             "Projector-01 did not load Roughness and both required A_R fields.");
+        return finish();
+    }
+    // The authored durable names must survive the apply/sanitize/load cycle
+    // verbatim. Partial residency once let binding defaults silently rewrite
+    // a cold authored name to the first resident field (Roughness), which
+    // also hid the field from the on-demand loader.
+    const auto& appliedOpacityMap = sandSession.pointStyle.opacity.fieldMap;
+    const auto& appliedEmissiveMap =
+        sandSession.pointStyle.emissiveStrength.fieldMap;
+    if (appliedOpacityMap.fieldName != "A_R_MeanCurvature_Combined" ||
+        appliedEmissiveMap.fieldName != "A_R_Recession_Combined") {
+        report.Fail(
+            "Projector-01 authored field names were rewritten after apply "
+            "(opacity '" + appliedOpacityMap.fieldName + "', emissive '" +
+            appliedEmissiveMap.fieldName + "').");
         return finish();
     }
     const auto neutralWaterFrame = ResolveWaterFrameState(runtimeState);

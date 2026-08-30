@@ -109,6 +109,90 @@ TEST_CASE("Legacy slot-only scalar bindings acquire a durable name once", "[styl
     CHECK(binding.fieldMap.fieldName == "Roughness");
 }
 
+TEST_CASE(
+    "Binding defaults never rebind an authored name that is not resident",
+    "[style][field-binding]") {
+    // Residency streams columns on demand, so `scalarFields` is routinely a
+    // partial subset that does not yet contain the authored field. The
+    // authored mapping must survive untouched: the renderer shows the
+    // constant fallback and the field loader keys on the retained name.
+    auto binding = MappedBinding(7, "A_R_MeanCurvature_Combined");
+    const auto originalMap = binding.fieldMap;
+    const std::vector residentSubset{Field("Roughness"), Field("GroundID")};
+
+    invisible_places::style::EnsureFieldMappedBindingDefaults(
+        &binding,
+        residentSubset,
+        0.0F,
+        1.0F);
+
+    CHECK(binding.mode == invisible_places::style::ParameterSourceMode::FieldMapped);
+    CHECK(binding.fieldMap.fieldSlot == -1);
+    CHECK(binding.fieldMap.fieldName == "A_R_MeanCurvature_Combined");
+    CHECK(binding.fieldMap.inputMin == Catch::Approx(originalMap.inputMin));
+    CHECK(binding.fieldMap.inputMax == Catch::Approx(originalMap.inputMax));
+    CHECK(binding.fieldMap.outputMin == Catch::Approx(originalMap.outputMin));
+    CHECK(binding.fieldMap.outputMax == Catch::Approx(originalMap.outputMax));
+    CHECK(binding.fieldMap.gamma == Catch::Approx(originalMap.gamma));
+    CHECK(binding.fieldMap.flags == originalMap.flags);
+
+    // Once the authored column streams in, the same entry point resolves the
+    // durable name to its resident slot without touching the mapping.
+    const std::vector withAuthored{
+        Field("Roughness"),
+        Field("GroundID"),
+        Field("A_R_MeanCurvature_Combined"),
+    };
+    invisible_places::style::EnsureFieldMappedBindingDefaults(
+        &binding,
+        withAuthored,
+        0.0F,
+        1.0F);
+    CHECK(binding.fieldMap.fieldSlot == 2);
+    CHECK(binding.fieldMap.fieldName == "A_R_MeanCurvature_Combined");
+    CHECK(binding.fieldMap.outputMin == Catch::Approx(originalMap.outputMin));
+    CHECK(binding.fieldMap.outputMax == Catch::Approx(originalMap.outputMax));
+}
+
+TEST_CASE(
+    "Binding defaults seed only a binding with no authored field",
+    "[style][field-binding]") {
+    auto binding = MappedBinding(-1, "");
+    const std::vector fields{Field("Roughness"), Field("Interest")};
+
+    invisible_places::style::EnsureFieldMappedBindingDefaults(
+        &binding,
+        fields,
+        0.25F,
+        0.75F);
+
+    CHECK(binding.fieldMap.fieldSlot == 0);
+    CHECK(binding.fieldMap.fieldName == "Roughness");
+    CHECK(binding.fieldMap.outputMin == Catch::Approx(0.25F));
+    CHECK(binding.fieldMap.outputMax == Catch::Approx(0.75F));
+
+    // An unresolvable legacy slot with no name also seeds the default rather
+    // than pointing at a column that does not exist.
+    auto legacy = MappedBinding(9, "");
+    invisible_places::style::EnsureFieldMappedBindingDefaults(
+        &legacy,
+        fields,
+        0.0F,
+        1.0F);
+    CHECK(legacy.fieldMap.fieldSlot == 0);
+    CHECK(legacy.fieldMap.fieldName == "Roughness");
+
+    // No resident fields at all leaves the binding untouched.
+    auto untouched = MappedBinding(3, "Interest");
+    invisible_places::style::EnsureFieldMappedBindingDefaults(
+        &untouched,
+        {},
+        0.0F,
+        1.0F);
+    CHECK(untouched.fieldMap.fieldSlot == 3);
+    CHECK(untouched.fieldMap.fieldName == "Interest");
+}
+
 TEST_CASE("Manual input bounds survive switching fields and back", "[style][field-binding]") {
     auto stats = Field("Interest");
     stats.minimum = -2.0F;

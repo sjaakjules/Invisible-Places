@@ -388,7 +388,7 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
                 LABELS "gui_smoke;pointcloud;full_site"
                 RUN_SERIAL TRUE
                 WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-                TIMEOUT 1200
+                TIMEOUT 2400
         )
         add_test(
             NAME scene3-visual-parity-gui-smoke

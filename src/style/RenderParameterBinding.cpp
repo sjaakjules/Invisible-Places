@@ -289,6 +289,46 @@ void SyncBindingFieldReference(
     }
 }
 
+void EnsureFieldMappedBindingDefaults(
+    RenderParameterBinding* binding,
+    const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields,
+    float defaultOutputMin,
+    float defaultOutputMax) {
+    if (binding == nullptr || scalarFields.empty()) {
+        return;
+    }
+
+    SyncBindingFieldReference(binding, scalarFields);
+    if (binding->fieldMap.fieldSlot >= 0 &&
+        static_cast<std::size_t>(binding->fieldMap.fieldSlot) <
+            scalarFields.size()) {
+        return;
+    }
+
+    // An authored field name that is not resident yet must be retained
+    // untouched. `scalarFields` holds only the streamed-in subset of the
+    // source's columns, so an unresolved slot usually means "not loaded
+    // yet", and the name is what the on-demand field loader keys on. The
+    // renderer draws the binding's constant fallback until the column
+    // arrives; rewriting the name here silently rebound authored visuals to
+    // whichever field happened to load first (typically Roughness) and hid
+    // the missing field from the loader entirely.
+    if (!binding->fieldMap.fieldName.empty()) {
+        return;
+    }
+
+    // Only a binding with no authored target (a fresh switch to
+    // Field-Mapped, or unresolvable legacy slot-only data) receives the
+    // first resident field as its starting default.
+    ConfigureFieldMapFromStats(
+        binding,
+        0,
+        scalarFields[0].name,
+        defaultOutputMin,
+        defaultOutputMax,
+        &scalarFields[0]);
+}
+
 float ResolveBindingInputMinimum(
     const RenderParameterBinding& binding,
     const invisible_places::io::ScalarFieldStats* fieldStats) {

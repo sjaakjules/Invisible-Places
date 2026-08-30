@@ -78,6 +78,19 @@ void SanitizeFieldMapBoundsMemory(FieldMapConfig* config);
 void SyncBindingFieldReference(
     RenderParameterBinding* binding,
     const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields);
+// Default entry point for presenting a Field-Mapped binding against the
+// currently resident scalar columns. Resolves the durable name to a slot
+// when its column is resident. An authored name whose column is absent is
+// retained untouched with slot -1 — `scalarFields` may be a partial
+// streamed-in subset, the renderer draws the constant fallback until the
+// column arrives, and the on-demand field loader keys on that name. Only a
+// binding with no authored name at all receives the first resident field as
+// its starting default.
+void EnsureFieldMappedBindingDefaults(
+    RenderParameterBinding* binding,
+    const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields,
+    float defaultOutputMin,
+    float defaultOutputMax);
 [[nodiscard]] float ResolveBindingInputMinimum(
     const RenderParameterBinding& binding,
     const invisible_places::io::ScalarFieldStats* fieldStats);
