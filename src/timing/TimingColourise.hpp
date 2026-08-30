@@ -681,6 +681,9 @@ struct TimingTakeSceneState {
     // List order is visual priority: index zero is the top layer and is
     // applied last.
     std::vector<TimingColouriseEffect> colouriseEffects;
+    // Named markers on this take's shared animation timeline. Marker ids are
+    // unique within the state; sanitize hoists legacy run-scoped marks here.
+    std::vector<invisible_places::water::TimingTakeMark> marks;
     std::uint32_t waterFeatureTimingRunSequence = 1U;
     std::uint32_t colouriseEffectSequence = 1U;
 };
@@ -1595,6 +1598,37 @@ NextTimingColouriseAnyEffectParameterKeyPosition(
     TimingTakeSceneState* state,
     const invisible_places::water::WaterKeyedFeatureId& feature,
     std::uint32_t targetRunId);
+
+// Markers on one take-and-scene timeline. Ids are unique within the state;
+// default names are unique within it too and follow the user-facing
+// Marker 01, Marker 02 sequence.
+[[nodiscard]] std::uint32_t AllocateTimingTakeMarkId(
+    const TimingTakeSceneState& state);
+[[nodiscard]] std::string AllocateTimingTakeMarkName(
+    const TimingTakeSceneState& state);
+[[nodiscard]] invisible_places::water::TimingTakeMark* FindTimingTakeMark(
+    TimingTakeSceneState* state,
+    std::uint32_t markId);
+[[nodiscard]] const invisible_places::water::TimingTakeMark*
+FindTimingTakeMark(
+    const TimingTakeSceneState* state,
+    std::uint32_t markId);
+[[nodiscard]] bool MoveTimingTakeMark(
+    TimingTakeSceneState* state,
+    std::uint32_t markId,
+    float position);
+[[nodiscard]] bool RenameTimingTakeMark(
+    TimingTakeSceneState* state,
+    std::uint32_t markId,
+    std::string_view text);
+[[nodiscard]] bool RemoveTimingTakeMark(
+    TimingTakeSceneState* state,
+    std::uint32_t markId);
+// Appends source markers that do not already exist at the same text and
+// position, reallocating ids that would collide with the destination's.
+void MergeTimingTakeMarksKeepingFirst(
+    TimingTakeSceneState* destination,
+    std::span<const invisible_places::water::TimingTakeMark> source);
 
 [[nodiscard]] std::string AllocateTimingTakeId(
     std::span<const TimingTakeDefinition> takes,

@@ -1733,6 +1733,62 @@ std::string AllocateSequentialId(
     }
 }
 
+// Trims texts, clamps positions, keeps every stored id unique (first entry
+// holding a contested id wins), and orders markers by position then id.
+std::vector<invisible_places::water::TimingTakeMark> SanitizeTimingTakeMarks(
+    std::vector<invisible_places::water::TimingTakeMark> marks) {
+    std::unordered_set<std::uint32_t> reservedIds;
+    for (const auto& mark : marks) {
+        if (mark.id != 0U) {
+            reservedIds.insert(mark.id);
+        }
+    }
+    std::unordered_set<std::uint32_t> assignedIds;
+    const auto allocateSanitizedId = [&] {
+        std::uint32_t candidate = 1U;
+        while ((reservedIds.contains(candidate) ||
+                assignedIds.contains(candidate)) &&
+               candidate != std::numeric_limits<std::uint32_t>::max()) {
+            ++candidate;
+        }
+        return reservedIds.contains(candidate) ||
+                       assignedIds.contains(candidate)
+                   ? 0U
+                   : candidate;
+    };
+    std::vector<invisible_places::water::TimingTakeMark> sanitized;
+    sanitized.reserve(marks.size());
+    for (auto mark : marks) {
+        mark.text = TrimRainProfileText(mark.text);
+        if (mark.text.empty()) {
+            mark.text = "Marker";
+        }
+        mark.position = std::clamp(
+            std::isfinite(mark.position) ? mark.position : 0.0F,
+            0.0F,
+            1.0F);
+        if (mark.id == 0U || assignedIds.contains(mark.id)) {
+            mark.id = allocateSanitizedId();
+        }
+        if (mark.id == 0U) {
+            continue;
+        }
+        assignedIds.insert(mark.id);
+        sanitized.push_back(std::move(mark));
+    }
+    std::stable_sort(
+        sanitized.begin(),
+        sanitized.end(),
+        [](const invisible_places::water::TimingTakeMark& left,
+           const invisible_places::water::TimingTakeMark& right) {
+            if (left.position != right.position) {
+                return left.position < right.position;
+            }
+            return left.id < right.id;
+        });
+    return sanitized;
+}
+
 }  // namespace
 
 std::string NormalizeTimingTakeId(std::string_view takeId) {
@@ -4857,7 +4913,16 @@ TimingTakeSceneState SanitizeTimingTakeSceneState(
     for (auto& run : state.waterFeatureTimingRuns) {
         run = invisible_places::water::SanitizeWaterFeatureTimingRun(
             std::move(run));
+        // Markers were run-scoped before project schema 90. The take's
+        // shared list owns them now, so a parse or merge that left legacy
+        // marks on a run migrates them here (ids dedupe below).
+        std::move(
+            run.marks.begin(),
+            run.marks.end(),
+            std::back_inserter(state.marks));
+        run.marks.clear();
     }
+    state.marks = SanitizeTimingTakeMarks(std::move(state.marks));
     for (auto& effect : state.colouriseEffects) {
         effect = SanitizeTimingColouriseEffect(std::move(effect));
     }
@@ -5768,10 +5833,10 @@ bool RetimeTimingTakeSceneStateNormalizedPositions(
         }
     };
 
+    for (auto& mark : state->marks) {
+        mark.position = retimePosition(mark.position);
+    }
     for (auto& run : state->waterFeatureTimingRuns) {
-        for (auto& mark : run.marks) {
-            mark.position = retimePosition(mark.position);
-        }
         for (auto& feature : run.features) {
             // A clip ending on 1 whose head sits above 0 may own a member
             // stored at time 0: the seam state SynchronizeWaterFeatureClip-
@@ -6088,38 +6153,6 @@ std::uint32_t AllocateMergedWaterRunId(
     return candidate;
 }
 
-void MergeWaterFeatureRunMarksKeepingFirst(
-    invisible_places::water::WaterFeatureTimingRun* destination,
-    std::span<const invisible_places::water::WaterFeatureRunMark> source) {
-    if (destination == nullptr) {
-        return;
-    }
-    for (const auto& sourceMark : source) {
-        const bool duplicate = std::any_of(
-            destination->marks.begin(),
-            destination->marks.end(),
-            [&](const auto& existing) {
-                return existing.text == sourceMark.text &&
-                       std::abs(existing.position - sourceMark.position) <=
-                           kTimingColouriseKeyTolerance;
-            });
-        if (duplicate) {
-            continue;
-        }
-        auto copied = sourceMark;
-        if (copied.id == 0U ||
-            invisible_places::water::FindWaterFeatureRunMark(
-                destination,
-                copied.id) != nullptr) {
-            copied.id = invisible_places::water::
-                AllocateWaterFeatureRunMarkId(*destination);
-        }
-        if (copied.id != 0U) {
-            destination->marks.push_back(std::move(copied));
-        }
-    }
-}
-
 void MergeWaterFeatureRunVariantsKeepingFirst(
     invisible_places::water::WaterFeatureTimingRun* destination,
     const invisible_places::water::WaterFeatureTimingRun& source,
@@ -6186,6 +6219,9 @@ void MergeTimingTakeSceneStateKeepingFirst(
     destination->onlyShowWaterFeaturesInRuns =
         destination->onlyShowWaterFeaturesInRuns ||
         source.onlyShowWaterFeaturesInRuns;
+    // Sanitize hoisted any legacy run-scoped marks into both states'
+    // shared lists, so one take-level merge covers every source run.
+    MergeTimingTakeMarksKeepingFirst(destination, source.marks);
 
     // Older linked-loop merges could leave duplicate/zero run ids and the
     // same feature assigned to multiple runs. Repair that historical state
@@ -6212,7 +6248,6 @@ void MergeTimingTakeSceneStateKeepingFirst(
          runIndex < destination->waterFeatureTimingRuns.size();
          ++runIndex) {
         auto& run = destination->waterFeatureTimingRuns[runIndex];
-        const bool originallyHadFeatures = !run.features.empty();
         for (std::size_t featureIndex = 0U;
              featureIndex < run.features.size();) {
             auto* firstOwner =
@@ -6252,9 +6287,6 @@ void MergeTimingTakeSceneStateKeepingFirst(
             MergeWaterFeatureTimelineKeepingFirst(
                 firstOwner,
                 run.features[featureIndex]);
-            MergeWaterFeatureRunMarksKeepingFirst(
-                firstOwnerRun,
-                run.marks);
             MergeWaterFeatureRunVariantsKeepingFirst(
                 firstOwnerRun,
                 run,
@@ -6264,13 +6296,6 @@ void MergeTimingTakeSceneStateKeepingFirst(
             run.features.erase(
                 run.features.begin() +
                 static_cast<std::ptrdiff_t>(featureIndex));
-        }
-        if (originallyHadFeatures && run.features.empty()) {
-            // Every feature that gave these marks meaning was repaired into
-            // its first owning run above. Do not leave the same annotations
-            // on an empty organizational shell where a future feature could
-            // inherit them accidentally.
-            run.marks.clear();
         }
     }
 
@@ -6328,15 +6353,11 @@ void MergeTimingTakeSceneStateKeepingFirst(
         MergeWaterFeatureRunVariantsKeepingFirst(
             targetRun,
             sourceRun);
-        bool targetReceivedFeature = sourceRun.features.empty();
         for (const auto& sourceFeature : sourceRun.features) {
             auto [owningRun, destinationFeature] =
                 findFeature(sourceFeature.feature);
             if (destinationFeature != nullptr) {
                 owningRun->enabled = owningRun->enabled || sourceRun.enabled;
-                MergeWaterFeatureRunMarksKeepingFirst(
-                    owningRun,
-                    sourceRun.marks);
                 MergeWaterFeatureTimelineKeepingFirst(
                     destinationFeature,
                     sourceFeature);
@@ -6354,12 +6375,6 @@ void MergeTimingTakeSceneStateKeepingFirst(
                 &merged,
                 sourceFeature);
             targetRun->features.push_back(std::move(merged));
-            targetReceivedFeature = true;
-        }
-        if (targetReceivedFeature) {
-            MergeWaterFeatureRunMarksKeepingFirst(
-                targetRun,
-                sourceRun.marks);
         }
     }
 
@@ -9825,6 +9840,149 @@ bool AssignWaterFeatureToTimingRun(
             targetRunId);
     state->waterFeatureTimingRuns = std::move(adapter.runs);
     return assigned;
+}
+
+std::uint32_t AllocateTimingTakeMarkId(const TimingTakeSceneState& state) {
+    const auto used = [&](std::uint32_t id) {
+        return id == 0U || std::any_of(
+            state.marks.begin(),
+            state.marks.end(),
+            [&](const invisible_places::water::TimingTakeMark& mark) {
+                return mark.id == id;
+            });
+    };
+    std::uint32_t candidate = 1U;
+    while (used(candidate) &&
+           candidate != std::numeric_limits<std::uint32_t>::max()) {
+        ++candidate;
+    }
+    return used(candidate) ? 0U : candidate;
+}
+
+std::string AllocateTimingTakeMarkName(const TimingTakeSceneState& state) {
+    for (std::size_t number = 1U;
+         number <= state.marks.size() + 1U;
+         ++number) {
+        std::ostringstream stream;
+        stream << "Marker " << std::setfill('0') << std::setw(2) << number;
+        const std::string candidate = stream.str();
+        const bool used = std::any_of(
+            state.marks.begin(),
+            state.marks.end(),
+            [&](const invisible_places::water::TimingTakeMark& mark) {
+                return mark.text == candidate;
+            });
+        if (!used) {
+            return candidate;
+        }
+    }
+    return "Marker";
+}
+
+invisible_places::water::TimingTakeMark* FindTimingTakeMark(
+    TimingTakeSceneState* state,
+    std::uint32_t markId) {
+    if (state == nullptr || markId == 0U) {
+        return nullptr;
+    }
+    const auto mark = std::find_if(
+        state->marks.begin(),
+        state->marks.end(),
+        [&](const invisible_places::water::TimingTakeMark& candidate) {
+            return candidate.id == markId;
+        });
+    return mark != state->marks.end() ? &*mark : nullptr;
+}
+
+const invisible_places::water::TimingTakeMark* FindTimingTakeMark(
+    const TimingTakeSceneState* state,
+    std::uint32_t markId) {
+    if (state == nullptr || markId == 0U) {
+        return nullptr;
+    }
+    const auto mark = std::find_if(
+        state->marks.begin(),
+        state->marks.end(),
+        [&](const invisible_places::water::TimingTakeMark& candidate) {
+            return candidate.id == markId;
+        });
+    return mark != state->marks.end() ? &*mark : nullptr;
+}
+
+bool MoveTimingTakeMark(
+    TimingTakeSceneState* state,
+    std::uint32_t markId,
+    float position) {
+    auto* mark = FindTimingTakeMark(state, markId);
+    if (mark == nullptr) {
+        return false;
+    }
+    const float next = std::clamp(
+        std::isfinite(position) ? position : 0.0F,
+        0.0F,
+        1.0F);
+    if (mark->position == next) {
+        return false;
+    }
+    mark->position = next;
+    return true;
+}
+
+bool RenameTimingTakeMark(
+    TimingTakeSceneState* state,
+    std::uint32_t markId,
+    std::string_view text) {
+    auto* mark = FindTimingTakeMark(state, markId);
+    const auto next = TrimRainProfileText(text);
+    if (mark == nullptr || next.empty() || mark->text == next) {
+        return false;
+    }
+    mark->text = next;
+    return true;
+}
+
+bool RemoveTimingTakeMark(
+    TimingTakeSceneState* state,
+    std::uint32_t markId) {
+    if (state == nullptr || markId == 0U) {
+        return false;
+    }
+    const auto previousSize = state->marks.size();
+    std::erase_if(
+        state->marks,
+        [&](const invisible_places::water::TimingTakeMark& mark) {
+            return mark.id == markId;
+        });
+    return state->marks.size() != previousSize;
+}
+
+void MergeTimingTakeMarksKeepingFirst(
+    TimingTakeSceneState* destination,
+    std::span<const invisible_places::water::TimingTakeMark> source) {
+    if (destination == nullptr) {
+        return;
+    }
+    for (const auto& sourceMark : source) {
+        const bool duplicate = std::any_of(
+            destination->marks.begin(),
+            destination->marks.end(),
+            [&](const invisible_places::water::TimingTakeMark& existing) {
+                return existing.text == sourceMark.text &&
+                       std::abs(existing.position - sourceMark.position) <=
+                           kTimingColouriseKeyTolerance;
+            });
+        if (duplicate) {
+            continue;
+        }
+        auto copied = sourceMark;
+        if (copied.id == 0U ||
+            FindTimingTakeMark(destination, copied.id) != nullptr) {
+            copied.id = AllocateTimingTakeMarkId(*destination);
+        }
+        if (copied.id != 0U) {
+            destination->marks.push_back(std::move(copied));
+        }
+    }
 }
 
 std::string AllocateTimingTakeId(

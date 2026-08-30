@@ -740,12 +740,17 @@ preview and every frozen export shall resolve exactly one profile into the
 existing Rain simulation.
 
 #### FR-STYLE-16
-Each Water Feature Run may own short text marks in its normalized animation
-domain. A mark applies to every feature assigned to that run, persists with the
-Timing Take scene state, follows reciprocal-loop mapping and retiming, and
-survives linked-state merging with stable run-local identity. Project schema 79
-adds the optional Feature Run `marks` array; projects without it load with no
-marks.
+Each Timing Take scene state may own short named timeline markers in its
+normalized animation domain. A marker applies to the whole take — it draws on
+the global animation bar and on every Timings and embedded feature timeline
+regardless of run or feature focus — persists with the Timing Take scene
+state, follows reciprocal-loop mapping and retiming, and survives
+linked-state merging with stable take-local identity. While a take is active,
+M inserts a marker at the current frame with a unique default `Marker NN`
+name; single-click selects, dragging retimes, double-click renames, and
+Delete removes it. Project schema 90 adds the optional take-level `marks`
+array; the schema-79 run-scoped `marks` arrays of older projects hoist into
+the owning take on load, and projects without either load with no markers.
 
 #### FR-STYLE-17
 A Timing Take scene may restrict Water visibility to features assigned to its
@@ -831,7 +836,7 @@ serializes additively with omitted defaults.
 
 #### FR-STYLE-19
 Each Water Feature Run shall support project-owned named variants that share
-the run's feature membership, keys, clips, and marks while storing sparse,
+the run's feature membership, keys, and clips while storing sparse,
 typed overrides only for detached non-keyable settings. Variants shall inherit
 live Base Run values for every attached setting, retain the last detached
 value across reattachment, and expose divergent state directly on the fixed

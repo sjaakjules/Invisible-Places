@@ -10076,12 +10076,12 @@ WaterFeatureTimingRun SanitizeWaterFeatureTimingRun(
                    ? 0U
                    : candidate;
     };
-    std::vector<WaterFeatureRunMark> marks;
+    std::vector<TimingTakeMark> marks;
     marks.reserve(run.marks.size());
     for (auto mark : run.marks) {
         mark.text = TrimSeepageName(mark.text);
         if (mark.text.empty()) {
-            mark.text = "Mark";
+            mark.text = "Marker";
         }
         mark.position = std::clamp(
             std::isfinite(mark.position) ? mark.position : 0.0F,
@@ -10099,8 +10099,7 @@ WaterFeatureTimingRun SanitizeWaterFeatureTimingRun(
     std::stable_sort(
         marks.begin(),
         marks.end(),
-        [](const WaterFeatureRunMark& left,
-           const WaterFeatureRunMark& right) {
+        [](const TimingTakeMark& left, const TimingTakeMark& right) {
             if (left.position != right.position) {
                 return left.position < right.position;
             }
@@ -10464,129 +10463,6 @@ WaterFeatureFixedSettingOverlay BuildWaterFeatureFixedSettingOverlay(
         }
     }
     return overlay;
-}
-
-std::uint32_t AllocateWaterFeatureRunMarkId(
-    const WaterFeatureTimingRun& run) {
-    const auto used = [&](std::uint32_t id) {
-        return id == 0U || std::any_of(
-            run.marks.begin(),
-            run.marks.end(),
-            [&](const WaterFeatureRunMark& mark) {
-                return mark.id == id;
-            });
-    };
-    std::uint32_t candidate = 1U;
-    while (used(candidate) &&
-           candidate != std::numeric_limits<std::uint32_t>::max()) {
-        ++candidate;
-    }
-    return used(candidate) ? 0U : candidate;
-}
-
-std::string AllocateWaterFeatureRunMarkName(
-    std::span<const WaterFeatureTimingRun> runs) {
-    std::size_t markCount = 0U;
-    for (const auto& run : runs) {
-        markCount += run.marks.size();
-    }
-    for (std::size_t number = 0U; number <= markCount; ++number) {
-        std::ostringstream stream;
-        stream << "Mark " << std::setfill('0') << std::setw(2) << number;
-        const std::string candidate = stream.str();
-        const bool used = std::any_of(
-            runs.begin(),
-            runs.end(),
-            [&](const WaterFeatureTimingRun& run) {
-                return std::any_of(
-                    run.marks.begin(),
-                    run.marks.end(),
-                    [&](const WaterFeatureRunMark& mark) {
-                        return mark.text == candidate;
-                    });
-            });
-        if (!used) {
-            return candidate;
-        }
-    }
-    return "Mark";
-}
-
-WaterFeatureRunMark* FindWaterFeatureRunMark(
-    WaterFeatureTimingRun* run,
-    std::uint32_t markId) {
-    if (run == nullptr || markId == 0U) {
-        return nullptr;
-    }
-    const auto mark = std::find_if(
-        run->marks.begin(),
-        run->marks.end(),
-        [&](const WaterFeatureRunMark& candidate) {
-            return candidate.id == markId;
-        });
-    return mark != run->marks.end() ? &*mark : nullptr;
-}
-
-const WaterFeatureRunMark* FindWaterFeatureRunMark(
-    const WaterFeatureTimingRun* run,
-    std::uint32_t markId) {
-    if (run == nullptr || markId == 0U) {
-        return nullptr;
-    }
-    const auto mark = std::find_if(
-        run->marks.begin(),
-        run->marks.end(),
-        [&](const WaterFeatureRunMark& candidate) {
-            return candidate.id == markId;
-        });
-    return mark != run->marks.end() ? &*mark : nullptr;
-}
-
-bool MoveWaterFeatureRunMark(
-    WaterFeatureTimingRun* run,
-    std::uint32_t markId,
-    float position) {
-    auto* mark = FindWaterFeatureRunMark(run, markId);
-    if (mark == nullptr) {
-        return false;
-    }
-    const float next = std::clamp(
-        std::isfinite(position) ? position : 0.0F,
-        0.0F,
-        1.0F);
-    if (mark->position == next) {
-        return false;
-    }
-    mark->position = next;
-    return true;
-}
-
-bool RenameWaterFeatureRunMark(
-    WaterFeatureTimingRun* run,
-    std::uint32_t markId,
-    std::string_view text) {
-    auto* mark = FindWaterFeatureRunMark(run, markId);
-    const auto next = TrimSeepageName(text);
-    if (mark == nullptr || next.empty() || mark->text == next) {
-        return false;
-    }
-    mark->text = next;
-    return true;
-}
-
-bool RemoveWaterFeatureRunMark(
-    WaterFeatureTimingRun* run,
-    std::uint32_t markId) {
-    if (run == nullptr || markId == 0U) {
-        return false;
-    }
-    const auto previousSize = run->marks.size();
-    std::erase_if(
-        run->marks,
-        [&](const WaterFeatureRunMark& mark) {
-            return mark.id == markId;
-        });
-    return run->marks.size() != previousSize;
 }
 
 bool AssignWaterFeatureToTimingRun(

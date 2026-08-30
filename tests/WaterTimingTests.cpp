@@ -5432,59 +5432,70 @@ TEST_CASE("Feature timing run sanitize repairs stored clips",
     CHECK(clips[1].id != clips[2].id);
 }
 
-TEST_CASE("Feature Run marks sanitize and edit with stable unique identities",
+TEST_CASE("Timing Take markers sanitize and edit with stable unique identities",
           "[water][timing][marks]") {
     using Catch::Approx;
-    using invisible_places::water::AllocateWaterFeatureRunMarkId;
-    using invisible_places::water::AllocateWaterFeatureRunMarkName;
-    using invisible_places::water::FindWaterFeatureRunMark;
-    using invisible_places::water::MoveWaterFeatureRunMark;
-    using invisible_places::water::RemoveWaterFeatureRunMark;
-    using invisible_places::water::RenameWaterFeatureRunMark;
-    using invisible_places::water::SanitizeWaterFeatureTimingRun;
-    using invisible_places::water::WaterFeatureTimingRun;
+    using invisible_places::timing::AllocateTimingTakeMarkId;
+    using invisible_places::timing::AllocateTimingTakeMarkName;
+    using invisible_places::timing::FindTimingTakeMark;
+    using invisible_places::timing::MoveTimingTakeMark;
+    using invisible_places::timing::RemoveTimingTakeMark;
+    using invisible_places::timing::RenameTimingTakeMark;
+    using invisible_places::timing::SanitizeTimingTakeSceneState;
+    using invisible_places::timing::TimingTakeSceneState;
 
-    WaterFeatureTimingRun run;
-    run.marks = {
-        {.id = 2U, .text = " Mark 00 ", .position = 1.4F},
-        {.id = 2U, .text = "Mark 02", .position = -0.3F},
+    TimingTakeSceneState state;
+    state.marks = {
+        {.id = 2U, .text = " Marker 01 ", .position = 1.4F},
+        {.id = 2U, .text = "Marker 03", .position = -0.3F},
         {.id = 0U,
          .text = "   ",
          .position = std::numeric_limits<float>::quiet_NaN()},
     };
-    run = SanitizeWaterFeatureTimingRun(std::move(run));
-    REQUIRE(run.marks.size() == 3U);
-    CHECK(run.marks[0].position == Approx(0.0F));
-    CHECK(run.marks[1].position == Approx(0.0F));
-    CHECK(run.marks[2].position == Approx(1.0F));
-    CHECK(run.marks[0].id != 0U);
-    CHECK(run.marks[1].id != 0U);
-    CHECK(run.marks[2].id != 0U);
-    CHECK(run.marks[0].id != run.marks[1].id);
-    CHECK(run.marks[0].id != run.marks[2].id);
-    CHECK(run.marks[1].id != run.marks[2].id);
-    CHECK(run.marks[1].text == "Mark");
+    // Legacy documents stored marks on individual Feature Runs; sanitize
+    // hoists them into the take-level list and keeps every id unique.
+    invisible_places::water::WaterFeatureTimingRun legacyRun;
+    legacyRun.id = 1U;
+    legacyRun.marks = {{.id = 2U, .text = "Legacy", .position = 0.5F}};
+    state.waterFeatureTimingRuns.push_back(std::move(legacyRun));
+    state = SanitizeTimingTakeSceneState(std::move(state));
+    REQUIRE(state.marks.size() == 4U);
+    CHECK(state.waterFeatureTimingRuns.front().marks.empty());
+    CHECK(state.marks[0].position == Approx(0.0F));
+    CHECK(state.marks[1].position == Approx(0.0F));
+    CHECK(state.marks[2].position == Approx(0.5F));
+    CHECK(state.marks[2].text == "Legacy");
+    CHECK(state.marks[3].position == Approx(1.0F));
+    for (std::size_t left = 0U; left < state.marks.size(); ++left) {
+        CHECK(state.marks[left].id != 0U);
+        for (std::size_t right = left + 1U;
+             right < state.marks.size();
+             ++right) {
+            CHECK(state.marks[left].id != state.marks[right].id);
+        }
+    }
+    CHECK(state.marks[1].text == "Marker");
 
-    std::vector<WaterFeatureTimingRun> runs{run, {}};
-    runs[1].marks = {{.id = 1U, .text = "Mark 01", .position = 0.5F}};
-    CHECK(AllocateWaterFeatureRunMarkName(runs) == "Mark 03");
-    const auto nextId = AllocateWaterFeatureRunMarkId(runs[0]);
+    // "Marker 01" and "Marker 03" are taken above; the next default name
+    // fills the gap before extending the sequence.
+    CHECK(AllocateTimingTakeMarkName(state) == "Marker 02");
+    const auto nextId = AllocateTimingTakeMarkId(state);
     REQUIRE(nextId != 0U);
-    runs[0].marks.push_back({
+    state.marks.push_back({
         .id = nextId,
-        .text = "Mark 03",
+        .text = "Marker 02",
         .position = 0.25F,
     });
-    REQUIRE(FindWaterFeatureRunMark(&runs[0], nextId) != nullptr);
-    CHECK(MoveWaterFeatureRunMark(&runs[0], nextId, 0.75F));
-    CHECK(FindWaterFeatureRunMark(&runs[0], nextId)->position ==
-          Approx(0.75F));
-    CHECK(RenameWaterFeatureRunMark(&runs[0], nextId, "  Peak flow  "));
-    CHECK(FindWaterFeatureRunMark(&runs[0], nextId)->text == "Peak flow");
-    CHECK_FALSE(RenameWaterFeatureRunMark(&runs[0], nextId, "   "));
-    CHECK(RemoveWaterFeatureRunMark(&runs[0], nextId));
-    CHECK(FindWaterFeatureRunMark(&runs[0], nextId) == nullptr);
-    CHECK_FALSE(RemoveWaterFeatureRunMark(&runs[0], nextId));
+    CHECK(AllocateTimingTakeMarkName(state) == "Marker 04");
+    REQUIRE(FindTimingTakeMark(&state, nextId) != nullptr);
+    CHECK(MoveTimingTakeMark(&state, nextId, 0.75F));
+    CHECK(FindTimingTakeMark(&state, nextId)->position == Approx(0.75F));
+    CHECK(RenameTimingTakeMark(&state, nextId, "  Peak flow  "));
+    CHECK(FindTimingTakeMark(&state, nextId)->text == "Peak flow");
+    CHECK_FALSE(RenameTimingTakeMark(&state, nextId, "   "));
+    CHECK(RemoveTimingTakeMark(&state, nextId));
+    CHECK(FindTimingTakeMark(&state, nextId) == nullptr);
+    CHECK_FALSE(RemoveTimingTakeMark(&state, nextId));
 }
 
 TEST_CASE("Settings clips and package lengths round-trip through the project document",
@@ -5563,20 +5574,26 @@ TEST_CASE("Settings clips and package lengths round-trip through the project doc
     REQUIRE(loaded->waterFeatureTimingRuns.size() == 1U);
     const auto& loadedRun =
         loaded->waterFeatureTimingRuns.front().runs.front();
+    // The legacy scenario pass-through store still round-trips run-scoped
+    // marks for older readers.
     REQUIRE(loadedRun.marks.size() == 2U);
     CHECK(loadedRun.marks[0].id == 3U);
     CHECK(loadedRun.marks[0].text == "Rain begins");
     CHECK(loadedRun.marks[0].position == Approx(0.18F));
     CHECK(loadedRun.marks[1].id == 7U);
     CHECK(loadedRun.marks[1].text == "Pool full");
+    // Timing Take states own their markers at take level (schema 90): the
+    // run-scoped marks constructed above hoist into the shared list on save
+    // and stay there through the round trip.
     REQUIRE(loaded->timingTakeStates.size() == 1U);
-    REQUIRE(loaded->timingTakeStates.front()
-                .waterFeatureTimingRuns.front()
-                .marks.size() == 2U);
     CHECK(loaded->timingTakeStates.front()
               .waterFeatureTimingRuns.front()
-              .marks[1]
-              .text == "Pool full");
+              .marks.empty());
+    REQUIRE(loaded->timingTakeStates.front().marks.size() == 2U);
+    CHECK(loaded->timingTakeStates.front().marks[0].text == "Rain begins");
+    CHECK(loaded->timingTakeStates.front().marks[0].position ==
+          Approx(0.18F));
+    CHECK(loaded->timingTakeStates.front().marks[1].text == "Pool full");
     REQUIRE(loadedRun.features.size() == 1U);
     const auto& clips = loadedRun.features.front().clips;
     REQUIRE(clips.size() == 1U);
@@ -5593,6 +5610,61 @@ TEST_CASE("Settings clips and package lengths round-trip through the project doc
     REQUIRE(loaded->waterKeyedSettingsProfiles.size() == 1U);
     CHECK(loaded->waterKeyedSettingsProfiles.front().nativeLengthFraction ==
           Approx(0.20F));
+
+    // A schema-89 document stored markers inside a take state's runs; the
+    // load hoists them into the take-level list with unique ids.
+    const std::string schema89Json = R"({
+        "schema_version": 89,
+        "project_name": "Legacy run marks",
+        "timing_take_states": [
+            {
+                "take_id": "legacy-take",
+                "scene_group": "Scene3",
+                "water_feature_timing_runs": [
+                    {
+                        "id": 1,
+                        "name": "Bursts",
+                        "features": [],
+                        "marks": [
+                            {"id": 2, "text": "Rain begins", "position": 0.18},
+                            {"id": 5, "text": "Pool full", "position": 0.72}
+                        ]
+                    },
+                    {
+                        "id": 2,
+                        "name": "Calm",
+                        "features": [],
+                        "marks": [
+                            {"id": 2, "text": "Calm again", "position": 0.9}
+                        ]
+                    }
+                ]
+            }
+        ]
+    })";
+    TemporaryTimingFile legacyFile{
+        "invisible_places_legacy_run_marks.json"};
+    {
+        std::ofstream output{legacyFile.path};
+        REQUIRE(output.good());
+        output << schema89Json;
+    }
+    const auto legacyLoaded =
+        LoadProjectDocument(legacyFile.path, &errorMessage);
+    REQUIRE(legacyLoaded.has_value());
+    REQUIRE(legacyLoaded->timingTakeStates.size() == 1U);
+    const auto& legacyState = legacyLoaded->timingTakeStates.front();
+    for (const auto& legacyRun : legacyState.waterFeatureTimingRuns) {
+        CHECK(legacyRun.marks.empty());
+    }
+    REQUIRE(legacyState.marks.size() == 3U);
+    CHECK(legacyState.marks[0].text == "Rain begins");
+    CHECK(legacyState.marks[0].position == Approx(0.18F));
+    CHECK(legacyState.marks[1].text == "Pool full");
+    CHECK(legacyState.marks[2].text == "Calm again");
+    CHECK(legacyState.marks[0].id != legacyState.marks[1].id);
+    CHECK(legacyState.marks[0].id != legacyState.marks[2].id);
+    CHECK(legacyState.marks[1].id != legacyState.marks[2].id);
 
     // A wrapped clip (end > 1, schema 81) round-trips intact: the parse is
     // a float pass-through and sanitize keeps the wrapped end.
@@ -5641,8 +5713,8 @@ TEST_CASE("Timing Take retiming carries settings clips with their keys",
     using invisible_places::water::WaterKeyedFeatureKind;
 
     TimingTakeSceneState state;
+    state.marks = {{.id = 4U, .text = "Event", .position = 0.40F}};
     invisible_places::water::WaterFeatureTimingRun run;
-    run.marks = {{.id = 4U, .text = "Event", .position = 0.40F}};
     run.features.push_back({
         .feature = {.kind = WaterKeyedFeatureKind::SeepageNode,
                     .objectId = 4U},
@@ -5666,9 +5738,8 @@ TEST_CASE("Timing Take retiming carries settings clips with their keys",
         200U,
         100U));
     const auto& timeline = state.waterFeatureTimingRuns.front().features.front();
-    REQUIRE(state.waterFeatureTimingRuns.front().marks.size() == 1U);
-    CHECK(state.waterFeatureTimingRuns.front().marks.front().position ==
-          Approx(0.70F));
+    REQUIRE(state.marks.size() == 1U);
+    CHECK(state.marks.front().position == Approx(0.70F));
     CHECK(timeline.settings.front().keys.front().position ==
           Approx(0.625F));
     CHECK(timeline.settings.front().keys.back().position ==
@@ -5842,7 +5913,7 @@ TEST_CASE("Timing Take retiming carries settings clips with their keys",
     CHECK(fullTimeline.clips.front().end == Approx(0.5F));
 }
 
-TEST_CASE("Timing Take merge keeps Feature Run marks with feature owners",
+TEST_CASE("Timing Take merge unions markers at take level without duplicates",
           "[water][timing][marks][merge]") {
     using Catch::Approx;
     using invisible_places::timing::MergeTimingTakeSceneStateKeepingFirst;
@@ -5855,6 +5926,8 @@ TEST_CASE("Timing Take merge keeps Feature Run marks with feature owners",
         .kind = WaterKeyedFeatureKind::SeepageNode,
         .objectId = 8U,
     };
+    // Legacy run-scoped marks on both sides hoist to take level before the
+    // merge, so the union dedupes across runs and takes alike.
     TimingTakeSceneState destination;
     destination.waterFeatureTimingRuns = {WaterFeatureTimingRun{
         .id = 1U,
@@ -5863,36 +5936,27 @@ TEST_CASE("Timing Take merge keeps Feature Run marks with feature owners",
         .marks = {{.id = 1U, .text = "Shared", .position = 0.20F}},
     }};
     TimingTakeSceneState source;
+    source.marks = {{.id = 1U, .text = "Second event", .position = 0.60F}};
     source.waterFeatureTimingRuns = {WaterFeatureTimingRun{
         .id = 1U,
         .name = "Other Run",
         .features = {{.feature = feature}},
-        .marks = {
-            {.id = 1U, .text = "Second event", .position = 0.60F},
-            {.id = 2U, .text = "Shared", .position = 0.20F},
-        },
+        .marks = {{.id = 2U, .text = "Shared", .position = 0.20F}},
     }};
 
     MergeTimingTakeSceneStateKeepingFirst(&destination, source);
     REQUIRE(destination.waterFeatureTimingRuns.size() == 2U);
-    const auto owner = std::find_if(
-        destination.waterFeatureTimingRuns.begin(),
-        destination.waterFeatureTimingRuns.end(),
-        [&](const WaterFeatureTimingRun& run) {
-            return std::any_of(
-                run.features.begin(),
-                run.features.end(),
-                [&](const auto& timeline) {
-                    return timeline.feature == feature;
-                });
-        });
-    REQUIRE(owner != destination.waterFeatureTimingRuns.end());
-    REQUIRE(owner->marks.size() == 2U);
-    CHECK(owner->marks[0].text == "Shared");
-    CHECK(owner->marks[0].position == Approx(0.20F));
-    CHECK(owner->marks[1].text == "Second event");
-    CHECK(owner->marks[1].position == Approx(0.60F));
-    CHECK(owner->marks[0].id != owner->marks[1].id);
+    for (const auto& run : destination.waterFeatureTimingRuns) {
+        CHECK(run.marks.empty());
+    }
+    REQUIRE(destination.marks.size() == 2U);
+    CHECK(destination.marks[0].text == "Shared");
+    CHECK(destination.marks[0].position == Approx(0.20F));
+    CHECK(destination.marks[1].text == "Second event");
+    CHECK(destination.marks[1].position == Approx(0.60F));
+    CHECK(destination.marks[0].id != 0U);
+    CHECK(destination.marks[1].id != 0U);
+    CHECK(destination.marks[0].id != destination.marks[1].id);
     const auto emptyRun = std::find_if(
         destination.waterFeatureTimingRuns.begin(),
         destination.waterFeatureTimingRuns.end(),
@@ -5901,10 +5965,9 @@ TEST_CASE("Timing Take merge keeps Feature Run marks with feature owners",
         });
     REQUIRE(emptyRun != destination.waterFeatureTimingRuns.end());
     CHECK(emptyRun->features.empty());
-    CHECK(emptyRun->marks.empty());
 }
 
-TEST_CASE("Timing Take merge removes marks from repaired empty duplicate runs",
+TEST_CASE("Timing Take merge keeps markers of repaired empty duplicate runs",
           "[water][timing][marks][merge][migration]") {
     using invisible_places::timing::MergeTimingTakeSceneStateKeepingFirst;
     using invisible_places::timing::TimingTakeSceneState;
@@ -5931,16 +5994,18 @@ TEST_CASE("Timing Take merge removes marks from repaired empty duplicate runs",
         },
     };
 
+    // Markers belong to the take, so repairing the duplicate feature away
+    // never discards the annotation that used to ride on the emptied run.
     MergeTimingTakeSceneStateKeepingFirst(
         &destination,
         TimingTakeSceneState{});
     REQUIRE(destination.waterFeatureTimingRuns.size() == 2U);
     CHECK(destination.waterFeatureTimingRuns[0].features.size() == 1U);
-    REQUIRE(destination.waterFeatureTimingRuns[0].marks.size() == 1U);
-    CHECK(destination.waterFeatureTimingRuns[0].marks[0].text ==
-          "Repair me");
+    CHECK(destination.waterFeatureTimingRuns[0].marks.empty());
     CHECK(destination.waterFeatureTimingRuns[1].features.empty());
     CHECK(destination.waterFeatureTimingRuns[1].marks.empty());
+    REQUIRE(destination.marks.size() == 1U);
+    CHECK(destination.marks[0].text == "Repair me");
 }
 
 TEST_CASE("Adjacent clips keep their boundary keys through span operations",

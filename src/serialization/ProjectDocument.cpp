@@ -182,6 +182,11 @@ constexpr std::uint32_t kEdgeFadeModeProjectSchemaVersion = 88U;
 // independently, so switching modes never converts or co-mingles tracks.
 constexpr std::uint32_t kIndependentEdgeFadeModeTracksProjectSchemaVersion =
     89U;
+// Schema 90 moves timeline markers from individual Feature Runs onto their
+// owning Timing Take scene state ("marks" beside the runs). Migration is
+// presence-based: sanitize hoists any run-scoped "marks" a document still
+// carries into the take-level list, so no version gate is needed.
+constexpr std::uint32_t kTimingTakeMarksProjectSchemaVersion = 90U;
 static_assert(
     kProjectDocumentSchemaVersion >=
     kSceneScopedTimingTakesProjectSchemaVersion);
@@ -242,6 +247,9 @@ static_assert(
 static_assert(
     kProjectDocumentSchemaVersion >=
     kWaterFeatureRunMarksProjectSchemaVersion);
+static_assert(
+    kProjectDocumentSchemaVersion >=
+    kTimingTakeMarksProjectSchemaVersion);
 static_assert(
     kProjectDocumentSchemaVersion >=
     kWaterFeatureRunVisibilityProjectSchemaVersion);
@@ -6702,6 +6710,17 @@ json SerializeTimingTakeSceneState(
         {"colourise_effects", std::move(legacyColouriseEffectsJson)},
         {"colourise_effect_sequence", sanitized.colouriseEffectSequence},
     };
+    if (!sanitized.marks.empty()) {
+        auto marksJson = json::array();
+        for (const auto& mark : sanitized.marks) {
+            marksJson.push_back({
+                {"id", mark.id},
+                {"text", mark.text},
+                {"position", mark.position},
+            });
+        }
+        stateJson["marks"] = std::move(marksJson);
+    }
     if (sanitized.onlyShowWaterFeaturesInRuns) {
         stateJson["only_show_water_features_in_runs"] = true;
     }
@@ -6735,6 +6754,20 @@ ParseTimingTakeSceneState(const json& stateJson) {
              stateJson.at("water_feature_timing_runs")) {
             state.waterFeatureTimingRuns.push_back(
                 ParseWaterFeatureTimingRun(runJson));
+        }
+    }
+    // Take-level markers (schema 90). Legacy run-scoped "marks" arrive on the
+    // parsed runs and the final sanitize hoists them into this list.
+    if (stateJson.contains("marks") && stateJson.at("marks").is_array()) {
+        for (const auto& markJson : stateJson.at("marks")) {
+            if (!markJson.is_object()) {
+                continue;
+            }
+            state.marks.push_back({
+                .id = markJson.value("id", 0U),
+                .text = markJson.value("text", std::string{"Marker"}),
+                .position = markJson.value("position", 0.0F),
+            });
         }
     }
     std::vector<bool> legacyAspectEffects;
@@ -9510,6 +9543,9 @@ void MigrateAndSanitizeTimingTakeData(
                     state.waterFeatureTimingRuns.begin()),
                 std::make_move_iterator(
                     state.waterFeatureTimingRuns.end()));
+            invisible_places::timing::MergeTimingTakeMarksKeepingFirst(
+                existing,
+                state.marks);
             existing->onlyShowWaterFeaturesInRuns =
                 existing->onlyShowWaterFeaturesInRuns ||
                 state.onlyShowWaterFeaturesInRuns;

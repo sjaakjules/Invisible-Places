@@ -5433,7 +5433,7 @@ TEST_CASE("Fade mode memories round-trip as independent tracks",
   const auto savedJson = nlohmann::json::parse(savedInput);
   const auto& savedEffect =
       savedJson["timing_take_states"][0]["timing_effects"][0];
-  CHECK(savedJson["schema_version"] == 89U);
+  CHECK(savedJson["schema_version"] == 90U);
   REQUIRE(savedEffect["edge_fade_mode_memories"].size() == 2U);
   CHECK(savedEffect["edge_fade_mode_memories"][0]["mode"] ==
         "relative_linked");
