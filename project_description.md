@@ -653,8 +653,12 @@ the animation overview.
   feature opts into one global set.
 - Emissive output gains a falloff profile over the bounds: level-multiplier
   nodes joined by a Monotone Spline, edited on their own curve above the
-  emissive timeline, keyable per node, warped by the falloff's own skew
-  band, and previewed as a mid-grey response strip atop the histogram -
+  emissive timeline, and warped by the falloff's own skew band. Curve nodes
+  support click and window selection plus Delete/Backspace removal. Authoring
+  any falloff key stores every node's Position and Level as one complete
+  snapshot; all coordinates interpolate between those shared instants, while
+  the unified timeline draws only node-coordinate tracks whose values change.
+  The result is previewed as a mid-grey response strip atop the histogram -
   brighter where emission adds, darker where negative levels dim.
 - Timeline markers hang below the value graphs' axis, click-select every
   key at their time (or a pre-selected subset), and drags snap onto other

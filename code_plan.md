@@ -522,6 +522,13 @@ Keep v1 simple and predictable.
   from only per-marker tracks with differing authored values, so invariant
   group members do not force a `0..1` view. Keep legacy snapshot palettes on
   their existing whole-palette path.
+- Treat each Emissive falloff key time as one complete curve snapshot without
+  changing the stored per-node key format. The curve editor owns click and
+  marquee node selection and removes selected nodes plus their keys on Delete
+  or Backspace. Typed falloff insertion/autokey stores Position and Level for
+  every node, group deletion/retiming operates on the full instant, and the
+  unified graph emits lanes only for node-coordinate tracks whose stored
+  values differ between snapshots.
 - Compose the selected Visual Feature editor as Bounds/profile controls,
   histogram, enabled Colourise palette, enabled Emissive falloff, one unified
   keyframe timeline, then one numeric-settings block. Put the Colourise preset

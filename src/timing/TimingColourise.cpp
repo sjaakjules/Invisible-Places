@@ -4035,6 +4035,212 @@ SanitizeTimingColouriseActivationRange(
     return range;
 }
 
+TimingColouriseCoupledRangeEdit
+ResolveTimingColouriseCoupledRangeEdit(
+    TimingColouriseActivationRange activationRange,
+    TimingColouriseSettingsKeySpan settingsSpan,
+    TimingColouriseRangeEditPart part,
+    float requestedDelta) {
+    activationRange = SanitizeTimingColouriseActivationRange(
+        activationRange);
+    settingsSpan.start = std::clamp(
+        FiniteOr(settingsSpan.start, 0.0F),
+        0.0F,
+        1.0F);
+    settingsSpan.end = std::clamp(
+        FiniteOr(settingsSpan.end, settingsSpan.start),
+        0.0F,
+        1.0F);
+    if (settingsSpan.start > settingsSpan.end) {
+        std::swap(settingsSpan.start, settingsSpan.end);
+    }
+    requestedDelta = FiniteOr(requestedDelta, 0.0F);
+
+    const float settingsLength =
+        settingsSpan.end - settingsSpan.start;
+    const bool pointSettings = settingsLength == 0.0F;
+    const float minimumSettingsLength = std::min(
+        settingsLength,
+        kTimingColouriseKeyTolerance);
+    float minimumDelta = 0.0F;
+    float maximumDelta = 0.0F;
+    switch (part) {
+        case TimingColouriseRangeEditPart::Start:
+            if (pointSettings) {
+                minimumDelta = std::max(
+                    -activationRange.start,
+                    -settingsSpan.start);
+                maximumDelta = std::min(
+                    activationRange.end - activationRange.start,
+                    1.0F - settingsSpan.end);
+            } else {
+                minimumDelta = -std::min(
+                    activationRange.start,
+                    settingsSpan.start);
+                maximumDelta = std::min(
+                    activationRange.end - activationRange.start,
+                    settingsLength - minimumSettingsLength);
+            }
+            break;
+        case TimingColouriseRangeEditPart::End:
+            if (pointSettings) {
+                minimumDelta = std::max(
+                    activationRange.start - activationRange.end,
+                    -settingsSpan.start);
+                maximumDelta = std::min(
+                    1.0F - activationRange.end,
+                    1.0F - settingsSpan.end);
+            } else {
+                minimumDelta = std::max(
+                    activationRange.start - activationRange.end,
+                    minimumSettingsLength - settingsLength);
+                maximumDelta = 1.0F - std::max(
+                    activationRange.end,
+                    settingsSpan.end);
+            }
+            break;
+        case TimingColouriseRangeEditPart::Body:
+        default:
+            minimumDelta = -std::min(
+                activationRange.start,
+                settingsSpan.start);
+            maximumDelta = 1.0F - std::max(
+                activationRange.end,
+                settingsSpan.end);
+            break;
+    }
+    const float appliedDelta = std::clamp(
+        requestedDelta,
+        minimumDelta,
+        maximumDelta);
+
+    switch (part) {
+        case TimingColouriseRangeEditPart::Start:
+            activationRange.start += appliedDelta;
+            if (pointSettings) {
+                settingsSpan.start += appliedDelta;
+                settingsSpan.end += appliedDelta;
+            } else {
+                settingsSpan.start += appliedDelta;
+            }
+            break;
+        case TimingColouriseRangeEditPart::End:
+            activationRange.end += appliedDelta;
+            if (pointSettings) {
+                settingsSpan.start += appliedDelta;
+                settingsSpan.end += appliedDelta;
+            } else {
+                settingsSpan.end += appliedDelta;
+            }
+            break;
+        case TimingColouriseRangeEditPart::Body:
+        default:
+            activationRange.start += appliedDelta;
+            activationRange.end += appliedDelta;
+            settingsSpan.start += appliedDelta;
+            settingsSpan.end += appliedDelta;
+            break;
+    }
+    return TimingColouriseCoupledRangeEdit{
+        .activationRange = activationRange,
+        .settingsSpan = settingsSpan,
+        .appliedDelta = appliedDelta,
+    };
+}
+
+TimingColouriseCoupledCyclicRangeEdit
+ResolveTimingColouriseCoupledCyclicRangeEdit(
+    TimingColouriseActivationRange activationRange,
+    TimingColouriseCyclicSettingsKeySpan settingsSpan,
+    TimingColouriseRangeEditPart part,
+    float requestedDelta) {
+    activationRange = SanitizeTimingColouriseActivationRange(
+        activationRange);
+    settingsSpan.start = WrapTimingColouriseLoopPosition(
+        settingsSpan.start);
+    settingsSpan.length = std::clamp(
+        FiniteOr(settingsSpan.length, 0.0F),
+        0.0F,
+        1.0F);
+    requestedDelta = FiniteOr(requestedDelta, 0.0F);
+
+    const bool pointSettings = settingsSpan.length == 0.0F;
+    const float minimumSettingsLength = std::min(
+        settingsSpan.length,
+        kTimingColouriseKeyTolerance);
+    const float maximumSettingsLength = std::max(
+        minimumSettingsLength,
+        1.0F - kTimingColouriseKeyTolerance);
+    float minimumDelta = 0.0F;
+    float maximumDelta = 0.0F;
+    switch (part) {
+        case TimingColouriseRangeEditPart::Start:
+            minimumDelta = -activationRange.start;
+            maximumDelta =
+                activationRange.end - activationRange.start;
+            if (!pointSettings) {
+                minimumDelta = std::max(
+                    minimumDelta,
+                    settingsSpan.length - maximumSettingsLength);
+                maximumDelta = std::min(
+                    maximumDelta,
+                    settingsSpan.length - minimumSettingsLength);
+            }
+            break;
+        case TimingColouriseRangeEditPart::End:
+            minimumDelta =
+                activationRange.start - activationRange.end;
+            maximumDelta = 1.0F - activationRange.end;
+            if (!pointSettings) {
+                minimumDelta = std::max(
+                    minimumDelta,
+                    minimumSettingsLength - settingsSpan.length);
+                maximumDelta = std::min(
+                    maximumDelta,
+                    maximumSettingsLength - settingsSpan.length);
+            }
+            break;
+        case TimingColouriseRangeEditPart::Body:
+        default:
+            minimumDelta = -activationRange.start;
+            maximumDelta = 1.0F - activationRange.end;
+            break;
+    }
+    const float appliedDelta = std::clamp(
+        requestedDelta,
+        minimumDelta,
+        maximumDelta);
+
+    switch (part) {
+        case TimingColouriseRangeEditPart::Start:
+            activationRange.start += appliedDelta;
+            settingsSpan.start += appliedDelta;
+            if (!pointSettings) {
+                settingsSpan.length -= appliedDelta;
+            }
+            break;
+        case TimingColouriseRangeEditPart::End:
+            activationRange.end += appliedDelta;
+            if (pointSettings) {
+                settingsSpan.start += appliedDelta;
+            } else {
+                settingsSpan.length += appliedDelta;
+            }
+            break;
+        case TimingColouriseRangeEditPart::Body:
+        default:
+            activationRange.start += appliedDelta;
+            activationRange.end += appliedDelta;
+            settingsSpan.start += appliedDelta;
+            break;
+    }
+    return TimingColouriseCoupledCyclicRangeEdit{
+        .activationRange = activationRange,
+        .settingsSpan = settingsSpan,
+        .appliedDelta = appliedDelta,
+    };
+}
+
 bool TimingColouriseActivationRangeContains(
     TimingColouriseActivationRange range,
     float normalizedPosition) {
@@ -4941,24 +5147,46 @@ bool IsCurrentTimingColouriseFieldMemory(
     return memory.selector == effect.field;
 }
 
-template <typename Key>
+bool TimingColouriseLegacyPaletteKeysAreActive(
+    const TimingColouriseEffect& effect) {
+    return effect.colouriseEnabled &&
+           effect.paletteKeyModel ==
+               TimingColourisePaletteKeyModel::LegacySnapshots;
+}
+
+bool TimingColourisePaletteStopKeysAreActive(
+    const TimingColouriseEffect& effect) {
+    return effect.colouriseEnabled &&
+           effect.paletteKeyModel ==
+               TimingColourisePaletteKeyModel::StopParameters;
+}
+
+bool TimingColouriseEffectParameterKeyIsActive(
+    const TimingColouriseEffect& effect,
+    const TimingColouriseEffectParameterKey& key) {
+    return TimingEffectParameterIsSupported(effect, key.parameter);
+}
+
+template <typename Key, typename IsActive>
 void AppendTimingColouriseSettingsKeyPositions(
     std::vector<float>* positions,
-    const std::vector<Key>& keys) {
+    const std::vector<Key>& keys,
+    IsActive isActive) {
     for (const auto& key : keys) {
-        if (!std::isfinite(key.position)) {
+        if (!isActive(key) || !std::isfinite(key.position)) {
             continue;
         }
         positions->push_back(Clamp01(key.position));
     }
 }
 
-template <typename Key>
+template <typename Key, typename IsActive>
 void ExtendTimingColouriseSettingsKeySpan(
     std::optional<TimingColouriseSettingsKeySpan>* span,
-    const std::vector<Key>& keys) {
+    const std::vector<Key>& keys,
+    IsActive isActive) {
     for (const auto& key : keys) {
-        if (!std::isfinite(key.position)) {
+        if (!isActive(key) || !std::isfinite(key.position)) {
             continue;
         }
         const float position = Clamp01(key.position);
@@ -4974,15 +5202,20 @@ void ExtendTimingColouriseSettingsKeySpan(
     }
 }
 
-template <typename Key, typename SameLane>
+template <typename Key, typename SameLane, typename IsActive>
 bool TimingColouriseKeysHaveNoLaneCollisions(
     const std::vector<Key>& keys,
-    SameLane sameLane) {
+    SameLane sameLane,
+    IsActive isActive) {
     for (std::size_t left = 0U; left < keys.size(); ++left) {
+        if (!isActive(keys[left])) {
+            continue;
+        }
         for (std::size_t right = left + 1U;
              right < keys.size();
              ++right) {
-            if (sameLane(keys[left], keys[right]) &&
+            if (isActive(keys[right]) &&
+                sameLane(keys[left], keys[right]) &&
                 std::abs(
                     keys[left].position - keys[right].position) <=
                     kTimingColouriseKeyTolerance) {
@@ -4998,63 +5231,67 @@ bool TimingColouriseEffectSettingsKeysHaveNoLaneCollisions(
     const auto sameSingleLane = [](const auto&, const auto&) {
         return true;
     };
-    if (!TimingColouriseKeysHaveNoLaneCollisions(
-            effect.paletteKeys,
-            sameSingleLane) ||
-        !TimingColouriseKeysHaveNoLaneCollisions(
-            effect.paletteStopParameterKeys,
-            [](const auto& left, const auto& right) {
-                return left.stopId == right.stopId &&
-                       left.parameter == right.parameter;
-            }) ||
+    const auto allActive = [](const auto&) { return true; };
+    if ((TimingColouriseLegacyPaletteKeysAreActive(effect) &&
+         !TimingColouriseKeysHaveNoLaneCollisions(
+             effect.paletteKeys,
+             sameSingleLane,
+             allActive)) ||
+        (TimingColourisePaletteStopKeysAreActive(effect) &&
+         !TimingColouriseKeysHaveNoLaneCollisions(
+             effect.paletteStopParameterKeys,
+             [](const auto& left, const auto& right) {
+                 return left.stopId == right.stopId &&
+                        left.parameter == right.parameter;
+             },
+             allActive)) ||
         !TimingColouriseKeysHaveNoLaneCollisions(
             effect.effectParameterKeys,
             [](const auto& left, const auto& right) {
                 return left.parameter == right.parameter;
+            },
+            [&](const auto& key) {
+                return TimingColouriseEffectParameterKeyIsActive(
+                    effect,
+                    key);
             }) ||
         !TimingColouriseKeysHaveNoLaneCollisions(
             effect.boundsKeys,
-            sameSingleLane) ||
+            sameSingleLane,
+            allActive) ||
         !TimingColouriseKeysHaveNoLaneCollisions(
             effect.boundsParameterKeys,
             [](const auto& left, const auto& right) {
                 return left.parameter == right.parameter;
-            }) ||
-        !TimingColouriseKeysHaveNoLaneCollisions(
-            effect.emissiveFalloffKeys,
-            [](const auto& left, const auto& right) {
-                return left.nodeId == right.nodeId &&
-                       left.parameter == right.parameter;
-            })) {
+            },
+            allActive) ||
+        (effect.emissiveEnabled &&
+         !TimingColouriseKeysHaveNoLaneCollisions(
+             effect.emissiveFalloffKeys,
+             [](const auto& left, const auto& right) {
+                 return left.nodeId == right.nodeId &&
+                        left.parameter == right.parameter;
+             },
+             allActive))) {
         return false;
-    }
-    for (const auto& memory : effect.fieldBoundsMemory) {
-        if (IsCurrentTimingColouriseFieldMemory(effect, memory)) {
-            continue;
-        }
-        if (!TimingColouriseKeysHaveNoLaneCollisions(
-                memory.boundsKeys,
-                sameSingleLane) ||
-            !TimingColouriseKeysHaveNoLaneCollisions(
-                memory.boundsParameterKeys,
-                [](const auto& left, const auto& right) {
-                    return left.parameter == right.parameter;
-                })) {
-            return false;
-        }
     }
     return true;
 }
 
-template <typename Key, typename SameLane>
+template <typename Key, typename SameLane, typename IsActive>
 bool TimingColouriseKeysHaveNoCyclicLaneCollisions(
     const std::vector<Key>& keys,
-    SameLane sameLane) {
+    SameLane sameLane,
+    IsActive isActive) {
     for (std::size_t left = 0U; left < keys.size(); ++left) {
+        if (!isActive(keys[left])) {
+            continue;
+        }
         for (std::size_t right = left + 1U;
              right < keys.size();
              ++right) {
-            if (sameLane(keys[left], keys[right]) &&
+            if (isActive(keys[right]) &&
+                sameLane(keys[left], keys[right]) &&
                 TimingColouriseKeyPositionsCoincideCyclically(
                     keys[left].position,
                     keys[right].position)) {
@@ -5072,50 +5309,49 @@ bool TimingColouriseEffectSettingsKeysHaveNoCyclicLaneCollisions(
     const auto sameSingleLane = [](const auto&, const auto&) {
         return true;
     };
-    if (!TimingColouriseKeysHaveNoCyclicLaneCollisions(
-            effect.paletteKeys,
-            sameSingleLane) ||
-        !TimingColouriseKeysHaveNoCyclicLaneCollisions(
-            effect.paletteStopParameterKeys,
-            [](const auto& left, const auto& right) {
-                return left.stopId == right.stopId &&
-                       left.parameter == right.parameter;
-            }) ||
+    const auto allActive = [](const auto&) { return true; };
+    if ((TimingColouriseLegacyPaletteKeysAreActive(effect) &&
+         !TimingColouriseKeysHaveNoCyclicLaneCollisions(
+             effect.paletteKeys,
+             sameSingleLane,
+             allActive)) ||
+        (TimingColourisePaletteStopKeysAreActive(effect) &&
+         !TimingColouriseKeysHaveNoCyclicLaneCollisions(
+             effect.paletteStopParameterKeys,
+             [](const auto& left, const auto& right) {
+                 return left.stopId == right.stopId &&
+                        left.parameter == right.parameter;
+             },
+             allActive)) ||
         !TimingColouriseKeysHaveNoCyclicLaneCollisions(
             effect.effectParameterKeys,
             [](const auto& left, const auto& right) {
                 return left.parameter == right.parameter;
+            },
+            [&](const auto& key) {
+                return TimingColouriseEffectParameterKeyIsActive(
+                    effect,
+                    key);
             }) ||
         !TimingColouriseKeysHaveNoCyclicLaneCollisions(
             effect.boundsKeys,
-            sameSingleLane) ||
+            sameSingleLane,
+            allActive) ||
         !TimingColouriseKeysHaveNoCyclicLaneCollisions(
             effect.boundsParameterKeys,
             [](const auto& left, const auto& right) {
                 return left.parameter == right.parameter;
-            }) ||
-        !TimingColouriseKeysHaveNoCyclicLaneCollisions(
-            effect.emissiveFalloffKeys,
-            [](const auto& left, const auto& right) {
-                return left.nodeId == right.nodeId &&
-                       left.parameter == right.parameter;
-            })) {
+            },
+            allActive) ||
+        (effect.emissiveEnabled &&
+         !TimingColouriseKeysHaveNoCyclicLaneCollisions(
+             effect.emissiveFalloffKeys,
+             [](const auto& left, const auto& right) {
+                 return left.nodeId == right.nodeId &&
+                        left.parameter == right.parameter;
+             },
+             allActive))) {
         return false;
-    }
-    for (const auto& memory : effect.fieldBoundsMemory) {
-        if (IsCurrentTimingColouriseFieldMemory(effect, memory)) {
-            continue;
-        }
-        if (!TimingColouriseKeysHaveNoCyclicLaneCollisions(
-                memory.boundsKeys,
-                sameSingleLane) ||
-            !TimingColouriseKeysHaveNoCyclicLaneCollisions(
-                memory.boundsParameterKeys,
-                [](const auto& left, const auto& right) {
-                    return left.parameter == right.parameter;
-                })) {
-            return false;
-        }
     }
     return true;
 }
@@ -5136,19 +5372,24 @@ void SynchronizeCurrentTimingColouriseFieldMemory(
     }
 }
 
-template <typename Key, typename SameLane>
+template <typename Key, typename SameLane, typename IsActive>
 std::size_t CoalesceCyclicallyCoincidentKeys(
     std::vector<Key>* keys,
-    SameLane sameLane) {
+    SameLane sameLane,
+    IsActive isActive) {
     // Mirror ExpandTimingKeysForCyclicEvaluation, which wraps 1.0 onto 0.0
     // and keeps the later key of a coincident pair: the linear-earlier key
     // is the one evaluation was already ignoring in the cyclic lens.
     std::vector<bool> drop(keys->size(), false);
     for (std::size_t left = 0U; left < keys->size(); ++left) {
+        if (!isActive((*keys)[left])) {
+            continue;
+        }
         for (std::size_t right = left + 1U;
              right < keys->size();
              ++right) {
-            if (!sameLane((*keys)[left], (*keys)[right]) ||
+            if (!isActive((*keys)[right]) ||
+                !sameLane((*keys)[left], (*keys)[right]) ||
                 !TimingColouriseKeyPositionsCoincideCyclically(
                     (*keys)[left].position,
                     (*keys)[right].position)) {
@@ -5217,18 +5458,67 @@ void EncodePalettePhaseKeysAsDeltas(TimingColouriseEffect* effect) {
 
 void SortTimingColouriseEffectSettingsKeys(
     TimingColouriseEffect* effect) {
-    SortAndCoalesceKeys(&effect->paletteKeys);
-    SortAndCoalescePaletteStopParameterKeys(
-        &effect->paletteStopParameterKeys);
-    SortAndCoalesceEffectParameterKeys(
-        &effect->effectParameterKeys);
-    SortAndCoalesceKeys(&effect->boundsKeys);
-    SortAndCoalesceBoundsParameterKeys(
-        &effect->boundsParameterKeys);
-    for (auto& memory : effect->fieldBoundsMemory) {
-        SortAndCoalesceKeys(&memory.boundsKeys);
-        SortAndCoalesceBoundsParameterKeys(
-            &memory.boundsParameterKeys);
+    // Collision checks run before this point, so the transforms need only
+    // restore each active track's evaluation order. Do not run the general
+    // coalescers here: inactive keys are deliberately retained verbatim,
+    // even if an old document contains dormant duplicates.
+    if (TimingColouriseLegacyPaletteKeysAreActive(*effect)) {
+        std::stable_sort(
+            effect->paletteKeys.begin(),
+            effect->paletteKeys.end(),
+            [](const auto& left, const auto& right) {
+                return left.position < right.position;
+            });
+    }
+    if (TimingColourisePaletteStopKeysAreActive(*effect)) {
+        std::stable_sort(
+            effect->paletteStopParameterKeys.begin(),
+            effect->paletteStopParameterKeys.end(),
+            [](const auto& left, const auto& right) {
+                return std::tie(
+                           left.stopId,
+                           left.parameter,
+                           left.position) <
+                       std::tie(
+                           right.stopId,
+                           right.parameter,
+                           right.position);
+            });
+    }
+    std::stable_sort(
+        effect->effectParameterKeys.begin(),
+        effect->effectParameterKeys.end(),
+        [](const auto& left, const auto& right) {
+            return std::tie(left.parameter, left.position) <
+                   std::tie(right.parameter, right.position);
+        });
+    std::stable_sort(
+        effect->boundsKeys.begin(),
+        effect->boundsKeys.end(),
+        [](const auto& left, const auto& right) {
+            return left.position < right.position;
+        });
+    std::stable_sort(
+        effect->boundsParameterKeys.begin(),
+        effect->boundsParameterKeys.end(),
+        [](const auto& left, const auto& right) {
+            return std::tie(left.parameter, left.position) <
+                   std::tie(right.parameter, right.position);
+        });
+    if (effect->emissiveEnabled) {
+        std::stable_sort(
+            effect->emissiveFalloffKeys.begin(),
+            effect->emissiveFalloffKeys.end(),
+            [](const auto& left, const auto& right) {
+                return std::tie(
+                           left.nodeId,
+                           left.parameter,
+                           left.position) <
+                       std::tie(
+                           right.nodeId,
+                           right.parameter,
+                           right.position);
+            });
     }
 }
 
@@ -5242,16 +5532,23 @@ std::size_t CoalesceTimingColouriseEffectCyclicallyCoincidentKeys(
     const auto sameSingleLane = [](const auto&, const auto&) {
         return true;
     };
+    const auto allActive = [](const auto&) { return true; };
     std::size_t removed = 0U;
-    removed += CoalesceCyclicallyCoincidentKeys(
-        &effect->paletteKeys,
-        sameSingleLane);
-    removed += CoalesceCyclicallyCoincidentKeys(
-        &effect->paletteStopParameterKeys,
-        [](const auto& left, const auto& right) {
-            return left.stopId == right.stopId &&
-                   left.parameter == right.parameter;
-        });
+    if (TimingColouriseLegacyPaletteKeysAreActive(*effect)) {
+        removed += CoalesceCyclicallyCoincidentKeys(
+            &effect->paletteKeys,
+            sameSingleLane,
+            allActive);
+    }
+    if (TimingColourisePaletteStopKeysAreActive(*effect)) {
+        removed += CoalesceCyclicallyCoincidentKeys(
+            &effect->paletteStopParameterKeys,
+            [](const auto& left, const auto& right) {
+                return left.stopId == right.stopId &&
+                       left.parameter == right.parameter;
+            },
+            allActive);
+    }
     // Palette Phase is delta-encoded and every key's delta, including the
     // one at 0.0 that cyclic evaluation replaces with the 1.0 key, has
     // already been accumulated into the later keys by the time evaluation
@@ -5266,43 +5563,55 @@ std::size_t CoalesceTimingColouriseEffectCyclicallyCoincidentKeys(
             .size();
     };
     auto authoredEffectKeys = effect->effectParameterKeys;
-    const std::size_t authoredPhaseKeys = phaseKeyCount();
-    EncodePalettePhaseKeysAsTargets(effect);
+    const std::size_t authoredPhaseKeys =
+        effect->colouriseEnabled ? phaseKeyCount() : 0U;
+    if (effect->colouriseEnabled) {
+        EncodePalettePhaseKeysAsTargets(effect);
+    }
     const std::size_t removedEffectKeys = CoalesceCyclicallyCoincidentKeys(
         &effect->effectParameterKeys,
-        sameParameter);
-    if (phaseKeyCount() == authoredPhaseKeys) {
+        sameParameter,
+        [&](const auto& key) {
+            return TimingColouriseEffectParameterKeyIsActive(
+                *effect,
+                key);
+        });
+    if (!effect->colouriseEnabled ||
+        phaseKeyCount() == authoredPhaseKeys) {
         // No phase key merged, so the authored deltas are still right;
         // coalescing depends only on positions, so replaying it on the
         // authored copy drops the same (non-phase) keys bit-for-bit.
         effect->effectParameterKeys = std::move(authoredEffectKeys);
         (void)CoalesceCyclicallyCoincidentKeys(
             &effect->effectParameterKeys,
-            sameParameter);
+            sameParameter,
+            [&](const auto& key) {
+                return TimingColouriseEffectParameterKeyIsActive(
+                    *effect,
+                    key);
+            });
     } else {
         EncodePalettePhaseKeysAsDeltas(effect);
     }
     removed += removedEffectKeys;
     removed += CoalesceCyclicallyCoincidentKeys(
         &effect->boundsKeys,
-        sameSingleLane);
+        sameSingleLane,
+        allActive);
     removed += CoalesceCyclicallyCoincidentKeys(
         &effect->boundsParameterKeys,
         [](const auto& left, const auto& right) {
             return left.parameter == right.parameter;
-        });
-    for (auto& memory : effect->fieldBoundsMemory) {
-        if (IsCurrentTimingColouriseFieldMemory(*effect, memory)) {
-            continue;
-        }
+        },
+        allActive);
+    if (effect->emissiveEnabled) {
         removed += CoalesceCyclicallyCoincidentKeys(
-            &memory.boundsKeys,
-            sameSingleLane);
-        removed += CoalesceCyclicallyCoincidentKeys(
-            &memory.boundsParameterKeys,
+            &effect->emissiveFalloffKeys,
             [](const auto& left, const auto& right) {
-                return left.parameter == right.parameter;
-            });
+                return left.nodeId == right.nodeId &&
+                       left.parameter == right.parameter;
+            },
+            allActive);
     }
     if (removed != 0U) {
         SynchronizeCurrentTimingColouriseFieldMemory(effect);
@@ -5318,38 +5627,42 @@ std::vector<float> TimingColouriseEffectSettingsKeyPositions(
         effect.paletteKeys.size() +
         effect.paletteStopParameterKeys.size() +
         effect.boundsParameterKeys.size() +
-        effect.boundsKeys.size());
+        effect.boundsKeys.size() +
+        effect.emissiveFalloffKeys.size());
+    const auto allActive = [](const auto&) { return true; };
     AppendTimingColouriseSettingsKeyPositions(
         &positions,
-        effect.effectParameterKeys);
-    AppendTimingColouriseSettingsKeyPositions(
-        &positions,
-        effect.paletteKeys);
-    AppendTimingColouriseSettingsKeyPositions(
-        &positions,
-        effect.paletteStopParameterKeys);
-    AppendTimingColouriseSettingsKeyPositions(
-        &positions,
-        effect.boundsParameterKeys);
-    AppendTimingColouriseSettingsKeyPositions(
-        &positions,
-        effect.boundsKeys);
-    AppendTimingColouriseSettingsKeyPositions(
-        &positions,
-        effect.emissiveFalloffKeys);
-    for (const auto& memory : effect.fieldBoundsMemory) {
-        // The live vectors above are authoritative for the selected field.
-        // Its remembered entry is only the snapshot from the last switch and
-        // may legitimately lag until the next Stash call.
-        if (IsCurrentTimingColouriseFieldMemory(effect, memory)) {
-            continue;
-        }
+        effect.effectParameterKeys,
+        [&](const auto& key) {
+            return TimingColouriseEffectParameterKeyIsActive(
+                effect,
+                key);
+        });
+    if (TimingColouriseLegacyPaletteKeysAreActive(effect)) {
         AppendTimingColouriseSettingsKeyPositions(
             &positions,
-            memory.boundsParameterKeys);
+            effect.paletteKeys,
+            allActive);
+    }
+    if (TimingColourisePaletteStopKeysAreActive(effect)) {
         AppendTimingColouriseSettingsKeyPositions(
             &positions,
-            memory.boundsKeys);
+            effect.paletteStopParameterKeys,
+            allActive);
+    }
+    AppendTimingColouriseSettingsKeyPositions(
+        &positions,
+        effect.boundsParameterKeys,
+        allActive);
+    AppendTimingColouriseSettingsKeyPositions(
+        &positions,
+        effect.boundsKeys,
+        allActive);
+    if (effect.emissiveEnabled) {
+        AppendTimingColouriseSettingsKeyPositions(
+            &positions,
+            effect.emissiveFalloffKeys,
+            allActive);
     }
     std::stable_sort(positions.begin(), positions.end());
     positions.erase(
@@ -5368,30 +5681,40 @@ std::optional<TimingColouriseSettingsKeySpan>
 TimingColouriseEffectSettingsKeySpan(
     const TimingColouriseEffect& effect) {
     std::optional<TimingColouriseSettingsKeySpan> span;
+    const auto allActive = [](const auto&) { return true; };
     ExtendTimingColouriseSettingsKeySpan(
         &span,
-        effect.effectParameterKeys);
-    ExtendTimingColouriseSettingsKeySpan(&span, effect.paletteKeys);
-    ExtendTimingColouriseSettingsKeySpan(
-        &span,
-        effect.paletteStopParameterKeys);
-    ExtendTimingColouriseSettingsKeySpan(
-        &span,
-        effect.boundsParameterKeys);
-    ExtendTimingColouriseSettingsKeySpan(&span, effect.boundsKeys);
-    ExtendTimingColouriseSettingsKeySpan(
-        &span,
-        effect.emissiveFalloffKeys);
-    for (const auto& memory : effect.fieldBoundsMemory) {
-        if (IsCurrentTimingColouriseFieldMemory(effect, memory)) {
-            continue;
-        }
+        effect.effectParameterKeys,
+        [&](const auto& key) {
+            return TimingColouriseEffectParameterKeyIsActive(
+                effect,
+                key);
+        });
+    if (TimingColouriseLegacyPaletteKeysAreActive(effect)) {
         ExtendTimingColouriseSettingsKeySpan(
             &span,
-            memory.boundsParameterKeys);
+            effect.paletteKeys,
+            allActive);
+    }
+    if (TimingColourisePaletteStopKeysAreActive(effect)) {
         ExtendTimingColouriseSettingsKeySpan(
             &span,
-            memory.boundsKeys);
+            effect.paletteStopParameterKeys,
+            allActive);
+    }
+    ExtendTimingColouriseSettingsKeySpan(
+        &span,
+        effect.boundsParameterKeys,
+        allActive);
+    ExtendTimingColouriseSettingsKeySpan(
+        &span,
+        effect.boundsKeys,
+        allActive);
+    if (effect.emissiveEnabled) {
+        ExtendTimingColouriseSettingsKeySpan(
+            &span,
+            effect.emissiveFalloffKeys,
+            allActive);
     }
     return span;
 }
@@ -5430,8 +5753,11 @@ bool TransformTimingColouriseEffectSettingsKeys(
 
     TimingColouriseEffect candidate = *effect;
     bool foundKey = false;
-    const auto mapKeys = [&](auto* keys) {
+    const auto mapKeys = [&](auto* keys, auto isActive) {
         for (auto& key : *keys) {
+            if (!isActive(key)) {
+                continue;
+            }
             foundKey = true;
             if (!std::isfinite(key.position) ||
                 key.position <
@@ -5470,22 +5796,25 @@ bool TransformTimingColouriseEffectSettingsKeys(
         return true;
     };
 
-    if (!mapKeys(&candidate.effectParameterKeys) ||
-        !mapKeys(&candidate.paletteKeys) ||
-        !mapKeys(&candidate.paletteStopParameterKeys) ||
-        !mapKeys(&candidate.boundsParameterKeys) ||
-        !mapKeys(&candidate.boundsKeys) ||
-        !mapKeys(&candidate.emissiveFalloffKeys)) {
+    const auto allActive = [](const auto&) { return true; };
+    if (!mapKeys(
+            &candidate.effectParameterKeys,
+            [&](const auto& key) {
+                return TimingColouriseEffectParameterKeyIsActive(
+                    candidate,
+                    key);
+            }) ||
+        (TimingColouriseLegacyPaletteKeysAreActive(candidate) &&
+         !mapKeys(&candidate.paletteKeys, allActive)) ||
+        (TimingColourisePaletteStopKeysAreActive(candidate) &&
+         !mapKeys(
+             &candidate.paletteStopParameterKeys,
+             allActive)) ||
+        !mapKeys(&candidate.boundsParameterKeys, allActive) ||
+        !mapKeys(&candidate.boundsKeys, allActive) ||
+        (candidate.emissiveEnabled &&
+         !mapKeys(&candidate.emissiveFalloffKeys, allActive))) {
         return false;
-    }
-    for (auto& memory : candidate.fieldBoundsMemory) {
-        if (IsCurrentTimingColouriseFieldMemory(candidate, memory)) {
-            continue;
-        }
-        if (!mapKeys(&memory.boundsParameterKeys) ||
-            !mapKeys(&memory.boundsKeys)) {
-            return false;
-        }
     }
     if (!foundKey ||
         !TimingColouriseEffectSettingsKeysHaveNoLaneCollisions(
@@ -5493,11 +5822,12 @@ bool TransformTimingColouriseEffectSettingsKeys(
         return false;
     }
 
-    // Bring an existing selected-field cache forward from the transformed
-    // live tracks. Do not manufacture a cache for effects that never needed
-    // one merely because their clip moved.
-    SynchronizeCurrentTimingColouriseFieldMemory(&candidate);
     SortTimingColouriseEffectSettingsKeys(&candidate);
+    // Bring an existing selected-field cache forward from the sorted live
+    // tracks. Do not manufacture a cache for effects that never needed one
+    // merely because their clip moved. Other field histories stay exactly
+    // where they were authored.
+    SynchronizeCurrentTimingColouriseFieldMemory(&candidate);
     *effect = std::move(candidate);
     return true;
 }
@@ -5676,8 +6006,11 @@ bool TransformTimingColouriseEffectSettingsKeysCyclic(
     (void)CoalesceTimingColouriseEffectCyclicallyCoincidentKeys(&original);
     TimingColouriseEffect candidate = original;
     bool foundKey = false;
-    const auto mapKeys = [&](auto* keys) {
+    const auto mapKeys = [&](auto* keys, auto isActive) {
         for (auto& key : *keys) {
+            if (!isActive(key)) {
+                continue;
+            }
             foundKey = true;
             if (!std::isfinite(key.position)) {
                 return false;
@@ -5708,22 +6041,25 @@ bool TransformTimingColouriseEffectSettingsKeysCyclic(
         return true;
     };
 
-    if (!mapKeys(&candidate.effectParameterKeys) ||
-        !mapKeys(&candidate.paletteKeys) ||
-        !mapKeys(&candidate.paletteStopParameterKeys) ||
-        !mapKeys(&candidate.boundsParameterKeys) ||
-        !mapKeys(&candidate.boundsKeys) ||
-        !mapKeys(&candidate.emissiveFalloffKeys)) {
+    const auto allActive = [](const auto&) { return true; };
+    if (!mapKeys(
+            &candidate.effectParameterKeys,
+            [&](const auto& key) {
+                return TimingColouriseEffectParameterKeyIsActive(
+                    candidate,
+                    key);
+            }) ||
+        (TimingColouriseLegacyPaletteKeysAreActive(candidate) &&
+         !mapKeys(&candidate.paletteKeys, allActive)) ||
+        (TimingColourisePaletteStopKeysAreActive(candidate) &&
+         !mapKeys(
+             &candidate.paletteStopParameterKeys,
+             allActive)) ||
+        !mapKeys(&candidate.boundsParameterKeys, allActive) ||
+        !mapKeys(&candidate.boundsKeys, allActive) ||
+        (candidate.emissiveEnabled &&
+         !mapKeys(&candidate.emissiveFalloffKeys, allActive))) {
         return false;
-    }
-    for (auto& memory : candidate.fieldBoundsMemory) {
-        if (IsCurrentTimingColouriseFieldMemory(candidate, memory)) {
-            continue;
-        }
-        if (!mapKeys(&memory.boundsParameterKeys) ||
-            !mapKeys(&memory.boundsKeys)) {
-            return false;
-        }
     }
     if (!foundKey ||
         !TimingColouriseEffectSettingsKeysHaveNoCyclicLaneCollisions(
@@ -5732,8 +6068,8 @@ bool TransformTimingColouriseEffectSettingsKeysCyclic(
     }
 
     PreserveTimingColourisePalettePhaseTargetsAfterMove(original, &candidate);
-    SynchronizeCurrentTimingColouriseFieldMemory(&candidate);
     SortTimingColouriseEffectSettingsKeys(&candidate);
+    SynchronizeCurrentTimingColouriseFieldMemory(&candidate);
     *effect = std::move(candidate);
     return true;
 }
@@ -7529,6 +7865,78 @@ EvaluatePreparedEmissiveFalloffNodes(
     return nodes;
 }
 
+using TimingColouriseFalloffInterpolation =
+    invisible_places::water::WaterScenarioInterpolation;
+
+TimingColouriseFalloffInterpolation SanitizeFalloffInterpolation(
+    TimingColouriseFalloffInterpolation interpolation) {
+    return IsValidInterpolation(interpolation)
+        ? interpolation
+        : TimingColouriseFalloffInterpolation::SmoothVelocity;
+}
+
+void UpsertTimingColouriseEmissiveFalloffKey(
+    TimingColouriseEffect* effect,
+    std::string_view nodeId,
+    TimingColouriseEmissiveFalloffParameter parameter,
+    float position,
+    float value,
+    TimingColouriseFalloffInterpolation interpolation) {
+    TimingColouriseEmissiveFalloffKey key{
+        .nodeId = std::string{nodeId},
+        .parameter = parameter,
+        .position = Clamp01(position),
+        .value = Clamp01(value),
+        .interpolation = SanitizeFalloffInterpolation(interpolation),
+    };
+    const auto existing = std::find_if(
+        effect->emissiveFalloffKeys.begin(),
+        effect->emissiveFalloffKeys.end(),
+        [&](const TimingColouriseEmissiveFalloffKey& candidate) {
+            return candidate.nodeId == key.nodeId &&
+                   candidate.parameter == key.parameter &&
+                   std::abs(candidate.position - key.position) <=
+                       kTimingColouriseKeyTolerance;
+        });
+    if (existing == effect->emissiveFalloffKeys.end()) {
+        effect->emissiveFalloffKeys.push_back(std::move(key));
+    } else {
+        *existing = std::move(key);
+    }
+}
+
+TimingColouriseFalloffInterpolation
+TimingColouriseEmissiveFalloffInterpolationAt(
+    const TimingColouriseEffect& effect,
+    std::string_view nodeId,
+    TimingColouriseEmissiveFalloffParameter parameter,
+    float position,
+    TimingColouriseFalloffInterpolation fallback) {
+    const TimingColouriseEmissiveFalloffKey* earliest = nullptr;
+    const TimingColouriseEmissiveFalloffKey* preceding = nullptr;
+    for (const auto& key : effect.emissiveFalloffKeys) {
+        if (key.nodeId != nodeId || key.parameter != parameter) {
+            continue;
+        }
+        if (std::abs(key.position - position) <=
+            kTimingColouriseKeyTolerance) {
+            return SanitizeFalloffInterpolation(key.interpolation);
+        }
+        if (earliest == nullptr || key.position < earliest->position) {
+            earliest = &key;
+        }
+        if (key.position < position &&
+            (preceding == nullptr ||
+             key.position > preceding->position)) {
+            preceding = &key;
+        }
+    }
+    const auto* source = preceding != nullptr ? preceding : earliest;
+    return source != nullptr
+        ? SanitizeFalloffInterpolation(source->interpolation)
+        : SanitizeFalloffInterpolation(fallback);
+}
+
 }  // namespace
 
 float EvaluateTimingColouriseEffectParameter(
@@ -7726,7 +8134,8 @@ bool AddOrUpdateTimingColouriseEmissiveFalloffKey(
     TimingColouriseEmissiveFalloffParameter parameter,
     float position,
     float value,
-    invisible_places::water::WaterScenarioInterpolation interpolation) {
+    invisible_places::water::WaterScenarioInterpolation interpolation,
+    bool cyclic) {
     if (effect == nullptr || nodeId.empty() ||
         !std::isfinite(position) || !std::isfinite(value) ||
         std::none_of(
@@ -7737,32 +8146,75 @@ bool AddOrUpdateTimingColouriseEmissiveFalloffKey(
             })) {
         return false;
     }
-    TimingColouriseEmissiveFalloffKey key{
-        .nodeId = std::string{nodeId},
-        .parameter = parameter,
-        .position = Clamp01(position),
-        .value = Clamp01(value),
-        .interpolation = IsValidInterpolation(interpolation)
-                             ? interpolation
-                             : invisible_places::water::
-                                   WaterScenarioInterpolation::
-                                       SmoothVelocity,
-    };
-    const auto existing = std::find_if(
-        effect->emissiveFalloffKeys.begin(),
-        effect->emissiveFalloffKeys.end(),
-        [&](const TimingColouriseEmissiveFalloffKey& candidate) {
-            return candidate.nodeId == key.nodeId &&
-                   candidate.parameter == key.parameter &&
-                   std::abs(candidate.position - key.position) <=
-                       kTimingColouriseKeyTolerance;
-        });
-    if (existing == effect->emissiveFalloffKeys.end()) {
-        effect->emissiveFalloffKeys.push_back(std::move(key));
-    } else {
-        *existing = std::move(key);
+    auto candidate = SanitizeTimingColouriseEffect(*effect);
+    UpsertTimingColouriseEmissiveFalloffKey(
+        &candidate,
+        nodeId,
+        parameter,
+        position,
+        value,
+        interpolation);
+    candidate = SanitizeTimingColouriseEffect(std::move(candidate));
+    if (!AddOrUpdateTimingColouriseEmissiveFalloffKeyframe(
+            &candidate,
+            position,
+            cyclic,
+            interpolation)) {
+        return false;
     }
-    *effect = SanitizeTimingColouriseEffect(std::move(*effect));
+    *effect = std::move(candidate);
+    return true;
+}
+
+bool AddOrUpdateTimingColouriseEmissiveFalloffKeyframe(
+    TimingColouriseEffect* effect,
+    float position,
+    bool cyclic,
+    invisible_places::water::WaterScenarioInterpolation interpolation) {
+    if (effect == nullptr || !std::isfinite(position)) {
+        return false;
+    }
+    auto candidate = SanitizeTimingColouriseEffect(*effect);
+    if (candidate.emissiveFalloffNodes.empty()) {
+        return false;
+    }
+    const float keyPosition = Clamp01(position);
+    const auto evaluated = EvaluateTimingColouriseEmissiveFalloffNodes(
+        candidate,
+        keyPosition,
+        cyclic);
+    if (evaluated.empty()) {
+        return false;
+    }
+
+    // Every authored instant is a complete falloff-curve snapshot. Keeping
+    // invariant coordinates in storage makes later topology-preserving edits
+    // deterministic; the UI filters those flat tracks when drawing curves.
+    for (const auto& node : evaluated) {
+        const auto store =
+            [&](TimingColouriseEmissiveFalloffParameter parameter,
+                float value) {
+                UpsertTimingColouriseEmissiveFalloffKey(
+                    &candidate,
+                    node.id,
+                    parameter,
+                    keyPosition,
+                    value,
+                    TimingColouriseEmissiveFalloffInterpolationAt(
+                        candidate,
+                        node.id,
+                        parameter,
+                        keyPosition,
+                        interpolation));
+            };
+        store(
+            TimingColouriseEmissiveFalloffParameter::Position,
+            node.position);
+        store(
+            TimingColouriseEmissiveFalloffParameter::Level,
+            node.level);
+    }
+    *effect = SanitizeTimingColouriseEffect(std::move(candidate));
     return true;
 }
 
@@ -7782,6 +8234,69 @@ std::size_t RemoveTimingColouriseEmissiveFalloffKeysAtPosition(
                    std::abs(key.position - position) <=
                        kTimingColouriseKeyTolerance;
         });
+}
+
+std::size_t RemoveTimingColouriseEmissiveFalloffKeyframeAtPosition(
+    TimingColouriseEffect* effect,
+    float position) {
+    if (effect == nullptr || !std::isfinite(position)) {
+        return 0U;
+    }
+    return std::erase_if(
+        effect->emissiveFalloffKeys,
+        [&](const TimingColouriseEmissiveFalloffKey& key) {
+            return std::abs(key.position - position) <=
+                   kTimingColouriseKeyTolerance;
+        });
+}
+
+std::size_t RemoveTimingColouriseEmissiveFalloffNodes(
+    TimingColouriseEffect* effect,
+    std::span<const std::string> nodeIds) {
+    if (effect == nullptr || nodeIds.empty()) {
+        return 0U;
+    }
+    const auto selected = [&](std::string_view nodeId) {
+        return std::any_of(
+            nodeIds.begin(),
+            nodeIds.end(),
+            [&](const std::string& candidate) {
+                return candidate == nodeId;
+            });
+    };
+    const std::size_t removed = std::erase_if(
+        effect->emissiveFalloffNodes,
+        [&](const TimingColouriseEmissiveFalloffNode& node) {
+            return selected(node.id);
+        });
+    if (removed > 0U) {
+        std::erase_if(
+            effect->emissiveFalloffKeys,
+            [&](const TimingColouriseEmissiveFalloffKey& key) {
+                return selected(key.nodeId);
+            });
+    }
+    return removed;
+}
+
+bool TimingColouriseEmissiveFalloffTrackChanges(
+    const TimingColouriseEffect& effect,
+    std::string_view nodeId,
+    TimingColouriseEmissiveFalloffParameter parameter) {
+    std::optional<float> firstValue;
+    for (const auto& key : effect.emissiveFalloffKeys) {
+        if (key.nodeId != nodeId || key.parameter != parameter) {
+            continue;
+        }
+        if (!firstValue.has_value()) {
+            firstValue = key.value;
+        } else if (
+            std::abs(key.value - firstValue.value()) >
+            kTimingColouriseKeyTolerance) {
+            return true;
+        }
+    }
+    return false;
 }
 
 TimingColourisePalette EvaluateTimingColourisePalette(

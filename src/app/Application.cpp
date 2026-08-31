@@ -851,6 +851,22 @@ struct TimingColouriseSkewNodeDragState {
     std::string nodeId;
 };
 
+// Falloff-curve node selection is separate from timeline-key selection. It
+// addresses curve topology (and therefore owns node deletion), while the
+// shared timeline continues to select stored animation keys.
+struct TimingColouriseEmissiveFalloffNodeSelectionState {
+    std::string effectId;
+    std::vector<std::string> nodeIds;
+};
+
+struct TimingColouriseEmissiveFalloffMarqueeState {
+    std::string effectId;
+    ImVec2 start{};
+    ImVec2 current{};
+    bool additive = false;
+    std::vector<std::string> baseSelection;
+};
+
 struct TimingColouriseKeyPositionEditState {
     std::string effectId;
     TimingColouriseKeyTrack track =
@@ -2012,10 +2028,42 @@ enum class TimingColouriseSettingsClipDragPart : std::uint8_t {
     End,
 };
 
-// The overview's lower-half settings clip is derived from every animation
-// key owned by one Visual Feature. Keep a complete immutable effect snapshot
-// so each drag frame can reapply one affine transform from the original
-// positions; stable ids avoid dangling references after list reordering.
+TimingColouriseSettingsClipDragPart
+TimingColouriseSettingsClipDragPartFor(
+    TimingColouriseActivationDragPart part) {
+    switch (part) {
+        case TimingColouriseActivationDragPart::Start:
+            return TimingColouriseSettingsClipDragPart::Start;
+        case TimingColouriseActivationDragPart::End:
+            return TimingColouriseSettingsClipDragPart::End;
+        case TimingColouriseActivationDragPart::Body:
+        default:
+            return TimingColouriseSettingsClipDragPart::Body;
+    }
+}
+
+invisible_places::timing::TimingColouriseRangeEditPart
+TimingColouriseRangeEditPartFor(
+    TimingColouriseSettingsClipDragPart part) {
+    switch (part) {
+        case TimingColouriseSettingsClipDragPart::Start:
+            return invisible_places::timing::
+                TimingColouriseRangeEditPart::Start;
+        case TimingColouriseSettingsClipDragPart::End:
+            return invisible_places::timing::
+                TimingColouriseRangeEditPart::End;
+        case TimingColouriseSettingsClipDragPart::Body:
+        default:
+            return invisible_places::timing::
+                TimingColouriseRangeEditPart::Body;
+    }
+}
+
+// The overview's lower-half settings clip is derived from the effect-wide
+// animation keys and the selected field's live Bounds keys. Keep a complete
+// immutable effect snapshot so each drag frame can reapply one affine
+// transform from the original positions; stable ids avoid dangling
+// references after list reordering.
 struct TimingColouriseSettingsClipDragState {
     std::string effectId;
     TimingColouriseSettingsClipDragPart part =
@@ -2029,6 +2077,9 @@ struct TimingColouriseSettingsClipDragState {
     std::optional<invisible_places::timing::TimingColouriseCyclicSettingsKeySpan>
         cyclicSourceSpan;
     invisible_places::timing::TimingColouriseEffect originalEffect{};
+    // Normal drags carry the active and settings ranges together. Option/Alt
+    // at drag start retains the historical single-range edit.
+    bool editRangesTogether = false;
     bool moved = false;
 };
 
@@ -2158,7 +2209,10 @@ struct TimingsPanelState {
         TimingColouriseHistogramHandle::None;
     std::optional<TimingColouriseSkewNodeDragState> skewNodeDrag;
     std::optional<TimingColouriseSkewNodeDragState> emissiveFalloffDrag;
-    std::string selectedEmissiveFalloffNodeId;
+    std::optional<TimingColouriseEmissiveFalloffNodeSelectionState>
+        emissiveFalloffNodeSelection;
+    std::optional<TimingColouriseEmissiveFalloffMarqueeState>
+        emissiveFalloffMarquee;
     float histogramHandleGrabOffset = 0.0F;
     // Distribution Spread is a UI-only editing lens. Keying, persistence,
     // preview, and export continue to use raw scalar values.
@@ -101225,10 +101279,8 @@ bool DeleteSelectedTimingColouriseKeys(
         if (handle.track == TimingColouriseKeyTrack::EmissiveFalloff &&
             handle.falloffParameter.has_value()) {
             removed += invisible_places::timing::
-                RemoveTimingColouriseEmissiveFalloffKeysAtPosition(
+                RemoveTimingColouriseEmissiveFalloffKeyframeAtPosition(
                     effect,
-                    handle.stopId,
-                    handle.falloffParameter.value(),
                     handle.position);
         } else if (
             handle.track == TimingColouriseKeyTrack::Palette &&
@@ -101702,25 +101754,27 @@ void DrawTimingKeyLaneGroup(
             float destinationPosition) {
             if (lane.track == TimingColouriseKeyTrack::EmissiveFalloff &&
                 lane.falloffParameter.has_value()) {
-                const auto found = std::find_if(
+                const bool found = std::any_of(
                     effect->emissiveFalloffKeys.begin(),
                     effect->emissiveFalloffKeys.end(),
                     [&](const auto& key) {
-                        return key.nodeId == lane.stopId &&
-                               key.parameter ==
-                                   lane.falloffParameter.value() &&
-                               std::abs(
+                        return std::abs(
                                    key.position - sourcePosition) <=
                                    invisible_places::timing::
                                        kTimingColouriseKeyTolerance;
                     });
-                if (found == effect->emissiveFalloffKeys.end()) {
+                if (!found) {
                     return false;
                 }
-                found->position = std::clamp(
-                    destinationPosition,
-                    0.0F,
-                    1.0F);
+                const float destination = std::clamp(
+                    destinationPosition, 0.0F, 1.0F);
+                for (auto& key : effect->emissiveFalloffKeys) {
+                    if (std::abs(key.position - sourcePosition) <=
+                        invisible_places::timing::
+                            kTimingColouriseKeyTolerance) {
+                        key.position = destination;
+                    }
+                }
                 *effect = invisible_places::timing::
                     SanitizeTimingColouriseEffect(std::move(*effect));
                 return true;
@@ -101813,10 +101867,7 @@ void DrawTimingKeyLaneGroup(
                     effect->emissiveFalloffKeys.begin(),
                     effect->emissiveFalloffKeys.end(),
                     [&](const auto& key) {
-                        return key.nodeId == lane.stopId &&
-                               key.parameter ==
-                                   lane.falloffParameter.value() &&
-                               std::abs(
+                        return std::abs(
                                    key.position -
                                    destinationPosition) <=
                                    invisible_places::timing::
@@ -102576,7 +102627,8 @@ void DrawTimingKeyLaneGroup(
                         parameter,
                         position,
                         scalarValue,
-                        interpolation);
+                        interpolation,
+                        cyclicTiming);
             } else if (
                 lane.track == TimingColouriseKeyTrack::Palette &&
                 effect->paletteKeyModel ==
@@ -103316,10 +103368,8 @@ void DrawTimingKeyLaneGroup(
                                     EmissiveFalloff &&
                             handle.falloffParameter.has_value()) {
                             (void)invisible_places::timing::
-                                RemoveTimingColouriseEmissiveFalloffKeysAtPosition(
+                                RemoveTimingColouriseEmissiveFalloffKeyframeAtPosition(
                                     target,
-                                    handle.stopId,
-                                    handle.falloffParameter.value(),
                                     handle.position);
                         } else if (
                             handle.track ==
@@ -103495,8 +103545,6 @@ void DrawTimingKeyLaneGroup(
                 for (const auto& selected : drag.handles) {
                     if (selected.track ==
                             TimingColouriseKeyTrack::EmissiveFalloff &&
-                        selected.falloffParameter == key.parameter &&
-                        selected.stopId == key.nodeId &&
                         std::abs(selected.position - key.position) <=
                             invisible_places::timing::
                                 kTimingColouriseKeyTolerance) {
@@ -105374,9 +105422,9 @@ bool DrawTimingColouriseEffectParameterEditor(
 }
 
 // The emissive falloff editor: level multiplier (y) over the bounds span
-// (x, before the emissive skew warp). Nodes drag in both axes, auto-keying
-// any armed per-node track at the current animation position; double-click
-// empty space adds a node and double-clicking a node removes it.
+// (x, before the emissive skew warp). Curve-node selection owns topology
+// edits, while any armed drag writes a complete animation snapshot so all
+// node coordinates remain aligned at each keyed instant.
 void DrawTimingEmissiveFalloffCurveEditor(
     PreviewRuntimeState* runtimeState,
     invisible_places::timing::TimingColouriseEffect* effect) {
@@ -105387,14 +105435,78 @@ void DrawTimingEmissiveFalloffCurveEditor(
     const float position = CurrentAuthoredTrackPosition(*runtimeState);
     const bool cyclicTiming =
         CurrentAnimationTimingIsCyclic(*runtimeState);
+    if (timings.emissiveFalloffNodeSelection.has_value() &&
+        timings.emissiveFalloffNodeSelection->effectId != effect->id) {
+        timings.emissiveFalloffNodeSelection.reset();
+    }
+    if (timings.emissiveFalloffMarquee.has_value() &&
+        timings.emissiveFalloffMarquee->effectId != effect->id) {
+        timings.emissiveFalloffMarquee.reset();
+    }
+    if (timings.emissiveFalloffNodeSelection.has_value()) {
+        auto& selected =
+            timings.emissiveFalloffNodeSelection->nodeIds;
+        std::erase_if(
+            selected,
+            [&](const std::string& nodeId) {
+                return std::none_of(
+                    effect->emissiveFalloffNodes.begin(),
+                    effect->emissiveFalloffNodes.end(),
+                    [&](const auto& node) { return node.id == nodeId; });
+            });
+        if (selected.empty()) {
+            timings.emissiveFalloffNodeSelection.reset();
+        }
+    }
+    const auto selectedNodeIds = [&]() -> std::vector<std::string> {
+        if (!timings.emissiveFalloffNodeSelection.has_value() ||
+            timings.emissiveFalloffNodeSelection->effectId != effect->id) {
+            return {};
+        }
+        return timings.emissiveFalloffNodeSelection->nodeIds;
+    };
+    const auto replaceNodeSelection =
+        [&](std::vector<std::string> nodeIds) {
+            if (nodeIds.empty()) {
+                timings.emissiveFalloffNodeSelection.reset();
+                return;
+            }
+            timings.emissiveFalloffNodeSelection =
+                TimingColouriseEmissiveFalloffNodeSelectionState{
+                    .effectId = effect->id,
+                    .nodeIds = std::move(nodeIds),
+                };
+        };
+    const auto addUniqueNodeId =
+        [](std::vector<std::string>* nodeIds, std::string_view nodeId) {
+            if (std::none_of(
+                    nodeIds->begin(),
+                    nodeIds->end(),
+                    [&](const std::string& existing) {
+                        return existing == nodeId;
+                    })) {
+                nodeIds->emplace_back(nodeId);
+            }
+        };
+    const auto nodeSelected = [&](std::string_view nodeId) {
+        const auto selected = selectedNodeIds();
+        return std::any_of(
+            selected.begin(),
+            selected.end(),
+            [&](const std::string& candidate) {
+                return candidate == nodeId;
+            });
+    };
     ImGui::TextDisabled("Emissive falloff over bounds");
     DrawTimingControlTooltip(
         "Scale the emissive level across the selected bounds: node height "
         "is a 0 to 1 multiplier joined by a Monotone Spline and held flat "
-        "past the outermost nodes. Drag nodes to shape the profile - "
-        "armed node tracks auto-key at the current animation position. "
-        "Double-click empty space to add a node, a node to remove it. No "
-        "nodes means emission applies evenly.");
+        "past the outermost nodes. Drag a node to shape the profile, or "
+        "drag empty space to window-select several nodes. Cmd/Ctrl-click "
+        "toggles and Shift-click adds a node; Delete or Backspace removes "
+        "the selection. Armed falloff animation saves every node. "
+        "Double-click empty space to add a node, or a node to remove it. "
+        "No nodes means emission applies evenly.");
     const ImVec2 size{
         std::max(160.0F, ImGui::GetContentRegionAvail().x),
         72.0F};
@@ -105402,6 +105514,9 @@ void DrawTimingEmissiveFalloffCurveEditor(
         "##TimingEmissiveFalloffCurve",
         size,
         ImGuiButtonFlags_MouseButtonLeft);
+    const bool curveHovered = ImGui::IsItemHovered();
+    const bool curveFocused = ImGui::IsItemFocused();
+    const bool curveActive = ImGui::IsItemActive();
     const auto minimum = ImGui::GetItemRectMin();
     const auto maximum = ImGui::GetItemRectMax();
     const float width = std::max(1.0F, maximum.x - minimum.x);
@@ -105479,28 +105594,10 @@ void DrawTimingEmissiveFalloffCurveEditor(
         const float distance = std::hypot(
             mouse.x - xForFraction(nodes[index].position),
             mouse.y - yForLevel(nodes[index].level));
-        if (ImGui::IsItemHovered() && distance <= nearestDistance) {
+        if (curveHovered && distance <= nearestDistance) {
             nearestDistance = distance;
             hoveredNode = index;
         }
-    }
-    for (std::size_t index = 0U; index < nodes.size(); ++index) {
-        const ImVec2 point{
-            xForFraction(nodes[index].position),
-            yForLevel(nodes[index].level)};
-        const bool selected =
-            timings.selectedEmissiveFalloffNodeId == nodes[index].id;
-        drawList->AddCircleFilled(point, 4.0F, curveColour);
-        drawList->AddCircle(
-            point,
-            selected ? 6.0F : 5.0F,
-            selected
-                ? ImGui::GetColorU32(ImGuiCol_SliderGrabActive)
-            : nodeHasKeys(nodes[index].id)
-                ? ImGui::GetColorU32(kWaterKeyedSettingColour)
-                : ImGui::GetColorU32(ImGuiCol_Border),
-            0,
-            selected ? 2.0F : 1.0F);
     }
 
     auto& drag = timings.emissiveFalloffDrag;
@@ -105518,19 +105615,19 @@ void DrawTimingEmissiveFalloffCurveEditor(
     if (hoveredNode.has_value() &&
         ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
         const std::string removedId = nodes[hoveredNode.value()].id;
-        std::erase_if(
-            effect->emissiveFalloffNodes,
-            [&](const auto& node) { return node.id == removedId; });
-        std::erase_if(
-            effect->emissiveFalloffKeys,
-            [&](const auto& key) { return key.nodeId == removedId; });
-        if (timings.selectedEmissiveFalloffNodeId == removedId) {
-            timings.selectedEmissiveFalloffNodeId.clear();
-        }
+        const std::array<std::string, 1U> removedIds{removedId};
+        (void)invisible_places::timing::
+            RemoveTimingColouriseEmissiveFalloffNodes(
+                effect,
+                removedIds);
+        auto selected = selectedNodeIds();
+        std::erase(selected, removedId);
+        replaceNodeSelection(std::move(selected));
         drag.reset();
+        timings.emissiveFalloffMarquee.reset();
         runtimeState->previewRenderStateSignatureValid = false;
     } else if (
-        ImGui::IsItemHovered() && !hoveredNode.has_value() &&
+        curveHovered && !hoveredNode.has_value() &&
         ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
         StopAnimationPlayback(runtimeState);
         TimingColouriseEmissiveFalloffNode node{
@@ -105540,25 +105637,66 @@ void DrawTimingEmissiveFalloffCurveEditor(
             .position = clickFraction,
             .level = clickLevel,
         };
-        timings.selectedEmissiveFalloffNodeId = node.id;
+        const std::string addedId = node.id;
         effect->emissiveFalloffNodes.push_back(std::move(node));
         *effect = invisible_places::timing::
             SanitizeTimingColouriseEffect(std::move(*effect));
+        replaceNodeSelection({addedId});
+        timings.emissiveFalloffMarquee.reset();
         runtimeState->previewRenderStateSignatureValid = false;
     } else if (
         hoveredNode.has_value() &&
         ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         StopAnimationPlayback(runtimeState);
-        timings.selectedEmissiveFalloffNodeId =
-            nodes[hoveredNode.value()].id;
-        drag = TimingColouriseSkewNodeDragState{
-            .effectId = effect->id,
-            .emissiveAspect = true,
-            .nodeId = nodes[hoveredNode.value()].id,
-        };
+        const std::string& nodeId = nodes[hoveredNode.value()].id;
+        const auto& io = ImGui::GetIO();
+        const bool command = io.KeyCtrl || io.KeySuper;
+        if (command || io.KeyShift) {
+            auto selected = selectedNodeIds();
+            const auto existing = std::find(
+                selected.begin(),
+                selected.end(),
+                nodeId);
+            if (command && existing != selected.end()) {
+                selected.erase(existing);
+            } else {
+                addUniqueNodeId(&selected, nodeId);
+            }
+            replaceNodeSelection(std::move(selected));
+            drag.reset();
+        } else {
+            if (!nodeSelected(nodeId)) {
+                replaceNodeSelection({nodeId});
+            }
+            drag = TimingColouriseSkewNodeDragState{
+                .effectId = effect->id,
+                .emissiveAspect = true,
+                .nodeId = nodeId,
+            };
+        }
+        timings.emissiveFalloffMarquee.reset();
+    } else if (
+        curveHovered && !hoveredNode.has_value() &&
+        ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        StopAnimationPlayback(runtimeState);
+        const auto& io = ImGui::GetIO();
+        const bool additive =
+            io.KeyCtrl || io.KeySuper || io.KeyShift;
+        auto base = additive ? selectedNodeIds()
+                             : std::vector<std::string>{};
+        replaceNodeSelection(base);
+        drag.reset();
+        timings.emissiveFalloffMarquee =
+            TimingColouriseEmissiveFalloffMarqueeState{
+                .effectId = effect->id,
+                .start = mouse,
+                .current = mouse,
+                .additive = additive,
+                .baseSelection = std::move(base),
+            };
     }
     if (drag.has_value() && drag->effectId == effect->id &&
-        ImGui::IsItemActive() &&
+        curveActive &&
         ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
         const auto node = std::find_if(
             effect->emissiveFalloffNodes.begin(),
@@ -105571,13 +105709,10 @@ void DrawTimingEmissiveFalloffCurveEditor(
                 [&](TimingColouriseEmissiveFalloffParameter parameter,
                     float value,
                     float* base) {
-                    const bool armed = std::any_of(
-                        effect->emissiveFalloffKeys.begin(),
-                        effect->emissiveFalloffKeys.end(),
-                        [&](const auto& key) {
-                            return key.nodeId == drag->nodeId &&
-                                   key.parameter == parameter;
-                        });
+                    // One falloff key arms the complete curve. This also
+                    // upgrades older partial per-node data on the next edit.
+                    const bool armed =
+                        !effect->emissiveFalloffKeys.empty();
                     if (armed) {
                         const auto interpolation =
                             TimingScalarTrackInterpolationAt(
@@ -105595,7 +105730,8 @@ void DrawTimingEmissiveFalloffCurveEditor(
                                 parameter,
                                 position,
                                 value,
-                                interpolation);
+                                interpolation,
+                                cyclicTiming);
                     } else {
                         *base = value;
                     }
@@ -105625,59 +105761,156 @@ void DrawTimingEmissiveFalloffCurveEditor(
         drag.reset();
     }
 
-    // Keying row for the selected node: arm both coordinates, navigate
-    // this node's keys, or delete them at the current position.
-    const auto selectedNode = std::find_if(
-        effect->emissiveFalloffNodes.begin(),
-        effect->emissiveFalloffNodes.end(),
-        [&](const auto& candidate) {
-            return candidate.id ==
-                   timings.selectedEmissiveFalloffNodeId;
-        });
-    if (selectedNode != effect->emissiveFalloffNodes.end()) {
-        const std::string nodeId = selectedNode->id;
-        ImGui::TextDisabled("Node keys");
+    const auto marqueeMatches = [&]() {
+        return timings.emissiveFalloffMarquee.has_value() &&
+               timings.emissiveFalloffMarquee->effectId == effect->id;
+    };
+    if (marqueeMatches() &&
+        ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        auto& marquee = timings.emissiveFalloffMarquee.value();
+        marquee.current = mouse;
+        if (ImGui::IsMouseDragging(ImGuiMouseButton_Left, 2.0F)) {
+            const ImVec2 selectionMinimum{
+                std::min(marquee.start.x, marquee.current.x),
+                std::min(marquee.start.y, marquee.current.y)};
+            const ImVec2 selectionMaximum{
+                std::max(marquee.start.x, marquee.current.x),
+                std::max(marquee.start.y, marquee.current.y)};
+            auto selected = marquee.baseSelection;
+            for (const auto& node : nodes) {
+                const ImVec2 point{
+                    xForFraction(node.position),
+                    yForLevel(node.level)};
+                if (point.x >= selectionMinimum.x &&
+                    point.x <= selectionMaximum.x &&
+                    point.y >= selectionMinimum.y &&
+                    point.y <= selectionMaximum.y) {
+                    addUniqueNodeId(&selected, node.id);
+                }
+            }
+            replaceNodeSelection(std::move(selected));
+        }
+    }
+
+    if (marqueeMatches() &&
+        ImGui::IsMouseDragging(ImGuiMouseButton_Left, 2.0F)) {
+        const auto& marquee = timings.emissiveFalloffMarquee.value();
+        const ImVec2 selectionMinimum{
+            std::clamp(
+                std::min(marquee.start.x, marquee.current.x),
+                minimum.x,
+                maximum.x),
+            std::clamp(
+                std::min(marquee.start.y, marquee.current.y),
+                minimum.y,
+                maximum.y)};
+        const ImVec2 selectionMaximum{
+            std::clamp(
+                std::max(marquee.start.x, marquee.current.x),
+                minimum.x,
+                maximum.x),
+            std::clamp(
+                std::max(marquee.start.y, marquee.current.y),
+                minimum.y,
+                maximum.y)};
+        drawList->AddRectFilled(
+            selectionMinimum,
+            selectionMaximum,
+            ImGui::GetColorU32(ImGuiCol_Header, 0.22F));
+        drawList->AddRect(
+            selectionMinimum,
+            selectionMaximum,
+            ImGui::GetColorU32(ImGuiCol_SliderGrabActive));
+    }
+
+    for (std::size_t index = 0U; index < nodes.size(); ++index) {
+        const ImVec2 point{
+            xForFraction(nodes[index].position),
+            yForLevel(nodes[index].level)};
+        const bool selected = nodeSelected(nodes[index].id);
+        drawList->AddCircleFilled(point, 4.0F, curveColour);
+        drawList->AddCircle(
+            point,
+            selected ? 6.0F : 5.0F,
+            selected
+                ? ImGui::GetColorU32(ImGuiCol_SliderGrabActive)
+            : nodeHasKeys(nodes[index].id)
+                ? ImGui::GetColorU32(kWaterKeyedSettingColour)
+                : ImGui::GetColorU32(ImGuiCol_Border),
+            0,
+            selected ? 2.0F : 1.0F);
+    }
+
+    if (marqueeMatches() &&
+        !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        timings.emissiveFalloffMarquee.reset();
+    }
+
+    const bool keyboardCommandsAvailable =
+        curveFocused && !ImGui::GetIO().WantTextInput &&
+        !drag.has_value() && !timings.emissiveFalloffMarquee.has_value();
+    if (keyboardCommandsAvailable) {
+        const auto& io = ImGui::GetIO();
+        const bool command = io.KeyCtrl || io.KeySuper;
+        if (command && ImGui::IsKeyPressed(ImGuiKey_A, false)) {
+            std::vector<std::string> allNodeIds;
+            allNodeIds.reserve(effect->emissiveFalloffNodes.size());
+            for (const auto& node : effect->emissiveFalloffNodes) {
+                allNodeIds.push_back(node.id);
+            }
+            replaceNodeSelection(std::move(allNodeIds));
+        } else if (
+            ImGui::IsKeyPressed(ImGuiKey_Delete, false) ||
+            ImGui::IsKeyPressed(ImGuiKey_Backspace, false)) {
+            const auto selected = selectedNodeIds();
+            if (!selected.empty()) {
+                StopAnimationPlayback(runtimeState);
+                if (invisible_places::timing::
+                        RemoveTimingColouriseEmissiveFalloffNodes(
+                            effect,
+                            selected) > 0U) {
+                    replaceNodeSelection({});
+                    drag.reset();
+                    runtimeState->previewRenderStateSignatureValid = false;
+                }
+            }
+        } else if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+            replaceNodeSelection({});
+        }
+    }
+
+    // Falloff keys are group snapshots: navigation and deletion operate on
+    // the shared animation instant, regardless of which changing curve is
+    // visible in the unified keyframe graph.
+    if (!effect->emissiveFalloffNodes.empty()) {
+        ImGui::TextDisabled("Falloff keys");
         ImGui::SameLine();
-        if (ImGui::SmallButton("+##KeyFalloffNode")) {
-            const auto evaluated = invisible_places::timing::
-                EvaluateTimingColouriseEmissiveFalloffNodes(
-                    *effect,
-                    position,
-                    cyclicTiming);
-            const auto current = std::find_if(
-                evaluated.begin(),
-                evaluated.end(),
-                [&](const auto& candidate) {
-                    return candidate.id == nodeId;
-                });
-            if (current != evaluated.end()) {
-                (void)invisible_places::timing::
-                    AddOrUpdateTimingColouriseEmissiveFalloffKey(
+        if (ImGui::SmallButton("+##KeyFalloffCurve")) {
+            if (invisible_places::timing::
+                    AddOrUpdateTimingColouriseEmissiveFalloffKeyframe(
                         effect,
-                        nodeId,
-                        TimingColouriseEmissiveFalloffParameter::
-                            Position,
                         position,
-                        current->position);
-                (void)invisible_places::timing::
-                    AddOrUpdateTimingColouriseEmissiveFalloffKey(
-                        effect,
-                        nodeId,
-                        TimingColouriseEmissiveFalloffParameter::Level,
-                        position,
-                        current->level);
+                        cyclicTiming)) {
                 runtimeState->previewRenderStateSignatureValid = false;
             }
         }
         DrawTimingControlTooltip(
-            "Key this node's curve position and level at the current animation position, arming both tracks for autokey.");
+            "Save every falloff node's position and level at the current animation position. Later edits autokey the complete curve.");
         std::vector<float> nodeKeyPositions;
         for (const auto& key : effect->emissiveFalloffKeys) {
-            if (key.nodeId == nodeId) {
-                nodeKeyPositions.push_back(key.position);
-            }
+            nodeKeyPositions.push_back(key.position);
         }
         std::sort(nodeKeyPositions.begin(), nodeKeyPositions.end());
+        nodeKeyPositions.erase(
+            std::unique(
+                nodeKeyPositions.begin(),
+                nodeKeyPositions.end(),
+                [](float left, float right) {
+                    return std::abs(left - right) <=
+                           invisible_places::timing::
+                               kTimingColouriseKeyTolerance;
+                }),
+            nodeKeyPositions.end());
         const auto previous = [&]() -> std::optional<float> {
             std::optional<float> result;
             for (const float candidate : nodeKeyPositions) {
@@ -105727,22 +105960,14 @@ void DrawTimingEmissiveFalloffCurveEditor(
         ImGui::BeginDisabled(!onKey);
         if (ImGui::SmallButton("X##FalloffDelete")) {
             (void)invisible_places::timing::
-                RemoveTimingColouriseEmissiveFalloffKeysAtPosition(
+                RemoveTimingColouriseEmissiveFalloffKeyframeAtPosition(
                     effect,
-                    nodeId,
-                    TimingColouriseEmissiveFalloffParameter::Position,
-                    position);
-            (void)invisible_places::timing::
-                RemoveTimingColouriseEmissiveFalloffKeysAtPosition(
-                    effect,
-                    nodeId,
-                    TimingColouriseEmissiveFalloffParameter::Level,
                     position);
             runtimeState->previewRenderStateSignatureValid = false;
         }
         ImGui::EndDisabled();
         DrawTimingControlTooltip(
-            "Delete this node's keys at the current animation position.");
+            "Delete the complete falloff snapshot at the current animation position.");
     }
 }
 
@@ -105768,8 +105993,9 @@ void AppendTimingEmissiveTimelineLanes(
             TimingColouriseEffectParameter::EmissiveLevel);
     lanes->push_back(std::move(levelLane));
 
-    // Keyed falloff-node coordinates join the same graph, one auto-ranged
-    // lane per (node, coordinate) track.
+    // Complete falloff snapshots store every coordinate, but flat tracks add
+    // no information to the graph. Only coordinates whose keyed values vary
+    // get an auto-ranged lane and visible interpolation curve.
     const auto nodeOrdinal =
         [&](std::string_view nodeId) -> std::optional<std::size_t> {
         for (std::size_t index = 0U;
@@ -105782,6 +106008,13 @@ void AppendTimingEmissiveTimelineLanes(
         return std::nullopt;
     };
     for (const auto& key : effect->emissiveFalloffKeys) {
+        if (!invisible_places::timing::
+                TimingColouriseEmissiveFalloffTrackChanges(
+                    *effect,
+                    key.nodeId,
+                    key.parameter)) {
+            continue;
+        }
         auto lane = std::find_if(
             lanes->begin(),
             lanes->end(),
@@ -109146,6 +109379,24 @@ void DrawTimingColouriseHistogram(
                 *effect,
                 position,
                 cyclicTiming);
+    // The histogram bands are a preview of the applied Visual Feature, not
+    // just its palette/falloff curves. Resolve Absolute fade endpoints to the
+    // same signed span fractions sent to the live/offline renderers so a
+    // bound-to-opposite-marker ramp is visible here as well.
+    const auto renderedBounds = invisible_places::timing::
+        ConvertTimingColouriseBoundsEdgeFadeMode(
+            evaluated,
+            effect->edgeFadeMode,
+            invisible_places::timing::
+                TimingColouriseEdgeFadeMode::RelativeSeparate);
+    const auto edgeMaskAtBoundsFraction = [&](float fraction) {
+        return invisible_places::timing::TimingColouriseBoundsMask(
+            renderedBounds,
+            std::lerp(
+                renderedBounds.lower,
+                renderedBounds.upper,
+                std::clamp(fraction, 0.0F, 1.0F)));
+    };
     const auto xForRaw = [&](float value) {
         return minimum.x + width * axis.RawToUnit(value);
     };
@@ -109378,8 +109629,8 @@ void DrawTimingColouriseHistogram(
                 effect->paletteSkewNodes);
 
         // The final sampled palette (loop, phase, skew, and override
-        // applied), with each segment's opacity following its colourise
-        // amount so skewed regions show whether they colourise at all.
+        // applied), with each segment's opacity following both its
+        // colourise amount and the applied edge-fade mask.
         const auto paletteLut =
             invisible_places::timing::EvaluateTimingColourisePaletteLut(
                 *effect,
@@ -109399,11 +109650,16 @@ void DrawTimingColouriseHistogram(
                 const auto stripColour = [&](float fraction) {
                     const auto sample = invisible_places::timing::
                         SampleTimingColouriseLut(paletteLut, fraction);
+                    const float edgeMask =
+                        edgeMaskAtBoundsFraction(fraction);
                     return ImGui::ColorConvertFloat4ToU32(ImVec4{
                         sample.colour[0],
                         sample.colour[1],
                         sample.colour[2],
-                        std::clamp(sample.colouriseAmount, 0.0F, 1.0F)});
+                        std::clamp(
+                            sample.colouriseAmount * edgeMask,
+                            0.0F,
+                            1.0F)});
                 };
                 const ImU32 startColour = stripColour(startFraction);
                 const ImU32 endColour = stripColour(endFraction);
@@ -109559,11 +109815,13 @@ void DrawTimingColouriseHistogram(
         constexpr int kStripSegments = 48;
         if (stripRight - stripLeft > 2.0F) {
             const auto responseColour = [&](float fraction) {
-                const float level = profile[std::min<std::size_t>(
-                    static_cast<std::size_t>(
-                        std::clamp(fraction, 0.0F, 1.0F) *
-                        static_cast<float>(profile.size() - 1U)),
-                    profile.size() - 1U)];
+                const float level =
+                    profile[std::min<std::size_t>(
+                        static_cast<std::size_t>(
+                            std::clamp(fraction, 0.0F, 1.0F) *
+                            static_cast<float>(profile.size() - 1U)),
+                        profile.size() - 1U)] *
+                    edgeMaskAtBoundsFraction(fraction);
                 // Mid-grey response: additive emission brightens toward
                 // white (saturating at +1), negative levels darken the
                 // retained light exactly as the renderer does.
@@ -109678,10 +109936,10 @@ void DrawTimingColouriseHistogram(
             "The sideways T handles set each edge's signed Fade: inward is positive up to 100%; outward is negative and may exceed 100% to feather far beyond a narrow bound.\n"
             "Double-click any bounds or fade handle to type an exact value. Double-click the J/S/A fade badge to cycle modes. Relative Joined moves both fade percentages together; Relative Separate edits them independently; Absolute keeps each typed scalar fade endpoint fixed while its bound moves. Each mode keeps its own keyed frames.\n"} +
         (paletteBandVisible
-             ? "The bottom band is Palette Skew: notches mark evenly spaced palette coordinates at their warped homes over the sampled palette strip, whose opacity follows the colourise amount. Drag a node left/right to skew around it, away from the strip to spread the area near it, toward it to pinch. Nodes snap onto neutral spread and their unskewed home. Double-click empty band to add a node, or double-click a node to type its exact Field Position and Spread; that editor also removes extras or resets the centre.\n"
+             ? "The bottom band is Palette Skew: notches mark evenly spaced palette coordinates at their warped homes over the sampled palette strip, whose opacity follows the colourise amount and edge fades. Drag a node left/right to skew around it, away from the strip to spread the area near it, toward it to pinch. Nodes snap onto neutral spread and their unskewed home. Double-click empty band to add a node, or double-click a node to type its exact Field Position and Spread; that editor also removes extras or resets the centre.\n"
              : std::string{}) +
         (emissiveBandVisible
-             ? "The top band is the emissive falloff's own skew, with a mid-grey strip showing the applied emission - brighter where it adds, darker where negative levels dim. Same node interactions as the palette band.\n"
+             ? "The top band is the emissive falloff's own skew, with a mid-grey strip showing the edge-faded applied emission - brighter where it adds, darker where negative levels dim. Same node interactions as the palette band.\n"
              : std::string{}) +
         (axis.UsesDistributionSpread()
              ? "Distribution Spread uses the cached high-resolution distribution for graph spacing and drag sensitivity; the vertical density shape stays in raw-value space and authored values remain raw."
@@ -111826,11 +112084,13 @@ void DrawTimingColouriseActivationOverview(
             "Visual Features timeline\n"
             "Click a feature name to select it, double-click to turn it on "
             "or off, or drag it to change its layer priority.\n"
-            "The upper half is the active range: drag an endpoint to resize "
-            "it or the body to move it; setting keys stay fixed.\n"
-            "The lower half bundles every setting key: drag an edge to "
-            "stretch all keys or the body to offset them; the active range "
-            "stays fixed. Individual keys remain editable below.\n"
+            "Drag either range normally to move both bodies together, or "
+            "move both corresponding edges together. This preserves their "
+            "carefully authored start and finish offsets. Hold Option/Alt "
+            "when starting a drag to edit only the chosen half.\n"
+            "The lower half contains the selected field's Bounds keys and "
+            "feature-wide visual keys; saved keys for other fields remain "
+            "at their authored times.\n"
             "Right-click or right-drag anywhere in the timeline area to "
             "scrub the shared animation playhead.\n"
             "Red overlays mark ranges where the active features need more "
@@ -112176,15 +112436,32 @@ void DrawTimingColouriseActivationOverview(
                                 TimingColouriseActivationDragPart::End
                             ? xForPosition(range.end)
                             : xForPosition(range.start);
-                    timings.colouriseActivationDrag =
-                        TimingColouriseActivationDragState{
-                            .effectId = effect.id,
-                            .part = hoveredPart.value(),
-                            .mouseStartX = mouse.x,
-                            .grabOffsetPixels = mouse.x - grabbedX,
-                            .originalStart = range.start,
-                            .originalEnd = range.end,
-                        };
+                    if (settingsSpan.has_value() &&
+                        !ImGui::GetIO().KeyAlt) {
+                        timings.colouriseSettingsClipDrag =
+                            TimingColouriseSettingsClipDragState{
+                                .effectId = effect.id,
+                                .part =
+                                    TimingColouriseSettingsClipDragPartFor(
+                                        hoveredPart.value()),
+                                .mouseStartX = mouse.x,
+                                .grabOffsetPixels = mouse.x - grabbedX,
+                                .sourceSpan = settingsSpan.value(),
+                                .cyclicSourceSpan = settingsCyclicSpan,
+                                .originalEffect = effect,
+                                .editRangesTogether = true,
+                            };
+                    } else {
+                        timings.colouriseActivationDrag =
+                            TimingColouriseActivationDragState{
+                                .effectId = effect.id,
+                                .part = hoveredPart.value(),
+                                .mouseStartX = mouse.x,
+                                .grabOffsetPixels = mouse.x - grabbedX,
+                                .originalStart = range.start,
+                                .originalEnd = range.end,
+                            };
+                    }
                 }
             } else if (
                 settingsHovered &&
@@ -112208,6 +112485,8 @@ void DrawTimingColouriseActivationOverview(
                             .sourceSpan = settingsSpan.value(),
                             .cyclicSourceSpan = settingsCyclicSpan,
                             .originalEffect = effect,
+                            .editRangesTogether =
+                                !ImGui::GetIO().KeyAlt,
                         };
                 }
             }
@@ -112278,7 +112557,10 @@ void DrawTimingColouriseActivationOverview(
                 if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
                     const auto activationRange = effect.activationRange;
                     effect = drag.originalEffect;
-                    effect.activationRange = activationRange;
+                    if (!drag.editRangesTogether) {
+                        effect.activationRange = activationRange;
+                    }
+                    range = effect.activationRange;
                     settingsKeyPositions = invisible_places::timing::
                         TimingColouriseEffectSettingsKeyPositions(effect);
                     settingsSpan = deriveSettingsSpan(effect);
@@ -112306,37 +112588,53 @@ void DrawTimingColouriseActivationOverview(
                         const auto cyclicSource =
                             drag.cyclicSourceSpan.value();
                         auto cyclicDestination = cyclicSource;
-                        const float minimumSpan = std::min(
-                            cyclicSource.length,
-                            invisible_places::timing::
-                                kTimingColouriseKeyTolerance);
-                        const float maximumSpan = std::max(
-                            minimumSpan,
-                            1.0F -
+                        auto destinationActivation =
+                            drag.originalEffect.activationRange;
+                        if (drag.editRangesTogether) {
+                            const auto coupled = invisible_places::timing::
+                                ResolveTimingColouriseCoupledCyclicRangeEdit(
+                                    drag.originalEffect.activationRange,
+                                    cyclicSource,
+                                    TimingColouriseRangeEditPartFor(
+                                        drag.part),
+                                    delta);
+                            cyclicDestination = coupled.settingsSpan;
+                            destinationActivation =
+                                coupled.activationRange;
+                        } else {
+                            const float minimumSpan = std::min(
+                                cyclicSource.length,
                                 invisible_places::timing::
                                     kTimingColouriseKeyTolerance);
-                        switch (drag.part) {
-                            case TimingColouriseSettingsClipDragPart::Start: {
-                                const float end =
-                                    cyclicSource.start + cyclicSource.length;
-                                cyclicDestination.start = std::clamp(
-                                    cyclicSource.start + delta,
-                                    end - maximumSpan,
-                                    end - minimumSpan);
-                                cyclicDestination.length =
-                                    end - cyclicDestination.start;
-                                break;
+                            const float maximumSpan = std::max(
+                                minimumSpan,
+                                1.0F -
+                                    invisible_places::timing::
+                                        kTimingColouriseKeyTolerance);
+                            switch (drag.part) {
+                                case TimingColouriseSettingsClipDragPart::Start: {
+                                    const float end =
+                                        cyclicSource.start +
+                                        cyclicSource.length;
+                                    cyclicDestination.start = std::clamp(
+                                        cyclicSource.start + delta,
+                                        end - maximumSpan,
+                                        end - minimumSpan);
+                                    cyclicDestination.length =
+                                        end - cyclicDestination.start;
+                                    break;
+                                }
+                                case TimingColouriseSettingsClipDragPart::End:
+                                    cyclicDestination.length = std::clamp(
+                                        cyclicSource.length + delta,
+                                        minimumSpan,
+                                        maximumSpan);
+                                    break;
+                                case TimingColouriseSettingsClipDragPart::Body:
+                                    cyclicDestination.start =
+                                        cyclicSource.start + delta;
+                                    break;
                             }
-                            case TimingColouriseSettingsClipDragPart::End:
-                                cyclicDestination.length = std::clamp(
-                                    cyclicSource.length + delta,
-                                    minimumSpan,
-                                    maximumSpan);
-                                break;
-                            case TimingColouriseSettingsClipDragPart::Body:
-                                cyclicDestination.start =
-                                    cyclicSource.start + delta;
-                                break;
                         }
                         const bool destinationChanged =
                             std::abs(
@@ -112357,10 +112655,15 @@ void DrawTimingColouriseActivationOverview(
                                         cyclicSource,
                                         cyclicDestination);
                             if (transformedSuccessfully) {
-                                const auto activationRange =
-                                    effect.activationRange;
+                                if (drag.editRangesTogether) {
+                                    transformed.activationRange =
+                                        destinationActivation;
+                                } else {
+                                    transformed.activationRange =
+                                        effect.activationRange;
+                                }
                                 effect = std::move(transformed);
-                                effect.activationRange = activationRange;
+                                range = effect.activationRange;
                                 settingsKeyPositions =
                                     invisible_places::timing::
                                         TimingColouriseEffectSettingsKeyPositions(
@@ -112396,75 +112699,100 @@ void DrawTimingColouriseActivationOverview(
                             }
                         }
                     } else {
-                    // Unlinked: bounded 0..1 timeline, unchanged.
-                    switch (drag.part) {
-                        case TimingColouriseSettingsClipDragPart::Start: {
-                            const float minimumSpan = std::min(
-                                sourceLength,
-                                invisible_places::timing::
-                                    kTimingColouriseKeyTolerance);
-                            destination.start = std::clamp(
-                                source.start + delta,
-                                0.0F,
-                                std::max(0.0F, source.end - minimumSpan));
-                            destination.end = source.end;
-                            break;
-                        }
-                        case TimingColouriseSettingsClipDragPart::End: {
-                            const float minimumSpan = std::min(
-                                sourceLength,
-                                invisible_places::timing::
-                                    kTimingColouriseKeyTolerance);
-                            destination.start = source.start;
-                            destination.end = std::clamp(
-                                source.end + delta,
-                                std::min(1.0F, source.start + minimumSpan),
-                                1.0F);
-                            break;
-                        }
-                        case TimingColouriseSettingsClipDragPart::Body: {
-                            const float destinationStart = std::clamp(
-                                source.start + delta,
-                                0.0F,
-                                std::max(0.0F, 1.0F - sourceLength));
-                            destination.start = destinationStart;
-                            destination.end = destinationStart + sourceLength;
-                            break;
-                        }
-                    }
-
-                    const bool destinationChanged =
-                        std::abs(destination.start - source.start) >
-                            std::numeric_limits<float>::epsilon() ||
-                        std::abs(destination.end - source.end) >
-                            std::numeric_limits<float>::epsilon();
-                    if (destinationChanged || drag.moved) {
-                        auto transformed = drag.originalEffect;
-                        const bool transformedSuccessfully =
-                            !destinationChanged ||
-                            invisible_places::timing::
-                                TransformTimingColouriseEffectSettingsKeys(
-                                    &transformed,
+                        // Unlinked timeline lens: both ranges remain bounded
+                        // to the 0..1 rail.
+                        auto destinationActivation =
+                            drag.originalEffect.activationRange;
+                        if (drag.editRangesTogether) {
+                            const auto coupled = invisible_places::timing::
+                                ResolveTimingColouriseCoupledRangeEdit(
+                                    drag.originalEffect.activationRange,
                                     source,
-                                    destination);
-                        if (transformedSuccessfully) {
-                            // The upper interval is an independent render
-                            // gate and never participates in a settings-clip
-                            // edit, even if another authoring path refreshed
-                            // it since this drag began.
-                            const auto activationRange =
-                                effect.activationRange;
-                            effect = std::move(transformed);
-                            effect.activationRange = activationRange;
-                            settingsKeyPositions = invisible_places::timing::
-                                TimingColouriseEffectSettingsKeyPositions(
-                                    effect);
-                            settingsSpan = deriveSettingsSpan(effect);
-                            drag.moved = true;
-                            runtimeState
-                                ->previewRenderStateSignatureValid = false;
+                                    TimingColouriseRangeEditPartFor(
+                                        drag.part),
+                                    delta);
+                            destination = coupled.settingsSpan;
+                            destinationActivation =
+                                coupled.activationRange;
+                        } else {
+                            switch (drag.part) {
+                                case TimingColouriseSettingsClipDragPart::Start: {
+                                    const float minimumSpan = std::min(
+                                        sourceLength,
+                                        invisible_places::timing::
+                                            kTimingColouriseKeyTolerance);
+                                    destination.start = std::clamp(
+                                        source.start + delta,
+                                        0.0F,
+                                        std::max(
+                                            0.0F,
+                                            source.end - minimumSpan));
+                                    destination.end = source.end;
+                                    break;
+                                }
+                                case TimingColouriseSettingsClipDragPart::End: {
+                                    const float minimumSpan = std::min(
+                                        sourceLength,
+                                        invisible_places::timing::
+                                            kTimingColouriseKeyTolerance);
+                                    destination.start = source.start;
+                                    destination.end = std::clamp(
+                                        source.end + delta,
+                                        std::min(
+                                            1.0F,
+                                            source.start + minimumSpan),
+                                        1.0F);
+                                    break;
+                                }
+                                case TimingColouriseSettingsClipDragPart::Body: {
+                                    const float destinationStart = std::clamp(
+                                        source.start + delta,
+                                        0.0F,
+                                        std::max(
+                                            0.0F,
+                                            1.0F - sourceLength));
+                                    destination.start = destinationStart;
+                                    destination.end =
+                                        destinationStart + sourceLength;
+                                    break;
+                                }
+                            }
                         }
-                    }
+
+                        const bool destinationChanged =
+                            std::abs(destination.start - source.start) >
+                                std::numeric_limits<float>::epsilon() ||
+                            std::abs(destination.end - source.end) >
+                                std::numeric_limits<float>::epsilon();
+                        if (destinationChanged || drag.moved) {
+                            auto transformed = drag.originalEffect;
+                            const bool transformedSuccessfully =
+                                !destinationChanged ||
+                                invisible_places::timing::
+                                    TransformTimingColouriseEffectSettingsKeys(
+                                        &transformed,
+                                        source,
+                                        destination);
+                            if (transformedSuccessfully) {
+                                if (drag.editRangesTogether) {
+                                    transformed.activationRange =
+                                        destinationActivation;
+                                } else {
+                                    transformed.activationRange =
+                                        effect.activationRange;
+                                }
+                                effect = std::move(transformed);
+                                range = effect.activationRange;
+                                settingsKeyPositions =
+                                    invisible_places::timing::
+                                        TimingColouriseEffectSettingsKeyPositions(
+                                            effect);
+                                settingsSpan = deriveSettingsSpan(effect);
+                                drag.moved = true;
+                                runtimeState
+                                    ->previewRenderStateSignatureValid = false;
+                            }
+                        }
                     }
                 }
             }
@@ -112806,8 +113134,8 @@ void DrawTimingColouriseActivationOverview(
                             help.layer ==
                                     TimingColouriseOverviewHelpLayer::
                                         Activation
-                                ? "Active range (upper half)\nDrag either edge to resize the render interval, or drag its body to move it. Setting keys remain at their authored positions."
-                                : "Settings clip (lower half)\nDrag either edge to stretch every setting key, or drag its body to offset all setting keys together. The active range remains unchanged; individual keys stay editable below.");
+                                ? "Active range (upper half)\nDrag an edge or the body to edit the active range and setting keys together. Hold Option/Alt when starting the drag to edit only the active range."
+                                : "Settings clip (lower half)\nDrag an edge or the body to edit the active setting keys and active range together. Hold Option/Alt when starting the drag to edit only the keys. Disabled output tracks, the inactive palette model, inactive fade modes, and saved keys for other fields remain at their authored times.");
                     }
                 } else if (now > help.visibleUntil) {
                     timings.colouriseOverviewHelpHover.reset();
@@ -112892,12 +113220,15 @@ void DrawTimingColouriseActivationOverview(
                                       .currentPath.value()))
                         : 0.0F;
                 ImGui::SetTooltip(
-                    "%s active %.4f–%.4f (%.2f–%.2f s)",
+                    "%s active %.4f–%.4f (%.2f–%.2f s)%s",
                     effect.name.c_str(),
                     range.start,
                     range.end,
                     range.start * durationSeconds,
-                    range.end * durationSeconds);
+                    range.end * durationSeconds,
+                    settingsSpan.has_value()
+                        ? "\nDrag links both ranges; Option/Alt-drag edits only the active range."
+                        : "");
             } else if (
                 hoveredSettingsPart.has_value() &&
                 settingsSpan.has_value()) {
@@ -112927,7 +113258,7 @@ void DrawTimingColouriseActivationOverview(
                               1.0F)
                         : settingsSpan->end;
                 ImGui::SetTooltip(
-                    "%s settings clip %.4f–%.4f%s (%.2f–%.2f s), %zu key position%s",
+                    "%s settings clip %.4f–%.4f%s (%.2f–%.2f s), %zu active key position%s\nDrag links both ranges; Option/Alt-drag edits only the active keys.",
                     effect.name.c_str(),
                     settingsSpan->start,
                     tooltipEnd,

@@ -249,6 +249,150 @@ TEST_CASE(
         0.5F));
 }
 
+TEST_CASE(
+    "Visual Feature overview couples active and settings range edits",
+    "[timing][colourise][activation][settings-clip]") {
+    using invisible_places::timing::TimingColouriseActivationRange;
+    using invisible_places::timing::TimingColouriseCyclicSettingsKeySpan;
+    using invisible_places::timing::TimingColouriseRangeEditPart;
+    using invisible_places::timing::TimingColouriseSettingsKeySpan;
+    using invisible_places::timing::
+        ResolveTimingColouriseCoupledCyclicRangeEdit;
+    using invisible_places::timing::
+        ResolveTimingColouriseCoupledRangeEdit;
+
+    const TimingColouriseActivationRange activation{
+        .start = 0.2F,
+        .end = 0.8F,
+    };
+    const TimingColouriseSettingsKeySpan settings{
+        .start = 0.3F,
+        .end = 0.7F,
+    };
+
+    SECTION("body motion stops when either range reaches the rail") {
+        const auto edit = ResolveTimingColouriseCoupledRangeEdit(
+            activation,
+            settings,
+            TimingColouriseRangeEditPart::Body,
+            0.4F);
+        CHECK(edit.appliedDelta == Approx(0.2F));
+        CHECK(edit.activationRange.start == Approx(0.4F));
+        CHECK(edit.activationRange.end == Approx(1.0F));
+        CHECK(edit.settingsSpan.start == Approx(0.5F));
+        CHECK(edit.settingsSpan.end == Approx(0.9F));
+    }
+
+    SECTION("corresponding start offsets survive a scale") {
+        const auto edit = ResolveTimingColouriseCoupledRangeEdit(
+            activation,
+            settings,
+            TimingColouriseRangeEditPart::Start,
+            -0.4F);
+        CHECK(edit.appliedDelta == Approx(-0.2F));
+        CHECK(edit.activationRange.start == Approx(0.0F));
+        CHECK(edit.activationRange.end == Approx(0.8F));
+        CHECK(edit.settingsSpan.start == Approx(0.1F));
+        CHECK(edit.settingsSpan.end == Approx(0.7F));
+        CHECK(edit.settingsSpan.start - edit.activationRange.start ==
+              Approx(0.1F));
+    }
+
+    SECTION("a non-point settings clip cannot collapse") {
+        const auto edit = ResolveTimingColouriseCoupledRangeEdit(
+            activation,
+            settings,
+            TimingColouriseRangeEditPart::End,
+            -0.5F);
+        CHECK(edit.settingsSpan.end - edit.settingsSpan.start ==
+              Approx(invisible_places::timing::
+                         kTimingColouriseKeyTolerance)
+                  .margin(1.0e-7F));
+        CHECK(edit.activationRange.end == Approx(0.4001F));
+    }
+
+    SECTION("a point key translates with an edited activation edge") {
+        const auto edit = ResolveTimingColouriseCoupledRangeEdit(
+            activation,
+            TimingColouriseSettingsKeySpan{
+                .start = 0.4F,
+                .end = 0.4F,
+            },
+            TimingColouriseRangeEditPart::Start,
+            0.1F);
+        CHECK(edit.activationRange.start == Approx(0.3F));
+        CHECK(edit.activationRange.end == Approx(0.8F));
+        CHECK(edit.settingsSpan.start == Approx(0.5F));
+        CHECK(edit.settingsSpan.end == Approx(0.5F));
+    }
+
+    SECTION("one coupled edge result retimes keys and activation atomically") {
+        TimingColouriseEffect effect;
+        effect.emissiveEnabled = true;
+        effect.activationRange = activation;
+        effect.effectParameterKeys = {
+            {.parameter = TimingColouriseEffectParameter::EmissiveLevel,
+             .position = 0.3F,
+             .value = 1.0F},
+            {.parameter = TimingColouriseEffectParameter::EmissiveLevel,
+             .position = 0.7F,
+             .value = 2.0F},
+        };
+        const auto edit = ResolveTimingColouriseCoupledRangeEdit(
+            activation,
+            settings,
+            TimingColouriseRangeEditPart::Start,
+            -0.1F);
+        REQUIRE(invisible_places::timing::
+                    TransformTimingColouriseEffectSettingsKeys(
+                        &effect,
+                        settings,
+                        edit.settingsSpan));
+        effect.activationRange = edit.activationRange;
+
+        CHECK(effect.activationRange.start == Approx(0.1F));
+        CHECK(effect.activationRange.end == Approx(0.8F));
+        REQUIRE(effect.effectParameterKeys.size() == 2U);
+        CHECK(effect.effectParameterKeys.front().position == Approx(0.2F));
+        CHECK(effect.effectParameterKeys.back().position == Approx(0.7F));
+    }
+
+    SECTION("cyclic keys cross loop zero while activation stays bounded") {
+        const auto moved = ResolveTimingColouriseCoupledCyclicRangeEdit(
+            TimingColouriseActivationRange{
+                .start = 0.1F,
+                .end = 0.9F,
+            },
+            TimingColouriseCyclicSettingsKeySpan{
+                .start = 0.95F,
+                .length = 0.1F,
+            },
+            TimingColouriseRangeEditPart::Body,
+            0.3F);
+        CHECK(moved.appliedDelta == Approx(0.1F));
+        CHECK(moved.activationRange.start == Approx(0.2F));
+        CHECK(moved.activationRange.end == Approx(1.0F));
+        CHECK(moved.settingsSpan.start == Approx(1.05F));
+        CHECK(moved.settingsSpan.length == Approx(0.1F));
+
+        const auto stretched =
+            ResolveTimingColouriseCoupledCyclicRangeEdit(
+                TimingColouriseActivationRange{
+                    .start = 0.1F,
+                    .end = 0.9F,
+                },
+                TimingColouriseCyclicSettingsKeySpan{
+                    .start = 0.95F,
+                    .length = 0.1F,
+                },
+                TimingColouriseRangeEditPart::Start,
+                0.05F);
+        CHECK(stretched.activationRange.start == Approx(0.15F));
+        CHECK(stretched.settingsSpan.start == Approx(1.0F));
+        CHECK(stretched.settingsSpan.length == Approx(0.05F));
+    }
+}
+
 TEST_CASE("Timing Colourise cyclic evaluation interpolates through loop zero",
           "[timing][colourise][cyclic]") {
     using invisible_places::timing::TimingColouriseEffectParameter;
@@ -433,7 +577,7 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "Visual Feature settings clips derive from every owned key family",
+    "Visual Feature settings clips derive only from active key families",
     "[timing][colourise][settings-clip]") {
     using invisible_places::timing::TimingColouriseFieldSelector;
     using invisible_places::timing::TimingColouriseFieldSource;
@@ -445,7 +589,8 @@ TEST_CASE(
         .scalarFieldName = "current",
     };
     // Palette and Palette Phase are dormant while the feature is
-    // emissive-only, but feature-wide timing still owns them.
+    // emissive-only. They stay authored, but do not widen or move with the
+    // overview's active settings clip.
     effect.colouriseEnabled = false;
     effect.emissiveEnabled = true;
     effect.basePalette.stops = {{.id = "tracked", .position = 0.5F}};
@@ -508,27 +653,35 @@ TEST_CASE(
 
     const auto positions = invisible_places::timing::
         TimingColouriseEffectSettingsKeyPositions(effect);
-    REQUIRE(positions.size() == 8U);
-    CHECK(positions.front() == Approx(0.05F));
-    CHECK(positions.back() == Approx(0.95F));
+    REQUIRE(positions.size() == 3U);
+    CHECK(positions[0U] == Approx(0.3F));
+    CHECK(positions[1U] == Approx(0.4F));
+    CHECK(positions[2U] == Approx(0.7F));
+    CHECK(std::find(positions.begin(), positions.end(), 0.1F) ==
+          positions.end());
+    CHECK(std::find(positions.begin(), positions.end(), 0.2F) ==
+          positions.end());
+    CHECK(std::find(positions.begin(), positions.end(), 0.9F) ==
+          positions.end());
     CHECK(std::find(positions.begin(), positions.end(), 0.01F) ==
           positions.end());
     CHECK(std::find(positions.begin(), positions.end(), 0.99F) ==
+          positions.end());
+    CHECK(std::find(positions.begin(), positions.end(), 0.05F) ==
+          positions.end());
+    CHECK(std::find(positions.begin(), positions.end(), 0.95F) ==
           positions.end());
 
     const auto span = invisible_places::timing::
         TimingColouriseEffectSettingsKeySpan(effect);
     REQUIRE(span.has_value());
-    CHECK(span->start == Approx(0.05F));
-    CHECK(span->end == Approx(0.95F));
-    // On the loop the 0.40 -> 0.70 hole (0.30) is wider than the wrap gap
-    // (0.10), so the cyclic clip is the 0.70 -> 0.40 cluster rather than
-    // the linear min..max; the same keys are covered either way.
+    CHECK(span->start == Approx(0.3F));
+    CHECK(span->end == Approx(0.7F));
     const auto cyclicSpan = invisible_places::timing::
         TimingColouriseEffectCyclicSettingsKeySpan(effect);
     REQUIRE(cyclicSpan.has_value());
-    CHECK(cyclicSpan->start == Approx(0.70F));
-    CHECK(cyclicSpan->length == Approx(0.70F));
+    CHECK(cyclicSpan->start == Approx(0.3F));
+    CHECK(cyclicSpan->length == Approx(0.4F));
 
     const auto activationBefore = effect.activationRange;
     REQUIRE(invisible_places::timing::
@@ -537,17 +690,17 @@ TEST_CASE(
                     *span,
                     {.start = 0.2F, .end = 0.8F}));
     const auto mapped = [](float position) {
-        return 0.2F + (position - 0.05F) * (0.6F / 0.9F);
+        return 0.2F + (position - 0.3F) * (0.6F / 0.4F);
     };
     CHECK(effect.activationRange.start == Approx(activationBefore.start));
     CHECK(effect.activationRange.end == Approx(activationBefore.end));
     REQUIRE(effect.paletteKeys.size() == 1U);
-    CHECK(effect.paletteKeys.front().position == Approx(mapped(0.1F)));
+    CHECK(effect.paletteKeys.front().position == Approx(0.1F));
     CHECK(effect.paletteKeys.front().palette.stops.front().colour[1] ==
           Approx(0.2F));
     REQUIRE(effect.paletteStopParameterKeys.size() == 1U);
     CHECK(effect.paletteStopParameterKeys.front().position ==
-          Approx(mapped(0.9F)));
+          Approx(0.9F));
     REQUIRE(effect.boundsParameterKeys.size() == 1U);
     CHECK(effect.boundsParameterKeys.front().position ==
           Approx(mapped(0.7F)));
@@ -561,10 +714,19 @@ TEST_CASE(
                    TimingColouriseEffectParameter::PalettePhase;
         });
     REQUIRE(dormantPhase != effect.effectParameterKeys.end());
-    CHECK(dormantPhase->position == Approx(mapped(0.2F)));
+    CHECK(dormantPhase->position == Approx(0.2F));
     CHECK(dormantPhase->value == Approx(0.3F));
     CHECK(dormantPhase->interpolation ==
           WaterScenarioInterpolation::Hold);
+    const auto activeLevel = std::find_if(
+        effect.effectParameterKeys.begin(),
+        effect.effectParameterKeys.end(),
+        [](const auto& key) {
+            return key.parameter ==
+                   TimingColouriseEffectParameter::EmissiveLevel;
+        });
+    REQUIRE(activeLevel != effect.effectParameterKeys.end());
+    CHECK(activeLevel->position == Approx(mapped(0.4F)));
 
     const auto transformedRemembered = std::find_if(
         effect.fieldBoundsMemory.begin(),
@@ -574,9 +736,9 @@ TEST_CASE(
         });
     REQUIRE(transformedRemembered != effect.fieldBoundsMemory.end());
     CHECK(transformedRemembered->boundsParameterKeys.front().position ==
-          Approx(mapped(0.05F)));
+          Approx(0.05F));
     CHECK(transformedRemembered->boundsKeys.front().position ==
-          Approx(mapped(0.95F)));
+          Approx(0.95F));
 
     // A selected-field memory entry is a cache, not another authored lane;
     // replace its stale snapshot from the transformed live bounds tracks.
@@ -602,9 +764,175 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Visual Feature settings clips ignore inactive palette models and "
+    "disabled output tracks",
+    "[timing][colourise][settings-clip]") {
+    using invisible_places::timing::
+        TimingColouriseEmissiveFalloffKey;
+
+    TimingColouriseEffect effect;
+    effect.colouriseEnabled = true;
+    effect.emissiveEnabled = false;
+    effect.paletteKeyModel = TimingColourisePaletteKeyModel::StopParameters;
+    effect.basePalette.stops = {{.id = "active-stop", .position = 0.5F}};
+    effect.effectParameterKeys = {
+        {.parameter = TimingColouriseEffectParameter::PalettePhase,
+         .position = 0.6F,
+         .value = 0.25F},
+        {.parameter = TimingColouriseEffectParameter::EmissiveLevel,
+         .position = 0.95F,
+         .value = 3.0F},
+    };
+    effect.paletteKeys = {
+        {.position = 0.05F,
+         .palette = Solid({0.8F, 0.2F, 0.1F})},
+    };
+    effect.paletteStopParameterKeys = {
+        {.stopId = "active-stop",
+         .parameter = TimingColourisePaletteStopParameter::ColouriseAmount,
+         .position = 0.4F,
+         .scalarValue = 0.75F},
+    };
+    effect.boundsParameterKeys = {
+        {.parameter = TimingColouriseBoundsParameter::Lower,
+         .position = 0.5F,
+         .value = -2.0F},
+    };
+    effect.emissiveFalloffKeys = {
+        TimingColouriseEmissiveFalloffKey{
+            .nodeId = "dormant-node",
+            .position = 0.9F,
+            .value = 0.2F},
+    };
+
+    const auto positions = invisible_places::timing::
+        TimingColouriseEffectSettingsKeyPositions(effect);
+    REQUIRE(positions.size() == 3U);
+    CHECK(positions[0U] == Approx(0.4F));
+    CHECK(positions[1U] == Approx(0.5F));
+    CHECK(positions[2U] == Approx(0.6F));
+    const auto span = invisible_places::timing::
+        TimingColouriseEffectSettingsKeySpan(effect);
+    REQUIRE(span.has_value());
+    REQUIRE(invisible_places::timing::
+                TransformTimingColouriseEffectSettingsKeys(
+                    &effect,
+                    *span,
+                    {.start = 0.2F, .end = 0.8F}));
+
+    CHECK(effect.paletteStopParameterKeys.front().position ==
+          Approx(0.2F));
+    CHECK(effect.boundsParameterKeys.front().position == Approx(0.5F));
+    CHECK(effect.effectParameterKeys.front().position == Approx(0.8F));
+    // The alternate palette model and disabled Emissive aspect remain
+    // authored at their exact old times.
+    CHECK(effect.paletteKeys.front().position == Approx(0.05F));
+    CHECK(effect.effectParameterKeys.back().position == Approx(0.95F));
+    CHECK(effect.effectParameterKeys.back().value == Approx(3.0F));
+    CHECK(effect.emissiveFalloffKeys.front().position == Approx(0.9F));
+
+    // Switching the active palette model changes which stored palette
+    // family contributes, without deleting either family.
+    effect.paletteKeyModel = TimingColourisePaletteKeyModel::LegacySnapshots;
+    const auto legacyPositions = invisible_places::timing::
+        TimingColouriseEffectSettingsKeyPositions(effect);
+    CHECK(std::find(
+              legacyPositions.begin(),
+              legacyPositions.end(),
+              0.05F) != legacyPositions.end());
+    CHECK(std::find(
+              legacyPositions.begin(),
+              legacyPositions.end(),
+              0.2F) == legacyPositions.end());
+
+    TimingColouriseEffect dormantOnly;
+    dormantOnly.colouriseEnabled = false;
+    dormantOnly.emissiveEnabled = true;
+    dormantOnly.effectParameterKeys = {
+        {.parameter = TimingColouriseEffectParameter::PalettePhase,
+         .position = 0.0F,
+         .value = 0.4F},
+    };
+    dormantOnly.paletteKeys = {
+        {.position = 1.0F,
+         .palette = Solid({0.1F, 0.2F, 0.3F})},
+    };
+    CHECK(invisible_places::timing::
+              TimingColouriseEffectSettingsKeyPositions(dormantOnly)
+                  .empty());
+    CHECK_FALSE(invisible_places::timing::
+                    TimingColouriseEffectSettingsKeySpan(dormantOnly)
+                        .has_value());
+    CHECK_FALSE(invisible_places::timing::
+                    TransformTimingColouriseEffectSettingsKeys(
+                        &dormantOnly,
+                        {.start = 0.0F, .end = 1.0F},
+                        {.start = 0.2F, .end = 0.8F}));
+}
+
+TEST_CASE(
     "Visual Feature settings clip transforms are atomic and lane aware",
     "[timing][colourise][settings-clip]") {
     using invisible_places::timing::TimingColouriseSettingsKeySpan;
+
+    SECTION("a dormant field key cannot ghost the selected field clip") {
+        using invisible_places::timing::TimingColouriseFieldBoundsMemory;
+        using invisible_places::timing::TimingColouriseFieldSelector;
+        using invisible_places::timing::TimingColouriseFieldSource;
+
+        TimingColouriseEffect effect;
+        effect.field = TimingColouriseFieldSelector{
+            .source = TimingColouriseFieldSource::Scalar,
+            .scalarFieldName = "A_R_Slope_deg",
+        };
+        effect.boundsParameterKeys = {
+            {.parameter = TimingColouriseBoundsParameter::Lower,
+             .position = 0.773528F,
+             .value = -1.0F},
+            {.parameter = TimingColouriseBoundsParameter::Lower,
+             .position = 1.0F,
+             .value = -2.0F},
+        };
+        TimingColouriseFieldBoundsMemory crossCurvature;
+        crossCurvature.selector = TimingColouriseFieldSelector{
+            .source = TimingColouriseFieldSource::Scalar,
+            .scalarFieldName = "A_R_CrossCurvature_Combined",
+        };
+        crossCurvature.boundsParameterKeys = {
+            {.parameter = TimingColouriseBoundsParameter::Lower,
+             .position = 0.0F,
+             .value = -3.0F},
+        };
+        effect.fieldBoundsMemory = {crossCurvature};
+
+        const auto positions = invisible_places::timing::
+            TimingColouriseEffectSettingsKeyPositions(effect);
+        REQUIRE(positions.size() == 2U);
+        CHECK(positions.front() == Approx(0.773528F));
+        CHECK(positions.back() == Approx(1.0F));
+        const auto span = invisible_places::timing::
+            TimingColouriseEffectSettingsKeySpan(effect);
+        REQUIRE(span.has_value());
+        CHECK(span->start == Approx(0.773528F));
+        CHECK(span->end == Approx(1.0F));
+
+        REQUIRE(invisible_places::timing::
+                    TransformTimingColouriseEffectSettingsKeys(
+                        &effect,
+                        *span,
+                        {.start = 0.7F, .end = 0.9F}));
+        REQUIRE(effect.boundsParameterKeys.size() == 2U);
+        CHECK(effect.boundsParameterKeys.front().position ==
+              Approx(0.7F));
+        CHECK(effect.boundsParameterKeys.back().position ==
+              Approx(0.9F));
+        REQUIRE(effect.fieldBoundsMemory.size() == 1U);
+        REQUIRE(effect.fieldBoundsMemory.front()
+                    .boundsParameterKeys.size() == 1U);
+        CHECK(effect.fieldBoundsMemory.front()
+                  .boundsParameterKeys.front()
+                  .position == Approx(0.0F));
+    }
 
     SECTION("a coincident point bundle translates without stretching") {
         TimingColouriseEffect effect;
@@ -944,7 +1272,7 @@ TEST_CASE(
                         .has_value());
     }
 
-    SECTION("remembered field keys participate, the current cache does not") {
+    SECTION("remembered field keys do not widen the selected-field clip") {
         TimingColouriseEffect effect;
         effect.field = TimingColouriseFieldSelector{
             .source = TimingColouriseFieldSource::Scalar,
@@ -977,7 +1305,7 @@ TEST_CASE(
         const auto span = TimingColouriseEffectCyclicSettingsKeySpan(effect);
         REQUIRE(span.has_value());
         CHECK(span->start == Approx(0.92F));
-        CHECK(span->length == Approx(0.12F));
+        CHECK(span->length == Approx(0.0F));
     }
 }
 
@@ -1061,7 +1389,7 @@ TEST_CASE(
             1U);
     CHECK(effect.fieldBoundsMemory.front()
               .boundsParameterKeys.front()
-              .position == Approx(0.05F));
+              .position == Approx(0.95F));
     for (const auto& key : effect.effectParameterKeys) {
         CHECK(key.position >= 0.0F);
         CHECK(key.position < 1.0F);
@@ -1100,6 +1428,9 @@ TEST_CASE(
     CHECK(effect.effectParameterKeys[0U].position == Approx(0.10F));
     CHECK(effect.effectParameterKeys[1U].position == Approx(0.95F));
     CHECK(effect.effectParameterKeys[1U].value == Approx(0.2F));
+    CHECK(effect.fieldBoundsMemory.front()
+              .boundsParameterKeys.front()
+              .position == Approx(0.95F));
     (void)original;
 }
 
@@ -1147,6 +1478,66 @@ TEST_CASE(
             TimingColouriseCyclicSettingsKeySpan{.start = 0.95F, .length = 0.0F},
             TimingColouriseCyclicSettingsKeySpan{.start = 1.05F, .length = 0.0F}));
         CHECK(effect.effectParameterKeys.front().position == Approx(0.05F));
+    }
+
+    SECTION("dormant seam keys neither merge nor move") {
+        TimingColouriseEffect effect;
+        effect.colouriseEnabled = false;
+        effect.emissiveEnabled = true;
+        effect.effectParameterKeys = {
+            {.parameter = TimingColouriseEffectParameter::PalettePhase,
+             .position = 0.0F,
+             .value = 0.25F},
+            {.parameter = TimingColouriseEffectParameter::PalettePhase,
+             .position = 1.0F,
+             .value = 0.5F},
+            {.parameter = TimingColouriseEffectParameter::EmissiveLevel,
+             .position = 0.2F,
+             .value = 1.0F},
+            {.parameter = TimingColouriseEffectParameter::EmissiveLevel,
+             .position = 0.4F,
+             .value = 2.0F},
+        };
+        effect.paletteKeys = {
+            {.position = 0.0F,
+             .palette = Solid({0.1F, 0.2F, 0.3F})},
+            {.position = 1.0F,
+             .palette = Solid({0.4F, 0.5F, 0.6F})},
+        };
+
+        const auto span = invisible_places::timing::
+            TimingColouriseEffectCyclicSettingsKeySpan(effect);
+        REQUIRE(span.has_value());
+        CHECK(span->start == Approx(0.2F));
+        CHECK(span->length == Approx(0.2F));
+        REQUIRE(TransformTimingColouriseEffectSettingsKeysCyclic(
+            &effect,
+            *span,
+            TimingColouriseCyclicSettingsKeySpan{
+                .start = 0.3F,
+                .length = 0.2F}));
+
+        REQUIRE(effect.paletteKeys.size() == 2U);
+        CHECK(effect.paletteKeys[0U].position == Approx(0.0F));
+        CHECK(effect.paletteKeys[1U].position == Approx(1.0F));
+        std::vector<float> phasePositions;
+        std::vector<float> emissivePositions;
+        for (const auto& key : effect.effectParameterKeys) {
+            if (key.parameter ==
+                TimingColouriseEffectParameter::PalettePhase) {
+                phasePositions.push_back(key.position);
+            } else if (
+                key.parameter ==
+                TimingColouriseEffectParameter::EmissiveLevel) {
+                emissivePositions.push_back(key.position);
+            }
+        }
+        REQUIRE(phasePositions.size() == 2U);
+        CHECK(phasePositions[0U] == Approx(0.0F));
+        CHECK(phasePositions[1U] == Approx(1.0F));
+        REQUIRE(emissivePositions.size() == 2U);
+        CHECK(emissivePositions[0U] == Approx(0.3F));
+        CHECK(emissivePositions[1U] == Approx(0.5F));
     }
 
     SECTION("more than one loop is rejected") {
@@ -1466,6 +1857,7 @@ TEST_CASE(
 
     SECTION("tracks without a merge keep their authored floats") {
         auto effect = original;
+        effect.emissiveEnabled = true;
         effect.effectParameterKeys.erase(effect.effectParameterKeys.begin());
         effect.effectParameterKeys.push_back(
             {.parameter = TimingColouriseEffectParameter::EmissiveLevel,
@@ -1476,7 +1868,8 @@ TEST_CASE(
              .position = 1.0F,
              .value = 0.9F});
         const auto phaseKeys = effect.effectParameterKeys;
-        // Only the emissive twins merge; the phase keys are untouched bits.
+        // Only the enabled Emissive twins merge; the phase keys are
+        // untouched bits.
         CHECK(CoalesceTimingColouriseEffectCyclicallyCoincidentKeys(&effect) ==
               1U);
         REQUIRE(effect.effectParameterKeys.size() == 3U);
@@ -2874,8 +3267,21 @@ TEST_CASE(
         const auto profile = invisible_places::timing::
             EvaluateTimingEmissiveFalloffProfile(effect, 0.5F);
         CHECK(profile[32] == Approx(1.0F));
+        CHECK(effect.emissiveFalloffKeys.size() == 4U);
+        CHECK(invisible_places::timing::
+                  TimingColouriseEmissiveFalloffTrackChanges(
+                      effect,
+                      "mobile",
+                      TimingColouriseEmissiveFalloffParameter::Level));
+        CHECK_FALSE(invisible_places::timing::
+                        TimingColouriseEmissiveFalloffTrackChanges(
+                            effect,
+                            "mobile",
+                            TimingColouriseEmissiveFalloffParameter::
+                                Position));
 
-        // Keys for unknown nodes are refused; removal works by track.
+        // Keys for unknown nodes are refused; deleting a displayed falloff
+        // key removes the complete curve snapshot at that instant.
         CHECK_FALSE(invisible_places::timing::
                         AddOrUpdateTimingColouriseEmissiveFalloffKey(
                             &effect,
@@ -2885,12 +3291,106 @@ TEST_CASE(
                             0.5F,
                             1.0F));
         CHECK(invisible_places::timing::
-                  RemoveTimingColouriseEmissiveFalloffKeysAtPosition(
+                  RemoveTimingColouriseEmissiveFalloffKeyframeAtPosition(
                       &effect,
-                      "mobile",
-                      TimingColouriseEmissiveFalloffParameter::Level,
-                      1.0F) == 1U);
-        CHECK(effect.emissiveFalloffKeys.size() == 1U);
+                      1.0F) == 2U);
+        CHECK(effect.emissiveFalloffKeys.size() == 2U);
+    }
+
+    SECTION("one falloff edit snapshots every node and coordinate") {
+        effect.emissiveFalloffNodes = {
+            {.id = "left", .position = 0.2F, .level = 0.9F},
+            {.id = "right", .position = 0.8F, .level = 0.1F},
+        };
+        REQUIRE(invisible_places::timing::
+                    AddOrUpdateTimingColouriseEmissiveFalloffKey(
+                        &effect,
+                        "left",
+                        TimingColouriseEmissiveFalloffParameter::Level,
+                        0.0F,
+                        0.9F,
+                        WaterScenarioInterpolation::Linear));
+        REQUIRE(invisible_places::timing::
+                    AddOrUpdateTimingColouriseEmissiveFalloffKey(
+                        &effect,
+                        "right",
+                        TimingColouriseEmissiveFalloffParameter::Position,
+                        1.0F,
+                        0.6F,
+                        WaterScenarioInterpolation::Linear));
+        REQUIRE(invisible_places::timing::
+                    AddOrUpdateTimingColouriseEmissiveFalloffKey(
+                        &effect,
+                        "left",
+                        TimingColouriseEmissiveFalloffParameter::Level,
+                        1.0F,
+                        0.5F,
+                        WaterScenarioInterpolation::Linear));
+
+        // Two nodes x two coordinates x two group frames. Invariant tracks
+        // are stored too, even though the timeline deliberately hides them.
+        REQUIRE(effect.emissiveFalloffKeys.size() == 8U);
+        for (const float keyPosition : {0.0F, 1.0F}) {
+            for (const std::string_view nodeId : {"left", "right"}) {
+                for (const auto parameter : {
+                         TimingColouriseEmissiveFalloffParameter::Position,
+                         TimingColouriseEmissiveFalloffParameter::Level}) {
+                    CHECK(std::count_if(
+                              effect.emissiveFalloffKeys.begin(),
+                              effect.emissiveFalloffKeys.end(),
+                              [&](const auto& key) {
+                                  return key.nodeId == nodeId &&
+                                         key.parameter == parameter &&
+                                         key.position ==
+                                             Approx(keyPosition);
+                              }) == 1);
+                }
+            }
+        }
+        const auto middle = invisible_places::timing::
+            EvaluateTimingColouriseEmissiveFalloffNodes(effect, 0.5F);
+        REQUIRE(middle.size() == 2U);
+        const auto left = std::find_if(
+            middle.begin(), middle.end(), [](const auto& node) {
+                return node.id == "left";
+            });
+        const auto right = std::find_if(
+            middle.begin(), middle.end(), [](const auto& node) {
+                return node.id == "right";
+            });
+        REQUIRE(left != middle.end());
+        REQUIRE(right != middle.end());
+        CHECK(left->position == Approx(0.2F));
+        CHECK(left->level == Approx(0.7F));
+        CHECK(right->position == Approx(0.7F));
+        CHECK(right->level == Approx(0.1F));
+        CHECK(invisible_places::timing::
+                  TimingColouriseEmissiveFalloffTrackChanges(
+                      effect,
+                      "left",
+                      TimingColouriseEmissiveFalloffParameter::Level));
+        CHECK(invisible_places::timing::
+                  TimingColouriseEmissiveFalloffTrackChanges(
+                      effect,
+                      "right",
+                      TimingColouriseEmissiveFalloffParameter::Position));
+        CHECK_FALSE(invisible_places::timing::
+                        TimingColouriseEmissiveFalloffTrackChanges(
+                            effect,
+                            "right",
+                            TimingColouriseEmissiveFalloffParameter::Level));
+
+        const std::vector<std::string> selectedNodes{"left"};
+        CHECK(invisible_places::timing::
+                  RemoveTimingColouriseEmissiveFalloffNodes(
+                      &effect,
+                      selectedNodes) == 1U);
+        CHECK(effect.emissiveFalloffNodes.size() == 1U);
+        CHECK(effect.emissiveFalloffKeys.size() == 4U);
+        CHECK(std::none_of(
+            effect.emissiveFalloffKeys.begin(),
+            effect.emissiveFalloffKeys.end(),
+            [](const auto& key) { return key.nodeId == "left"; }));
     }
 
     SECTION("the emissive skew warp shifts where the falloff lands") {
@@ -5886,6 +6386,49 @@ TEST_CASE(
     CHECK(render.upper == Approx(14.0F));
     CHECK(render.edgeFadeLower == Approx(0.0F));
     CHECK(render.edgeFadeUpper == Approx(0.5F));
+
+    // Absolute endpoints are converted to the renderer's signed span
+    // fractions before the mask is sampled.  Pinning one endpoint to its
+    // bound disables only that side; putting the other endpoint at the
+    // opposite bound must produce a visible full-span ramp, rather than a
+    // full-strength mask across the interval.
+    auto fullSpanEffect = effect;
+    fullSpanEffect.baseBounds = {
+        .lower = 0.0F,
+        .upper = 10.0F,
+        .edgeFadeLower = 10.0F,
+        .edgeFadeUpper = 10.0F,
+    };
+    fullSpanEffect.boundsParameterKeys.clear();
+    const auto lowerFullSpan = invisible_places::timing::
+        EvaluateTimingColouriseBounds(fullSpanEffect, 0.5F);
+    CHECK(lowerFullSpan.edgeFadeLower == Approx(1.0F));
+    CHECK(lowerFullSpan.edgeFadeUpper == Approx(0.0F));
+    CHECK(invisible_places::timing::TimingColouriseBoundsMask(
+              lowerFullSpan,
+              0.0F) == Approx(0.0F));
+    CHECK(invisible_places::timing::TimingColouriseBoundsMask(
+              lowerFullSpan,
+              5.0F) == Approx(0.5F));
+    CHECK(invisible_places::timing::TimingColouriseBoundsMask(
+              lowerFullSpan,
+              10.0F) == Approx(1.0F));
+
+    fullSpanEffect.baseBounds.edgeFadeLower = 0.0F;
+    fullSpanEffect.baseBounds.edgeFadeUpper = 0.0F;
+    const auto upperFullSpan = invisible_places::timing::
+        EvaluateTimingColouriseBounds(fullSpanEffect, 0.5F);
+    CHECK(upperFullSpan.edgeFadeLower == Approx(0.0F));
+    CHECK(upperFullSpan.edgeFadeUpper == Approx(1.0F));
+    CHECK(invisible_places::timing::TimingColouriseBoundsMask(
+              upperFullSpan,
+              0.0F) == Approx(1.0F));
+    CHECK(invisible_places::timing::TimingColouriseBoundsMask(
+              upperFullSpan,
+              5.0F) == Approx(0.5F));
+    CHECK(invisible_places::timing::TimingColouriseBoundsMask(
+              upperFullSpan,
+              10.0F) == Approx(0.0F));
 
     // A representation visited for the first time starts unkeyed from the
     // endpoints visible at the switch position. It then follows its own

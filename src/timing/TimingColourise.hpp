@@ -378,8 +378,9 @@ struct TimingColouriseActivationRange {
 };
 
 // Exact first/last animation-time coordinates owned by one Visual Feature's
-// setting keys. This is derived authoring state, independent of the feature's
-// activation window, and is therefore never serialized.
+// setting keys. This is derived authoring state and is therefore never
+// serialized. The overview may edit it together with the activation window,
+// but both ranges remain independently authored.
 struct TimingColouriseSettingsKeySpan {
     float start = 0.0F;
     float end = 0.0F;
@@ -392,6 +393,29 @@ struct TimingColouriseSettingsKeySpan {
 struct TimingColouriseCyclicSettingsKeySpan {
     float start = 0.0F;
     float length = 0.0F;
+};
+
+enum class TimingColouriseRangeEditPart : std::uint8_t {
+    Start = 0,
+    Body,
+    End,
+};
+
+// Result of one overview gesture that carries the activation window and
+// derived settings clip together. appliedDelta may be smaller than the mouse
+// request when either range reaches a 0..1 boundary or minimum span.
+struct TimingColouriseCoupledRangeEdit {
+    TimingColouriseActivationRange activationRange{};
+    TimingColouriseSettingsKeySpan settingsSpan{};
+    float appliedDelta = 0.0F;
+};
+
+struct TimingColouriseCoupledCyclicRangeEdit {
+    TimingColouriseActivationRange activationRange{};
+    // May be unwrapped during a drag; the cyclic transform accepts any finite
+    // destination start and canonicalizes the stored key positions.
+    TimingColouriseCyclicSettingsKeySpan settingsSpan{};
+    float appliedDelta = 0.0F;
 };
 
 // Remembered bounds authoring for one scalar field selector, so switching a
@@ -1058,23 +1082,43 @@ SanitizeTimingColouriseActivationRange(
     const TimingColouriseEffect& effect,
     float normalizedPosition,
     bool cyclic = false);
-// Derives one feature-wide settings clip from every authoritative animation
-// key, including keys for disabled aspects and remembered non-current field
-// bounds. A remembered entry matching effect.field is a cache of the live
-// bounds tracks and is deliberately not counted twice. The positions helper
-// returns a sorted, tolerance-deduplicated union for clip ticks; the span is
-// nullopt when the feature owns no setting keys.
+// Moves a body or corresponding edge of the activation and settings ranges by
+// one common delta. This preserves deliberate start/end offsets between the
+// two ranges. A point settings clip translates with an edited activation edge
+// because it has no duration to stretch. The cyclic counterpart permits the
+// settings clip to pass loop zero while the activation window remains bounded.
+[[nodiscard]] TimingColouriseCoupledRangeEdit
+ResolveTimingColouriseCoupledRangeEdit(
+    TimingColouriseActivationRange activationRange,
+    TimingColouriseSettingsKeySpan settingsSpan,
+    TimingColouriseRangeEditPart part,
+    float requestedDelta);
+[[nodiscard]] TimingColouriseCoupledCyclicRangeEdit
+ResolveTimingColouriseCoupledCyclicRangeEdit(
+    TimingColouriseActivationRange activationRange,
+    TimingColouriseCyclicSettingsKeySpan settingsSpan,
+    TimingColouriseRangeEditPart part,
+    float requestedDelta);
+// Derives one feature-wide settings clip from only the current active key
+// families: live Bounds, supported parameters for enabled aspects, the active
+// palette key model, and Emissive falloff while Emissive is enabled. Keys for
+// disabled aspects, the inactive palette model, inactive fade modes, and
+// field memories remain stored but are deliberately not represented. The
+// positions helper returns a sorted, tolerance-deduplicated union for clip
+// ticks; the span is nullopt when the current feature state has no active
+// setting keys.
 [[nodiscard]] std::vector<float>
 TimingColouriseEffectSettingsKeyPositions(
     const TimingColouriseEffect& effect);
 [[nodiscard]] std::optional<TimingColouriseSettingsKeySpan>
 TimingColouriseEffectSettingsKeySpan(
     const TimingColouriseEffect& effect);
-// Affinely maps every key represented by source onto destination without
-// changing the activation window, values, interpolation, or other settings.
-// Dormant aspect and non-current field-memory tracks move with the live keys.
+// Affinely maps every active current-state key represented by source onto
+// destination without changing the activation window, values, interpolation,
+// or other settings. Dormant aspect/model, fade-mode, and field-memory tracks
+// retain their authored times.
 // A zero-width source may only translate to another zero-width destination.
-// Invalid bounds, a source that does not contain every owned key, or a
+// Invalid bounds, a source that does not contain every represented key, or a
 // same-lane collision rejects the complete operation without mutation.
 [[nodiscard]] bool TransformTimingColouriseEffectSettingsKeys(
     TimingColouriseEffect* effect,
@@ -1118,17 +1162,21 @@ TimingColouriseEffectSettingsKeySpan(
 TimingColouriseEffectCyclicSettingsKeySpan(
     const TimingColouriseEffect& effect);
 // Cyclic counterpart of TransformTimingColouriseEffectSettingsKeys: every
-// key is unwrapped relative to source.start, affinely mapped onto destination
-// (whose start may be any finite real), and wrapped back into [0, 1). Keys
-// outside the forward source span, a point/non-point mismatch, a length
-// above one cycle, or a same-lane collision measured around the loop reject
-// the whole operation without mutation.
+// represented active current-state key is unwrapped relative to source.start,
+// affinely mapped onto destination (whose start may be any finite real), and
+// wrapped back into [0, 1). Dormant field memories are untouched. Keys outside
+// the forward source span, a point/non-point mismatch, a length above one
+// cycle, or a same-lane collision measured around the loop reject the whole
+// operation without mutation.
 // Same-lane keys that sit on one cyclic instant (0.0 and 1.0, the usual
 // first/last layout of a linear-authored feature) are merged the way cyclic
 // evaluation already merges them: the linear-later key survives, and Palette
 // Phase deltas are re-encoded so every remaining key keeps the accumulated
-// phase the cyclic lens was showing. Returns the number of keys removed. The cyclic transform applies this itself; the key
-// lane drag applies it to a selection that wraps both keys together.
+// phase the cyclic lens was showing. Only current active key families are
+// considered; every dormant key family is untouched.
+// Returns the number of keys removed. The cyclic transform applies this
+// itself; the key lane drag applies it to a selection that wraps both keys
+// together.
 std::size_t CoalesceTimingColouriseEffectCyclicallyCoincidentKeys(
     TimingColouriseEffect* effect);
 [[nodiscard]] bool TransformTimingColouriseEffectSettingsKeysCyclic(
@@ -1291,12 +1339,22 @@ EvaluateTimingEmissiveFalloffProfile(
     bool cyclic = false);
 [[nodiscard]] std::string AllocateTimingColouriseEmissiveFalloffNodeId(
     std::span<const TimingColouriseEmissiveFalloffNode> nodes);
+// Falloff keyframes are complete curve snapshots. Adding or changing one
+// node coordinate also stores Position and Level for every falloff node at
+// that animation position, so all nodes interpolate between the same frames.
 [[nodiscard]] bool AddOrUpdateTimingColouriseEmissiveFalloffKey(
     TimingColouriseEffect* effect,
     std::string_view nodeId,
     TimingColouriseEmissiveFalloffParameter parameter,
     float position,
     float value,
+    invisible_places::water::WaterScenarioInterpolation interpolation =
+        invisible_places::water::WaterScenarioInterpolation::SmoothVelocity,
+    bool cyclic = false);
+[[nodiscard]] bool AddOrUpdateTimingColouriseEmissiveFalloffKeyframe(
+    TimingColouriseEffect* effect,
+    float position,
+    bool cyclic = false,
     invisible_places::water::WaterScenarioInterpolation interpolation =
         invisible_places::water::WaterScenarioInterpolation::SmoothVelocity);
 [[nodiscard]] std::size_t
@@ -1305,6 +1363,19 @@ RemoveTimingColouriseEmissiveFalloffKeysAtPosition(
     std::string_view nodeId,
     TimingColouriseEmissiveFalloffParameter parameter,
     float position);
+[[nodiscard]] std::size_t
+RemoveTimingColouriseEmissiveFalloffKeyframeAtPosition(
+    TimingColouriseEffect* effect,
+    float position);
+[[nodiscard]] std::size_t RemoveTimingColouriseEmissiveFalloffNodes(
+    TimingColouriseEffect* effect,
+    std::span<const std::string> nodeIds);
+// Complete snapshots intentionally include invariant tracks; the timeline
+// uses this query to draw only coordinates whose stored values really vary.
+[[nodiscard]] bool TimingColouriseEmissiveFalloffTrackChanges(
+    const TimingColouriseEffect& effect,
+    std::string_view nodeId,
+    TimingColouriseEmissiveFalloffParameter parameter);
 [[nodiscard]] TimingColourisePalette EvaluateTimingColourisePalette(
     const TimingColouriseEffect& effect,
     float normalizedPosition,

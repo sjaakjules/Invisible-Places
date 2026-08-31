@@ -797,8 +797,13 @@ honoured stored styles, keys are authoritative at their exact instant, and new
 keys default to Monotone Spline); keyed stop colours shall interpolate in an authored sRGB,
 linear-light, or OkLab space and tint their curve. Emissive output shall
 support a falloff profile over the bounds: level-multiplier nodes joined by
-a Monotone Spline, each node keyable over time, shaped by the falloff's own
-skew warp, and previewed as a mid-grey response strip atop the histogram.
+a Monotone Spline and shaped by the falloff's own skew warp. The curve shall
+support click and window selection of nodes plus Delete/Backspace removal.
+Authoring any falloff key shall store Position and Level for every node as one
+complete snapshot; all coordinates shall interpolate between those shared
+instants, while the unified timeline shall draw only node-coordinate tracks
+whose stored values change. The result shall be previewed as a mid-grey
+response strip atop the histogram.
 Value-graph time markers shall hang below the axis, select every key at
 their time (or a pre-selected subset), and drags shall snap onto other
 keys' times unless a dragged key would stack on its own setting, with a
