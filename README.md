@@ -158,8 +158,18 @@ The `vcpkg.json` manifest currently includes:
 3. Configure:
 
 ```bash
-cmake --preset macos-debug-home-vcpkg
+./scripts/configure_macos.sh macos-debug-home-vcpkg
 ```
+
+The macOS configure wrapper first verifies that the selected compiler can read
+the C++20 and Objective-C++ standard-library headers. It uses a working Apple
+Clang when available and otherwise discovers Homebrew LLVM under either the
+Apple Silicon or Intel Homebrew prefix. Set `INVISIBLE_PLACES_CXX` to a
+`clang++` path to override that choice on one machine. The wrapper also replaces
+an unusable compiler retained by an existing local CMake cache; no compiler path
+is stored in the repository. When the Homebrew fallback is required, the local
+app links the matching Homebrew libc++ runtime; a normal Apple Clang build on
+the other Mac continues to use its system runtime.
 
 4. Build:
 
@@ -176,7 +186,7 @@ cmake --build --preset build-macos-debug-home-vcpkg
 An optimised build (`RelWithDebInfo`: `-O2` with symbols, tests off) lives beside it and is what to run when using the app rather than debugging it — CPU-side work such as the linked HQ preparation is several times faster, while GPU-bound frame times are unchanged:
 
 ```bash
-cmake --preset macos-release-home-vcpkg && cmake --build --preset build-macos-release-home-vcpkg --target invisible_places
+./scripts/configure_macos.sh macos-release-home-vcpkg && cmake --build --preset build-macos-release-home-vcpkg --target invisible_places
 ./build/macos-release/invisible_places.app/Contents/MacOS/invisible_places ./Data
 ```
 

@@ -10,13 +10,14 @@ If you are using VS Code:
 2. Open the Run and Debug panel.
 3. Choose one of:
    - `Debug Invisible Places App`
+   - `Run Invisible Places App (Release)`
    - `Debug Invisible Places Tests`
    - `Debug Asset Discovery Test Only`
 4. Press `F5`.
 
-The debug launch configurations automatically:
+The launch configurations automatically:
 
-- build the debug target first,
+- build the selected target first,
 - run from the workspace root,
 - pass the `Data/` directory as the program argument,
 - disable most macOS unified-log noise in the VS Code debug console.
@@ -28,6 +29,9 @@ The workspace also includes reusable tasks:
 - `configure-debug`
 - `build-debug`
 - `run-app`
+- `configure-release`
+- `build-release`
+- `run-app-release`
 - `run-tests`
 
 These are useful even if you are not stepping through code yet.
@@ -37,10 +41,15 @@ These are useful even if you are not stepping through code yet.
 If you want to debug from the terminal instead of an editor:
 
 ```bash
-cmake --preset macos-debug-home-vcpkg
+./scripts/configure_macos.sh macos-debug-home-vcpkg
 cmake --build --preset build-macos-debug-home-vcpkg
 lldb -- ./build/macos-debug/invisible_places.app/Contents/MacOS/invisible_places "/Users/juju/Documents/Repositories/Invisible Places/Data"
 ```
+
+The wrapper keeps the same build directory and preset on both Macs while
+selecting a compiler that actually has complete C++/Objective-C++ headers. An
+explicit `INVISIBLE_PLACES_CXX=/path/to/clang++` override remains available for
+machine-local toolchain experiments.
 
 Inside LLDB:
 

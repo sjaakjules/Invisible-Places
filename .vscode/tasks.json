@@ -4,9 +4,9 @@
     {
       "label": "configure-debug",
       "type": "shell",
-      "command": "cmake",
+      "command": "/bin/sh",
       "args": [
-        "--preset",
+        "${workspaceFolder}/scripts/configure_macos.sh",
         "macos-debug-home-vcpkg"
       ],
       "options": {
@@ -60,9 +60,9 @@
     {
       "label": "configure-release",
       "type": "shell",
-      "command": "cmake",
+      "command": "/bin/sh",
       "args": [
-        "--preset",
+        "${workspaceFolder}/scripts/configure_macos.sh",
         "macos-release-home-vcpkg"
       ],
       "options": {
