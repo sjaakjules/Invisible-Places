@@ -19,7 +19,6 @@ inline constexpr std::string_view kAuthoredTimingTakeName = "Authored Timing";
 // Authoring remains unrestricted. This is only the shared responsiveness
 // recommendation for how many effects should overlap at one animation time.
 inline constexpr std::size_t kTimingColouriseSoftActiveEffectLimit = 5U;
-inline constexpr std::size_t kMaximumTimingColourisePaletteStops = 8U;
 inline constexpr std::size_t kTimingColouriseLutSampleCount = 64U;
 inline constexpr float kTimingColouriseKeyTolerance = 1.0e-4F;
 // Positive fades consume the selected interval and therefore stop at one
@@ -1587,8 +1586,12 @@ NextTimingColourisePaletteMarkerKeyPosition(
 [[nodiscard]] std::optional<std::pair<float, float>>
 TimingColouriseAnimatedPaletteMarkerRange(
     const TimingColouriseEffect& effect);
-// Stop topology is static for independent property tracks. Removing a stop
-// is refused while it has keys, preserving dormant animation data.
+// Stop-parameter palettes may change topology while animated. Adding a stop
+// backfills its Position into every existing marker-group keyframe; removing
+// one also removes every property key that addresses that stable stop id.
+[[nodiscard]] bool AddTimingColourisePaletteStop(
+    TimingColouriseEffect* effect,
+    TimingColourisePaletteStop stop);
 [[nodiscard]] bool CanRemoveTimingColourisePaletteStop(
     const TimingColouriseEffect& effect,
     std::string_view stopId);

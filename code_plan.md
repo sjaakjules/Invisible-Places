@@ -514,13 +514,22 @@ Keep v1 simple and predictable.
   clips, dormant tracks, and manual spline handles. Absolute Colourise scalar
   controls reuse `DrawRangedFloatControl`; Palette Phase keeps its relative
   signed-turn rail and accumulated wrapped graph.
-- Treat palette marker Position keys as one authoring group without changing
-  the stored per-stop key format. The palette's vertical `+ / < / > / X` rail,
-  graph insertion, retiming, deletion, and paste create or operate on every
-  marker Position at that moment; stop Colour and Colourise Amount remain
-  independent. Give all marker Position curves the same graph range computed
-  from only per-marker tracks with differing authored values, so invariant
-  group members do not force a `0..1` view. Keep legacy snapshot palettes on
+- Keep palette stops in an uncapped vector with stable ids. Palette-surface
+  selection owns Delete/Backspace, and stop removal erases every Position,
+  Colour, and Colourise Amount key for that id. Adding a stop to an animated
+  stop-parameter palette backfills its Position at every existing marker-group
+  key time; active legacy whole-palette snapshots retain fixed topology.
+- Treat the palette's vertical `+ / < / > / X` Position rail as group
+  authoring without changing the stored per-stop key format, while direct
+  per-marker graph edits remain independent. Build adaptive lane descriptors:
+  Palette-only visibility emits every Position/Amount marker plus three
+  Colour-coordinate lanes in the effect's selected interpolation space; mixed
+  visibility emits a directly editable per-marker lane when exactly one track
+  varies, or a read-only arithmetic-mean lane when several do. Expand an
+  aggregate's lower time marker back to its real stop keys for selection,
+  deletion, and retiming, and exclude its summary nodes from value gestures.
+  Compute Position range only from tracks with differing authored values so
+  invariant group members do not widen it. Keep legacy snapshot palettes on
   their existing whole-palette path.
 - Treat each Emissive falloff key time as one complete curve snapshot without
   changing the stored per-node key format. The curve editor owns click and
@@ -537,7 +546,9 @@ Keep v1 simple and predictable.
   Position, Fade, Skew, Palette, and Intensity; Palette and Intensity appear
   only when their output aspect is enabled. `VisualFeatureTimeline.hpp`
   assigns a separate snap domain to every group, so keys snap within their own
-  kind but never across the shared graph. Visibility is UI state only, so
+  kind but never across the shared graph. Add a session-only Palette Map toggle
+  that samples the fully evaluated LUT over time and draws it vertically behind
+  the curves. Visibility is UI state only, so
   existing effect parameters, typed key APIs, and serialized key schemas
   remain unchanged.
 - Project schema 74 / water-sources schema 28 add per-feature-timeline

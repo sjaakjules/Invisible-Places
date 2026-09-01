@@ -3080,9 +3080,6 @@ std::array<float, 3> TimingColouriseColourFromSpace(
 
 TimingColourisePalette SanitizeTimingColourisePalette(
     TimingColourisePalette palette) {
-    if (palette.stops.size() > kMaximumTimingColourisePaletteStops) {
-        palette.stops.resize(kMaximumTimingColourisePaletteStops);
-    }
     for (auto& stop : palette.stops) {
         stop.position = Clamp01(stop.position);
         for (float& channel : stop.colour) {
@@ -9960,11 +9957,84 @@ TimingColouriseAnimatedPaletteMarkerRange(
     return range;
 }
 
+bool AddTimingColourisePaletteStop(
+    TimingColouriseEffect* effect,
+    TimingColourisePaletteStop stop) {
+    if (effect == nullptr ||
+        (effect->paletteKeyModel ==
+             TimingColourisePaletteKeyModel::LegacySnapshots &&
+         !effect->paletteKeys.empty())) {
+        return false;
+    }
+    auto updated = *effect;
+    updated.basePalette =
+        SanitizeTimingColourisePalette(std::move(updated.basePalette));
+    std::unordered_set<std::string> existingIds;
+    for (const auto& existing : updated.basePalette.stops) {
+        existingIds.insert(existing.id);
+    }
+    if (stop.id.empty() || existingIds.contains(stop.id)) {
+        stop.id = AllocateTimingColourisePaletteStopId(
+            updated.basePalette);
+    }
+    const std::string addedId = stop.id;
+    updated.basePalette.stops.push_back(std::move(stop));
+    updated.basePalette =
+        SanitizeTimingColourisePalette(std::move(updated.basePalette));
+    const auto added = std::find_if(
+        updated.basePalette.stops.begin(),
+        updated.basePalette.stops.end(),
+        [&](const TimingColourisePaletteStop& candidate) {
+            return candidate.id == addedId;
+        });
+    if (added == updated.basePalette.stops.end()) {
+        return false;
+    }
+    const float addedPosition = added->position;
+    updated.paletteKeyModel =
+        TimingColourisePaletteKeyModel::StopParameters;
+
+    // Marker Position keys are group snapshots. A stop added after animation
+    // was authored joins every existing snapshot at its base position, so a
+    // topology edit cannot create a partial or apparently missing track.
+    const auto markerPositions =
+        TimingColourisePaletteMarkerKeyPositions(updated);
+    for (const float keyPosition : markerPositions) {
+        auto interpolation = invisible_places::water::
+            WaterScenarioInterpolation::SmoothVelocity;
+        if (const auto source = std::find_if(
+                updated.paletteStopParameterKeys.begin(),
+                updated.paletteStopParameterKeys.end(),
+                [&](const TimingColourisePaletteStopParameterKey& key) {
+                    return key.parameter ==
+                               TimingColourisePaletteStopParameter::Position &&
+                           std::abs(key.position - keyPosition) <=
+                               kTimingColouriseKeyTolerance;
+                });
+            source != updated.paletteStopParameterKeys.end()) {
+            interpolation = source->interpolation;
+        }
+        if (!AddOrUpdateTimingColourisePaletteStopScalarKey(
+                &updated,
+                addedId,
+                TimingColourisePaletteStopParameter::Position,
+                keyPosition,
+                addedPosition,
+                interpolation)) {
+            return false;
+        }
+    }
+    *effect = std::move(updated);
+    return true;
+}
+
 bool CanRemoveTimingColourisePaletteStop(
     const TimingColouriseEffect& effect,
     std::string_view stopId) {
     if (stopId.empty() || effect.basePalette.stops.size() <= 1U ||
-        !effect.paletteKeys.empty()) {
+        (effect.paletteKeyModel ==
+             TimingColourisePaletteKeyModel::LegacySnapshots &&
+         !effect.paletteKeys.empty())) {
         return false;
     }
     const bool stopExists = std::any_of(
@@ -9973,13 +10043,7 @@ bool CanRemoveTimingColourisePaletteStop(
         [&](const TimingColourisePaletteStop& stop) {
             return stop.id == stopId;
         });
-    const bool hasKeys = std::any_of(
-        effect.paletteStopParameterKeys.begin(),
-        effect.paletteStopParameterKeys.end(),
-        [&](const TimingColourisePaletteStopParameterKey& key) {
-            return key.stopId == stopId;
-        });
-    return stopExists && !hasKeys;
+    return stopExists;
 }
 
 bool RemoveTimingColourisePaletteStop(
@@ -9993,6 +10057,11 @@ bool RemoveTimingColourisePaletteStop(
         effect->basePalette.stops,
         [&](const TimingColourisePaletteStop& stop) {
             return stop.id == stopId;
+        });
+    std::erase_if(
+        effect->paletteStopParameterKeys,
+        [&](const TimingColourisePaletteStopParameterKey& key) {
+            return key.stopId == stopId;
         });
     effect->basePalette = SanitizeTimingColourisePalette(
         std::move(effect->basePalette));

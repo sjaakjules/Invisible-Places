@@ -2583,6 +2583,34 @@ TEST_CASE(
     moved = invisible_places::timing::SanitizeTimingColourisePalette(
         std::move(moved));
     CHECK(moved.stops.front().id == "mineral");
+
+    // Palette authoring is vector-backed rather than capped at the old eight
+    // markers. Sanitisation preserves every practical marker and repairs ids
+    // without changing the compiled palette contract.
+    TimingColourisePalette large;
+    large.stops.clear();
+    for (std::size_t index = 0U; index < 32U; ++index) {
+        const float amount = static_cast<float>(index) / 31.0F;
+        large.stops.push_back({
+            .position = amount,
+            .colour = {amount, 1.0F - amount, 0.25F},
+            .colouriseAmount = amount,
+        });
+    }
+    large = invisible_places::timing::SanitizeTimingColourisePalette(
+        std::move(large));
+    REQUIRE(large.stops.size() == 32U);
+    std::vector<std::string> largeIds;
+    for (const auto& stop : large.stops) {
+        largeIds.push_back(stop.id);
+    }
+    std::sort(largeIds.begin(), largeIds.end());
+    CHECK(std::adjacent_find(largeIds.begin(), largeIds.end()) ==
+          largeIds.end());
+    const auto largeLut = invisible_places::timing::
+        CompileTimingColourisePaletteLut(large);
+    CHECK(largeLut.front()[0] == Approx(0.0F));
+    CHECK(largeLut.back()[0] == Approx(1.0F));
 }
 
 TEST_CASE(
@@ -4426,43 +4454,133 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "Timing Colourise refuses to remove keyed palette topology",
+    "Timing Colourise keyed palettes add and remove marker topology cleanly",
     "[timing][colourise][palette][topology]") {
     TimingColouriseEffect effect;
     effect.basePalette = invisible_places::timing::
         SanitizeTimingColourisePalette({
             .stops = {
-                {.id = "keyed", .position = 0.0F},
-                {.id = "unkeyed", .position = 1.0F},
+                {.id = "left", .position = 0.0F},
+                {.id = "right", .position = 1.0F},
             },
         });
+    auto keyedPalette = effect.basePalette;
+    REQUIRE(
+        invisible_places::timing::
+            AddOrUpdateTimingColourisePaletteMarkerKeys(
+                &effect,
+                0.2F,
+                keyedPalette));
+    keyedPalette.stops[0].position = 0.1F;
+    keyedPalette.stops[1].position = 0.9F;
+    REQUIRE(
+        invisible_places::timing::CanRemoveTimingColourisePaletteStop(
+            effect, "left"));
+    REQUIRE(
+        invisible_places::timing::
+            AddOrUpdateTimingColourisePaletteMarkerKeys(
+            &effect,
+            0.8F,
+            keyedPalette));
+
+    REQUIRE(invisible_places::timing::AddTimingColourisePaletteStop(
+        &effect,
+        TimingColourisePaletteStop{
+            .id = "middle",
+            .position = 0.5F,
+            .colour = {0.4F, 0.5F, 0.6F},
+            .colouriseAmount = 0.7F,
+        }));
+    REQUIRE(effect.basePalette.stops.size() == 3U);
+    CHECK(
+        invisible_places::timing::
+            TimingColourisePaletteMarkerKeyCountAtPosition(
+                effect,
+                0.2F) == 3U);
+    CHECK(
+        invisible_places::timing::
+            TimingColourisePaletteMarkerKeyCountAtPosition(
+                effect,
+                0.8F) == 3U);
+    const auto middlePositionKeys = static_cast<std::size_t>(std::count_if(
+        effect.paletteStopParameterKeys.begin(),
+        effect.paletteStopParameterKeys.end(),
+        [](const auto& key) {
+            return key.stopId == "middle" &&
+                   key.parameter ==
+                       TimingColourisePaletteStopParameter::Position &&
+                   key.scalarValue == 0.5F;
+        }));
+    CHECK(middlePositionKeys == 2U);
+
     REQUIRE(
         invisible_places::timing::
             AddOrUpdateTimingColourisePaletteStopColourKey(
                 &effect,
-                "keyed",
+                "middle",
                 0.4F,
                 {1.0F, 0.0F, 0.0F}));
-    CHECK_FALSE(
-        invisible_places::timing::CanRemoveTimingColourisePaletteStop(
-            effect,
-            "keyed"));
-    CHECK_FALSE(
-        invisible_places::timing::RemoveTimingColourisePaletteStop(
-            &effect,
-            "keyed"));
+    REQUIRE(
+        invisible_places::timing::
+            AddOrUpdateTimingColourisePaletteStopScalarKey(
+                &effect,
+                "middle",
+                TimingColourisePaletteStopParameter::ColouriseAmount,
+                0.6F,
+                0.25F));
+    CHECK(invisible_places::timing::CanRemoveTimingColourisePaletteStop(
+        effect,
+        "middle"));
+    REQUIRE(invisible_places::timing::RemoveTimingColourisePaletteStop(
+        &effect,
+        "middle"));
+    CHECK(effect.basePalette.stops.size() == 2U);
+    CHECK(std::none_of(
+        effect.paletteStopParameterKeys.begin(),
+        effect.paletteStopParameterKeys.end(),
+        [](const auto& key) { return key.stopId == "middle"; }));
     CHECK(
-        invisible_places::timing::CanRemoveTimingColourisePaletteStop(
-            effect,
-            "unkeyed"));
-    CHECK(
-        invisible_places::timing::RemoveTimingColourisePaletteStop(
+        invisible_places::timing::
+            TimingColourisePaletteMarkerKeyCountAtPosition(
+                effect,
+                0.2F) == 2U);
+
+    REQUIRE(invisible_places::timing::RemoveTimingColourisePaletteStop(
+        &effect,
+        "right"));
+    CHECK_FALSE(invisible_places::timing::RemoveTimingColourisePaletteStop(
             &effect,
-            "unkeyed"));
-    CHECK_FALSE(
-        invisible_places::timing::RemoveTimingColourisePaletteStop(
-            &effect,
-            "keyed"));
+            "left"));
+    REQUIRE(invisible_places::timing::AddTimingColourisePaletteStop(
+        &effect,
+        TimingColourisePaletteStop{
+            .id = "left",
+            .position = 0.5F,
+        }));
+    CHECK(effect.basePalette.stops.size() == 2U);
+    CHECK(std::count_if(
+              effect.basePalette.stops.begin(),
+              effect.basePalette.stops.end(),
+              [](const auto& stop) { return stop.id == "left"; }) == 1);
+
+    TimingColouriseEffect legacy;
+    legacy.basePalette = invisible_places::timing::
+        SanitizeTimingColourisePalette({
+            .stops = {
+                {.id = "legacy-left", .position = 0.0F},
+                {.id = "legacy-right", .position = 1.0F},
+            },
+        });
+    invisible_places::timing::AddOrUpdateTimingColourisePaletteKey(
+        &legacy,
+        0.5F,
+        legacy.basePalette);
+    CHECK_FALSE(invisible_places::timing::CanRemoveTimingColourisePaletteStop(
+        legacy,
+        "legacy-left"));
+    CHECK_FALSE(invisible_places::timing::AddTimingColourisePaletteStop(
+        &legacy,
+        TimingColourisePaletteStop{.position = 0.5F}));
 }
 
 TEST_CASE(

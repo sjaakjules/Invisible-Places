@@ -786,16 +786,26 @@ rest of a scalar field; they stay linked through one recoloured "Ends Fade"
 control until a fade handle is
 double-clicked apart, splitting into per-edge tinted columns. Every
 geometric bounds coordinate shall remain text-editable in any Bounds Keying
-mode, writing through the keyed pair. Palette marker Positions shall key as
-one complete group through a vertical `+ / < / > / X` rail beside the palette;
-Colour and Colourise Amount shall remain independent stop tracks. Every marker
-Position curve shall share the min/max of only the marker tracks whose authored
-values vary, excluding invariant group-keyed markers from that axis. Other
-keyed palette-stop properties shall join the shared value graph as one
-auto-ranged curve per track with the full curve-style set (Linear and Hold are
-honoured stored styles, keys are authoritative at their exact instant, and new
-keys default to Monotone Spline); keyed stop colours shall interpolate in an authored sRGB,
-linear-light, or OkLab space and tint their curve. Emissive output shall
+mode, writing through the keyed pair. Palette authoring shall not impose a
+fixed marker-count ceiling. A clicked marker shall have an unmistakable
+selected state, and Delete/Backspace shall remove it and every stop-parameter
+key that addresses its stable id while always retaining at least one marker.
+Palette marker Positions shall key as one complete group through a vertical
+`+ / < / > / X` rail beside the palette; Colour and Colourise Amount shall
+remain independent stop tracks. In the shared value graph, one marker whose
+stored values vary shall remain a directly value-editable curve; several
+varying markers of one property shall collapse to a read-only arithmetic-mean
+curve whose underlying keys can be moved only with its lower time marker.
+When Palette is the only visible key group, every marker Position and
+Colourise Amount track shall expand into its own curve. Colour tracks shall
+likewise expand into the three coordinates of their authored sRGB,
+linear-light, or OkLab interpolation space; compact mode shall use the same
+single-marker/average rule. Invariant group-keyed Position tracks shall not
+widen the animated-marker axis. The full curve-style set shall remain active
+(Linear and Hold are honoured stored styles, exact keys are authoritative, and
+new keys default to Monotone Spline). A session-only display toggle shall draw
+the evaluated palette vertically across animation time behind the curves.
+Emissive output shall
 support a falloff profile over the bounds: level-multiplier nodes joined by
 a Monotone Spline and shaped by the falloff's own skew warp. The curve shall
 support click and window selection of nodes plus Delete/Backspace removal.
@@ -814,8 +824,9 @@ scalar numeric settings shall occupy a separate block below. When Colourise is
 enabled, its preset and saved-palette selectors shall sit directly below
 Bounds Profile and above Histogram Axis. Position, Fade, Skew, Palette, and
 Intensity key groups shall be independently showable for the session without
-deleting keys; Palette and Intensity visibility controls shall appear only
-for their enabled output aspects. Each group shall snap only to its own kind
+deleting keys; an optional Palette Map shall be independently showable behind
+the curves. Palette and Intensity visibility controls shall appear only for
+their enabled output aspects. Each group shall snap only to its own kind
 on the shared graph. Disabling Colourise or Emissive shall hide that aspect's
 interactive editor and timeline group while retaining its dormant authored
 data. Double-clicking open

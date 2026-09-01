@@ -904,6 +904,7 @@ struct TimingColouriseLocalKeyPositionEditState {
     std::optional<
         invisible_places::timing::TimingColourisePaletteStopParameter>
         stopParameter;
+    std::optional<std::uint8_t> paletteColourComponent;
     std::optional<
         invisible_places::timing::TimingColouriseEmissiveFalloffParameter>
         falloffParameter;
@@ -957,6 +958,9 @@ struct TimingColouriseKeyHandle {
     std::optional<
         invisible_places::timing::TimingColourisePaletteStopParameter>
         stopParameter;
+    // Colour keys store all three coordinates together. Component lanes
+    // address one coordinate in the effect's actual interpolation space.
+    std::optional<std::uint8_t> paletteColourComponent;
     std::optional<
         invisible_places::timing::TimingColouriseEmissiveFalloffParameter>
         falloffParameter;
@@ -971,6 +975,7 @@ bool TimingColouriseKeyHandlesMatch(
            left.effectParameter == right.effectParameter &&
            left.stopId == right.stopId &&
            left.stopParameter == right.stopParameter &&
+           left.paletteColourComponent == right.paletteColourComponent &&
            left.falloffParameter == right.falloffParameter &&
            std::abs(left.position - right.position) <=
                invisible_places::timing::kTimingColouriseKeyTolerance;
@@ -2252,6 +2257,7 @@ struct TimingsPanelState {
     bool colouriseFadeTimelineVisible = true;
     bool colouriseSkewTimelineVisible = true;
     bool colourisePaletteTimelineVisible = true;
+    bool colourisePaletteTimelineStripVisible = false;
     bool colouriseIntensityTimelineVisible = true;
     // Remembered variant choice per scalar family so switching families
     // returns to the variant the user last authored with.
@@ -100314,6 +100320,8 @@ std::size_t InsertTimingColourisePaletteStop(
     const auto selectedIndex = static_cast<std::size_t>(
         std::distance(palette->stops.begin(), insertion));
     palette->stops.insert(insertion, std::move(stop));
+    *palette = invisible_places::timing::
+        SanitizeTimingColourisePalette(std::move(*palette));
     return selectedIndex;
 }
 
@@ -100636,10 +100644,7 @@ bool DrawTimingPalettePreview(
         ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
     if (doubleClickedEmptySpectrum && editable != nullptr &&
         allowEditing && allowTopologyEditing &&
-        selectedStopIndex != nullptr &&
-        editable->stops.size() <
-            invisible_places::timing::
-                kMaximumTimingColourisePaletteStops) {
+        selectedStopIndex != nullptr) {
         const float newPosition =
             SnapTimingColourisePaletteStopPosition(
                 *editable,
@@ -100820,8 +100825,9 @@ bool DrawTimingPalettePreview(
         "stop sampled from the existing colour. Click a marker "
         "to select it, drag it horizontally, or double-click it "
         "to edit its colour. Drag its dash over the gradient "
-        "vertically to set Colourise Amount. Stops and amounts "
-        "snap to 0, 0.5, and 1.");
+        "vertically to set Colourise Amount. The selected marker "
+        "has a bright outline; Delete/Backspace removes it and its "
+        "keys. Stops and amounts snap to 0, 0.5, and 1.");
     if (hovered && !helpMarkHovered) {
         if (!allowEditing) {
             ImGui::SetTooltip(
@@ -100843,21 +100849,16 @@ bool DrawTimingPalettePreview(
             ImGui::SetTooltip(
                 "Stop %zu — position %.4f, Colourise Amount %.3f\n"
                 "Click to select; drag horizontally to reposition.\n"
-                "Double-click to edit the colour.",
+                "Double-click to edit the colour; Delete/Backspace removes "
+                "the selected marker and its keys.",
                 hoveredStop.value() + 1U,
                 stop.position,
                 stop.colouriseAmount);
         } else if (!allowTopologyEditing) {
             ImGui::SetTooltip(
-                "Palette keys exist, so stop topology is locked. "
-                "Existing markers can still be selected and keyed.");
-        } else if (
-            editable->stops.size() >=
-            invisible_places::timing::
-                kMaximumTimingColourisePaletteStops) {
-            ImGui::SetTooltip(
-                "This palette has the maximum eight colour stops. "
-                "Select a marker below the spectrum to edit or remove it.");
+                "Legacy whole-palette snapshots keep their authored stop "
+                "topology. Stop-parameter palettes allow any number of "
+                "markers, including while they are animated.");
         }
     }
     return changed;
@@ -100882,9 +100883,15 @@ struct TimingColouriseKeyLaneSeries {
     std::optional<
         invisible_places::timing::TimingColourisePaletteStopParameter>
         stopParameter;
+    std::optional<std::uint8_t> paletteColourComponent;
     std::optional<
         invisible_places::timing::TimingColouriseEmissiveFalloffParameter>
         falloffParameter;
+    // Non-empty means this is a read-only average of several stored stop
+    // tracks. Its curve nodes are visual summaries; the lower marker expands
+    // back to the real keys for retiming and deletion.
+    std::vector<std::string> paletteAggregateStopIds;
+    bool valueEditable = true;
     // Owned storage for dynamically built lanes; `positions` points at it
     // when used. Both owned fields need a fix-up pass after the containing
     // vector stops growing, because growth relocates them.
@@ -100990,6 +100997,7 @@ TimingColouriseKeyHandle TimingColouriseKeyHandleForLane(
         .effectParameter = lane.effectParameter,
         .stopId = lane.stopId,
         .stopParameter = lane.stopParameter,
+        .paletteColourComponent = lane.paletteColourComponent,
         .falloffParameter = lane.falloffParameter,
         .position = position,
     };
@@ -101072,11 +101080,33 @@ TimingColouriseExactScalarKey(
     }
     if (handle.track == TimingColouriseKeyTrack::Palette &&
         handle.stopParameter.has_value()) {
-        // Colour keys have no single scalar; their lane is time-only.
         if (handle.stopParameter.value() ==
             invisible_places::timing::
                 TimingColourisePaletteStopParameter::Colour) {
-            return std::nullopt;
+            if (!handle.paletteColourComponent.has_value() ||
+                handle.paletteColourComponent.value() >= 3U) {
+                return std::nullopt;
+            }
+            const auto found = std::find_if(
+                effect.paletteStopParameterKeys.begin(),
+                effect.paletteStopParameterKeys.end(),
+                [&](const auto& key) {
+                    return key.stopId == handle.stopId &&
+                           key.parameter == handle.stopParameter.value() &&
+                           std::abs(key.position - handle.position) <=
+                               invisible_places::timing::
+                                   kTimingColouriseKeyTolerance;
+                });
+            if (found == effect.paletteStopParameterKeys.end()) {
+                return std::nullopt;
+            }
+            const auto coordinates = invisible_places::timing::
+                TimingColouriseColourToSpace(
+                    found->colourValue,
+                    effect.colourKeyInterpolationSpace);
+            return std::pair{
+                coordinates[handle.paletteColourComponent.value()],
+                found->interpolation};
         }
         const auto found = std::find_if(
             effect.paletteStopParameterKeys.begin(),
@@ -101151,6 +101181,7 @@ bool CopySelectedTimingColouriseKeys(
     };
     constexpr float kPaletteClusterTolerance =
         invisible_places::timing::kTimingColouriseKeyTolerance * 4.0F;
+    std::vector<TimingColouriseKeyHandle> copiedPaletteKeys;
     for (const auto& handle : selection->keys) {
         if (handle.track == TimingColouriseKeyTrack::Bounds ||
             handle.track == TimingColouriseKeyTrack::EffectParameter) {
@@ -101171,6 +101202,19 @@ bool CopySelectedTimingColouriseKeys(
         }
         if (handle.track == TimingColouriseKeyTrack::Palette &&
             handle.stopParameter.has_value()) {
+            const bool alreadyCopied = std::any_of(
+                copiedPaletteKeys.begin(),
+                copiedPaletteKeys.end(),
+                [&](const auto& copied) {
+                    return copied.stopId == handle.stopId &&
+                           copied.stopParameter == handle.stopParameter &&
+                           std::abs(copied.position - handle.position) <=
+                               invisible_places::timing::
+                                   kTimingColouriseKeyTolerance;
+                });
+            if (alreadyCopied) {
+                continue;
+            }
             // A per-stop track handle copies exactly its one key.
             const auto exact = std::find_if(
                 effect.paletteStopParameterKeys.begin(),
@@ -101207,6 +101251,7 @@ bool CopySelectedTimingColouriseKeys(
                 .paletteStopParameter = exact->parameter,
                 .colourValue = exact->colourValue,
             });
+            copiedPaletteKeys.push_back(handle);
             continue;
         }
 
@@ -101285,20 +101330,12 @@ bool DeleteSelectedTimingColouriseKeys(
         } else if (
             handle.track == TimingColouriseKeyTrack::Palette &&
             handle.stopParameter.has_value()) {
-            if (handle.stopParameter == invisible_places::timing::
-                    TimingColourisePaletteStopParameter::Position) {
-                removed += invisible_places::timing::
-                    RemoveTimingColourisePaletteMarkerKeysAtPosition(
-                        effect,
-                        handle.position);
-            } else {
-                removed += invisible_places::timing::
-                    RemoveTimingColourisePaletteStopParameterKeysAtPosition(
-                        effect,
-                        handle.stopId,
-                        handle.stopParameter.value(),
-                        handle.position);
-            }
+            removed += invisible_places::timing::
+                RemoveTimingColourisePaletteStopParameterKeysAtPosition(
+                    effect,
+                    handle.stopId,
+                    handle.stopParameter.value(),
+                    handle.position);
         } else if (handle.track == TimingColouriseKeyTrack::Palette) {
             removed += invisible_places::timing::
                 RemoveTimingColourisePaletteKeysAtPosition(
@@ -101522,7 +101559,8 @@ void DrawTimingKeyLaneGroup(
     const char* id,
     PreviewRuntimeState* runtimeState,
     invisible_places::timing::TimingColouriseEffect* effect,
-    std::span<const TimingColouriseKeyLaneSeries> series) {
+    std::span<const TimingColouriseKeyLaneSeries> series,
+    bool drawPaletteTimeStrip) {
     if (runtimeState == nullptr || effect == nullptr ||
         series.empty()) {
         return;
@@ -101732,6 +101770,8 @@ void DrawTimingKeyLaneGroup(
                    state.effectParameter == lane.effectParameter &&
                    state.stopId == lane.stopId &&
                    state.stopParameter == lane.stopParameter &&
+                   state.paletteColourComponent ==
+                       lane.paletteColourComponent &&
                    state.falloffParameter == lane.falloffParameter;
         };
     const auto findMatchingSeries =
@@ -101914,60 +101954,110 @@ void DrawTimingKeyLaneGroup(
                            lane.effectParameter.value(),
                            destinationPosition) > 0U;
         };
-    // A per-stop lane's curve height: the stop's evaluated position or
-    // amount, or for Colour tracks its perceptual OkLab lightness, so the
-    // colour-tinted line still has a meaningful shape.
+    // Palette lanes either read one stable marker id or the arithmetic mean
+    // of the changing marker ids represented by a compact aggregate lane.
+    // Colour coordinates use the same space as the model's interpolation,
+    // so every drawn component is the value the evaluator actually blends.
     const auto stopLaneValueFromPalette =
-        [](const invisible_places::timing::TimingColourisePalette&
-               palette,
-           const TimingColouriseKeyLaneSeries& lane)
+        [&](const invisible_places::timing::TimingColourisePalette& palette,
+            const TimingColouriseKeyLaneSeries& lane)
             -> std::optional<float> {
-            const auto stop = std::find_if(
-                palette.stops.begin(),
-                palette.stops.end(),
-                [&](const auto& candidate) {
-                    return candidate.id == lane.stopId;
-                });
-            if (stop == palette.stops.end() ||
-                !lane.stopParameter.has_value()) {
+            if (!lane.stopParameter.has_value()) {
                 return std::nullopt;
             }
-            switch (lane.stopParameter.value()) {
-                case invisible_places::timing::
-                    TimingColourisePaletteStopParameter::Position:
-                    return stop->position;
-                case invisible_places::timing::
-                    TimingColourisePaletteStopParameter::
-                        ColouriseAmount:
-                    return stop->colouriseAmount;
-                case invisible_places::timing::
-                    TimingColourisePaletteStopParameter::Colour:
-                    return invisible_places::timing::
-                        TimingColouriseColourToSpace(
-                            stop->colour,
+            const auto valueForStop = [&](const auto& stop) {
+                switch (lane.stopParameter.value()) {
+                    case invisible_places::timing::
+                        TimingColourisePaletteStopParameter::Position:
+                        return std::optional<float>{stop.position};
+                    case invisible_places::timing::
+                        TimingColourisePaletteStopParameter::
+                            ColouriseAmount:
+                        return std::optional<float>{stop.colouriseAmount};
+                    case invisible_places::timing::
+                        TimingColourisePaletteStopParameter::Colour:
+                        if (!lane.paletteColourComponent.has_value() ||
+                            lane.paletteColourComponent.value() >= 3U) {
+                            return std::optional<float>{};
+                        }
+                        return std::optional<float>{
                             invisible_places::timing::
-                                TimingColouriseColourSpace::OkLab)[0];
+                                TimingColouriseColourToSpace(
+                                    stop.colour,
+                                    effect->colourKeyInterpolationSpace)
+                                    [lane.paletteColourComponent.value()]};
+                }
+                return std::optional<float>{};
+            };
+            float total = 0.0F;
+            std::size_t count = 0U;
+            const auto includeStop = [&](const auto& stop) {
+                const auto value = valueForStop(stop);
+                if (value.has_value() && std::isfinite(value.value())) {
+                    total += value.value();
+                    ++count;
+                }
+            };
+            if (!lane.paletteAggregateStopIds.empty()) {
+                for (const auto& stop : palette.stops) {
+                    if (std::find(
+                            lane.paletteAggregateStopIds.begin(),
+                            lane.paletteAggregateStopIds.end(),
+                            stop.id) != lane.paletteAggregateStopIds.end()) {
+                        includeStop(stop);
+                    }
+                }
+            } else {
+                const auto stop = std::find_if(
+                    palette.stops.begin(),
+                    palette.stops.end(),
+                    [&](const auto& candidate) {
+                        return candidate.id == lane.stopId;
+                    });
+                if (stop != palette.stops.end()) {
+                    includeStop(*stop);
+                }
             }
-            return std::nullopt;
+            return count == 0U
+                       ? std::nullopt
+                       : std::optional<float>{
+                             total / static_cast<float>(count)};
         };
     const auto stopLaneColourFromPalette =
         [](const invisible_places::timing::TimingColourisePalette&
                palette,
            const TimingColouriseKeyLaneSeries& lane)
             -> std::optional<ImU32> {
-            const auto stop = std::find_if(
-                palette.stops.begin(),
-                palette.stops.end(),
-                [&](const auto& candidate) {
-                    return candidate.id == lane.stopId;
-                });
-            if (stop == palette.stops.end()) {
+            std::array<float, 3U> total{};
+            std::size_t count = 0U;
+            for (const auto& stop : palette.stops) {
+                if (!lane.paletteAggregateStopIds.empty()) {
+                    if (std::find(
+                            lane.paletteAggregateStopIds.begin(),
+                            lane.paletteAggregateStopIds.end(),
+                            stop.id) == lane.paletteAggregateStopIds.end()) {
+                        continue;
+                    }
+                } else if (stop.id != lane.stopId) {
+                    continue;
+                }
+                for (std::size_t channel = 0U;
+                     channel < total.size();
+                     ++channel) {
+                    total[channel] += stop.colour[channel];
+                }
+                ++count;
+            }
+            if (count == 0U) {
                 return std::nullopt;
             }
+            for (auto& channel : total) {
+                channel /= static_cast<float>(count);
+            }
             return ImGui::ColorConvertFloat4ToU32(ImVec4{
-                stop->colour[0],
-                stop->colour[1],
-                stop->colour[2],
+                total[0],
+                total[1],
+                total[2],
                 1.0F});
         };
     const auto scalarValueAt =
@@ -102103,6 +102193,7 @@ void DrawTimingKeyLaneGroup(
         float maximum = 0.0F;
         bool wrappedPalettePhase = false;
         bool sharedPaletteMarkerRange = false;
+        bool sharedPaletteMarkerBaseRange = false;
     };
     std::vector<float> graphPositions;
     std::vector<float> graphViewFractions;
@@ -102258,6 +102349,23 @@ void DrawTimingKeyLaneGroup(
             if (graph.wrappedPalettePhase) {
                 graph.minimum = -1.0F;
                 graph.maximum = 1.0F;
+            } else if (
+                colourStopLane &&
+                lane.paletteColourComponent.has_value()) {
+                const bool okLabChroma =
+                    effect->colourKeyInterpolationSpace ==
+                        invisible_places::timing::
+                            TimingColouriseColourSpace::OkLab &&
+                    lane.paletteColourComponent.value() > 0U;
+                graph.minimum = okLabChroma ? -0.5F : 0.0F;
+                graph.maximum = okLabChroma ? 0.5F : 1.0F;
+            } else if (
+                stopLane &&
+                lane.stopParameter == invisible_places::timing::
+                                          TimingColourisePaletteStopParameter::
+                                              ColouriseAmount) {
+                graph.minimum = 0.0F;
+                graph.maximum = 1.0F;
             } else {
                 const float magnitude = std::max(
                     std::abs(graph.minimum),
@@ -102277,9 +102385,9 @@ void DrawTimingKeyLaneGroup(
         // markers should not force the graph to show the palette's full
         // 0..1 domain. Give every marker Position curve the same range made
         // from only the marker tracks whose authored values actually vary.
-        if (const auto markerRange = invisible_places::timing::
-                TimingColouriseAnimatedPaletteMarkerRange(*effect);
-            markerRange.has_value()) {
+        const auto markerRange = invisible_places::timing::
+            TimingColouriseAnimatedPaletteMarkerRange(*effect);
+        if (markerRange.has_value()) {
             for (auto& graph : valueGraphs) {
                 if (graph.lane->track !=
                         TimingColouriseKeyTrack::Palette ||
@@ -102292,6 +102400,45 @@ void DrawTimingKeyLaneGroup(
                 graph.maximum = markerRange->second;
                 graph.sharedPaletteMarkerRange = true;
             }
+        } else {
+            // Palette-only view also emits unkeyed constant marker curves. If
+            // no marker actually animates, give those curves one common range
+            // so their base positions remain vertically distinguishable. As
+            // soon as any marker varies, the active-only range above takes
+            // over and invariant tracks stop contributing again.
+            float positionMinimum = std::numeric_limits<float>::max();
+            float positionMaximum = std::numeric_limits<float>::lowest();
+            std::size_t positionGraphCount = 0U;
+            for (const auto& graph : valueGraphs) {
+                if (graph.lane->track !=
+                        TimingColouriseKeyTrack::Palette ||
+                    graph.lane->stopParameter !=
+                        invisible_places::timing::
+                            TimingColourisePaletteStopParameter::Position) {
+                    continue;
+                }
+                ++positionGraphCount;
+                for (const float value : graph.values) {
+                    positionMinimum = std::min(positionMinimum, value);
+                    positionMaximum = std::max(positionMaximum, value);
+                }
+            }
+            if (positionGraphCount > 1U &&
+                positionMaximum - positionMinimum >
+                    invisible_places::timing::
+                        kTimingColouriseKeyTolerance) {
+                for (auto& graph : valueGraphs) {
+                    if (graph.lane->track ==
+                            TimingColouriseKeyTrack::Palette &&
+                        graph.lane->stopParameter ==
+                            invisible_places::timing::
+                                TimingColourisePaletteStopParameter::Position) {
+                        graph.minimum = positionMinimum;
+                        graph.maximum = positionMaximum;
+                        graph.sharedPaletteMarkerBaseRange = true;
+                    }
+                }
+            }
         }
 
         drawList->AddRectFilled(
@@ -102299,6 +102446,86 @@ void DrawTimingKeyLaneGroup(
             maximum,
             ImGui::GetColorU32(ImGuiCol_FrameBg),
             2.0F);
+        if (drawPaletteTimeStrip) {
+            // Draw time horizontally and the evaluated palette vertically.
+            // A modest grid is enough for a continuous-looking map while
+            // keeping this optional authoring aid cheaper than the preview.
+            const int timeSamples = std::clamp(
+                static_cast<int>(std::ceil(width / 16.0F)),
+                24,
+                72);
+            constexpr std::size_t kVerticalBands = 20U;
+            std::vector<invisible_places::timing::TimingColouriseLut>
+                paletteSlices;
+            paletteSlices.reserve(
+                static_cast<std::size_t>(timeSamples));
+            for (int index = 0; index < timeSamples; ++index) {
+                const float fraction = timeSamples > 1
+                    ? static_cast<float>(index) /
+                          static_cast<float>(timeSamples - 1)
+                    : 0.0F;
+                paletteSlices.push_back(
+                    invisible_places::timing::
+                        EvaluateTimingColourisePaletteLut(
+                            *effect,
+                            timelineCoordinates.ViewFractionToAuthored(
+                                fraction),
+                            cyclicTiming));
+            }
+            const auto stripColour = [](const auto& sample) {
+                return ImGui::ColorConvertFloat4ToU32(ImVec4{
+                    sample[0], sample[1], sample[2], 0.30F});
+            };
+            for (int timeIndex = 1;
+                 timeIndex < timeSamples;
+                 ++timeIndex) {
+                const float leftFraction =
+                    static_cast<float>(timeIndex - 1) /
+                    static_cast<float>(timeSamples - 1);
+                const float rightFraction =
+                    static_cast<float>(timeIndex) /
+                    static_cast<float>(timeSamples - 1);
+                const float leftX = minimum.x + width * leftFraction;
+                const float rightX = minimum.x + width * rightFraction;
+                const auto& left = paletteSlices[
+                    static_cast<std::size_t>(timeIndex - 1)];
+                const auto& right = paletteSlices[
+                    static_cast<std::size_t>(timeIndex)];
+                for (std::size_t band = 0U;
+                     band < kVerticalBands;
+                     ++band) {
+                    const float lower =
+                        static_cast<float>(band) /
+                        static_cast<float>(kVerticalBands);
+                    const float upper =
+                        static_cast<float>(band + 1U) /
+                        static_cast<float>(kVerticalBands);
+                    const auto lutIndex = [](float value) {
+                        return std::min<std::size_t>(
+                            invisible_places::timing::
+                                kTimingColouriseLutSampleCount - 1U,
+                            static_cast<std::size_t>(std::round(
+                                value * static_cast<float>(
+                                    invisible_places::timing::
+                                        kTimingColouriseLutSampleCount -
+                                    1U))));
+                    };
+                    const std::size_t lowerIndex = lutIndex(lower);
+                    const std::size_t upperIndex = lutIndex(upper);
+                    const float topY =
+                        std::lerp(axisY, graphTopY, upper);
+                    const float bottomY =
+                        std::lerp(axisY, graphTopY, lower);
+                    drawList->AddRectFilledMultiColor(
+                        ImVec2{leftX, topY},
+                        ImVec2{rightX, bottomY},
+                        stripColour(left[upperIndex]),
+                        stripColour(right[upperIndex]),
+                        stripColour(right[lowerIndex]),
+                        stripColour(left[lowerIndex]));
+                }
+            }
+        }
         drawList->AddRect(
             minimum,
             maximum,
@@ -102360,6 +102587,73 @@ void DrawTimingKeyLaneGroup(
                     .keys = std::move(handles),
                     .rangeAnchor = std::move(anchor),
                 };
+        };
+    const auto appendLaneHandlesAtPosition =
+        [&](const TimingColouriseKeyLaneSeries& lane,
+            float position,
+            std::vector<TimingColouriseKeyHandle>* handles) {
+            if (handles == nullptr) {
+                return;
+            }
+            if (lane.paletteAggregateStopIds.empty()) {
+                AddUniqueTimingColouriseKeyHandle(
+                    handles,
+                    TimingColouriseKeyHandleForLane(lane, position));
+                return;
+            }
+            for (const auto& key : effect->paletteStopParameterKeys) {
+                if (key.parameter != lane.stopParameter ||
+                    std::abs(key.position - position) >
+                        invisible_places::timing::
+                            kTimingColouriseKeyTolerance ||
+                    std::find(
+                        lane.paletteAggregateStopIds.begin(),
+                        lane.paletteAggregateStopIds.end(),
+                        key.stopId) == lane.paletteAggregateStopIds.end()) {
+                    continue;
+                }
+                AddUniqueTimingColouriseKeyHandle(
+                    handles,
+                    TimingColouriseKeyHandle{
+                        .track = TimingColouriseKeyTrack::Palette,
+                        .stopId = key.stopId,
+                        .stopParameter = key.parameter,
+                        .paletteColourComponent =
+                            lane.paletteColourComponent,
+                        .position = key.position,
+                    });
+            }
+        };
+    const auto laneRepresentsHandle =
+        [&](const TimingColouriseKeyLaneSeries& lane,
+            const TimingColouriseKeyHandle& handle) {
+            if (lane.paletteAggregateStopIds.empty()) {
+                return sameTrack(handle, lane);
+            }
+            return handle.track == TimingColouriseKeyTrack::Palette &&
+                   handle.stopParameter == lane.stopParameter &&
+                   handle.paletteColourComponent ==
+                       lane.paletteColourComponent &&
+                   std::find(
+                       lane.paletteAggregateStopIds.begin(),
+                       lane.paletteAggregateStopIds.end(),
+                       handle.stopId) != lane.paletteAggregateStopIds.end();
+        };
+    const auto lanePositionSelected =
+        [&](const TimingColouriseKeyLaneSeries& lane, float position) {
+            if (!timings.colouriseKeySelection.has_value() ||
+                timings.colouriseKeySelection->effectId != effect->id) {
+                return false;
+            }
+            return std::any_of(
+                timings.colouriseKeySelection->keys.begin(),
+                timings.colouriseKeySelection->keys.end(),
+                [&](const auto& selected) {
+                    return laneRepresentsHandle(lane, selected) &&
+                           std::abs(selected.position - position) <=
+                               invisible_places::timing::
+                                   kTimingColouriseKeyTolerance;
+                });
         };
     const auto selectClickedHandle =
         [&](const TimingColouriseKeyLaneSeries& lane,
@@ -102450,9 +102744,11 @@ void DrawTimingKeyLaneGroup(
                 TimingColourisePaletteKeyModel;
             using invisible_places::timing::
                 TimingColourisePaletteStopParameter;
+            if (!lane.valueEditable) {
+                return false;
+            }
             position = std::clamp(position, 0.0F, 1.0F);
             bool added = false;
-            bool groupedMarkerPositions = false;
             if (lane.track == TimingColouriseKeyTrack::EffectParameter &&
                 lane.effectParameter.has_value()) {
                 const auto parameter = lane.effectParameter.value();
@@ -102562,43 +102858,41 @@ void DrawTimingKeyLaneGroup(
                             return candidate.id == lane.stopId;
                         });
                     if (stop != palette.stops.end()) {
-                        // A single graph ordinate is OkLab lightness only;
-                        // key the full evaluated colour rather than inventing
-                        // chroma from a vertical click.
-                        added = invisible_places::timing::
-                            AddOrUpdateTimingColourisePaletteStopColourKey(
-                                effect,
-                                lane.stopId,
-                                position,
+                        auto coordinates = invisible_places::timing::
+                            TimingColouriseColourToSpace(
                                 stop->colour,
-                                interpolation);
+                                effect->colourKeyInterpolationSpace);
+                        if (lane.paletteColourComponent.has_value() &&
+                            lane.paletteColourComponent.value() < 3U) {
+                            coordinates[lane.paletteColourComponent.value()] =
+                                scalarValue;
+                            added = invisible_places::timing::
+                                AddOrUpdateTimingColourisePaletteStopColourKey(
+                                    effect,
+                                    lane.stopId,
+                                    position,
+                                    invisible_places::timing::
+                                        TimingColouriseColourFromSpace(
+                                            coordinates,
+                                            effect->
+                                                colourKeyInterpolationSpace),
+                                    interpolation);
+                        }
                     }
                 } else if (
                     parameter ==
                     TimingColourisePaletteStopParameter::Position) {
-                    auto palette = invisible_places::timing::
-                        EvaluateTimingColourisePalette(
-                            *effect,
+                    // A directly manipulated marker curve changes only that
+                    // marker. The lower rail expands aggregate/grouped times
+                    // back to every represented key for coordinated retiming.
+                    added = invisible_places::timing::
+                        AddOrUpdateTimingColourisePaletteStopScalarKey(
+                            effect,
+                            lane.stopId,
+                            parameter,
                             position,
-                            cyclicTiming);
-                    const auto stop = std::find_if(
-                        palette.stops.begin(),
-                        palette.stops.end(),
-                        [&](const auto& candidate) {
-                            return candidate.id == lane.stopId;
-                        });
-                    if (stop != palette.stops.end()) {
-                        stop->position = std::clamp(
                             scalarValue,
-                            0.0F,
-                            1.0F);
-                        added = invisible_places::timing::
-                            AddOrUpdateTimingColourisePaletteMarkerKeys(
-                                effect,
-                                position,
-                                std::move(palette));
-                        groupedMarkerPositions = added;
-                    }
+                            interpolation);
                 } else {
                     added = invisible_places::timing::
                         AddOrUpdateTimingColourisePaletteStopScalarKey(
@@ -102663,32 +102957,14 @@ void DrawTimingKeyLaneGroup(
             timings.colouriseKeyMarquee.reset();
             const auto handle =
                 TimingColouriseKeyHandleForLane(lane, position);
-            if (groupedMarkerPositions) {
-                std::vector<TimingColouriseKeyHandle> markerHandles;
-                markerHandles.reserve(effect->basePalette.stops.size());
-                for (const auto& stop : effect->basePalette.stops) {
-                    markerHandles.push_back({
-                        .track = TimingColouriseKeyTrack::Palette,
-                        .stopId = stop.id,
-                        .stopParameter =
-                            TimingColourisePaletteStopParameter::Position,
-                        .position = position,
-                    });
-                }
-                replaceSelection(std::move(markerHandles), handle);
-            } else {
-                replaceSelection({handle}, handle);
-            }
+            replaceSelection({handle}, handle);
             ScrubFeatureTimelineToAuthoredPosition(
                 runtimeState,
                 position);
             runtimeState->previewRenderStateSignatureValid = false;
             runtimeState->statusMessage =
-                groupedMarkerPositions
-                    ? "Added grouped palette-marker Position keys at " +
-                          FormatFixed(position, 4) + "."
-                    : std::string{"Added "} + lane.label +
-                          " key at " + FormatFixed(position, 4) + ".";
+                std::string{"Added "} + lane.label +
+                " key at " + FormatFixed(position, 4) + ".";
             return true;
         };
 
@@ -102699,6 +102975,9 @@ void DrawTimingKeyLaneGroup(
     float hoveredDotDistance = 7.0F;
     if (itemHovered && !keyHelpHovered) {
         for (const auto& graph : valueGraphs) {
+            if (!graph.lane->valueEditable) {
+                continue;
+            }
             for (const float position : graph.lane->positions) {
                 if (!positionInView(position)) {
                     continue;
@@ -102754,7 +103033,7 @@ void DrawTimingKeyLaneGroup(
                     series.begin(),
                     series.end(),
                     [&](const auto& lane) {
-                        return sameTrack(selected, lane);
+                        return laneRepresentsHandle(lane, selected);
                     });
                 if (visible) {
                     return selected;
@@ -102838,6 +103117,8 @@ void DrawTimingKeyLaneGroup(
                     .effectParameter = handle.effectParameter,
                     .stopId = handle.stopId,
                     .stopParameter = handle.stopParameter,
+                    .paletteColourComponent =
+                        handle.paletteColourComponent,
                     .falloffParameter = handle.falloffParameter,
                     .sourcePosition = handle.position,
                     .draftPosition = handle.position,
@@ -102852,11 +103133,16 @@ void DrawTimingKeyLaneGroup(
                 return nullptr;
             }
             if (valueGraphs.size() == 1U) {
-                return &valueGraphs.front();
+                return valueGraphs.front().lane->valueEditable
+                           ? &valueGraphs.front()
+                           : nullptr;
             }
             const ValueGraph* nearest = nullptr;
             float nearestDistance = 28.0F;
             for (const auto& graph : valueGraphs) {
+                if (!graph.lane->valueEditable) {
+                    continue;
+                }
                 const auto evaluated =
                     scalarValueAt(*graph.lane, position);
                 if (!evaluated.has_value()) {
@@ -102929,9 +103215,6 @@ void DrawTimingKeyLaneGroup(
         }
     } else if (markerHovered && nearestSeries != nullptr) {
         ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
-        const auto handle = TimingColouriseKeyHandleForLane(
-            *nearestSeries,
-            nearestPosition);
         if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
             // An unselected lower handle forms a time-only cluster from all
             // visible coincident keys. If a dot at this time is already
@@ -102946,18 +103229,23 @@ void DrawTimingKeyLaneGroup(
                                 lanePosition - nearestPosition) <=
                             invisible_places::timing::
                                 kTimingColouriseKeyTolerance) {
-                            AddUniqueTimingColouriseKeyHandle(
-                                &cluster,
-                                TimingColouriseKeyHandleForLane(
-                                    lane,
-                                    lanePosition));
+                            appendLaneHandlesAtPosition(
+                                lane,
+                                lanePosition,
+                                &cluster);
                         }
                     }
                 }
-                replaceSelection(std::move(cluster), handle);
-                dragHandle = handle;
+                if (!cluster.empty()) {
+                    dragHandle = cluster.front();
+                    replaceSelection(
+                        std::move(cluster),
+                        dragHandle.value());
+                }
             }
-            armKeyDrag(dragHandle.value(), true, false);
+            if (dragHandle.has_value()) {
+                armKeyDrag(dragHandle.value(), true, false);
+            }
         }
     } else if (
         itemHovered && !keyHelpHovered &&
@@ -103043,7 +103331,14 @@ void DrawTimingKeyLaneGroup(
                         continue;
                     }
                     bool inside = false;
-                    if (graph == valueGraphs.end()) {
+                    if (!lane.valueEditable) {
+                        // Aggregate curves are summaries. Their authored keys
+                        // participate in marquee selection only through the
+                        // lower time handle, keeping vertical value gestures
+                        // unavailable for a multi-marker average.
+                        inside = pointInside(ImVec2{
+                            xForPosition(position), markerCentreY});
+                    } else if (graph == valueGraphs.end()) {
                         inside = pointInside(
                             ImVec2{xForPosition(position), axisY});
                     } else if (const auto value =
@@ -103071,11 +103366,10 @@ void DrawTimingKeyLaneGroup(
                         }
                     }
                     if (inside) {
-                        AddUniqueTimingColouriseKeyHandle(
-                            &selected,
-                            TimingColouriseKeyHandleForLane(
-                                lane,
-                                position));
+                        appendLaneHandlesAtPosition(
+                            lane,
+                            position,
+                            &selected);
                     }
                 }
             }
@@ -103107,11 +103401,10 @@ void DrawTimingKeyLaneGroup(
             std::vector<TimingColouriseKeyHandle> selected;
             for (const auto& lane : series) {
                 for (const float position : lane.positions) {
-                    AddUniqueTimingColouriseKeyHandle(
-                        &selected,
-                        TimingColouriseKeyHandleForLane(
-                            lane,
-                            position));
+                    appendLaneHandlesAtPosition(
+                        lane,
+                        position,
+                        &selected);
                 }
             }
             replaceSelection(std::move(selected));
@@ -103244,12 +103537,28 @@ void DrawTimingKeyLaneGroup(
         // every stop key position is also a cluster position.
         for (const auto& key :
              drag.originalEffect.paletteStopParameterKeys) {
-            existingHandles.push_back({
-                .track = TimingColouriseKeyTrack::Palette,
-                .stopId = key.stopId,
-                .stopParameter = key.parameter,
-                .position = key.position,
-            });
+            if (key.parameter == invisible_places::timing::
+                                     TimingColourisePaletteStopParameter::
+                                         Colour) {
+                for (std::uint8_t component = 0U;
+                     component < 3U;
+                     ++component) {
+                    existingHandles.push_back({
+                        .track = TimingColouriseKeyTrack::Palette,
+                        .stopId = key.stopId,
+                        .stopParameter = key.parameter,
+                        .paletteColourComponent = component,
+                        .position = key.position,
+                    });
+                }
+            } else {
+                existingHandles.push_back({
+                    .track = TimingColouriseKeyTrack::Palette,
+                    .stopId = key.stopId,
+                    .stopParameter = key.parameter,
+                    .position = key.position,
+                });
+            }
         }
         for (const auto& key :
              drag.originalEffect.emissiveFalloffKeys) {
@@ -103281,6 +103590,8 @@ void DrawTimingKeyLaneGroup(
                                existing.stopId == destination.stopId &&
                                existing.stopParameter ==
                                    destination.stopParameter &&
+                               existing.paletteColourComponent ==
+                                   destination.paletteColourComponent &&
                                existing.falloffParameter ==
                                    destination.falloffParameter &&
                                keysCoincide(
@@ -103375,22 +103686,12 @@ void DrawTimingKeyLaneGroup(
                             handle.track ==
                                 TimingColouriseKeyTrack::Palette &&
                             handle.stopParameter.has_value()) {
-                            if (handle.stopParameter ==
-                                invisible_places::timing::
-                                    TimingColourisePaletteStopParameter::
-                                        Position) {
-                                (void)invisible_places::timing::
-                                    RemoveTimingColourisePaletteMarkerKeysAtPosition(
-                                        target,
-                                        handle.position);
-                            } else {
-                                (void)invisible_places::timing::
-                                    RemoveTimingColourisePaletteStopParameterKeysAtPosition(
-                                        target,
-                                        handle.stopId,
-                                        handle.stopParameter.value(),
-                                        handle.position);
-                            }
+                            (void)invisible_places::timing::
+                                RemoveTimingColourisePaletteStopParameterKeysAtPosition(
+                                    target,
+                                    handle.stopId,
+                                    handle.stopParameter.value(),
+                                    handle.position);
                         } else if (
                             handle.track ==
                             TimingColouriseKeyTrack::Palette) {
@@ -103434,6 +103735,11 @@ void DrawTimingKeyLaneGroup(
                         if (a.track != b.track ||
                             a.boundsParameter != b.boundsParameter ||
                             a.effectParameter != b.effectParameter ||
+                            a.stopId != b.stopId ||
+                            a.stopParameter != b.stopParameter ||
+                            a.paletteColourComponent !=
+                                b.paletteColourComponent ||
+                            a.falloffParameter != b.falloffParameter ||
                             !keysCoincide(a.position, b.position) ||
                             std::abs(a.position - b.position) <=
                                 invisible_places::timing::
@@ -103743,8 +104049,6 @@ void DrawTimingKeyLaneGroup(
                     valueDrag.handle.track ==
                         TimingColouriseKeyTrack::Palette &&
                     valueDrag.handle.stopParameter.has_value()) {
-                    // Stop Position and Amount are normalized values.
-                    value = std::clamp(value, 0.0F, 1.0F);
                     const auto found = std::find_if(
                         updated.paletteStopParameterKeys.begin(),
                         updated.paletteStopParameterKeys.end(),
@@ -103763,7 +104067,29 @@ void DrawTimingKeyLaneGroup(
                         });
                     if (found !=
                         updated.paletteStopParameterKeys.end()) {
-                        found->scalarValue = value;
+                        if (found->parameter == invisible_places::timing::
+                                                    TimingColourisePaletteStopParameter::
+                                                        Colour &&
+                            valueDrag.handle.paletteColourComponent
+                                .has_value() &&
+                            valueDrag.handle.paletteColourComponent.value() <
+                                3U) {
+                            auto coordinates = invisible_places::timing::
+                                TimingColouriseColourToSpace(
+                                    found->colourValue,
+                                    updated.colourKeyInterpolationSpace);
+                            coordinates[valueDrag.handle
+                                            .paletteColourComponent.value()] =
+                                value;
+                            found->colourValue = invisible_places::timing::
+                                TimingColouriseColourFromSpace(
+                                    coordinates,
+                                    updated.colourKeyInterpolationSpace);
+                        } else {
+                            // Stop Position and Amount are normalized values.
+                            found->scalarValue =
+                                std::clamp(value, 0.0F, 1.0F);
+                        }
                     }
                 }
             }
@@ -104225,8 +104551,7 @@ void DrawTimingKeyLaneGroup(
                 std::abs(position - nearestPosition) <=
                     invisible_places::timing::
                         kTimingColouriseKeyTolerance;
-            const bool selected = handleSelected(
-                TimingColouriseKeyHandleForLane(lane, position));
+            const bool selected = lanePositionSelected(lane, position);
             if (selected) {
                 drawList->AddCircleFilled(
                     ImVec2{x, markerCentreY},
@@ -104359,7 +104684,9 @@ void DrawTimingKeyLaneGroup(
         ImGui::TextUnformatted(
             "Right-click or right-drag to scrub the animation position.");
         ImGui::TextUnformatted(
-            "First-drag an unselected curve dot to change only its value while time stays locked. Click/release to select it, then drag it again to change time and value.");
+            "First-drag an unselected editable curve dot to change only its value while time stays locked. Click/release to select it, then drag it again to change time and value.");
+        ImGui::TextUnformatted(
+            "A Palette average curve summarises several changing markers. Its curve dots are display-only; use the lower time marker to select and retime the represented keys.");
         ImGui::TextUnformatted(
             "An unselected lower time handle selects and retimes every visible key snapped there. After selecting a dot, its lower handle retimes only the explicit selection. Values always stay locked.");
         ImGui::TextUnformatted(
@@ -104461,12 +104788,27 @@ void DrawTimingKeyLaneGroup(
                     ? activation.start
                     : activation.end);
         } else if (hoveredGraph != nullptr) {
-            if (hoveredGraph->wrappedPalettePhase) {
+            if (!hoveredGraph->lane->valueEditable) {
+                ImGui::SetTooltip(
+                    "%s %.6g at animation position %.4f\nRead-only average of %zu represented palette markers. Use its lower time marker to select and retime the represented keys.",
+                    hoveredGraph->lane->label,
+                    hoveredGraphValue,
+                    hoveredGraphPosition,
+                    hoveredGraph->lane->paletteAggregateStopIds.size());
+            } else if (hoveredGraph->wrappedPalettePhase) {
                 ImGui::SetTooltip(
                     "%s accumulated %.6g turns at animation position %.4f\nInteger-shifted copies show the same cyclic phase across the fixed -1 to +1 graph range.",
                     hoveredGraph->lane->label,
                     hoveredGraphValue,
                     hoveredGraphPosition);
+            } else if (hoveredGraph->sharedPaletteMarkerBaseRange) {
+                ImGui::SetTooltip(
+                    "%s %.6g at animation position %.4f\nShared constant-marker range %.6g–%.6g; no marker currently varies, so Palette-only curves use their base positions for a readable common axis.",
+                    hoveredGraph->lane->label,
+                    hoveredGraphValue,
+                    hoveredGraphPosition,
+                    hoveredGraph->minimum,
+                    hoveredGraph->maximum);
             } else if (hoveredGraph->sharedPaletteMarkerRange) {
                 ImGui::SetTooltip(
                     "%s %.6g at animation position %.4f\nShared marker range %.6g–%.6g; only marker Position tracks that actually move set this axis. Group-keyed markers that stay fixed do not widen it.",
@@ -106063,7 +106405,8 @@ void DrawTimingEmissiveInteractiveEditor(
 
 void AppendTimingColourisePaletteTimelineLanes(
     const invisible_places::timing::TimingColouriseEffect* effect,
-    std::vector<TimingColouriseKeyLaneSeries>* lanes) {
+    std::vector<TimingColouriseKeyLaneSeries>* lanes,
+    bool paletteOnly) {
     if (effect == nullptr || lanes == nullptr) {
         return;
     }
@@ -106100,67 +106443,251 @@ void AppendTimingColourisePaletteTimelineLanes(
         TimingColourisePaletteKeyModel::LegacySnapshots) {
         return;
     }
-    const auto stopOrdinal =
-        [&](std::string_view stopId) -> std::optional<std::size_t> {
-        const auto found = std::find_if(
-            effect->basePalette.stops.begin(),
-            effect->basePalette.stops.end(),
-            [&](const auto& candidate) {
-                return candidate.id == stopId;
-            });
-        return found == effect->basePalette.stops.end()
-                   ? std::nullopt
-                   : std::optional<std::size_t>{
-                         static_cast<std::size_t>(std::distance(
-                             effect->basePalette.stops.begin(),
-                             found))};
+
+    struct StopTrack {
+        std::string stopId;
+        std::size_t ordinal = 0U;
+        ImU32 colour = IM_COL32_WHITE;
+        std::vector<float> positions;
+        std::vector<float> values;
+        bool changes = false;
     };
-    for (const auto& key : effect->paletteStopParameterKeys) {
-        auto lane = std::find_if(
-            lanes->begin(),
-            lanes->end(),
-            [&](const auto& candidate) {
-                return candidate.track == TimingColouriseKeyTrack::Palette &&
-                       candidate.stopParameter == key.parameter &&
-                       candidate.stopId == key.stopId;
-            });
-        if (lane == lanes->end()) {
-            const auto ordinal = stopOrdinal(key.stopId);
-            const char* propertyName =
-                key.parameter ==
-                        TimingColourisePaletteStopParameter::Position
-                    ? "Position"
-                : key.parameter ==
-                        TimingColourisePaletteStopParameter::Colour
-                    ? "Colour"
-                    : "Amount";
-            const auto stopColour = [&]() {
-                if (!ordinal.has_value()) {
-                    return IM_COL32(222, 134, 190, 255);
-                }
-                const auto& authored =
-                    effect->basePalette.stops[ordinal.value()].colour;
-                return ImGui::ColorConvertFloat4ToU32(ImVec4{
-                    authored[0],
-                    authored[1],
-                    authored[2],
-                    1.0F});
-            }();
-            lanes->push_back(TimingColouriseKeyLaneSeries{
-                .ownedLabel =
-                    "Stop " +
-                    (ordinal.has_value()
-                         ? std::to_string(ordinal.value() + 1U)
-                         : std::string{"?"}) +
-                    " " + propertyName,
-                .track = TimingColouriseKeyTrack::Palette,
-                .stopId = key.stopId,
-                .stopParameter = key.parameter,
-                .colour = stopColour,
-            });
-            lane = std::prev(lanes->end());
+    const auto stopColour = [](const auto& stop) {
+        return ImGui::ColorConvertFloat4ToU32(ImVec4{
+            stop.colour[0],
+            stop.colour[1],
+            stop.colour[2],
+            1.0F});
+    };
+    const auto valuesChange = [](std::span<const float> values) {
+        if (values.size() < 2U) {
+            return false;
         }
-        lane->ownedPositions.push_back(key.position);
+        const auto [minimum, maximum] =
+            std::minmax_element(values.begin(), values.end());
+        return maximum != values.end() && minimum != values.end() &&
+               *maximum - *minimum > invisible_places::timing::
+                                          kTimingColouriseKeyTolerance;
+    };
+    const auto scalarTracksFor =
+        [&](TimingColourisePaletteStopParameter parameter) {
+            std::vector<StopTrack> tracks;
+            for (std::size_t ordinal = 0U;
+                 ordinal < effect->basePalette.stops.size();
+                 ++ordinal) {
+                const auto& stop = effect->basePalette.stops[ordinal];
+                StopTrack track{
+                    .stopId = stop.id,
+                    .ordinal = ordinal,
+                    .colour = stopColour(stop),
+                };
+                for (const auto& key :
+                     effect->paletteStopParameterKeys) {
+                    if (key.stopId != stop.id ||
+                        key.parameter != parameter) {
+                        continue;
+                    }
+                    track.positions.push_back(key.position);
+                    track.values.push_back(key.scalarValue);
+                }
+                if (!track.positions.empty() || paletteOnly) {
+                    track.changes = valuesChange(track.values);
+                    tracks.push_back(std::move(track));
+                }
+            }
+            return tracks;
+        };
+    const auto colourTracks = [&]() {
+        std::vector<StopTrack> tracks;
+        for (std::size_t ordinal = 0U;
+             ordinal < effect->basePalette.stops.size();
+             ++ordinal) {
+            const auto& stop = effect->basePalette.stops[ordinal];
+            StopTrack track{
+                .stopId = stop.id,
+                .ordinal = ordinal,
+                .colour = stopColour(stop),
+            };
+            std::array<std::vector<float>, 3U> componentValues;
+            for (const auto& key : effect->paletteStopParameterKeys) {
+                if (key.stopId != stop.id ||
+                    key.parameter !=
+                        TimingColourisePaletteStopParameter::Colour) {
+                    continue;
+                }
+                track.positions.push_back(key.position);
+                const auto coordinates = invisible_places::timing::
+                    TimingColouriseColourToSpace(
+                        key.colourValue,
+                        effect->colourKeyInterpolationSpace);
+                for (std::size_t component = 0U;
+                     component < componentValues.size();
+                     ++component) {
+                    componentValues[component].push_back(
+                        coordinates[component]);
+                }
+            }
+            if (!track.positions.empty() || paletteOnly) {
+                track.changes = std::any_of(
+                    componentValues.begin(),
+                    componentValues.end(),
+                    [&](const auto& values) {
+                        return valuesChange(values);
+                    });
+                tracks.push_back(std::move(track));
+            }
+        }
+        return tracks;
+    }();
+    const auto uniquePositions = [](std::vector<float> positions) {
+        std::sort(positions.begin(), positions.end());
+        std::vector<float> unique;
+        for (const float position : positions) {
+            if (unique.empty() ||
+                std::abs(unique.back() - position) >
+                    invisible_places::timing::
+                        kTimingColouriseKeyTolerance) {
+                unique.push_back(position);
+            }
+        }
+        return unique;
+    };
+    const auto visibleTracks = [&](const std::vector<StopTrack>& tracks) {
+        std::vector<const StopTrack*> visible;
+        for (const auto& track : tracks) {
+            if (paletteOnly || track.changes) {
+                visible.push_back(&track);
+            }
+        }
+        // A constant keyed track is still authoring data. When no track in a
+        // property animates, retain a compact route to those keys instead of
+        // making them disappear from the timeline entirely.
+        if (visible.empty()) {
+            for (const auto& track : tracks) {
+                visible.push_back(&track);
+            }
+        }
+        return visible;
+    };
+    const auto appendScalarProperty =
+        [&](TimingColourisePaletteStopParameter parameter,
+            const char* propertyName,
+            ImU32 aggregateColour) {
+            const auto tracks = scalarTracksFor(parameter);
+            const auto visible = visibleTracks(tracks);
+            if (visible.empty()) {
+                return;
+            }
+            if (paletteOnly || visible.size() == 1U) {
+                for (const auto* track : visible) {
+                    lanes->push_back(TimingColouriseKeyLaneSeries{
+                        .ownedLabel =
+                            "Marker " +
+                            std::to_string(track->ordinal + 1U) + " " +
+                            propertyName,
+                        .track = TimingColouriseKeyTrack::Palette,
+                        .stopId = track->stopId,
+                        .stopParameter = parameter,
+                        .ownedPositions = track->positions,
+                        .colour = track->colour,
+                    });
+                }
+                return;
+            }
+            TimingColouriseKeyLaneSeries aggregate{
+                .ownedLabel =
+                    std::string{"Palette "} + propertyName + " (" +
+                    std::to_string(visible.size()) + " markers average)",
+                .track = TimingColouriseKeyTrack::Palette,
+                .stopParameter = parameter,
+                .valueEditable = false,
+                .colour = aggregateColour,
+            };
+            for (const auto* track : visible) {
+                aggregate.paletteAggregateStopIds.push_back(track->stopId);
+                aggregate.ownedPositions.insert(
+                    aggregate.ownedPositions.end(),
+                    track->positions.begin(),
+                    track->positions.end());
+            }
+            aggregate.ownedPositions =
+                uniquePositions(std::move(aggregate.ownedPositions));
+            lanes->push_back(std::move(aggregate));
+        };
+
+    appendScalarProperty(
+        TimingColourisePaletteStopParameter::Position,
+        "Position",
+        IM_COL32(226, 186, 116, 255));
+    appendScalarProperty(
+        TimingColourisePaletteStopParameter::ColouriseAmount,
+        "Colourise Amount",
+        IM_COL32(120, 205, 172, 255));
+
+    const auto visibleColourTracks = visibleTracks(colourTracks);
+    if (visibleColourTracks.empty()) {
+        return;
+    }
+    const std::array<const char*, 3U> componentNames = [&]() {
+        using invisible_places::timing::TimingColouriseColourSpace;
+        switch (effect->colourKeyInterpolationSpace) {
+            case TimingColouriseColourSpace::LinearRgb:
+                return std::array<const char*, 3U>{
+                    "Linear R", "Linear G", "Linear B"};
+            case TimingColouriseColourSpace::OkLab:
+                return std::array<const char*, 3U>{"L", "a", "b"};
+            case TimingColouriseColourSpace::Srgb:
+                return std::array<const char*, 3U>{"R", "G", "B"};
+        }
+        return std::array<const char*, 3U>{"R", "G", "B"};
+    }();
+    const std::array<ImU32, 3U> componentColours{
+        IM_COL32(238, 108, 108, 255),
+        IM_COL32(105, 218, 145, 255),
+        IM_COL32(108, 158, 238, 255),
+    };
+    for (std::uint8_t component = 0U; component < 3U; ++component) {
+        if (paletteOnly || visibleColourTracks.size() == 1U) {
+            for (const auto* track : visibleColourTracks) {
+                lanes->push_back(TimingColouriseKeyLaneSeries{
+                    .ownedLabel =
+                        "Marker " +
+                        std::to_string(track->ordinal + 1U) + " Colour " +
+                        componentNames[component],
+                    .track = TimingColouriseKeyTrack::Palette,
+                    .stopId = track->stopId,
+                    .stopParameter =
+                        TimingColourisePaletteStopParameter::Colour,
+                    .paletteColourComponent = component,
+                    .ownedPositions = track->positions,
+                    .colour = componentColours[component],
+                });
+            }
+            continue;
+        }
+        TimingColouriseKeyLaneSeries aggregate{
+            .ownedLabel =
+                std::string{"Palette Colour "} +
+                componentNames[component] + " (" +
+                std::to_string(visibleColourTracks.size()) +
+                " markers average)",
+            .track = TimingColouriseKeyTrack::Palette,
+            .stopParameter =
+                TimingColourisePaletteStopParameter::Colour,
+            .paletteColourComponent = component,
+            .valueEditable = false,
+            .colour = componentColours[component],
+        };
+        for (const auto* track : visibleColourTracks) {
+            aggregate.paletteAggregateStopIds.push_back(track->stopId);
+            aggregate.ownedPositions.insert(
+                aggregate.ownedPositions.end(),
+                track->positions.begin(),
+                track->positions.end());
+        }
+        aggregate.ownedPositions =
+            uniquePositions(std::move(aggregate.ownedPositions));
+        lanes->push_back(std::move(aggregate));
     }
 }
 
@@ -107095,7 +107622,7 @@ void DrawTimingColourisePaletteEditor(
         (!legacyModel || legacyEditable != nullptr) &&
         !baseEditingBlocked;
     const bool canEditTopology =
-        canEditStops && !hasPaletteKeys;
+        canEditStops && (!legacyModel || !hasPaletteKeys);
     if (baseEditingBlocked) {
         ImGui::TextDisabled(
             "This original is view-only while its _edited version "
@@ -107108,7 +107635,7 @@ void DrawTimingColourisePaletteEditor(
     const auto removePaletteStop =
         [&](const std::string& stopId,
             std::size_t stopIndex) -> bool {
-        if (legacyModel || hasPaletteKeys ||
+        if (legacyModel ||
             !invisible_places::timing::
                 CanRemoveTimingColourisePaletteStop(
                     *effect,
@@ -107373,6 +107900,7 @@ void DrawTimingColourisePaletteEditor(
             canEditTopology,
             paletteEditorHeight,
             "##TimingColourisePalettePreview");
+    const bool palettePreviewFocused = ImGui::IsItemFocused();
     // Colour keys can blend along different colour paths; the choice is
     // authored per effect and only matters once a stop colour is keyed.
     const bool hasColourStopKeys = std::any_of(
@@ -107485,9 +108013,30 @@ void DrawTimingColourisePaletteEditor(
             workingPalette = effect->basePalette;
             markPaletteBaseEdited();
         } else if (!legacyModel) {
+            const auto editedPalette = workingPalette;
+            std::optional<std::string> selectedStopId;
+            if (timings.selectedColourisePaletteStopIndex.has_value() &&
+                timings.selectedColourisePaletteStopIndex.value() <
+                    editedPalette.stops.size()) {
+                selectedStopId = editedPalette
+                    .stops[timings.selectedColourisePaletteStopIndex.value()]
+                    .id;
+            }
+            bool topologyChanged = false;
+            for (const auto& stop : editedPalette.stops) {
+                if (stopIndexById(paletteBeforePreview, stop.id).has_value()) {
+                    continue;
+                }
+                topologyChanged = invisible_places::timing::
+                    AddTimingColourisePaletteStop(effect, stop) ||
+                    topologyChanged;
+            }
+            if (topologyChanged) {
+                markPaletteBaseEdited();
+            }
             bool markerPositionChanged = false;
             for (const auto& stop :
-                 workingPalette.stops) {
+                 editedPalette.stops) {
                 const auto beforeIndex =
                     stopIndexById(
                         paletteBeforePreview,
@@ -107550,7 +108099,20 @@ void DrawTimingColourisePaletteEditor(
                     AddOrUpdateTimingColourisePaletteMarkerKeys(
                         effect,
                         previewKeyPosition,
-                        workingPalette);
+                        editedPalette);
+            }
+            if (topologyChanged) {
+                workingPalette = invisible_places::timing::
+                    EvaluateTimingColourisePalette(
+                        *effect,
+                        previewKeyPosition,
+                        cyclicTiming);
+                if (selectedStopId.has_value()) {
+                    timings.selectedColourisePaletteStopIndex =
+                        stopIndexById(
+                            workingPalette,
+                            selectedStopId.value());
+                }
             }
         }
         runtimeState->previewRenderStateSignatureValid =
@@ -107884,7 +108446,7 @@ void DrawTimingColourisePaletteEditor(
             }
 
             const bool canRemoveStop =
-                !legacyModel && !hasPaletteKeys &&
+                !legacyModel && canEditStops &&
                 invisible_places::timing::
                     CanRemoveTimingColourisePaletteStop(
                         *effect,
@@ -107899,8 +108461,8 @@ void DrawTimingColourisePaletteEditor(
             ImGui::EndDisabled();
             DrawTimingControlTooltip(
                 canRemoveStop
-                    ? "Delete this colour marker. The Delete key also removes the selected stop."
-                    : "A stop cannot be removed while palette keys depend on its topology.");
+                    ? "Delete this colour marker and every Position, Amount, and Colour key that belongs to it. The Delete or Backspace key does the same while the palette has focus."
+                    : "At least one colour marker must remain; legacy whole-palette snapshots also keep their authored topology.");
         }
         ImGui::EndPopup();
     }
@@ -107918,8 +108480,9 @@ void DrawTimingColourisePaletteEditor(
                 timings
                     .selectedColourisePaletteStopIndex
                     .value()];
-        ImGui::TextDisabled(
-            "Stop %zu/%zu   Pos %.4f   Amount %.3f",
+        ImGui::TextColored(
+            ImGui::GetStyleColorVec4(ImGuiCol_SliderGrabActive),
+            "Selected marker %zu/%zu   Pos %.4f   Amount %.3f   [Delete/Backspace removes marker + keys]",
             timings
                     .selectedColourisePaletteStopIndex
                     .value() +
@@ -107953,17 +108516,16 @@ void DrawTimingColourisePaletteEditor(
         }
     }
 
-    // Delete removes the selected stop through the exact gates the Colour
-    // Stop popup's Remove button uses; refusals stay silent because those
-    // gates' tooltips explain the topology locks elsewhere.
+    // Keyboard deletion belongs to the focused palette surface. This keeps a
+    // selected marker visibly armed without leaking Delete from the timeline
+    // graph, another feature, or an active text editor.
     if (timings.selectedColourisePaletteStopIndex.has_value() &&
         timings.selectedColourisePaletteStopIndex.value() <
             workingPalette.stops.size() &&
-        ImGui::IsKeyPressed(ImGuiKey_Delete, false) &&
-        ImGui::IsWindowFocused(
-            ImGuiFocusedFlags_RootAndChildWindows) &&
+        (ImGui::IsKeyPressed(ImGuiKey_Delete, false) ||
+         ImGui::IsKeyPressed(ImGuiKey_Backspace, false)) &&
+        palettePreviewFocused &&
         !ImGui::GetIO().WantTextInput &&
-        !ImGui::IsAnyItemActive() &&
         !ImGui::IsPopupOpen(
             nullptr,
             ImGuiPopupFlags_AnyPopup)) {
@@ -111498,6 +112060,14 @@ void DrawTimingColouriseUnifiedTimeline(
 
     std::vector<TimingColouriseKeyLaneSeries> lanes;
     lanes.reserve(20U);
+    const bool paletteOnly =
+        effect->colouriseEnabled &&
+        timings.colourisePaletteTimelineVisible &&
+        !timings.colourisePositionTimelineVisible &&
+        !timings.colouriseFadeTimelineVisible &&
+        !timings.colouriseSkewTimelineVisible &&
+        !(effect->emissiveEnabled &&
+          timings.colouriseIntensityTimelineVisible);
     constexpr std::array positionDefinitions{
         std::tuple{
             TimingColouriseBoundsParameter::Lower,
@@ -111577,7 +112147,10 @@ void DrawTimingColouriseUnifiedTimeline(
 
     if (effect->colouriseEnabled &&
         timings.colourisePaletteTimelineVisible) {
-        AppendTimingColourisePaletteTimelineLanes(effect, &lanes);
+        AppendTimingColourisePaletteTimelineLanes(
+            effect,
+            &lanes,
+            paletteOnly);
     }
     if (effect->emissiveEnabled &&
         timings.colouriseIntensityTimelineVisible) {
@@ -111598,15 +112171,18 @@ void DrawTimingColouriseUnifiedTimeline(
     } else {
         ImGui::TextDisabled("Values over animation position");
         DrawTimingControlTooltip(
-            "All enabled Visual Feature key groups share this graph. Position, Fade, Skew, Palette, and Intensity each snap only to their own kind. Every curve keeps its existing value range and typed key behaviour. Double-click open graph space to add a key on the only or nearest visible curve. First-drag an unselected dot to edit its value with time locked; click/release and drag it again to edit time and value. An unselected lower marker retimes its snapped cluster, while a marker under an explicitly selected dot retimes only that selection. Left-drag empty space to window-select, and right-drag to scrub.");
+            "All enabled Visual Feature key groups share this graph. Position, Fade, Skew, Palette, and Intensity each snap only to their own kind. Double-click open graph space to add a key on the only or nearest editable curve. First-drag an unselected editable dot to change its value with time locked; click/release and drag it again to change time and value. A Palette average curve summarises several changing markers and is value-read-only; its lower marker expands to the real keys for retiming. An unselected lower marker retimes its snapped cluster, while a marker under an explicitly selected dot retimes only that selection. Left-drag empty space to window-select, and right-drag to scrub.");
         DrawTimingKeyLaneGroup(
             "##TimingColouriseUnifiedKeyLane",
             runtimeState,
             effect,
-            lanes);
+            lanes,
+            effect->colouriseEnabled &&
+                timings.colourisePaletteTimelineVisible &&
+                timings.colourisePaletteTimelineStripVisible);
     }
 
-    // Keep graph filtering next to the graph it affects. Six fixed columns
+    // Keep graph filtering next to the graph it affects. Seven fixed columns
     // stop the controls from reflowing as Colourise or Emissive is toggled;
     // dormant groups remain visible but disabled, with their authored keys
     // untouched.
@@ -111643,7 +112219,7 @@ void DrawTimingColouriseUnifiedTimeline(
             TimingColouriseEffectParameterDisplayColour(
                 TimingColouriseEffectParameter::AmountOverride),
             effect->colouriseEnabled,
-            "Show or hide Colourise Amount, Colour Phase, and keyed palette-marker curves. Their authored keys stay stored while hidden."},
+            "Show or hide Colourise Amount, Colour Phase, and adaptive palette-marker curves. Their authored keys stay stored while hidden."},
         TimelineVisibilityChoice{
             "Intensity##TimelineVisibility",
             &timings.colouriseIntensityTimelineVisible,
@@ -111658,7 +112234,7 @@ void DrawTimingColouriseUnifiedTimeline(
         ImGui::GetStyle().FontSizeBase * 0.80F);
     if (ImGui::BeginTable(
             "##VisualFeatureTimelineVisibility",
-            6,
+            7,
             ImGuiTableFlags_NoSavedSettings |
                 ImGuiTableFlags_SizingStretchSame |
                 ImGuiTableFlags_NoPadOuterX)) {
@@ -111668,6 +112244,18 @@ void DrawTimingColouriseUnifiedTimeline(
             &timings.colouriseGraphTimeOnly);
         DrawTimingControlTooltip(
             "When enabled, dragging a curve key changes only animation time for the explicitly selected keys. Use the lower time marker, Shift/Cmd selection, or a selection window to retime several keys together.");
+        ImGui::TableNextColumn();
+        ImGui::BeginDisabled(
+            !effect->colouriseEnabled ||
+            !timings.colourisePaletteTimelineVisible);
+        visibilityChanged = ImGui::Checkbox(
+                                "Palette map##TimelineVisibility",
+                                &timings
+                                     .colourisePaletteTimelineStripVisible) ||
+                            visibilityChanged;
+        ImGui::EndDisabled();
+        DrawTimingControlTooltip(
+            "Draw the evaluated palette vertically through time behind the key curves. This is a display aid only; curve nodes and lower time markers remain the editing controls.");
         for (const auto& choice : visibilityChoices) {
             ImGui::TableNextColumn();
             ImGui::BeginDisabled(!choice.enabled);

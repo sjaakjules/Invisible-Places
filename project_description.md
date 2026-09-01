@@ -640,17 +640,25 @@ the animation overview.
   one green "Ends Fade" control until a fade handle is double-clicked
   apart, recolouring each edge. Every geometric bounds coordinate stays
   text-editable in any Bounds Keying mode by writing through the keyed
-  pair. Palette marker Positions key as one group from the vertical
-  `+ / < / > / X` rail beside the palette: every marker receives a Position
-  key at that animation moment, while stop Colour and Colourise Amount remain
-  independent tracks. Their Position curves share one vertical axis derived
-  only from marker tracks whose authored values change, so fixed group-keyed
-  markers do not widen the view. Other keyed palette-stop properties draw as
-  auto-ranged curves on the shared value graph with every curve style (new
-  keys default to Monotone Spline; Linear and Hold are honoured), keyed colours
-  blend in a chosen sRGB, linear-light, or OkLab space while tinting their curve, and each
-  scalar field remembers its own Colourise/Emissive settings unless the
-  feature opts into one global set.
+  pair. The palette accepts a practical unbounded number of colour markers.
+  Clicking a marker gives it a bright selected outline and Delete/Backspace
+  removes that marker together with every Position, Colourise Amount, and
+  Colour key addressed by its stable id. Palette marker Positions still key as
+  one group from the vertical `+ / < / > / X` rail beside the palette: every
+  marker receives a Position key at that animation moment, while stop Colour
+  and Colourise Amount remain independent tracks. The shared timeline adapts
+  those stored per-marker tracks to the visible context. With other key groups
+  visible, one changing marker remains its own value-editable curve; several
+  changing markers become one read-only average curve and their real keys can
+  be retimed only through the lower time marker. With Palette as the only
+  visible group, every marker's Position and Amount curve is expanded, and
+  Colour is shown as three curves in the effect's selected sRGB,
+  linear-light, or OkLab interpolation space. Fixed group-keyed Position tracks
+  stay out of the shared animated-marker range. A session-only Palette Map can
+  draw the evaluated palette vertically across time behind the curves. New
+  keys default to Monotone Spline; Linear and Hold remain honoured, and each
+  scalar field remembers its own Colourise/Emissive settings unless the feature
+  opts into one global set.
 - Emissive output gains a falloff profile over the bounds: level-multiplier
   nodes joined by a Monotone Spline, edited on their own curve above the
   emissive timeline, and warped by the falloff's own skew band. Curve nodes
@@ -669,8 +677,9 @@ the animation overview.
   selectors directly below Bounds Profile), the histogram, an enabled
   Colourise palette, an enabled Emissive falloff curve, then one unified
   keyframe timeline. Its session-only visibility controls expose Position,
-  Fade, Skew, Palette, and Intensity groups, with the last two present only
-  for enabled output aspects. Every group snaps only to its own kind even
+  Fade, Skew, Palette, and Intensity groups plus the optional Palette Map,
+  with the last two key groups present only for enabled output aspects. Every
+  group snaps only to its own kind even
   though all visible curves share the graph. Disabling an aspect hides only
   that aspect's editor and timeline group while keeping its authored settings
   and keys dormant.
