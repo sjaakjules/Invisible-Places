@@ -818,6 +818,11 @@ PointCloudLoadResult LoadPointCloud(
     cloud.focusPoint = ComputeRepresentativeFocusPoint(cloud.bounds, focusSamples);
     cloud.hasFocusPoint = cloud.bounds.valid;
 
+    (void)AppendSceneDisplayDensitySurfaceWeights(
+        filePath,
+        {},
+        &cloud);
+
     return {.cloud = std::move(cloud), .success = true};
 }
 
@@ -1651,6 +1656,10 @@ PointCloudSubsetLoadResult LoadPointCloudSubset(
     if (options.progress) {
         options.progress(scanPointCount, scanPointCount);
     }
+    (void)AppendSceneDisplayDensitySurfaceWeights(
+        filePath,
+        result.sourcePointIndices,
+        &result.cloud);
     result.success = true;
     return result;
 }

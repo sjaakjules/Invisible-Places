@@ -23,7 +23,9 @@ tradeoff is temporary disk approximately equal to the largest source role:
 1. stream and hash the source into deterministic spatial shards;
 2. sort each shard by cell and point hash while collecting cell populations;
 3. apportion exact quotas and aggregate each sorted shard into the output;
-4. independently re-read and validate the output before publishing.
+4. save the exact 1 mm parent -> 5 mm stratum link plus compact alternative
+   surface-opacity weights for stable overlapping-scan comparisons;
+5. independently re-read and validate every output before publishing.
 
 RGB defaults to a numeric byte-domain mean because that is how the current
 1 mm renderer interprets PLY RGB.  ``--rgb-filter srgb-linear-light`` exists
@@ -57,8 +59,14 @@ except ImportError as exc:  # pragma: no cover - exercised by the CLI host.
 
 SCHEMA_VERSION = 1
 ALGORITHM_ID = "scene-display-density-stratified-prefilter-v1"
-ALGORITHM_VERSION = 3
+ALGORITHM_VERSION = 4
 POSITION_POLICY = "real-parent-q1-centroid-medoid-qN-stable-hash"
+ANALYSIS_SCHEMA_VERSION = 1
+ANALYSIS_HORIZONTAL_CELL_METERS = 0.020
+ANALYSIS_CLOSE_SURFACE_METERS = 0.012
+ANALYSIS_SEPARATE_SURFACE_METERS = 0.035
+SOURCE_INDEX_SENTINEL = np.uint32(0xFFFFFFFF)
+_TEMP_SOURCE_INDEX = "__builder_source_index"
 MANIFEST_NAME = "display-density-manifest.json"
 ACTIVE_POINTER_NAME = "active-bundle.json"
 DEFAULT_SEED = 0x4950565F53433331  # "IPV_SC31"
@@ -383,6 +391,30 @@ def _counts_from_starts(starts: np.ndarray, total: int) -> np.ndarray:
     ).astype(np.uint64, copy=False)
 
 
+def _temporary_record_dtype(description: PlyDescription) -> np.dtype:
+    """Canonical packed record plus an internal source-order index."""
+
+    return np.dtype(
+        list(description.dtype.descr) + [(_TEMP_SOURCE_INDEX, "<u4")],
+        align=False,
+    )
+
+
+def _temporary_dtype_for_shard(
+    path: Path,
+    description: PlyDescription,
+) -> np.dtype:
+    """Accept historical unit-test shards while production uses provenance."""
+
+    temporary = _temporary_record_dtype(description)
+    byte_count = path.stat().st_size
+    if byte_count % temporary.itemsize == 0:
+        return temporary
+    if byte_count % description.dtype.itemsize == 0:
+        return description.dtype
+    raise RuntimeError(f"{path}: incomplete temporary record")
+
+
 def _write_shards(
     description: PlyDescription,
     work_root: Path,
@@ -406,6 +438,7 @@ def _write_shards(
     digest = hashlib.sha256()
     digest.update(description.raw_header)
     completed = 0
+    temporary_dtype = _temporary_record_dtype(description)
     try:
         with source_path.open("rb") as source:
             source.seek(description.data_offset)
@@ -416,6 +449,12 @@ def _write_shards(
                     raise ValueError(f"{source_path}: truncated vertex data")
                 digest.update(raw)
                 records = np.frombuffer(raw, dtype=description.dtype, count=take)
+                temporary_records = np.empty(take, dtype=temporary_dtype)
+                for name in description.dtype.names or ():
+                    temporary_records[name] = records[name]
+                temporary_records[_TEMP_SOURCE_INDEX] = (
+                    np.arange(take, dtype=np.uint64) + np.uint64(completed)
+                ).astype(np.uint32)
                 cell_x, cell_y, cell_z = _cell_coordinates(
                     records, config.voxel_size_m
                 )
@@ -430,7 +469,9 @@ def _write_shards(
                 run_ends = np.concatenate((boundaries, np.asarray([take])))
                 for run_start, run_end in zip(run_starts, run_ends, strict=True):
                     shard_id = int(sorted_ids[run_start])
-                    streams[shard_id].write(records[order[run_start:run_end]].tobytes())
+                    streams[shard_id].write(
+                        temporary_records[order[run_start:run_end]].tobytes()
+                    )
                 completed += take
                 print(
                     f"[{description.path.name}] sharded {completed:,}/"
@@ -471,13 +512,12 @@ def _sort_shards_and_collect_cells(
     cell_part_sizes: list[int] = []
     for shard_index, path in enumerate(shard_paths):
         byte_count = path.stat().st_size
-        if byte_count % description.dtype.itemsize != 0:
-            raise RuntimeError(f"{path}: incomplete temporary record")
-        record_count = byte_count // description.dtype.itemsize
+        shard_dtype = _temporary_dtype_for_shard(path, description)
+        record_count = byte_count // shard_dtype.itemsize
         if record_count == 0:
             cell_part_sizes.append(0)
             continue
-        records = np.memmap(path, dtype=description.dtype, mode="r", shape=(record_count,))
+        records = np.memmap(path, dtype=shard_dtype, mode="r", shape=(record_count,))
         cell_x, cell_y, cell_z = _cell_coordinates(records, config.voxel_size_m)
         point_priority = _point_priority(records, role_seed)
         # lexsort's last key is primary: cell XYZ, then stable point identity.
@@ -493,7 +533,7 @@ def _sort_shards_and_collect_cells(
         os.replace(sorted_path, path)
 
         sorted_records = np.memmap(
-            path, dtype=description.dtype, mode="r", shape=(record_count,)
+            path, dtype=shard_dtype, mode="r", shape=(record_count,)
         )
         cell_x, cell_y, cell_z = _cell_coordinates(
             sorted_records, config.voxel_size_m
@@ -663,9 +703,12 @@ def _aggregate_sorted_groups(
     starts: np.ndarray,
     rgb_filter: str,
     position_indices: np.ndarray | None = None,
+    output_dtype: np.dtype | None = None,
 ) -> np.ndarray:
-    output = np.empty(starts.size, dtype=records.dtype)
-    names = records.dtype.names or ()
+    if output_dtype is None:
+        output_dtype = records.dtype
+    output = np.empty(starts.size, dtype=output_dtype)
+    names = output.dtype.names or ()
     handled: set[str] = set()
 
     # A sampled child position is always a real canonical parent position.
@@ -816,11 +859,15 @@ def _aggregate_shard(
     config: BuildConfig,
     target_count: int,
     systematic_extras: np.ndarray,
+    source_to_output: np.memmap | None = None,
+    output_index_offset: int = 0,
+    coarse_parent_counts: np.memmap | None = None,
 ) -> np.ndarray:
-    record_count = path.stat().st_size // description.dtype.itemsize
+    shard_dtype = _temporary_dtype_for_shard(path, description)
+    record_count = path.stat().st_size // shard_dtype.itemsize
     if record_count == 0:
         return np.empty(0, dtype=description.dtype)
-    records = np.memmap(path, dtype=description.dtype, mode="r", shape=(record_count,))
+    records = np.memmap(path, dtype=shard_dtype, mode="r", shape=(record_count,))
     cell_x, cell_y, cell_z = _cell_coordinates(records, config.voxel_size_m)
     cell_starts = _group_starts_from_cells(cell_x, cell_y, cell_z)
     cell_counts = _counts_from_starts(cell_starts, record_count)
@@ -866,13 +913,391 @@ def _aggregate_shard(
         output_starts,
         config.rgb_filter,
         position_indices,
+        description.dtype,
     )
     expected = int(np.sum(quotas, dtype=np.int64))
     if output.size != expected:
         raise RuntimeError(
             f"{path}: aggregated {output.size} strata, expected {expected}"
         )
+    output_group_counts = _counts_from_starts(
+        output_starts,
+        kept_records.size,
+    ).astype(np.uint32, copy=False)
+    if coarse_parent_counts is not None:
+        coarse_parent_counts[
+            output_index_offset : output_index_offset + output.size
+        ] = output_group_counts
+    if source_to_output is not None and _TEMP_SOURCE_INDEX in (
+        kept_records.dtype.names or ()
+    ):
+        group_for_kept = np.repeat(
+            np.arange(output.size, dtype=np.uint32),
+            output_group_counts.astype(np.int64),
+        )
+        source_to_output[
+            kept_records[_TEMP_SOURCE_INDEX].astype(np.uint32, copy=False)
+        ] = group_for_kept + np.uint32(output_index_offset)
     return output
+
+
+def _create_u32_memmap(
+    path: Path,
+    count: int,
+    fill: np.uint32,
+) -> np.memmap:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("xb") as stream:
+        stream.truncate(count * np.dtype("<u4").itemsize)
+        stream.flush()
+        os.fsync(stream.fileno())
+    result = np.memmap(path, dtype="<u4", mode="r+", shape=(count,))
+    result[:] = fill
+    result.flush()
+    return result
+
+
+def _normalized_property_name(name: str) -> str:
+    return "".join(character for character in name.lower() if character.isalnum())
+
+
+def _recession_property_name(description: PlyDescription) -> str | None:
+    names = description.dtype.names or ()
+    preferred = (
+        "scalararrecessionmedium",
+        "arrecessionmedium",
+        "scalarrecessionmedium",
+    )
+    normalized = {_normalized_property_name(name): name for name in names}
+    for candidate in preferred:
+        if candidate in normalized:
+            return normalized[candidate]
+    for name in names:
+        if "recession" in _normalized_property_name(name):
+            return name
+    return None
+
+
+def _soft_loser_weights(
+    cluster_z: np.ndarray,
+    selected_cluster: np.ndarray,
+    cluster_columns: np.ndarray,
+) -> np.ndarray:
+    selected_z = cluster_z[selected_cluster[cluster_columns]]
+    gap = np.abs(cluster_z - selected_z)
+    denominator = max(
+        1.0e-9,
+        ANALYSIS_SEPARATE_SURFACE_METERS - ANALYSIS_CLOSE_SURFACE_METERS,
+    )
+    fade = np.clip(
+        (ANALYSIS_SEPARATE_SURFACE_METERS - gap) / denominator,
+        0.0,
+        1.0,
+    )
+    weights = np.rint(128.0 * fade).astype(np.uint8)
+    selected_for_cluster = selected_cluster[cluster_columns]
+    weights[np.arange(cluster_z.size) == selected_for_cluster] = np.uint8(255)
+    return weights
+
+
+def _surface_analysis_weights_for_sorted(
+    cell_x: np.ndarray,
+    cell_y: np.ndarray,
+    z: np.ndarray,
+    parent_counts: np.ndarray,
+    recession: np.ndarray,
+    role: str,
+) -> np.ndarray:
+    """Return packed RGBA8 weights for records sorted by XY cell then Z.
+
+    R selects the locally densest, recession-coherent surface; G/B select
+    lower/upper surfaces; A is the user's soft-separation proposal. Nearby
+    rival surfaces retain half opacity and fade continuously to zero as their
+    separation grows. The winning surface always remains fully authored.
+    """
+
+    if z.size == 0 or role == "VEG":
+        return np.full(z.size, np.uint32(0xFFFFFFFF), dtype=np.uint32)
+    new_column = np.empty(z.size, dtype=bool)
+    new_column[0] = True
+    new_column[1:] = (
+        (cell_x[1:] != cell_x[:-1]) | (cell_y[1:] != cell_y[:-1])
+    )
+    new_cluster = new_column.copy()
+    new_cluster[1:] |= (
+        (~new_column[1:])
+        & ((z[1:] - z[:-1]) > ANALYSIS_CLOSE_SURFACE_METERS)
+    )
+    cluster_starts = np.flatnonzero(new_cluster).astype(np.int64, copy=False)
+    cluster_counts = _counts_from_starts(cluster_starts, z.size).astype(
+        np.int64,
+        copy=False,
+    )
+    cluster_for_point = np.repeat(
+        np.arange(cluster_starts.size, dtype=np.int64),
+        cluster_counts,
+    )
+    column_starts = np.flatnonzero(new_column).astype(np.int64, copy=False)
+    point_column_counts = _counts_from_starts(column_starts, z.size).astype(
+        np.int64,
+        copy=False,
+    )
+    point_columns = np.repeat(
+        np.arange(column_starts.size, dtype=np.int64),
+        point_column_counts,
+    )
+    cluster_columns = point_columns[cluster_starts]
+    cluster_z = (
+        np.add.reduceat(z.astype(np.float64), cluster_starts)
+        / cluster_counts
+    )
+    population = np.add.reduceat(
+        np.maximum(parent_counts.astype(np.float64), 1.0),
+        cluster_starts,
+    )
+
+    finite_recession = np.isfinite(recession)
+    finite_count = np.add.reduceat(
+        finite_recession.astype(np.int64),
+        cluster_starts,
+    )
+    safe_recession = np.where(finite_recession, recession, 0.0).astype(
+        np.float64,
+        copy=False,
+    )
+    recession_sum = np.add.reduceat(safe_recession, cluster_starts)
+    recession_square_sum = np.add.reduceat(
+        safe_recession * safe_recession,
+        cluster_starts,
+    )
+    denominator_count = np.maximum(finite_count, 1)
+    variance = np.maximum(
+        0.0,
+        recession_square_sum / denominator_count
+        - (recession_sum / denominator_count) ** 2,
+    )
+    finite_values = recession[finite_recession]
+    if finite_values.size > 1:
+        recession_scale = max(
+            1.0e-6,
+            float(np.nanpercentile(finite_values, 95.0)
+                  - np.nanpercentile(finite_values, 5.0))
+            * 0.05,
+        )
+    else:
+        recession_scale = 1.0
+    coherence = np.clip(
+        1.0 / (1.0 + np.sqrt(variance) / recession_scale),
+        0.5,
+        1.0,
+    )
+    coherence[finite_count < 2] = 1.0
+    density_score = population * coherence
+
+    # lexsort's final key is primary. Within each column, the largest score
+    # wins and equal-density scans prefer the lower surface as requested.
+    density_order = np.lexsort((cluster_z, -density_score, cluster_columns))
+    ordered_columns = cluster_columns[density_order]
+    first = np.empty(density_order.size, dtype=bool)
+    first[0] = True
+    first[1:] = ordered_columns[1:] != ordered_columns[:-1]
+    density_selected = np.empty(column_starts.size, dtype=np.int64)
+    density_selected[ordered_columns[first]] = density_order[first]
+
+    cluster_column_starts = np.flatnonzero(
+        np.concatenate(
+            (np.asarray([True]), cluster_columns[1:] != cluster_columns[:-1])
+        )
+    ).astype(np.int64, copy=False)
+    lower_selected = cluster_column_starts
+    upper_selected = np.concatenate(
+        (cluster_column_starts[1:] - 1, np.asarray([cluster_z.size - 1]))
+    ).astype(np.int64, copy=False)
+
+    density_weight = _soft_loser_weights(
+        cluster_z, density_selected, cluster_columns
+    )
+    lower_weight = _soft_loser_weights(
+        cluster_z, lower_selected, cluster_columns
+    )
+    upper_weight = _soft_loser_weights(
+        cluster_z, upper_selected, cluster_columns
+    )
+    soft_selected = upper_selected if role == "ROCK" else density_selected
+    soft_weight = _soft_loser_weights(
+        cluster_z, soft_selected, cluster_columns
+    )
+
+    packed_cluster = (
+        density_weight.astype(np.uint32)
+        | (lower_weight.astype(np.uint32) << np.uint32(8))
+        | (upper_weight.astype(np.uint32) << np.uint32(16))
+        | (soft_weight.astype(np.uint32) << np.uint32(24))
+    )
+    return packed_cluster[cluster_for_point]
+
+
+def _build_surface_analysis_weights(
+    role: str,
+    output_path: Path,
+    description: PlyDescription,
+    coarse_parent_counts: np.memmap,
+    coarse_weights_path: Path,
+    work_root: Path,
+    config: BuildConfig,
+    role_seed: int,
+) -> tuple[np.memmap, dict[str, int]]:
+    weights = _create_u32_memmap(
+        coarse_weights_path,
+        description.vertex_count,
+        np.uint32(0xFFFFFFFF),
+    )
+    if role == "VEG":
+        return weights, {"attenuated_points": 0, "zero_weight_points": 0}
+
+    analysis_dtype = np.dtype(
+        [
+            ("index", "<u4"),
+            ("cell_x", "<i8"),
+            ("cell_y", "<i8"),
+            ("z", "<f4"),
+            ("parents", "<u4"),
+            ("recession", "<f4"),
+        ],
+        align=False,
+    )
+    shard_root = work_root / "surface-analysis"
+    shard_root.mkdir(parents=True, exist_ok=False)
+    shard_paths = [
+        shard_root / f"analysis-{index:04d}.bin"
+        for index in range(config.shard_count)
+    ]
+    streams = [path.open("wb") for path in shard_paths]
+    recession_name = _recession_property_name(description)
+    records = np.memmap(
+        output_path,
+        dtype=description.dtype,
+        mode="r",
+        offset=description.data_offset,
+        shape=(description.vertex_count,),
+    )
+    try:
+        for start in range(0, description.vertex_count, config.chunk_records):
+            end = min(description.vertex_count, start + config.chunk_records)
+            chunk = records[start:end]
+            grid_offset = ANALYSIS_HORIZONTAL_CELL_METERS * 0.5
+            cell_x = np.floor(
+                (chunk["x"].astype(np.float64) - grid_offset)
+                / ANALYSIS_HORIZONTAL_CELL_METERS
+            ).astype(np.int64)
+            cell_y = np.floor(
+                (chunk["y"].astype(np.float64) - grid_offset)
+                / ANALYSIS_HORIZONTAL_CELL_METERS
+            ).astype(np.int64)
+            shard_ids = np.remainder(
+                _cell_priority(
+                    cell_x,
+                    cell_y,
+                    np.zeros(cell_x.size, dtype=np.int64),
+                    role_seed ^ 0xB5AD4ECEDA1CE2A9,
+                ),
+                config.shard_count,
+            ).astype(np.int64, copy=False)
+            temporary = np.empty(end - start, dtype=analysis_dtype)
+            temporary["index"] = np.arange(start, end, dtype=np.uint32)
+            temporary["cell_x"] = cell_x
+            temporary["cell_y"] = cell_y
+            temporary["z"] = chunk["z"]
+            temporary["parents"] = coarse_parent_counts[start:end]
+            temporary["recession"] = (
+                chunk[recession_name]
+                if recession_name is not None
+                else np.full(end - start, np.nan, dtype=np.float32)
+            )
+            order = np.argsort(shard_ids, kind="stable")
+            sorted_ids = shard_ids[order]
+            boundaries = np.flatnonzero(sorted_ids[1:] != sorted_ids[:-1]) + 1
+            run_starts = np.concatenate((np.asarray([0]), boundaries))
+            run_ends = np.concatenate((boundaries, np.asarray([end - start])))
+            for run_start, run_end in zip(run_starts, run_ends, strict=True):
+                streams[int(sorted_ids[run_start])].write(
+                    temporary[order[run_start:run_end]].tobytes()
+                )
+    finally:
+        del records
+        for stream in streams:
+            stream.flush()
+            os.fsync(stream.fileno())
+            stream.close()
+
+    attenuated = 0
+    zero_weight = 0
+    for path in shard_paths:
+        count = path.stat().st_size // analysis_dtype.itemsize
+        if count == 0:
+            continue
+        shard = np.memmap(path, dtype=analysis_dtype, mode="r", shape=(count,))
+        order = np.lexsort((shard["z"], shard["cell_y"], shard["cell_x"]))
+        sorted_shard = np.asarray(shard[order])
+        packed = _surface_analysis_weights_for_sorted(
+            sorted_shard["cell_x"],
+            sorted_shard["cell_y"],
+            sorted_shard["z"].astype(np.float64),
+            sorted_shard["parents"],
+            sorted_shard["recession"].astype(np.float64),
+            role,
+        )
+        weights[sorted_shard["index"]] = packed
+        channels = np.column_stack(
+            [((packed >> np.uint32(shift)) & np.uint32(0xFF))
+             for shift in (0, 8, 16, 24)]
+        )
+        attenuated += int(np.count_nonzero(channels < 255))
+        zero_weight += int(np.count_nonzero(channels == 0))
+        del shard
+    weights.flush()
+    shutil.rmtree(shard_root)
+    return weights, {
+        "attenuated_channel_values": attenuated,
+        "zero_weight_channel_values": zero_weight,
+    }
+
+
+def _derive_fine_surface_weights(
+    links: np.memmap,
+    coarse_weights: np.memmap,
+    fine_weights_path: Path,
+    chunk_records: int,
+) -> np.memmap:
+    fine = _create_u32_memmap(
+        fine_weights_path,
+        links.size,
+        np.uint32(0xFFFFFFFF),
+    )
+    for start in range(0, links.size, chunk_records):
+        end = min(links.size, start + chunk_records)
+        linked = np.asarray(links[start:end])
+        valid = linked != SOURCE_INDEX_SENTINEL
+        values = np.full(end - start, np.uint32(0xFFFFFFFF), dtype=np.uint32)
+        values[valid] = coarse_weights[linked[valid]]
+        fine[start:end] = values
+    fine.flush()
+    return fine
+
+
+def _binary_u32_proof(path: Path, count: int) -> dict[str, object]:
+    stat = path.stat()
+    expected_size = count * np.dtype("<u4").itemsize
+    if stat.st_size != expected_size:
+        raise RuntimeError(f"{path}: sidecar size {stat.st_size} != {expected_size}")
+    return {
+        "file": path.as_posix(),  # made bundle-relative below
+        "size_bytes": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "sha256": _sha256_file(path),
+        "count": count,
+        "encoding": "little-endian-uint32",
+    }
 
 
 def _validate_output(
@@ -943,6 +1368,24 @@ def _build_role(
         flush=True,
     )
 
+    analysis_root = output_path.parent.parent / "Analysis"
+    analysis_root.mkdir(parents=True, exist_ok=True)
+    analysis_stem = f"Site3-{role}"
+    link_path = analysis_root / f"{analysis_stem}-1mm-to-5mm.u32"
+    parent_count_path = analysis_root / f"{analysis_stem}-5mm-parent-count.u32"
+    coarse_weights_path = analysis_root / f"{analysis_stem}-5mm-stability.u32"
+    fine_weights_path = analysis_root / f"{analysis_stem}-1mm-stability.u32"
+    source_to_output = _create_u32_memmap(
+        link_path,
+        description.vertex_count,
+        SOURCE_INDEX_SENTINEL,
+    )
+    coarse_parent_counts = _create_u32_memmap(
+        parent_count_path,
+        target_count,
+        np.uint32(0),
+    )
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     header = _output_header(
         description,
@@ -965,6 +1408,9 @@ def _build_role(
                 config,
                 target_count,
                 systematic_extras[cell_offset : cell_offset + cell_count],
+                source_to_output,
+                emitted,
+                coarse_parent_counts,
             )
             cell_offset += cell_count
             raw = aggregated.tobytes()
@@ -989,6 +1435,64 @@ def _build_role(
         description.schema_sha256,
         digest.hexdigest(),
     )
+    source_to_output.flush()
+    coarse_parent_counts.flush()
+    linked_parent_count = int(np.count_nonzero(
+        source_to_output != SOURCE_INDEX_SENTINEL
+    ))
+    coarse_weights, analysis_diagnostics = _build_surface_analysis_weights(
+        role,
+        output_path,
+        output_description,
+        coarse_parent_counts,
+        coarse_weights_path,
+        work_root,
+        config,
+        role_seed,
+    )
+    fine_weights = _derive_fine_surface_weights(
+        source_to_output,
+        coarse_weights,
+        fine_weights_path,
+        config.chunk_records,
+    )
+    source_to_output.flush()
+    coarse_parent_counts.flush()
+    coarse_weights.flush()
+    fine_weights.flush()
+    analysis_record = {
+        "schema_version": ANALYSIS_SCHEMA_VERSION,
+        "fine_to_coarse": _binary_u32_proof(
+            link_path,
+            description.vertex_count,
+        ),
+        "coarse_parent_count": _binary_u32_proof(
+            parent_count_path,
+            target_count,
+        ),
+        "fine_stability_weights": _binary_u32_proof(
+            fine_weights_path,
+            description.vertex_count,
+        ),
+        "coarse_stability_weights": _binary_u32_proof(
+            coarse_weights_path,
+            target_count,
+        ),
+        "weight_channels": [
+            "density_continuity",
+            "prefer_lower",
+            "prefer_upper",
+            "soft_separation",
+        ],
+        "horizontal_cell_m": ANALYSIS_HORIZONTAL_CELL_METERS,
+        "close_surface_m": ANALYSIS_CLOSE_SURFACE_METERS,
+        "separate_surface_m": ANALYSIS_SEPARATE_SURFACE_METERS,
+        "recession_field": _recession_property_name(output_description) or "",
+        "linked_fine_points": linked_parent_count,
+        "unlinked_fine_points": description.vertex_count - linked_parent_count,
+        "selection_diagnostics": analysis_diagnostics,
+    }
+    del source_to_output, coarse_parent_counts, coarse_weights, fine_weights
     shutil.rmtree(work_root)
     return {
         "role": role,
@@ -1002,6 +1506,7 @@ def _build_role(
             "vertex_count": output_description.vertex_count,
             "schema_sha256": output_description.schema_sha256,
         },
+        "analysis": analysis_record,
         "population": {
             "source_points": description.vertex_count,
             "output_points": target_count,
@@ -1047,6 +1552,11 @@ def _bundle_fingerprint_payload(manifest: dict[str, object]) -> dict[str, object
                 "source_schema_sha256": role["source"]["schema_sha256"],
                 "output_sha256": role["output"]["sha256"],
                 "output_schema_sha256": role["output"]["schema_sha256"],
+                "analysis_schema_version": role["analysis"]["schema_version"],
+                "fine_to_coarse_sha256": role["analysis"]["fine_to_coarse"]["sha256"],
+                "coarse_parent_count_sha256": role["analysis"]["coarse_parent_count"]["sha256"],
+                "fine_stability_weights_sha256": role["analysis"]["fine_stability_weights"]["sha256"],
+                "coarse_stability_weights_sha256": role["analysis"]["coarse_stability_weights"]["sha256"],
             }
             for role in roles
         ],
@@ -1107,6 +1617,15 @@ def _preflight_build(config: BuildConfig) -> tuple[Path, Path]:
         )
         for role in ROLE_ORDER
     )
+    # Published provenance/weights use three uint32 columns over the fine
+    # source (link + packed weights; the third allowance covers temporary
+    # analysis sharding) and two over the coarse output. Keeping this in the
+    # preflight prevents a late failure after the expensive PLY aggregation.
+    analysis_bytes = sum(
+        descriptions[role].vertex_count * 12
+        + config.targets[role] * 8
+        for role in ROLE_ORDER
+    )
     largest_source = max(source_sizes)
     # Each role owns one full set of raw shards. Sorting briefly needs one
     # additional shard copy; allow two average-shard sizes for skew, all final
@@ -1114,7 +1633,12 @@ def _preflight_build(config: BuildConfig) -> tuple[Path, Path]:
     largest_shard_allowance = (
         2 * (largest_source + config.shard_count - 1) // config.shard_count
     )
-    working_bytes = largest_source + largest_shard_allowance + output_bytes
+    working_bytes = (
+        largest_source
+        + largest_shard_allowance
+        + output_bytes
+        + analysis_bytes
+    )
     required_free = int(math.ceil(working_bytes * 1.10)) + FREE_SPACE_MARGIN_BYTES
     available = shutil.disk_usage(cache_root).free
     if available < required_free:
@@ -1222,6 +1746,36 @@ def _validate_existing_bundle(
                 "existing cached output differs from deterministic rebuild: "
                 f"{output_path}"
             )
+        analysis = existing_role.get("analysis")
+        expected_analysis = expected_role.get("analysis")
+        if not isinstance(analysis, dict) or not isinstance(
+            expected_analysis, dict
+        ):
+            raise RuntimeError("existing analysis proof is malformed")
+        for key in (
+            "fine_to_coarse",
+            "coarse_parent_count",
+            "fine_stability_weights",
+            "coarse_stability_weights",
+        ):
+            proof = analysis.get(key)
+            expected_proof = expected_analysis.get(key)
+            if not isinstance(proof, dict) or not isinstance(
+                expected_proof, dict
+            ):
+                raise RuntimeError(f"existing {key} proof is malformed")
+            if proof.get("file") != expected_proof.get("file"):
+                raise RuntimeError(f"existing {key} path differs from rebuild")
+            sidecar_path = _validated_relative_path(final_root, proof["file"])
+            stat = sidecar_path.stat()
+            if stat.st_size != int(proof.get("size_bytes", -1)):
+                raise RuntimeError(f"existing sidecar size changed: {sidecar_path}")
+            if _sha256_file(sidecar_path) != proof.get("sha256"):
+                raise RuntimeError(f"existing sidecar hash changed: {sidecar_path}")
+            if proof.get("sha256") != expected_proof.get("sha256"):
+                raise RuntimeError(
+                    f"existing {key} differs from deterministic rebuild"
+                )
     return manifest_path
 
 
@@ -1266,6 +1820,19 @@ def build_cache(config: BuildConfig) -> Path:
             output = record["output"]
             assert isinstance(output, dict)
             output["file"] = relative_output.as_posix()
+            analysis = record["analysis"]
+            assert isinstance(analysis, dict)
+            for key in (
+                "fine_to_coarse",
+                "coarse_parent_count",
+                "fine_stability_weights",
+                "coarse_stability_weights",
+            ):
+                proof = analysis[key]
+                assert isinstance(proof, dict)
+                proof["file"] = Path(str(proof["file"])).relative_to(
+                    staging_root
+                ).as_posix()
             role_records.append(record)
         # Shard scratch lives under .work only while a role is being built;
         # never publish the (empty) scratch tree inside the immutable bundle.
@@ -1289,6 +1856,9 @@ def build_cache(config: BuildConfig) -> Path:
                 "continuous_filter": "finite-arithmetic-mean",
                 "circular_degree_filter": (
                     "finite-unit-circle-mean-first-parent-fallback"
+                ),
+                "surface_analysis": (
+                    "exact-parent-link-horizontal-density-recession-coherence-v1"
                 ),
             },
             "scene": "Scene3",

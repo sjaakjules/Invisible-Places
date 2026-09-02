@@ -222,6 +222,62 @@ class DisplayDensityCacheBuilderTests(unittest.TestCase):
                     ],
                     [2, 2, 1],
                 )
+                analysis = role_record["analysis"]
+                self.assertEqual(
+                    analysis["schema_version"],
+                    cache_builder.ANALYSIS_SCHEMA_VERSION,
+                )
+                self.assertEqual(
+                    analysis["weight_channels"],
+                    [
+                        "density_continuity",
+                        "prefer_lower",
+                        "prefer_upper",
+                        "soft_separation",
+                    ],
+                )
+                sidecars = {
+                    name: bundle_a / analysis[name]["file"]
+                    for name in (
+                        "fine_to_coarse",
+                        "coarse_parent_count",
+                        "fine_stability_weights",
+                        "coarse_stability_weights",
+                    )
+                }
+                for name, sidecar in sidecars.items():
+                    self.assertTrue(sidecar.is_file(), name)
+                    self.assertEqual(
+                        analysis[name]["sha256"],
+                        _sha256(sidecar),
+                    )
+                links = np.fromfile(sidecars["fine_to_coarse"], dtype="<u4")
+                parents = np.fromfile(
+                    sidecars["coarse_parent_count"], dtype="<u4"
+                )
+                fine_weights = np.fromfile(
+                    sidecars["fine_stability_weights"], dtype="<u4"
+                )
+                coarse_weights = np.fromfile(
+                    sidecars["coarse_stability_weights"], dtype="<u4"
+                )
+                self.assertEqual(links.size, _fixture_records().size)
+                self.assertEqual(parents.size, 5)
+                self.assertEqual(fine_weights.size, links.size)
+                self.assertEqual(coarse_weights.size, parents.size)
+                linked = links != cache_builder.SOURCE_INDEX_SENTINEL
+                self.assertTrue(np.all(links[linked] < coarse_weights.size))
+                np.testing.assert_array_equal(
+                    fine_weights[linked], coarse_weights[links[linked]]
+                )
+                self.assertEqual(
+                    int(np.sum(parents, dtype=np.uint64)),
+                    int(np.count_nonzero(linked)),
+                )
+                if role == "VEG":
+                    self.assertTrue(
+                        np.all(coarse_weights == np.uint32(0xFFFFFFFF))
+                    )
 
             for role, (source_hash, source_mtime_ns) in source_proofs.items():
                 source = source_root / f"Site3-{role}-1mm.ply"
@@ -563,6 +619,54 @@ class DisplayDensityCacheBuilderTests(unittest.TestCase):
         self.assertEqual(int(np.count_nonzero(extras_a[:20])), 5)
         self.assertEqual(int(np.sum(quotas, dtype=np.uint64)), 10)
         np.testing.assert_array_equal(extras_a, extras_b)
+
+    def test_surface_modes_choose_density_lower_upper_and_role_specific_soft_winner(
+        self,
+    ) -> None:
+        cell_x = np.zeros(5, dtype=np.int64)
+        cell_y = np.zeros(5, dtype=np.int64)
+        z = np.asarray([0.000, 0.002, 0.020, 0.022, 0.060], dtype=np.float64)
+        # The lower scan is denser than the upper one; the middle scan is a
+        # nearby rival and should receive fractional rather than binary weight.
+        parents = np.asarray([8, 8, 2, 2, 10], dtype=np.uint32)
+        recession = np.asarray([0.10, 0.11, 0.50, 0.51, 0.90], dtype=np.float64)
+
+        sand = cache_builder._surface_analysis_weights_for_sorted(
+            cell_x, cell_y, z, parents, recession, "SAND"
+        )
+        rock = cache_builder._surface_analysis_weights_for_sorted(
+            cell_x, cell_y, z, parents, recession, "ROCK"
+        )
+        channels = lambda packed: np.column_stack(
+            [
+                ((packed >> np.uint32(shift)) & np.uint32(0xFF)).astype(
+                    np.uint8
+                )
+                for shift in (0, 8, 16, 24)
+            ]
+        )
+        sand_channels = channels(sand)
+        rock_channels = channels(rock)
+
+        # Density+continuity and Prefer Lower retain the denser lower scan.
+        self.assertTrue(np.all(sand_channels[:2, 0] == 255))
+        self.assertTrue(np.all(sand_channels[:2, 1] == 255))
+        # Prefer Upper retains the highest scan and rejects a well-separated
+        # lower scan.
+        self.assertEqual(int(sand_channels[4, 2]), 255)
+        self.assertEqual(int(sand_channels[0, 2]), 0)
+        # The middle scan blends rather than toggles because its separation
+        # lies between the close and fully-separated thresholds.
+        self.assertGreater(int(sand_channels[2, 0]), 0)
+        self.assertLess(int(sand_channels[2, 0]), 128)
+        # SAND soft mode follows the density winner; ROCK soft mode follows
+        # the upper surface for under-rock culling.
+        np.testing.assert_array_equal(
+            sand_channels[:, 3], sand_channels[:, 0]
+        )
+        np.testing.assert_array_equal(
+            rock_channels[:, 3], rock_channels[:, 2]
+        )
 
 
 if __name__ == "__main__":

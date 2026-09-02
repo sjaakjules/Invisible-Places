@@ -44,6 +44,9 @@ struct ScalarFieldStats {
     // every on-disk field loaded, which legacy documents may still reference
     // by raw index.
     std::int32_t sourceIndex = -1;
+    // Runtime support columns can share the field-major CPU/GPU storage
+    // without becoming selectable inputs for authored colour/material maps.
+    bool authoringVisible = true;
 
     void Include(float value);
 };

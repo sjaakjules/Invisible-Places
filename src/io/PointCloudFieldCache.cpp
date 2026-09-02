@@ -651,8 +651,13 @@ PointCloudLoadResult LoadPointCloudWithFieldCache(
     if (manifestNeedsUpdate &&
         !WriteManifest(cacheDirectory, updatedManifest)) {
         std::cerr << "Point-cloud field cache: manifest update failed for "
-                  << sourcePath.filename().string() << std::endl;
+                      << sourcePath.filename().string() << std::endl;
     }
+
+    (void)AppendSceneDisplayDensitySurfaceWeights(
+        sourcePath,
+        {},
+        &cloud);
 
     return {.cloud = std::move(cloud), .success = true};
 }

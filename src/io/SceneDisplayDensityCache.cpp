@@ -1,17 +1,20 @@
 #include "io/SceneDisplayDensityCache.hpp"
 
 #include "io/PlyHeader.hpp"
+#include "io/PointCloudData.hpp"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cctype>
 #include <cmath>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -66,7 +69,9 @@ constexpr std::array<std::string_view, 3U> kRequiredRoles{
         (algorithmVersion ==
              kSceneDisplayDensityCacheQ1CentroidMedoidAlgorithmVersion ||
          algorithmVersion ==
-             kSceneDisplayDensityCacheCircularFieldAlgorithmVersion) &&
+             kSceneDisplayDensityCacheCircularFieldAlgorithmVersion ||
+         algorithmVersion ==
+             kSceneDisplayDensityCacheSurfaceAnalysisAlgorithmVersion) &&
         positionPolicy ==
             kSceneDisplayDensityCacheQ1CentroidMedoidPositionPolicy;
     return legacyStableHash || q1CentroidMedoid;
@@ -75,6 +80,21 @@ constexpr std::array<std::string_view, 3U> kRequiredRoles{
 std::mutex gPayloadOverridesMutex;
 std::map<std::string, std::filesystem::path> gPayloadOverrides;
 std::string gActiveBundleFingerprint;
+
+struct SurfaceAnalysisSource {
+    std::filesystem::path weightsPath;
+    std::filesystem::path fineToCoarsePath;
+    std::uint64_t pointCount = 0U;
+    // Lazily materialised copy of the whole weights column, shared by every
+    // later indexed lookup. Subset and aHQ block loads gather tens of
+    // thousands of scattered 4-byte values per block; per-element seeks on a
+    // cold sidecar cost tens of seconds per role, while the resident array
+    // makes the same gather a sub-millisecond memory walk. The array lives
+    // until the activation map is replaced, so its budget is bounded by the
+    // three role sidecars actually touched by indexed loads.
+    std::shared_ptr<const std::vector<std::uint32_t>> residentWeights;
+};
+std::map<std::string, SurfaceAnalysisSource> gSurfaceAnalysisSources;
 
 class SoftwareSha256 {
   public:
@@ -294,10 +314,12 @@ std::string NormalizedAbsolutePathKey(const std::filesystem::path& path) {
 
 void InstallPayloadOverrides(
     std::map<std::string, std::filesystem::path> overrides,
-    std::string bundleFingerprint = {}) {
+    std::string bundleFingerprint = {},
+    std::map<std::string, SurfaceAnalysisSource> analysisSources = {}) {
     std::scoped_lock lock(gPayloadOverridesMutex);
     gPayloadOverrides = std::move(overrides);
     gActiveBundleFingerprint = std::move(bundleFingerprint);
+    gSurfaceAnalysisSources = std::move(analysisSources);
 }
 
 bool IsHexString(std::string_view value, std::size_t expectedSize) {
@@ -553,6 +575,86 @@ bool ReadDouble(
     }
 }
 
+struct ValidatedU32Sidecar {
+    std::filesystem::path path;
+    std::string sha256;
+    std::uint64_t count = 0U;
+};
+
+std::optional<ValidatedU32Sidecar> ValidateU32Sidecar(
+    const json& proof,
+    const std::filesystem::path& bundlePath,
+    const std::filesystem::path& canonicalBundle,
+    std::uint64_t expectedCount,
+    std::string_view label,
+    std::string* errorMessage) {
+    std::string fileText;
+    std::string sha256;
+    std::string encoding;
+    std::uint64_t count = 0U;
+    std::uint64_t sizeBytes = 0U;
+    std::int64_t mtime = 0;
+    if (!proof.is_object() ||
+        !ReadString(proof, "file", &fileText) ||
+        !ReadString(proof, "sha256", &sha256) ||
+        !ReadString(proof, "encoding", &encoding) ||
+        encoding != "little-endian-uint32" ||
+        !ReadUnsigned(proof, "count", &count) ||
+        !ReadUnsigned(proof, "size_bytes", &sizeBytes) ||
+        !ReadSigned(proof, "mtime_ns", &mtime) ||
+        count != expectedCount ||
+        count > std::numeric_limits<std::uint32_t>::max() ||
+        sizeBytes != count * sizeof(std::uint32_t) ||
+        !IsHexDigest(sha256)) {
+        *errorMessage = std::string{label} +
+                        " sidecar identity is malformed.";
+        return std::nullopt;
+    }
+    const std::filesystem::path relative{fileText};
+    if (relative.empty() || relative.is_absolute() ||
+        relative.extension() != ".u32") {
+        *errorMessage = std::string{label} +
+                        " sidecar path is not a relative .u32 file.";
+        return std::nullopt;
+    }
+    std::error_code error;
+    const auto status =
+        std::filesystem::symlink_status(bundlePath / relative, error);
+    if (error || status.type() != std::filesystem::file_type::regular) {
+        *errorMessage = std::string{label} +
+                        " sidecar is missing or is a symbolic link.";
+        return std::nullopt;
+    }
+    const auto canonical =
+        std::filesystem::canonical(bundlePath / relative, error);
+    if (error || !PathIsInside(canonical, canonicalBundle)) {
+        *errorMessage = std::string{label} +
+                        " sidecar escapes the immutable bundle.";
+        return std::nullopt;
+    }
+    const auto actualSize = std::filesystem::file_size(canonical, error);
+    const auto actualMtime = FileMtimeNanoseconds(canonical);
+    if (error || !actualMtime.has_value() || actualSize != sizeBytes ||
+        actualMtime.value() != mtime) {
+        *errorMessage = std::string{label} +
+                        " sidecar size or timestamp changed.";
+        return std::nullopt;
+    }
+    const auto actualSha256 = Sha256File(canonical, errorMessage);
+    if (!actualSha256.has_value() || actualSha256.value() != sha256) {
+        if (actualSha256.has_value()) {
+            *errorMessage = std::string{label} +
+                            " sidecar failed SHA-256 verification.";
+        }
+        return std::nullopt;
+    }
+    return ValidatedU32Sidecar{
+        .path = canonical,
+        .sha256 = std::move(sha256),
+        .count = count,
+    };
+}
+
 std::string VertexSchemaSha256(const PlyHeader& header) {
     json properties = json::array();
     for (const auto& property : header.properties) {
@@ -597,6 +699,250 @@ std::string ActiveSceneDisplayDensityBundleFingerprint() {
 
 void ClearSceneDisplayDensityCacheActivation() {
     InstallPayloadOverrides({});
+}
+
+namespace {
+
+std::optional<SurfaceAnalysisSource> FindSurfaceAnalysisSource(
+    const std::filesystem::path& sourcePath) {
+    std::scoped_lock lock(gPayloadOverridesMutex);
+    const auto found = gSurfaceAnalysisSources.find(
+        NormalizedAbsolutePathKey(sourcePath));
+    return found == gSurfaceAnalysisSources.end()
+               ? std::nullopt
+               : std::optional<SurfaceAnalysisSource>{found->second};
+}
+
+void SwapU32VectorToNativeFromLittleEndian(std::vector<std::uint32_t>* values) {
+    if constexpr (std::endian::native == std::endian::big) {
+        for (auto& value : *values) {
+            value = ((value & 0x000000ffU) << 24U) |
+                    ((value & 0x0000ff00U) << 8U) |
+                    ((value & 0x00ff0000U) >> 8U) |
+                    ((value & 0xff000000U) >> 24U);
+        }
+    }
+}
+
+// Loads (once) and shares the complete weights column for one registered
+// source. Loading happens under the registry mutex so eight concurrent aHQ
+// block workers cannot each read the same multi-hundred-MB file; later
+// callers only copy the shared_ptr.
+std::shared_ptr<const std::vector<std::uint32_t>>
+ResidentSurfaceAnalysisWeights(const std::filesystem::path& sourcePath) {
+    const auto key = NormalizedAbsolutePathKey(sourcePath);
+    std::scoped_lock lock(gPayloadOverridesMutex);
+    const auto found = gSurfaceAnalysisSources.find(key);
+    if (found == gSurfaceAnalysisSources.end() ||
+        found->second.weightsPath.empty() ||
+        found->second.pointCount == 0U ||
+        found->second.pointCount >
+            std::numeric_limits<std::size_t>::max() / sizeof(std::uint32_t)) {
+        return nullptr;
+    }
+    if (found->second.residentWeights != nullptr) {
+        return found->second.residentWeights;
+    }
+    std::vector<std::uint32_t> values;
+    try {
+        values.resize(static_cast<std::size_t>(found->second.pointCount));
+    } catch (const std::exception&) {
+        return nullptr;
+    }
+    std::ifstream input{found->second.weightsPath, std::ios::binary};
+    if (!input.is_open()) {
+        return nullptr;
+    }
+    const auto byteCount = static_cast<std::streamsize>(
+        values.size() * sizeof(std::uint32_t));
+    input.read(reinterpret_cast<char*>(values.data()), byteCount);
+    if (input.gcount() != byteCount) {
+        return nullptr;
+    }
+    SwapU32VectorToNativeFromLittleEndian(&values);
+    found->second.residentWeights =
+        std::make_shared<const std::vector<std::uint32_t>>(std::move(values));
+    return found->second.residentWeights;
+}
+
+bool ReadIndexedU32(
+    const std::filesystem::path& path,
+    std::uint64_t sourceCount,
+    std::span<const std::uint32_t> indices,
+    std::size_t expectedOutputCount,
+    std::vector<std::uint32_t>* values) {
+    if (values == nullptr || sourceCount == 0U ||
+        sourceCount > std::numeric_limits<std::size_t>::max()) {
+        return false;
+    }
+    const bool complete = indices.empty();
+    const auto outputCount = complete
+                                 ? static_cast<std::size_t>(sourceCount)
+                                 : indices.size();
+    if (outputCount != expectedOutputCount) {
+        return false;
+    }
+    try {
+        values->resize(outputCount);
+    } catch (const std::exception&) {
+        return false;
+    }
+    std::ifstream input{path, std::ios::binary};
+    if (!input.is_open()) {
+        values->clear();
+        return false;
+    }
+    if (complete) {
+        input.read(
+            reinterpret_cast<char*>(values->data()),
+            static_cast<std::streamsize>(
+                values->size() * sizeof(std::uint32_t)));
+        if (input.gcount() != static_cast<std::streamsize>(
+                                    values->size() * sizeof(std::uint32_t))) {
+            values->clear();
+            return false;
+        }
+    } else {
+        std::size_t destination = 0U;
+        while (destination < indices.size()) {
+            const std::uint64_t first = indices[destination];
+            if (first >= sourceCount) {
+                values->clear();
+                return false;
+            }
+            std::size_t count = 1U;
+            while (destination + count < indices.size() &&
+                   static_cast<std::uint64_t>(indices[destination + count]) ==
+                       first + count) {
+                ++count;
+            }
+            input.clear();
+            input.seekg(
+                static_cast<std::streamoff>(first * sizeof(std::uint32_t)),
+                std::ios::beg);
+            input.read(
+                reinterpret_cast<char*>(values->data() + destination),
+                static_cast<std::streamsize>(count * sizeof(std::uint32_t)));
+            if (!input.good() && !input.eof()) {
+                values->clear();
+                return false;
+            }
+            if (input.gcount() != static_cast<std::streamsize>(
+                                    count * sizeof(std::uint32_t))) {
+                values->clear();
+                return false;
+            }
+            destination += count;
+        }
+    }
+    SwapU32VectorToNativeFromLittleEndian(values);
+    return true;
+}
+
+}  // namespace
+
+bool AppendSceneDisplayDensitySurfaceWeights(
+    const std::filesystem::path& sourcePath,
+    std::span<const std::uint32_t> sourcePointIndices,
+    LoadedPointCloud* cloud) {
+    if (cloud == nullptr || cloud->PointCount() == 0U ||
+        std::any_of(
+            cloud->scalarFields.begin(),
+            cloud->scalarFields.end(),
+            [](const auto& field) {
+                return field.name ==
+                       kPointCloudSurfaceStabilityPackedFieldName;
+            })) {
+        return false;
+    }
+    const auto source = FindSurfaceAnalysisSource(sourcePath);
+    if (!source.has_value() || source->weightsPath.empty()) {
+        return false;
+    }
+    // A validated sidecar that then fails to append must be loud: the
+    // renderer falls back to weight one, which is otherwise
+    // indistinguishable from the feature being off.
+    const auto reportFailure = [&]() {
+        std::cerr << "Display-density surface weights unavailable for "
+                  << sourcePath.filename().string()
+                  << "; authored opacity renders without surface selection."
+                  << std::endl;
+        return false;
+    };
+    std::vector<std::uint32_t> packed;
+    if (sourcePointIndices.empty()) {
+        if (!ReadIndexedU32(
+                source->weightsPath,
+                source->pointCount,
+                sourcePointIndices,
+                cloud->PointCount(),
+                &packed)) {
+            return reportFailure();
+        }
+    } else {
+        // Subset and aHQ block loads gather scattered indices. Per-element
+        // file seeks cost tens of seconds per role on a cold sidecar, so
+        // these paths share one resident copy of the column instead.
+        const auto resident = ResidentSurfaceAnalysisWeights(sourcePath);
+        if (resident == nullptr ||
+            sourcePointIndices.size() != cloud->PointCount()) {
+            return reportFailure();
+        }
+        try {
+            packed.resize(sourcePointIndices.size());
+        } catch (const std::exception&) {
+            return reportFailure();
+        }
+        for (std::size_t index = 0U;
+             index < sourcePointIndices.size();
+             ++index) {
+            const auto sourceIndex = sourcePointIndices[index];
+            if (sourceIndex >= resident->size()) {
+                return reportFailure();
+            }
+            packed[index] = (*resident)[sourceIndex];
+        }
+    }
+    const auto oldSize = cloud->scalarFieldValues.size();
+    try {
+        cloud->scalarFieldValues.resize(oldSize + packed.size());
+        for (std::size_t index = 0U; index < packed.size(); ++index) {
+            cloud->scalarFieldValues[oldSize + index] =
+                std::bit_cast<float>(packed[index]);
+        }
+        cloud->scalarFields.push_back({
+            .name = std::string{kPointCloudSurfaceStabilityPackedFieldName},
+            .minimum = 0.0F,
+            .maximum = 1.0F,
+            .count = packed.size(),
+            .valid = true,
+            .sourceIndex = -1,
+            .authoringVisible = false,
+        });
+    } catch (const std::exception&) {
+        cloud->scalarFieldValues.resize(oldSize);
+        return false;
+    }
+    return true;
+}
+
+bool ReadSceneDisplayDensityFineToCoarseLinks(
+    const std::filesystem::path& sourcePath,
+    std::span<const std::uint32_t> sourcePointIndices,
+    std::vector<std::uint32_t>* links) {
+    const auto source = FindSurfaceAnalysisSource(sourcePath);
+    if (!source.has_value() || source->fineToCoarsePath.empty()) {
+        return false;
+    }
+    const auto expected = sourcePointIndices.empty()
+                              ? static_cast<std::size_t>(source->pointCount)
+                              : sourcePointIndices.size();
+    return ReadIndexedU32(
+        source->fineToCoarsePath,
+        source->pointCount,
+        sourcePointIndices,
+        expected,
+        links);
 }
 
 SceneDisplayDensityCacheActivation ActivateScene3DisplayDensityCacheImpl(
@@ -784,6 +1130,10 @@ SceneDisplayDensityCacheActivation ActivateScene3DisplayDensityCacheImpl(
         std::int64_t expectedSourceMtime = 0;
         std::uint64_t expectedOutputSize = 0U;
         std::int64_t expectedOutputMtime = 0;
+        std::optional<ValidatedU32Sidecar> fineToCoarse;
+        std::optional<ValidatedU32Sidecar> coarseParentCount;
+        std::optional<ValidatedU32Sidecar> fineWeights;
+        std::optional<ValidatedU32Sidecar> coarseWeights;
     };
     std::array<PendingOverlay, kRequiredRoles.size()> pending;
     std::array<json, kRequiredRoles.size()> fingerprintRoles;
@@ -985,6 +1335,60 @@ SceneDisplayDensityCacheActivation ActivateScene3DisplayDensityCacheImpl(
                 "Cached " + role +
                     " output failed full SHA-256 verification or changed while being verified.");
         }
+        if (algorithmVersion ==
+            kSceneDisplayDensityCacheSurfaceAnalysisAlgorithmVersion) {
+            const auto analysisIt = roleJson.find("analysis");
+            std::uint64_t analysisSchema = 0U;
+            if (analysisIt == roleJson.end() ||
+                !analysisIt->is_object() ||
+                !ReadUnsigned(
+                    *analysisIt,
+                    "schema_version",
+                    &analysisSchema) ||
+                analysisSchema != 1U) {
+                return Reject(
+                    std::move(result),
+                    "Bundle " + role +
+                        " role is missing its schema-1 surface-analysis sidecar.");
+            }
+            const auto validateAnalysisFile =
+                [&](std::string_view key,
+                    std::uint64_t expectedCount,
+                    std::optional<ValidatedU32Sidecar>* destination) {
+                    const auto it = analysisIt->find(key);
+                    if (it == analysisIt->end()) {
+                        readError = role + " " + std::string{key} +
+                                    " sidecar proof is missing.";
+                        return false;
+                    }
+                    *destination = ValidateU32Sidecar(
+                        *it,
+                        bundlePath,
+                        canonicalBundle,
+                        expectedCount,
+                        role + " " + std::string{key},
+                        &readError);
+                    return destination->has_value();
+                };
+            if (!validateAnalysisFile(
+                    "fine_to_coarse",
+                    sourceVertexCount,
+                    &overlay.fineToCoarse) ||
+                !validateAnalysisFile(
+                    "coarse_parent_count",
+                    outputVertexCount,
+                    &overlay.coarseParentCount) ||
+                !validateAnalysisFile(
+                    "fine_stability_weights",
+                    sourceVertexCount,
+                    &overlay.fineWeights) ||
+                !validateAnalysisFile(
+                    "coarse_stability_weights",
+                    outputVertexCount,
+                    &overlay.coarseWeights)) {
+                return Reject(std::move(result), std::move(readError));
+            }
+        }
         overlay.cachedHeader = cachedHeader.header;
         overlay.expectedSourceSize = sourceSize;
         overlay.expectedSourceMtime = sourceMtime;
@@ -999,6 +1403,14 @@ SceneDisplayDensityCacheActivation ActivateScene3DisplayDensityCacheImpl(
             .outputSha256 = outputSha256,
             .outputPointCount = outputVertexCount,
         };
+        if (overlay.fineToCoarse.has_value()) {
+            overlay.provenance.fineToCoarseLinkPath =
+                overlay.fineToCoarse->path;
+            overlay.provenance.fineStabilityWeightsPath =
+                overlay.fineWeights->path;
+            overlay.provenance.coarseStabilityWeightsPath =
+                overlay.coarseWeights->path;
+        }
         fingerprintRoles[roleIndex] = {
             {"role", role},
             {"requested_point_count", requestedPointCount},
@@ -1007,6 +1419,18 @@ SceneDisplayDensityCacheActivation ActivateScene3DisplayDensityCacheImpl(
             {"output_sha256", outputSha256},
             {"output_schema_sha256", outputSchemaSha256},
         };
+        if (algorithmVersion ==
+            kSceneDisplayDensityCacheSurfaceAnalysisAlgorithmVersion) {
+            fingerprintRoles[roleIndex]["analysis_schema_version"] = 1U;
+            fingerprintRoles[roleIndex]["fine_to_coarse_sha256"] =
+                overlay.fineToCoarse->sha256;
+            fingerprintRoles[roleIndex]["coarse_parent_count_sha256"] =
+                overlay.coarseParentCount->sha256;
+            fingerprintRoles[roleIndex]["fine_stability_weights_sha256"] =
+                overlay.fineWeights->sha256;
+            fingerprintRoles[roleIndex]["coarse_stability_weights_sha256"] =
+                overlay.coarseWeights->sha256;
+        }
     }
 
     if (seenRoles.size() != kRequiredRoles.size()) {
@@ -1065,17 +1489,42 @@ SceneDisplayDensityCacheActivation ActivateScene3DisplayDensityCacheImpl(
     }
 
     std::map<std::string, std::filesystem::path> overrides;
+    std::map<std::string, SurfaceAnalysisSource> analysisSources;
     result.roles.reserve(pending.size());
     for (auto& overlay : pending) {
         overrides.emplace(
             NormalizedAbsolutePathKey(overlay.displayAsset->filePath),
             overlay.cachedPath);
+        if (overlay.fineWeights.has_value() &&
+            overlay.coarseWeights.has_value()) {
+            const SurfaceAnalysisSource fine{
+                .weightsPath = overlay.fineWeights->path,
+                .fineToCoarsePath = overlay.fineToCoarse->path,
+                .pointCount = overlay.fineWeights->count,
+            };
+            const SurfaceAnalysisSource coarse{
+                .weightsPath = overlay.coarseWeights->path,
+                .pointCount = overlay.coarseWeights->count,
+            };
+            analysisSources.emplace(
+                NormalizedAbsolutePathKey(
+                    overlay.provenance.canonicalSourcePath),
+                fine);
+            analysisSources.emplace(
+                NormalizedAbsolutePathKey(
+                    overlay.provenance.logicalDisplayPath),
+                coarse);
+            analysisSources.emplace(
+                NormalizedAbsolutePathKey(overlay.cachedPath),
+                coarse);
+        }
         overlay.displayAsset->header = std::move(overlay.cachedHeader);
         result.roles.push_back(std::move(overlay.provenance));
     }
     InstallPayloadOverrides(
         std::move(overrides),
-        result.bundleFingerprint);
+        result.bundleFingerprint,
+        std::move(analysisSources));
 
     result.state = SceneDisplayDensityCacheState::Activated;
     result.message =

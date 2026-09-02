@@ -1,6 +1,7 @@
 #include "io/AdaptiveHqCache.hpp"
 
 #include "io/PlyHeader.hpp"
+#include "io/SceneDisplayDensityCache.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -1966,6 +1967,10 @@ PointCloudSubsetLoadResult LoadAdaptiveHqCacheBlock(
         cloud.hasFocusPoint = true;
     }
     loaded.includedPointCount = block.pointCount;
+    (void)AppendSceneDisplayDensitySurfaceWeights(
+        index.source.path,
+        loaded.sourcePointIndices,
+        &cloud);
     loaded.success = true;
     if (progress) {
         progress(block.pointCount, block.pointCount);

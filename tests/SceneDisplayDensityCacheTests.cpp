@@ -10,6 +10,7 @@
 #include <array>
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -18,6 +19,7 @@
 #include <fstream>
 #include <limits>
 #include <string>
+#include <vector>
 
 #if defined(__APPLE__) || defined(__linux__)
 #include <sys/stat.h>
@@ -127,6 +129,9 @@ struct SyntheticBundle {
     std::array<std::filesystem::path, 3U> sourcePaths;
     std::array<std::filesystem::path, 3U> logicalDisplayPaths;
     std::array<std::filesystem::path, 3U> cachedDisplayPaths;
+    std::array<std::filesystem::path, 3U> fineToCoarsePaths;
+    std::array<std::filesystem::path, 3U> fineWeightPaths;
+    std::array<std::filesystem::path, 3U> coarseWeightPaths;
 };
 
 SyntheticBundle WriteSyntheticBundle(
@@ -207,7 +212,7 @@ SyntheticBundle WriteSyntheticBundle(
                 bundle.cachedDisplayPaths[index]);
         REQUIRE(sourceSha256.has_value());
         REQUIRE(outputSha256.has_value());
-        roleEntries.push_back({
+        nlohmann::json roleEntry{
             {"role", role},
             {"source",
              {{"path", std::filesystem::absolute(bundle.sourcePaths[index]).string()},
@@ -228,15 +233,102 @@ SyntheticBundle WriteSyntheticBundle(
               {"mtime_ns", MtimeNanoseconds(bundle.cachedDisplayPaths[index])},
               {"vertex_count", 3U + index},
               {"schema_sha256", schemaDigest}}},
-        });
-        fingerprintRoles.push_back({
+        };
+        nlohmann::json fingerprintRole{
             {"role", role},
             {"requested_point_count", 3U + index},
             {"source_sha256", sourceSha256.value()},
             {"source_schema_sha256", schemaDigest},
             {"output_sha256", outputSha256.value()},
             {"output_schema_sha256", schemaDigest},
-        });
+        };
+        if (algorithmVersion == invisible_places::io::
+                                    kSceneDisplayDensityCacheSurfaceAnalysisAlgorithmVersion) {
+            const auto analysisRoot = stagingRoot / "Analysis";
+            std::filesystem::create_directories(analysisRoot);
+            bundle.fineToCoarsePaths[index] =
+                analysisRoot / ("Site3-" + role + "-1mm-to-5mm.u32");
+            const auto parentCountPath =
+                analysisRoot / ("Site3-" + role + "-5mm-parent-count.u32");
+            bundle.fineWeightPaths[index] =
+                analysisRoot / ("Site3-" + role + "-1mm-stability.u32");
+            bundle.coarseWeightPaths[index] =
+                analysisRoot / ("Site3-" + role + "-5mm-stability.u32");
+            const auto writeU32 = [](const std::filesystem::path& path,
+                                     const std::vector<std::uint32_t>& values) {
+                std::ofstream output{
+                    path,
+                    std::ios::binary | std::ios::trunc};
+                REQUIRE(output.is_open());
+                output.write(
+                    reinterpret_cast<const char*>(values.data()),
+                    static_cast<std::streamsize>(
+                        values.size() * sizeof(std::uint32_t)));
+            };
+            const std::size_t fineCount = 5U + index;
+            const std::size_t coarseCount = 3U + index;
+            std::vector<std::uint32_t> links(fineCount);
+            std::vector<std::uint32_t> fineWeights(fineCount);
+            std::vector<std::uint32_t> coarseWeights(coarseCount);
+            std::vector<std::uint32_t> parentCounts(coarseCount, 0U);
+            for (std::size_t point = 0U; point < fineCount; ++point) {
+                links[point] = static_cast<std::uint32_t>(
+                    point % coarseCount);
+                fineWeights[point] =
+                    0x10203040U + static_cast<std::uint32_t>(point);
+                ++parentCounts[links[point]];
+            }
+            for (std::size_t point = 0U; point < coarseCount; ++point) {
+                coarseWeights[point] =
+                    0x50607080U + static_cast<std::uint32_t>(point);
+            }
+            writeU32(bundle.fineToCoarsePaths[index], links);
+            writeU32(parentCountPath, parentCounts);
+            writeU32(bundle.fineWeightPaths[index], fineWeights);
+            writeU32(bundle.coarseWeightPaths[index], coarseWeights);
+            const auto proof = [&](const std::filesystem::path& path,
+                                   std::size_t count) {
+                const auto sha = invisible_places::io::
+                    ComputeSceneDisplayDensityFileSha256(path);
+                REQUIRE(sha.has_value());
+                return nlohmann::json{
+                    {"file",
+                     std::filesystem::relative(path, stagingRoot)
+                         .generic_string()},
+                    {"size_bytes", std::filesystem::file_size(path)},
+                    {"mtime_ns", MtimeNanoseconds(path)},
+                    {"sha256", sha.value()},
+                    {"count", count},
+                    {"encoding", "little-endian-uint32"},
+                };
+            };
+            const auto fineToCoarseProof =
+                proof(bundle.fineToCoarsePaths[index], fineCount);
+            const auto parentCountProof =
+                proof(parentCountPath, coarseCount);
+            const auto fineWeightProof =
+                proof(bundle.fineWeightPaths[index], fineCount);
+            const auto coarseWeightProof =
+                proof(bundle.coarseWeightPaths[index], coarseCount);
+            roleEntry["analysis"] = {
+                {"schema_version", 1U},
+                {"fine_to_coarse", fineToCoarseProof},
+                {"coarse_parent_count", parentCountProof},
+                {"fine_stability_weights", fineWeightProof},
+                {"coarse_stability_weights", coarseWeightProof},
+            };
+            fingerprintRole["analysis_schema_version"] = 1U;
+            fingerprintRole["fine_to_coarse_sha256"] =
+                fineToCoarseProof.at("sha256");
+            fingerprintRole["coarse_parent_count_sha256"] =
+                parentCountProof.at("sha256");
+            fingerprintRole["fine_stability_weights_sha256"] =
+                fineWeightProof.at("sha256");
+            fingerprintRole["coarse_stability_weights_sha256"] =
+                coarseWeightProof.at("sha256");
+        }
+        roleEntries.push_back(std::move(roleEntry));
+        fingerprintRoles.push_back(std::move(fingerprintRole));
     }
 
     bundle.fingerprint =
@@ -254,6 +346,17 @@ SyntheticBundle WriteSyntheticBundle(
         bundle.cachedDisplayPaths[index] =
             bundleRoot / "Scene3" /
             bundle.cachedDisplayPaths[index].filename();
+        if (!bundle.fineToCoarsePaths[index].empty()) {
+            bundle.fineToCoarsePaths[index] =
+                bundleRoot / "Analysis" /
+                bundle.fineToCoarsePaths[index].filename();
+            bundle.fineWeightPaths[index] =
+                bundleRoot / "Analysis" /
+                bundle.fineWeightPaths[index].filename();
+            bundle.coarseWeightPaths[index] =
+                bundleRoot / "Analysis" /
+                bundle.coarseWeightPaths[index].filename();
+        }
     }
     bundle.manifestPath = bundleRoot / "display-density-manifest.json";
     {
@@ -424,6 +527,145 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Scene3 surface-analysis bundle supplies exact fine and coarse sidecars",
+    "[pointcloud][density][cache][surface-stability]") {
+    TemporaryDirectory temporary;
+    const auto bundle = WriteSyntheticBundle(
+        temporary.path,
+        "renderer-byte-mean",
+        invisible_places::io::
+            kSceneDisplayDensityCacheSurfaceAnalysisAlgorithmVersion,
+        kGeneratorQ1CentroidPositionPolicy);
+    auto catalog = invisible_places::io::DiscoverAssets(bundle.dataRoot);
+
+    const auto activation =
+        invisible_places::io::ActivateScene3DisplayDensityCache(
+            bundle.cacheRoot,
+            &catalog);
+    INFO(activation.message);
+    REQUIRE(activation.Activated());
+    REQUIRE(activation.roles.size() == 3U);
+    CHECK_FALSE(activation.roles[0U].fineToCoarseLinkPath.empty());
+    CHECK_FALSE(activation.roles[0U].fineStabilityWeightsPath.empty());
+    CHECK_FALSE(activation.roles[0U].coarseStabilityWeightsPath.empty());
+
+    const auto coarse = invisible_places::io::LoadPointCloud(
+        bundle.logicalDisplayPaths[0U]);
+    REQUIRE(coarse.success);
+    REQUIRE(coarse.cloud.PointCount() == 3U);
+    const auto coarseField = std::find_if(
+        coarse.cloud.scalarFields.begin(),
+        coarse.cloud.scalarFields.end(),
+        [](const auto& field) {
+            return field.name == invisible_places::io::
+                                     kPointCloudSurfaceStabilityPackedFieldName;
+        });
+    REQUIRE(coarseField != coarse.cloud.scalarFields.end());
+    const auto coarseSlot = static_cast<std::size_t>(
+        std::distance(coarse.cloud.scalarFields.begin(), coarseField));
+    CHECK(
+        std::bit_cast<std::uint32_t>(
+            coarse.cloud.scalarFieldValues[
+                coarse.cloud.ScalarFieldValueIndex(coarseSlot, 0U)]) ==
+        0x50607080U);
+
+    const auto fine = invisible_places::io::LoadPointCloud(
+        bundle.sourcePaths[0U]);
+    REQUIRE(fine.success);
+    REQUIRE(fine.cloud.PointCount() == 5U);
+    const auto fineField = std::find_if(
+        fine.cloud.scalarFields.begin(),
+        fine.cloud.scalarFields.end(),
+        [](const auto& field) {
+            return field.name == invisible_places::io::
+                                     kPointCloudSurfaceStabilityPackedFieldName;
+        });
+    REQUIRE(fineField != fine.cloud.scalarFields.end());
+    const auto fineSlot = static_cast<std::size_t>(
+        std::distance(fine.cloud.scalarFields.begin(), fineField));
+    CHECK(
+        std::bit_cast<std::uint32_t>(
+            fine.cloud.scalarFieldValues[
+                fine.cloud.ScalarFieldValueIndex(fineSlot, 4U)]) ==
+        0x10203044U);
+
+    std::vector<std::uint32_t> links;
+    REQUIRE(
+        invisible_places::io::ReadSceneDisplayDensityFineToCoarseLinks(
+            bundle.sourcePaths[0U],
+            {},
+            &links));
+    CHECK(links == std::vector<std::uint32_t>{0U, 1U, 2U, 0U, 1U});
+
+    // The subset/aHQ path passes scattered, unordered source indices (aHQ
+    // blocks are Morton-shuffled) and gathers through the resident weights
+    // copy. Values, the hidden authoring flag, and the availability contract
+    // must match the complete-load column exactly.
+    const auto packedAt = [&](std::size_t point) {
+        return std::bit_cast<std::uint32_t>(
+            fine.cloud.scalarFieldValues[
+                fine.cloud.ScalarFieldValueIndex(fineSlot, point)]);
+    };
+    invisible_places::io::LoadedPointCloud subsetCloud;
+    subsetCloud.positions.resize(3U);
+    const std::vector<std::uint32_t> shuffledIndices{4U, 0U, 3U};
+    REQUIRE(
+        invisible_places::io::AppendSceneDisplayDensitySurfaceWeights(
+            bundle.sourcePaths[0U],
+            shuffledIndices,
+            &subsetCloud));
+    REQUIRE(subsetCloud.scalarFields.size() == 1U);
+    const auto& appendedField = subsetCloud.scalarFields.front();
+    CHECK(
+        appendedField.name ==
+        invisible_places::io::kPointCloudSurfaceStabilityPackedFieldName);
+    CHECK_FALSE(appendedField.authoringVisible);
+    CHECK(appendedField.sourceIndex == -1);
+    CHECK(subsetCloud.availableScalarFields.empty());
+    REQUIRE(subsetCloud.scalarFieldValues.size() == shuffledIndices.size());
+    for (std::size_t point = 0U; point < shuffledIndices.size(); ++point) {
+        CHECK(
+            std::bit_cast<std::uint32_t>(
+                subsetCloud.scalarFieldValues[
+                    subsetCloud.ScalarFieldValueIndex(0U, point)]) ==
+            packedAt(shuffledIndices[point]));
+    }
+
+    // The links read accepts the same subset spans.
+    std::vector<std::uint32_t> subsetLinks;
+    REQUIRE(
+        invisible_places::io::ReadSceneDisplayDensityFineToCoarseLinks(
+            bundle.sourcePaths[0U],
+            shuffledIndices,
+            &subsetLinks));
+    CHECK(subsetLinks == std::vector<std::uint32_t>{1U, 0U, 0U});
+
+    // An out-of-range source index refuses the append outright and leaves
+    // the cloud untouched rather than mis-indexing weights.
+    invisible_places::io::LoadedPointCloud rejectedCloud;
+    rejectedCloud.positions.resize(1U);
+    const std::vector<std::uint32_t> outOfRange{5U};
+    CHECK_FALSE(
+        invisible_places::io::AppendSceneDisplayDensitySurfaceWeights(
+            bundle.sourcePaths[0U],
+            outOfRange,
+            &rejectedCloud));
+    CHECK(rejectedCloud.scalarFields.empty());
+    CHECK(rejectedCloud.scalarFieldValues.empty());
+
+    // A source with no registered sidecar is a quiet no-op: no column, no
+    // failure side effects.
+    invisible_places::io::LoadedPointCloud unrelatedCloud;
+    unrelatedCloud.positions.resize(1U);
+    CHECK_FALSE(
+        invisible_places::io::AppendSceneDisplayDensitySurfaceWeights(
+            temporary.path / "unregistered.ply",
+            {},
+            &unrelatedCloud));
+    CHECK(unrelatedCloud.scalarFields.empty());
+}
+
+TEST_CASE(
     "Scene3 display-density cache rejects crossed or unknown position policies",
     "[pointcloud][density][cache]") {
     struct UnsupportedPolicy {
@@ -443,7 +685,7 @@ TEST_CASE(
             kGeneratorQ1CentroidAlgorithmVersion,
             "real-parent-q1-centroid-medoid-qN-stable-hash-unknown"},
         UnsupportedPolicy{
-            4U,
+            5U,
             kGeneratorQ1CentroidPositionPolicy},
     };
 

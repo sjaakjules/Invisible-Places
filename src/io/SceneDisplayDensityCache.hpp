@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -22,6 +23,8 @@ inline constexpr std::uint64_t
     kSceneDisplayDensityCacheQ1CentroidMedoidAlgorithmVersion = 2U;
 inline constexpr std::uint64_t
     kSceneDisplayDensityCacheCircularFieldAlgorithmVersion = 3U;
+inline constexpr std::uint64_t
+    kSceneDisplayDensityCacheSurfaceAnalysisAlgorithmVersion = 4U;
 inline constexpr std::string_view
     kSceneDisplayDensityCacheQ1CentroidMedoidPositionPolicy =
         "real-parent-q1-centroid-medoid-qN-stable-hash";
@@ -40,7 +43,14 @@ struct SceneDisplayDensityCacheRoleProvenance {
     std::string sourceSha256;
     std::string outputSha256;
     std::uint64_t outputPointCount = 0U;
+    std::filesystem::path fineToCoarseLinkPath;
+    std::filesystem::path fineStabilityWeightsPath;
+    std::filesystem::path coarseStabilityWeightsPath;
 };
+
+inline constexpr std::string_view
+    kPointCloudSurfaceStabilityPackedFieldName =
+        "__InvisiblePlacesSurfaceStabilityRGBA8";
 
 struct SceneDisplayDensityCacheActivation {
     SceneDisplayDensityCacheState state =
@@ -74,6 +84,23 @@ ActivateScene3DisplayDensityCache(
     const std::filesystem::path& logicalPath);
 [[nodiscard]] std::string ActiveSceneDisplayDensityBundleFingerprint();
 void ClearSceneDisplayDensityCacheActivation();
+
+// Appends one runtime-generated, field-major float column whose bit pattern
+// is the sidecar's packed RGBA8 opacity alternatives. `sourcePointIndices`
+// is empty for a complete source-order load and populated for aHQ/subsets.
+// Missing legacy sidecars are a normal no-op; canonical PLY data is untouched.
+struct LoadedPointCloud;
+[[nodiscard]] bool AppendSceneDisplayDensitySurfaceWeights(
+    const std::filesystem::path& sourcePath,
+    std::span<const std::uint32_t> sourcePointIndices,
+    LoadedPointCloud* cloud);
+
+// Exact fine-parent -> emitted 5 mm stratum links, exposed for later coarse
+// analyses without making the renderer retain the large link array.
+[[nodiscard]] bool ReadSceneDisplayDensityFineToCoarseLinks(
+    const std::filesystem::path& sourcePath,
+    std::span<const std::uint32_t> sourcePointIndices,
+    std::vector<std::uint32_t>* links);
 
 // Shared with explicit cache build/promotion verification and small synthetic
 // tests so every stage uses the same SHA-256 implementation.
