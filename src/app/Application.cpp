@@ -6495,9 +6495,20 @@ invisible_places::io::AssetCatalog DiscoverApplicationAssets(
     const std::filesystem::path& primaryDataRoot) {
     auto catalog = invisible_places::io::DiscoverAssets(primaryDataRoot);
     const auto localDataRoot = Application::DefaultDataDirectory();
-    const auto displayDensityCacheRoot =
+    auto displayDensityCacheRoot =
         invisible_places::app::workspace::LocalSavedDirectory(localDataRoot) /
         ".invisible_places" / "cache" / "display_density" / "Scene3";
+    // Diagnostics can validate a candidate bundle (for example a rebuilt
+    // surface-analysis generation) without repointing the machine's settled
+    // cache, so a live editing session and a test process never share
+    // activation state.
+    if (const char* overrideRoot = std::getenv(
+            "INVISIBLE_PLACES_DISPLAY_DENSITY_CACHE_ROOT");
+        overrideRoot != nullptr && overrideRoot[0] != '\0') {
+        displayDensityCacheRoot = std::filesystem::path{overrideRoot};
+        std::cout << "Scene3 display-density cache root override: "
+                  << displayDensityCacheRoot.string() << '\n';
+    }
     invisible_places::io::SceneDisplayDensityCacheActivation
         displayDensityCache;
     if (const char* disabled =
@@ -134505,6 +134516,602 @@ int RunAdaptiveHqSurfacePerformanceSmoke(
     return finish();
 }
 
+// Temporal-stability lab for the Transparency & Depth options on the real
+// Surface_05 aHQ scene. For each configuration it measures, at one fixed
+// early-animation camera: static frame-to-frame flicker while nothing
+// changes, the one-frame pop when an aHQ republish lands, the settled delta
+// after scrubbing away and back (the user's 20-second adjustment loop), and
+// over-culling holes versus the Draw All reference. Read-only towards
+// project and caches; pass a duplicated project via --smoke-project so a
+// live editing session stays untouched.
+int RunSurfaceStabilityFlickerSmoke(
+    const GuiSmokeOptions& options,
+    platform::Window* window,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    PreviewRuntimeState* runtimeState) {
+    const auto outputDirectory = options.outputDirectory.empty()
+        ? std::filesystem::path{
+              "build/macos-debug/surface-stability-flicker"}
+        : options.outputDirectory;
+    const auto reportPath =
+        outputDirectory / "surface-stability-flicker.json";
+    std::vector<std::string> passes;
+    std::vector<std::string> failures;
+    nlohmann::json report{
+        {"scenario", options.scenario},
+        {"passed", false},
+    };
+    const auto finish = [&]() {
+        report["passed"] = failures.empty();
+        report["passes"] = passes;
+        report["failures"] = failures;
+        std::error_code createError;
+        std::filesystem::create_directories(outputDirectory, createError);
+        if (createError) {
+            std::cerr << "Could not create flicker output: "
+                      << createError.message() << '\n';
+            return 1;
+        }
+        std::ofstream output{reportPath, std::ios::trunc};
+        if (!output.is_open()) {
+            std::cerr << "Could not write flicker report: "
+                      << reportPath.string() << '\n';
+            return 1;
+        }
+        output << report.dump(2) << '\n';
+        std::cout << "Surface-stability flicker report: "
+                  << reportPath.string() << '\n';
+        for (const auto& failure : failures) {
+            std::cerr << "Surface-stability flicker failure: " << failure
+                      << '\n';
+        }
+        return failures.empty() ? 0 : 1;
+    };
+    if (window == nullptr || viewport == nullptr || runtimeState == nullptr) {
+        failures.emplace_back("The flicker lab needs a live viewport.");
+        return finish();
+    }
+
+    const auto projectPath = options.projectPath.empty()
+        ? std::filesystem::path{
+              runtimeState->persistence.authoredWorkspacePath} /
+              "ExhibitionFinal_project.json"
+        : options.projectPath;
+    report["project_path"] = projectPath.string();
+    std::string loadError;
+    auto project = invisible_places::serialization::LoadProjectDocument(
+        projectPath,
+        &loadError);
+    if (!project.has_value()) {
+        failures.emplace_back("Project did not load: " + loadError);
+        return finish();
+    }
+    // Mirror the user's live setup: 1 mm aHQ patches for all three roles.
+    project->linkedHqIncludeSand = true;
+    project->linkedHqPatchSpacingMicrometres = 1'000U;
+    if (!ApplyProjectDocumentToRuntime(project.value(), runtimeState, viewport)) {
+        failures.emplace_back(
+            "Project could not be applied: " +
+            (runtimeState->errorMessage.empty()
+                 ? runtimeState->statusMessage
+                 : runtimeState->errorMessage));
+        return finish();
+    }
+    const auto animationPath = projectPath.parent_path() / "animations" /
+        "Surface_05.ipanim.json";
+    report["animation_path"] = animationPath.string();
+    if (!LoadAnimationPathFromFile(runtimeState, animationPath) ||
+        !runtimeState->animationPanel.currentPath.has_value()) {
+        failures.emplace_back(
+            "Surface_05 did not load: " + runtimeState->errorMessage);
+        return finish();
+    }
+    const auto& animation = runtimeState->animationPanel.currentPath.value();
+    const float durationSeconds =
+        invisible_places::camera::AnimationPathDurationSeconds(animation);
+    if (durationSeconds <= 0.0F) {
+        failures.emplace_back("Surface_05 has no duration.");
+        return finish();
+    }
+    // The user's problem area: the early rock/sand interface (~31 s).
+    constexpr float kFocusNormalized = 0.1467F;
+    // Far enough to leave the refresh border and force a republish, near
+    // enough to stay in the same working area like a timing-adjustment scrub.
+    constexpr float kChurnOffsetNormalized = 0.10F;
+    report["focus_normalized"] = kFocusNormalized;
+    report["churn_offset_normalized"] = kChurnOffsetNormalized;
+
+    const auto pumpFrame = [&](float simulatedSeconds) {
+        window->PollEvents();
+        PollPendingLayerLoad(runtimeState, viewport);
+        PollTimingColouriseHistogram(runtimeState);
+        EnsureWaterSurfaceCacheReady(runtimeState, viewport);
+        PollWaterFlowTrailBuildJob(runtimeState, viewport);
+        CommitReadySceneDisplaySwitches(runtimeState, viewport);
+        StartQueuedLayerLoadIfIdle(runtimeState);
+        EnsureLinkedHqPreview(runtimeState, viewport);
+        viewport->BeginUiFrame();
+        const auto waterFrameState = ResolveWaterFrameState(runtimeState);
+        EnsureWaterSeepageRuntimeUpToDate(
+            runtimeState,
+            viewport,
+            &waterFrameState);
+        EnsureWaterDynamicMeshFlowGpuUpToDate(
+            runtimeState,
+            viewport,
+            waterFrameState,
+            simulatedSeconds);
+        viewport->SetDiagnosticsEnabled(true);
+        viewport->SetSceneCachingEnabled(false);
+        viewport->SetLiveSceneRenderingEnabled(true);
+        viewport->SetLiveRainSimulationEnabled(true);
+        auto renderState = BuildRenderState(
+            *runtimeState,
+            *viewport,
+            simulatedSeconds,
+            &waterFrameState,
+            nullptr,
+            true);
+        viewport->UpdateRenderState(renderState);
+        runtimeState->previewRenderStateSignatureValid = false;
+        viewport->DrawFrame();
+        return renderState;
+    };
+    const auto adaptiveVisible = [](const auto& state) {
+        const auto fine = std::count_if(
+            state.pointCloudLayers.begin(),
+            state.pointCloudLayers.end(),
+            [](const auto& layer) {
+                return layer.adaptiveDensityRole ==
+                    invisible_places::renderer::pointcloud::
+                        PointCloudAdaptiveDensityRole::Fine;
+            });
+        const auto coarse = std::count_if(
+            state.pointCloudLayers.begin(),
+            state.pointCloudLayers.end(),
+            [](const auto& layer) {
+                return layer.adaptiveDensityRole ==
+                    invisible_places::renderer::pointcloud::
+                        PointCloudAdaptiveDensityRole::Coarse;
+            });
+        return state.adaptiveDensityTransition.Valid() && fine == 3 &&
+            coarse == 3;
+    };
+
+    runtimeState->animationPanel.scrubAmount = kFocusNormalized;
+    ApplyAnimationEvaluation(
+        runtimeState,
+        animation,
+        kFocusNormalized,
+        runtimeState->animationPanel.previewDepthOfField);
+    if (!SetLinkedHqPreviewMode(
+            runtimeState,
+            viewport,
+            LinkedHqPreviewMode::Adaptive)) {
+        failures.emplace_back(
+            "Could not request adaptive HQ: " +
+            runtimeState->linkedHqPreview.failureMessage);
+        return finish();
+    }
+    const auto waitPublished = [&](float normalized,
+                                   std::chrono::seconds deadlineSeconds) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + deadlineSeconds;
+        while (std::chrono::steady_clock::now() < deadline &&
+               !window->ShouldClose()) {
+            const auto state =
+                pumpFrame(durationSeconds * normalized);
+            const auto& hq = runtimeState->linkedHqPreview;
+            if (hq.ready && hq.enabled && hq.adaptiveEnabled &&
+                hq.request.has_value() &&
+                hq.publishedFingerprint == hq.request->fingerprint &&
+                adaptiveVisible(state)) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+        }
+        return false;
+    };
+    if (!waitPublished(kFocusNormalized, std::chrono::seconds{1200})) {
+        failures.emplace_back(
+            "Initial aHQ did not publish at the focus camera.");
+        return finish();
+    }
+
+    struct CapturedRgba {
+        std::uint32_t width = 0U;
+        std::uint32_t height = 0U;
+        std::vector<std::uint8_t> rgba;
+    };
+    const bool captureWasEnabled =
+        viewport->LiveSceneReadbackCaptureEnabled();
+    viewport->SetLiveSceneReadbackCaptureEnabled(true);
+    const auto capture = [&]() -> std::optional<CapturedRgba> {
+        try {
+            const auto frame = viewport->ReadLiveSceneFrame();
+            if (frame.width == 0U || frame.height == 0U ||
+                frame.colorRgba8.size() !=
+                    static_cast<std::size_t>(frame.width) * frame.height *
+                        4U) {
+                return std::nullopt;
+            }
+            return CapturedRgba{
+                .width = frame.width,
+                .height = frame.height,
+                .rgba = frame.colorRgba8,
+            };
+        } catch (...) {
+            return std::nullopt;
+        }
+    };
+    const auto changedPixelFraction = [](const CapturedRgba& before,
+                                         const CapturedRgba& after) {
+        if (before.width != after.width || before.height != after.height ||
+            before.rgba.size() != after.rgba.size() || before.rgba.empty()) {
+            return 1.0;
+        }
+        std::size_t changed = 0U;
+        const auto pixelCount = before.rgba.size() / 4U;
+        for (std::size_t pixel = 0U; pixel < pixelCount; ++pixel) {
+            const auto offset = pixel * 4U;
+            const int difference = std::max({
+                std::abs(
+                    static_cast<int>(before.rgba[offset]) -
+                    static_cast<int>(after.rgba[offset])),
+                std::abs(
+                    static_cast<int>(before.rgba[offset + 1U]) -
+                    static_cast<int>(after.rgba[offset + 1U])),
+                std::abs(
+                    static_cast<int>(before.rgba[offset + 2U]) -
+                    static_cast<int>(after.rgba[offset + 2U])),
+            });
+            changed += difference >= 8 ? 1U : 0U;
+        }
+        return pixelCount > 0U
+            ? static_cast<double>(changed) /
+                  static_cast<double>(pixelCount)
+            : 0.0;
+    };
+    // Holes: pixels that this configuration leaves near-black where the
+    // Draw All reference is clearly lit, over the reference's lit pixels.
+    const auto darkFractionVsReference = [](const CapturedRgba& reference,
+                                            const CapturedRgba& sample) {
+        if (reference.width != sample.width ||
+            reference.rgba.size() != sample.rgba.size() ||
+            reference.rgba.empty()) {
+            return 1.0;
+        }
+        std::size_t litReference = 0U;
+        std::size_t holes = 0U;
+        const auto pixelCount = reference.rgba.size() / 4U;
+        for (std::size_t pixel = 0U; pixel < pixelCount; ++pixel) {
+            const auto offset = pixel * 4U;
+            const int referenceMax = std::max({
+                static_cast<int>(reference.rgba[offset]),
+                static_cast<int>(reference.rgba[offset + 1U]),
+                static_cast<int>(reference.rgba[offset + 2U]),
+            });
+            if (referenceMax <= 48) {
+                continue;
+            }
+            ++litReference;
+            const int sampleMax = std::max({
+                static_cast<int>(sample.rgba[offset]),
+                static_cast<int>(sample.rgba[offset + 1U]),
+                static_cast<int>(sample.rgba[offset + 2U]),
+            });
+            holes += sampleMax <= 18 ? 1U : 0U;
+        }
+        return litReference > 0U
+            ? static_cast<double>(holes) / static_cast<double>(litReference)
+            : 0.0;
+    };
+    const auto savePpm = [&](const CapturedRgba& image,
+                             const std::string& stem) {
+        std::error_code createError;
+        std::filesystem::create_directories(outputDirectory, createError);
+        std::ofstream output{
+            outputDirectory / (stem + ".ppm"),
+            std::ios::binary | std::ios::trunc};
+        if (!output.is_open()) {
+            return;
+        }
+        output << "P6\n"
+               << image.width << ' ' << image.height << "\n255\n";
+        for (std::size_t pixel = 0U;
+             pixel < image.rgba.size() / 4U;
+             ++pixel) {
+            output.put(static_cast<char>(image.rgba[pixel * 4U]));
+            output.put(static_cast<char>(image.rgba[pixel * 4U + 1U]));
+            output.put(static_cast<char>(image.rgba[pixel * 4U + 2U]));
+        }
+    };
+
+    using StabilityMode =
+        invisible_places::renderer::pointcloud::PointCloudSurfaceStabilityMode;
+    using DepthPolicy =
+        invisible_places::renderer::pointcloud::PointCloudDepthRolePolicy;
+    struct FlickerConfig {
+        std::string name;
+        bool prepass = true;
+        DepthPolicy depthPolicy = DepthPolicy::Uniform;
+        bool sort = true;
+        StabilityMode rock = StabilityMode::DrawAll;
+        StabilityMode sand = StabilityMode::DrawAll;
+        StabilityMode vegetation = StabilityMode::DrawAll;
+    };
+    const std::vector<FlickerConfig> configs{
+        {"reference-draw-all-noprepass", false, DepthPolicy::Uniform, true,
+         StabilityMode::DrawAll, StabilityMode::DrawAll,
+         StabilityMode::DrawAll},
+        {"prepass-uniform-original", true, DepthPolicy::Uniform, true,
+         StabilityMode::Original, StabilityMode::Original,
+         StabilityMode::Original},
+        {"prepass-rockoccluder-original", true, DepthPolicy::RockOccluder,
+         true, StabilityMode::Original, StabilityMode::Original,
+         StabilityMode::Original},
+        {"rock-softsep-prepass-uniform", true, DepthPolicy::Uniform, true,
+         StabilityMode::SoftSeparation, StabilityMode::Original,
+         StabilityMode::Original},
+        {"rock-softsep-rockoccluder", true, DepthPolicy::RockOccluder, true,
+         StabilityMode::SoftSeparation, StabilityMode::Original,
+         StabilityMode::Original},
+        {"rock-softsep-noprepass", false, DepthPolicy::Uniform, true,
+         StabilityMode::SoftSeparation, StabilityMode::Original,
+         StabilityMode::Original},
+        {"rock-preferupper-rockoccluder", true, DepthPolicy::RockOccluder,
+         true, StabilityMode::PreferUpper, StabilityMode::Original,
+         StabilityMode::Original},
+        {"sand-softsep-rockoccluder", true, DepthPolicy::RockOccluder, true,
+         StabilityMode::DrawAll, StabilityMode::SoftSeparation,
+         StabilityMode::Original},
+        {"sand-density-rockoccluder", true, DepthPolicy::RockOccluder, true,
+         StabilityMode::DrawAll, StabilityMode::DensityContinuity,
+         StabilityMode::Original},
+        {"sand-preferlower-rockoccluder", true, DepthPolicy::RockOccluder,
+         true, StabilityMode::DrawAll, StabilityMode::PreferLower,
+         StabilityMode::Original},
+        {"sand-preferupper-rockoccluder", true, DepthPolicy::RockOccluder,
+         true, StabilityMode::DrawAll, StabilityMode::PreferUpper,
+         StabilityMode::Original},
+        {"stable-roles-nosort", true, DepthPolicy::RockOccluder, false,
+         StabilityMode::SoftSeparation, StabilityMode::DensityContinuity,
+         StabilityMode::DrawAll},
+    };
+    const auto applyConfig = [&](const FlickerConfig& config) {
+        for (auto& session : runtimeState->sessions) {
+            if (session.kind != LayerKind::PointCloud ||
+                !IsSceneGroupedPointCloud(session)) {
+                continue;
+            }
+            auto& style = session.pointStyle;
+            style.gpuBackToFrontSorting = config.sort;
+            style.gpuSortMode = invisible_places::renderer::pointcloud::
+                PointCloudGpuSortMode::FullAnimation;
+            style.depthPrepassEnabled = config.prepass;
+            style.depthRolePolicy = config.depthPolicy;
+            style.surfaceStabilityPolicy =
+                invisible_places::renderer::pointcloud::
+                    PointCloudSurfaceStabilityPolicy::Custom;
+            style.rockSurfaceStabilityMode = config.rock;
+            style.sandSurfaceStabilityMode = config.sand;
+            style.vegetationSurfaceStabilityMode = config.vegetation;
+            style.surfaceStabilityInfluence = 1.0F;
+        }
+        runtimeState->previewRenderStateSignatureValid = false;
+    };
+
+    std::optional<CapturedRgba> referenceBaseline;
+    nlohmann::json results = nlohmann::json::array();
+    for (const auto& config : configs) {
+        applyConfig(config);
+        for (std::uint32_t settle = 0U; settle < 8U; ++settle) {
+            (void)pumpFrame(durationSeconds * kFocusNormalized);
+        }
+        auto baseline = capture();
+        if (!baseline.has_value()) {
+            failures.emplace_back(
+                config.name + ": baseline capture failed.");
+            break;
+        }
+        double staticMax = 0.0;
+        double staticMean = 0.0;
+        auto previous = baseline;
+        constexpr std::uint32_t kStaticSamples = 6U;
+        for (std::uint32_t sample = 0U;
+             sample < kStaticSamples;
+             ++sample) {
+            (void)pumpFrame(durationSeconds * kFocusNormalized);
+            const auto current = capture();
+            if (!current.has_value()) {
+                continue;
+            }
+            const auto delta =
+                changedPixelFraction(previous.value(), current.value());
+            staticMax = std::max(staticMax, delta);
+            staticMean += delta / kStaticSamples;
+            previous = current;
+        }
+        // The transition itself is what the user perceives: the one-frame
+        // pop when a republish replaces the retained overlay at a resting
+        // camera, and delta spikes above ordinary motion during a slow
+        // continuous scrub. Settled states are byte-stable by design (the
+        // warm pool reclaims identical patches), so those are measured
+        // frame-by-frame instead.
+        double publishPopMax = 0.0;
+        double republishDeltaMax = 0.0;
+        bool churnPublished = true;
+        for (std::uint32_t cycle = 0U; cycle < 2U; ++cycle) {
+            const float away = std::min(
+                1.0F,
+                kFocusNormalized +
+                    kChurnOffsetNormalized *
+                        static_cast<float>(cycle + 1U));
+            runtimeState->animationPanel.scrubAmount = away;
+            ApplyAnimationEvaluation(
+                runtimeState,
+                animation,
+                away,
+                runtimeState->animationPanel.previewDepthOfField);
+            runtimeState->linkedHqPreview.resolveTimestampValid = false;
+            churnPublished &=
+                waitPublished(away, std::chrono::seconds{120});
+            runtimeState->animationPanel.scrubAmount = kFocusNormalized;
+            ApplyAnimationEvaluation(
+                runtimeState,
+                animation,
+                kFocusNormalized,
+                runtimeState->animationPanel.previewDepthOfField);
+            runtimeState->linkedHqPreview.resolveTimestampValid = false;
+            // Pump at the resting camera, capturing every frame; the frame
+            // on which the published fingerprint flips is the visible pop.
+            const auto popDeadline = std::chrono::steady_clock::now() +
+                std::chrono::seconds{120};
+            // Land at the focus camera before the baseline: the away->focus
+            // cut is a legitimate full-frame change, not a transient.
+            (void)pumpFrame(durationSeconds * kFocusNormalized);
+            auto beforePublish = capture();
+            bool sawPublish = false;
+            // Every consecutive-frame delta during the fixed-camera refresh
+            // window counts: the fallback restore, the depth-faded overlay,
+            // and the publish itself are each a visible transient if they
+            // change pixels.
+            while (std::chrono::steady_clock::now() < popDeadline &&
+                   !window->ShouldClose()) {
+                const auto& hq = runtimeState->linkedHqPreview;
+                const auto fingerprintBefore = hq.publishedFingerprint;
+                const auto state =
+                    pumpFrame(durationSeconds * kFocusNormalized);
+                const auto current = capture();
+                if (beforePublish.has_value() && current.has_value()) {
+                    publishPopMax = std::max(
+                        publishPopMax,
+                        changedPixelFraction(
+                            beforePublish.value(),
+                            current.value()));
+                }
+                const bool publishedNow =
+                    runtimeState->linkedHqPreview.publishedFingerprint !=
+                        fingerprintBefore &&
+                    adaptiveVisible(state);
+                if (publishedNow) {
+                    sawPublish = true;
+                    break;
+                }
+                beforePublish = current;
+            }
+            churnPublished &= sawPublish;
+            for (std::uint32_t settle = 0U; settle < 4U; ++settle) {
+                (void)pumpFrame(durationSeconds * kFocusNormalized);
+            }
+            const auto settled = capture();
+            if (settled.has_value()) {
+                republishDeltaMax = std::max(
+                    republishDeltaMax,
+                    changedPixelFraction(
+                        baseline.value(),
+                        settled.value()));
+            }
+        }
+        // Continuous slow scrub, matching a real timing-adjustment drag:
+        // guard refreshes land mid-motion, so a stable configuration shows
+        // per-frame deltas near the motion median while an unstable one
+        // spikes at each publish.
+        double scrubMedianDelta = 0.0;
+        double scrubMaxDelta = 0.0;
+        {
+            std::vector<double> deltas;
+            auto previousFrame = capture();
+            constexpr std::uint32_t kScrubSteps = 60U;
+            constexpr float kScrubStep = 0.0016F;
+            float position = kFocusNormalized;
+            for (std::uint32_t step = 0U; step < kScrubSteps; ++step) {
+                position = std::min(
+                    1.0F,
+                    kFocusNormalized +
+                        kScrubStep *
+                            static_cast<float>(
+                                step < kScrubSteps / 2U
+                                    ? step
+                                    : kScrubSteps - step));
+                runtimeState->animationPanel.scrubAmount = position;
+                ApplyAnimationEvaluation(
+                    runtimeState,
+                    animation,
+                    position,
+                    runtimeState->animationPanel.previewDepthOfField);
+                (void)pumpFrame(durationSeconds * position);
+                const auto current = capture();
+                if (previousFrame.has_value() && current.has_value()) {
+                    deltas.push_back(changedPixelFraction(
+                        previousFrame.value(),
+                        current.value()));
+                }
+                previousFrame = current;
+            }
+            if (!deltas.empty()) {
+                auto sorted = deltas;
+                std::sort(sorted.begin(), sorted.end());
+                scrubMedianDelta = sorted[sorted.size() / 2U];
+                scrubMaxDelta = sorted.back();
+            }
+            runtimeState->animationPanel.scrubAmount = kFocusNormalized;
+            ApplyAnimationEvaluation(
+                runtimeState,
+                animation,
+                kFocusNormalized,
+                runtimeState->animationPanel.previewDepthOfField);
+            runtimeState->linkedHqPreview.resolveTimestampValid = false;
+            (void)waitPublished(kFocusNormalized, std::chrono::seconds{120});
+        }
+        if (!referenceBaseline.has_value()) {
+            referenceBaseline = baseline;
+        }
+        const auto darkFraction = darkFractionVsReference(
+            referenceBaseline.value(),
+            baseline.value());
+        savePpm(baseline.value(), config.name);
+        results.push_back({
+            {"name", config.name},
+            {"prepass", config.prepass},
+            {"depth_role_policy",
+             static_cast<std::uint32_t>(config.depthPolicy)},
+            {"gpu_sort", config.sort},
+            {"rock_mode", static_cast<std::uint32_t>(config.rock)},
+            {"sand_mode", static_cast<std::uint32_t>(config.sand)},
+            {"veg_mode", static_cast<std::uint32_t>(config.vegetation)},
+            {"static_flicker_max", staticMax},
+            {"static_flicker_mean", staticMean},
+            {"publish_pop_max", publishPopMax},
+            {"republish_delta_max", republishDeltaMax},
+            {"scrub_median_delta", scrubMedianDelta},
+            {"scrub_max_delta", scrubMaxDelta},
+            {"dark_fraction_vs_reference", darkFraction},
+            {"churn_published", churnPublished},
+        });
+        std::cout << "Flicker config " << config.name
+                  << ": static max " << staticMax << ", publish pop "
+                  << publishPopMax << ", republish delta "
+                  << republishDeltaMax << ", scrub median/max "
+                  << scrubMedianDelta << "/" << scrubMaxDelta
+                  << ", dark " << darkFraction << std::endl;
+    }
+    report["configs"] = std::move(results);
+    if (referenceBaseline.has_value()) {
+        passes.emplace_back(
+            "Measured temporal stability across the transparency and depth configurations.");
+    }
+    if (!captureWasEnabled) {
+        viewport->SetLiveSceneReadbackCaptureEnabled(false);
+    }
+    (void)SetLinkedHqPreviewMode(
+        runtimeState,
+        viewport,
+        LinkedHqPreviewMode::Off);
+    viewport->WaitIdle();
+    return finish();
+}
+
 // Frame-time profile of the linked HQ preview on the production pair. Loads
 // the authored workspace project (or --smoke-project), waits for the HQ
 // patches, then samples the live render path at each member's normalized 0.5
@@ -138723,6 +139330,16 @@ int Application::Run(ApplicationRunOptions options) const {
                     &window,
                     &viewport.value(),
                     &runtimeState);
+            StopBackgroundWorkForShutdown(&runtimeState);
+            viewport->WaitIdle();
+            return smokeExitCode;
+        }
+        if (options.guiSmoke->scenario == "surface-stability-flicker") {
+            const auto smokeExitCode = RunSurfaceStabilityFlickerSmoke(
+                options.guiSmoke.value(),
+                &window,
+                &viewport.value(),
+                &runtimeState);
             StopBackgroundWorkForShutdown(&runtimeState);
             viewport->WaitIdle();
             return smokeExitCode;
