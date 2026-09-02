@@ -83,6 +83,16 @@ enum class AdaptiveHqInteractionProfile : std::uint8_t {
     Timeline,
 };
 
+// Camera-following playback makes the future view knowable. Widening the
+// guard union along the path was measured and rejected twice (every point
+// in the union pays vertex work on every frame; even 2.5 s of lookahead
+// roughly doubled frame cost on top-down paths). Instead a refresh BEGINS
+// once the view this many seconds ahead of the playhead is no longer
+// covered within the refresh border, so preparation overlaps covered
+// playback rather than starting only after the camera reaches the border
+// the way interactive navigation must.
+constexpr float kAdaptiveHqPlaybackRefreshLeadSeconds = 2.5F;
+
 // Superseded CPU patches are retired into a bounded warm pool rather than
 // freed on a fixed grace. Reclaiming an exact-selection return from that pool
 // skips the multi-hundred-millisecond reassembly entirely; the pool budget
@@ -137,9 +147,18 @@ ResolveAdaptiveHqRetiredPatchHold(
 // (captured frame-pair diffs show the veil staircase dominating the
 // transient). 700 ms keeps every step under ~15% even at 90 ms frames.
 constexpr std::chrono::milliseconds kAdaptiveHqPublishCrossfadeDuration{700};
+// During camera-following playback the motion itself masks the publish and
+// every crossfade frame draws both patch banks plus the fuller coarse veil,
+// so playback publishes swap instantly (no outgoing bank) under a short
+// veil ramp instead of paying the resting-camera fade's double draw.
+constexpr std::chrono::milliseconds
+    kAdaptiveHqPlaybackPublishCrossfadeDuration{250};
 
 [[nodiscard]] float ResolveAdaptiveHqPublishCoarseEngage(
     std::chrono::nanoseconds elapsedSincePublish);
+[[nodiscard]] float ResolveAdaptiveHqPublishCoarseEngage(
+    std::chrono::nanoseconds elapsedSincePublish,
+    std::chrono::milliseconds crossfadeDuration);
 
 struct AdaptiveHqFiveMillimeterGuardRetention {
     std::vector<std::uint32_t> indices;

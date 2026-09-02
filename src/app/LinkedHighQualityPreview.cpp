@@ -183,6 +183,14 @@ AdaptiveHqRetiredPatchHold ResolveAdaptiveHqRetiredPatchHold(
 
 float ResolveAdaptiveHqPublishCoarseEngage(
     std::chrono::nanoseconds elapsedSincePublish) {
+    return ResolveAdaptiveHqPublishCoarseEngage(
+        elapsedSincePublish,
+        kAdaptiveHqPublishCrossfadeDuration);
+}
+
+float ResolveAdaptiveHqPublishCoarseEngage(
+    std::chrono::nanoseconds elapsedSincePublish,
+    std::chrono::milliseconds crossfadeDuration) {
     if (elapsedSincePublish <= std::chrono::nanoseconds::zero()) {
         return 0.0F;
     }
@@ -203,7 +211,7 @@ float ResolveAdaptiveHqPublishCoarseEngage(
     }();
     const auto duration = overrideDuration.value_or(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
-            kAdaptiveHqPublishCrossfadeDuration));
+            crossfadeDuration));
     if (elapsedSincePublish >= duration) {
         return 1.0F;
     }

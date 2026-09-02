@@ -3971,6 +3971,12 @@ struct LinkedHqPatchJobOutput {
     std::shared_ptr<const std::vector<std::uint32_t>>
         reusedWarmSourcePointIndices;
     std::uint64_t reusedWarmIncludedPointCount = 0U;
+    // GPU payload staged on the preparation worker (buffers created and
+    // filled off the render thread); the publish adopts it so the visible
+    // frame no longer pays the multi-hundred-millisecond upload copies.
+    std::shared_ptr<invisible_places::renderer::core::VulkanViewportShell::
+                        StagedPointCloudUpload>
+        stagedUpload;
     std::vector<std::uint32_t> fiveMillimeterOutsideIndices;
     std::optional<invisible_places::io::AdaptiveHqCacheIndex>
         adaptiveCacheIndex;
@@ -4155,6 +4161,10 @@ struct LinkedHqPreviewRuntime {
     // window instead of one visible frame.
     std::chrono::steady_clock::time_point publishCrossfadeStartedAt{};
     bool publishCrossfadeActive = false;
+    // Chosen per publish: resting publishes fade the banks over the long
+    // window; playback publishes swap instantly under a short veil ramp.
+    std::chrono::milliseconds publishCrossfadeDuration{
+        kAdaptiveHqPublishCrossfadeDuration};
     // The previous publish's fine patches, kept alive on the other layer-id
     // bank for the crossfade window so the near zone hands over point by
     // point (role FineOutgoing) instead of swapping in one frame. Retired
@@ -15524,9 +15534,10 @@ void RollBackSceneDisplaySwitch(
 class PointCloudMutationBatchScope {
   public:
     explicit PointCloudMutationBatchScope(
-        invisible_places::renderer::core::VulkanViewportShell* viewport)
+        invisible_places::renderer::core::VulkanViewportShell* viewport,
+        bool requiresQuiescentGpu = true)
         : viewport_{viewport} {
-        viewport_->BeginPointCloudMutationBatch();
+        viewport_->BeginPointCloudMutationBatch(requiresQuiescentGpu);
     }
 
     PointCloudMutationBatchScope(const PointCloudMutationBatchScope&) = delete;
@@ -59044,14 +59055,34 @@ std::optional<LinkedHqSelectionRequest> ResolveLinkedHqSelectionRequest(
         const auto currentMatrices =
             runtimeState.camera.Matrices(fallbackAspect);
         patchViewProjections.push_back(currentMatrices.viewProjection);
-        // The earlier implementation appended sampled cameras from the
-        // complete loaded animation. On Surface_05 that selected 18.9M
-        // block-level points (2.98 GB) before aHQ could publish, even when
-        // the user was only working in one section. The persistent cache and
-        // guarded current camera are now the authority; animation playback
-        // naturally advances that same guard without inflating it to the
-        // complete 120-second path.
+        // The union stays sized to the CURRENT camera plus its guard
+        // border. Widening it along the path was measured twice and paid
+        // every frame: the whole-animation union once selected 18.9M points
+        // (2.98 GB) up front, and even a 2.5 s playback lookahead roughly
+        // doubled per-frame cost because on top-down paths the points ahead
+        // sit at fine-band depth, off screen, running the full vertex
+        // shader. Camera-following playback instead REFRESHES EARLY (the
+        // lead-view check below), so preparation overlaps covered playback
+        // without inflating the drawn union.
         request.animationPrefetchFingerprint = 0U;
+        const bool playbackFollowing =
+            runtimeState.animationPlayback.active &&
+            runtimeState.animationPlayback.followCamera &&
+            firstAnimation != nullptr;
+        std::optional<
+            invisible_places::camera::PreparedAnimationPathEvaluationContext>
+            playbackPath;
+        float playbackCurrentSeconds = 0.0F;
+        if (playbackFollowing) {
+            playbackPath = invisible_places::camera::
+                PrepareAnimationPathEvaluation(*firstAnimation);
+            playbackCurrentSeconds =
+                std::clamp(
+                    runtimeState.animationPanel.scrubAmount,
+                    0.0F,
+                    1.0F) *
+                playbackPath->durationSeconds;
+        }
         request.adaptiveTransition = invisible_places::renderer::pointcloud::
             ResolvePointCloudAdaptiveDensityTransition(
                 std::abs(currentMatrices.projection[1][1]),
@@ -59065,6 +59096,32 @@ std::optional<LinkedHqSelectionRequest> ResolveLinkedHqSelectionRequest(
             return std::nullopt;
         }
         const auto& prior = runtimeState.linkedHqPreview.request;
+        // During camera-following playback the union must also still cover
+        // the view a lead interval ahead of the playhead; failing that
+        // starts the refresh while the current view is fully covered, so
+        // the publish lands before the camera reaches unprepared ground.
+        const auto coversPlaybackLeadView = [&]() {
+            if (!playbackFollowing || !playbackPath.has_value()) {
+                return true;
+            }
+            const float leadSeconds = std::min(
+                playbackPath->durationSeconds,
+                playbackCurrentSeconds +
+                    kAdaptiveHqPlaybackRefreshLeadSeconds);
+            invisible_places::camera::OrbitCamera leadCamera;
+            leadCamera.ApplyState(
+                invisible_places::camera::EvaluatePreparedAnimationPath(
+                    playbackPath.value(),
+                    leadSeconds)
+                    .camera);
+            const auto leadMatrices = leadCamera.Matrices(fallbackAspect);
+            return LinkedHqFrustumUnionCoversView(
+                prior->patchFrustums,
+                leadMatrices.view,
+                leadMatrices.projection,
+                request.adaptiveTransition.endDepthMeters,
+                kAdaptiveHqRefreshBorderFraction);
+        };
         const bool priorGuardReusable =
             prior.has_value() &&
             prior->mode == LinkedHqPreviewMode::Adaptive &&
@@ -59081,7 +59138,8 @@ std::optional<LinkedHqSelectionRequest> ResolveLinkedHqSelectionRequest(
                 currentMatrices.view,
                 currentMatrices.projection,
                 request.adaptiveTransition.endDepthMeters,
-                kAdaptiveHqRefreshBorderFraction);
+                kAdaptiveHqRefreshBorderFraction) &&
+            coversPlaybackLeadView();
         if (priorGuardReusable) {
             request.patchFrustums = prior->patchFrustums;
         } else {
@@ -59701,7 +59759,8 @@ void ResetLinkedHqPreview(
 }
 
 void StartLinkedHqPreparation(
-    PreviewRuntimeState* runtimeState) {
+    PreviewRuntimeState* runtimeState,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
     if (runtimeState == nullptr ||
         !runtimeState->linkedHqPreview.request.has_value()) {
         return;
@@ -59831,6 +59890,7 @@ void StartLinkedHqPreparation(
               << "." << std::endl;
     hq.preparationWorker = std::jthread{
         [shared,
+         viewport,
          request,
          patchRoles,
          patchLayerIds,
@@ -60358,6 +60418,38 @@ void StartLinkedHqPreparation(
                     }
                 }
 
+                // Stage the GPU payloads off the render thread. Buffer
+                // creation and the host-visible copies are device-level
+                // Vulkan work; the publish then only allocates descriptor
+                // sets and registers the layers, which removed a measured
+                // 190-830 ms upload from a visible playback frame. A
+                // staging failure falls back to the inline upload.
+                if (request.mode == LinkedHqPreviewMode::Adaptive &&
+                    viewport != nullptr) {
+                    for (auto& stagedOutput : result.patches) {
+                        if (stopToken.stop_requested()) {
+                            result.cancelled = true;
+                            finish();
+                            return;
+                        }
+                        const auto* stageCloud =
+                            stagedOutput.reusedWarmCloud != nullptr
+                                ? stagedOutput.reusedWarmCloud.get()
+                                : &stagedOutput.subset.cloud;
+                        if (stageCloud == nullptr ||
+                            stageCloud->PointCount() == 0U) {
+                            continue;
+                        }
+                        try {
+                            stagedOutput.stagedUpload =
+                                viewport->StagePointCloudUpload(
+                                    *stageCloud,
+                                    {});
+                        } catch (...) {
+                            stagedOutput.stagedUpload = nullptr;
+                        }
+                    }
+                }
                 PublishLinkedHqStageProgress(
                     shared,
                     LinkedHqPreparationStage::Organising,
@@ -60690,12 +60782,14 @@ bool PollLinkedHqPreparation(
     hq.publishGuardRetentionMilliseconds = 0.0;
     hq.publishActivationMilliseconds = 0.0;
     // One depth-counted mutation batch spans the patch uploads and the mask
-    // activation below. Batches only settle the device when their depth
-    // reaches one, so this removes the second full device settle the old
-    // upload-batch-then-activation-batch publication paid per publish.
+    // activation below, opened creation-only: bank alternation means the
+    // upload targets carry no live resources, so the multi-hundred-MB
+    // buffer fills overlap whatever the GPU still has in flight and the
+    // single device settle happens lazily at the first destructive step
+    // (mask activation, or a replace if a bank is unexpectedly occupied).
     std::optional<PointCloudMutationBatchScope> publicationBatch;
     try {
-        publicationBatch.emplace(viewport);
+        publicationBatch.emplace(viewport, false);
         for (std::size_t patch = 0U;
              patch < completed->patches.size();
              ++patch) {
@@ -60755,7 +60849,8 @@ bool PollLinkedHqPreparation(
                 viewport->UploadPointCloud(
                     destination.layerId,
                     *destination.cloud,
-                    {});
+                    {},
+                    std::move(source.stagedUpload));
                 destination.uploaded = true;
                 destination.adaptivePublishUploadMilliseconds =
                     std::chrono::duration<double, std::milli>(
@@ -60860,22 +60955,30 @@ bool PollLinkedHqPreparation(
     }
     auto retiredPatches = std::move(hq.patches);
     hq.patches = std::move(published);
-    if (hq.request->mode == LinkedHqPreviewMode::Adaptive) {
+    const bool restingBankFade =
+        hq.request->mode == LinkedHqPreviewMode::Adaptive &&
+        !runtimeState->animationPlayback.active;
+    if (restingBankFade) {
         // Keep the previous fine patches alive on the other layer-id bank
-        // for the publish crossfade: the shader hands the shared points
-        // over one by one along the engage ramp (role FineOutgoing), and
-        // the fade-completion pump retires them into the warm pool.
+        // for the publish crossfade: the outgoing bank fades out by
+        // complementary opacity along the engage ramp (role FineOutgoing),
+        // and the fade-completion pump retires it into the warm pool.
         hq.outgoingPatches = std::move(retiredPatches);
     } else {
-        // Fixed-mode publishes do not crossfade, so the vacated bank's GPU
-        // layers must not linger and double-draw.
+        // Fixed-mode publishes do not crossfade, and camera-following
+        // playback swaps instantly (motion masks the change while a bank
+        // fade would double-draw every crossfade frame), so the vacated
+        // bank's GPU layers must not linger.
         for (const auto& retired : retiredPatches) {
             if (!IsLinkedHqPatchLayerId(retired.layerId) ||
                 !viewport->HasPointCloudResources(retired.layerId)) {
                 continue;
             }
             try {
-                viewport->RemovePointCloud(retired.layerId);
+                // Deferred: detaches now, destroys after the in-flight
+                // frames complete, so the publish never drains the device
+                // to free the vacated bank.
+                viewport->RemovePointCloudDeferred(retired.layerId);
             } catch (...) {
             }
         }
@@ -60921,6 +61024,10 @@ bool PollLinkedHqPreparation(
     if (hq.request->mode == LinkedHqPreviewMode::Adaptive) {
         hq.publishCrossfadeStartedAt = std::chrono::steady_clock::now();
         hq.publishCrossfadeActive = true;
+        hq.publishCrossfadeDuration =
+            runtimeState->animationPlayback.active
+                ? kAdaptiveHqPlaybackPublishCrossfadeDuration
+                : kAdaptiveHqPublishCrossfadeDuration;
     }
     runtimeState->previewRenderStateSignatureValid = false;
     const bool includesSand =
@@ -61473,7 +61580,8 @@ void EnsureLinkedHqPreview(
         runtimeState->previewRenderStateSignatureValid = false;
         if (ResolveAdaptiveHqPublishCoarseEngage(
                 std::chrono::steady_clock::now() -
-                hq.publishCrossfadeStartedAt) >= 1.0F) {
+                    hq.publishCrossfadeStartedAt,
+                hq.publishCrossfadeDuration) >= 1.0F) {
             hq.publishCrossfadeActive = false;
         }
     }
@@ -61488,7 +61596,7 @@ void EnsureLinkedHqPreview(
                     continue;
                 }
                 if (viewport->HasPointCloudResources(outgoing.layerId)) {
-                    viewport->RemovePointCloud(outgoing.layerId);
+                    viewport->RemovePointCloudDeferred(outgoing.layerId);
                 }
                 ForgetWaterSeepageLayerAttachment(
                     &runtimeState->water,
@@ -61806,7 +61914,7 @@ void EnsureLinkedHqPreview(
         runtimeState->persistence.queuedLoads.empty() &&
         !runtimeState->water.waterSurfaceCacheWarmup.worker.joinable() &&
         !runtimeState->water.waterSurfaceCachePreprocessPending) {
-        StartLinkedHqPreparation(runtimeState);
+        StartLinkedHqPreparation(runtimeState, viewport);
     }
     if (hq.ready &&
         hq.publishedFingerprint == hq.request->fingerprint) {
@@ -121168,7 +121276,9 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
             renderState.adaptiveDensityTransition.coarseEngage =
                 ResolveAdaptiveHqPublishCoarseEngage(
                     std::chrono::steady_clock::now() -
-                    runtimeState.linkedHqPreview.publishCrossfadeStartedAt);
+                        runtimeState.linkedHqPreview
+                            .publishCrossfadeStartedAt,
+                    runtimeState.linkedHqPreview.publishCrossfadeDuration);
         }
     }
 
@@ -134763,6 +134873,279 @@ int RunAdaptiveHqSurfacePerformanceSmoke(
 // median GPU frame time, mean luma, a 9x9 high-pass detail measure, and a
 // frame capture per candidate. Read-only towards project and caches; pass a
 // duplicated project via --smoke-project while a live session is editing.
+// Measures adaptive-HQ behaviour during real camera-following playback: the
+// user's complaint is that guard refreshes start only after the camera has
+// left the published union (a visible gap of missing fine points) and that
+// the publish work lands on visible frames (a pause). Plays a section of
+// Surface_05 with aHQ on and records per-frame wall time, whether the
+// published union still covers the view, and every publish, so lookahead
+// prefetch and publish-path changes can be compared by number.
+int RunAdaptiveHqPlaybackSmoke(
+    const GuiSmokeOptions& options,
+    platform::Window* window,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    PreviewRuntimeState* runtimeState) {
+    const auto outputDirectory = options.outputDirectory.empty()
+        ? std::filesystem::path{"build/macos-debug/ahq-playback"}
+        : options.outputDirectory;
+    const auto reportPath = outputDirectory / "ahq-playback.json";
+    std::vector<std::string> passes;
+    std::vector<std::string> failures;
+    nlohmann::json report{
+        {"scenario", options.scenario},
+        {"passed", false},
+    };
+    const auto finish = [&]() {
+        report["passed"] = failures.empty();
+        report["passes"] = passes;
+        report["failures"] = failures;
+        std::error_code createError;
+        std::filesystem::create_directories(outputDirectory, createError);
+        std::ofstream output{reportPath, std::ios::trunc};
+        if (!output.is_open()) {
+            std::cerr << "Could not write playback report: "
+                      << reportPath.string() << '\n';
+            return 1;
+        }
+        output << report.dump(2) << '\n';
+        std::cout << "aHQ playback report: " << reportPath.string() << '\n';
+        for (const auto& failure : failures) {
+            std::cerr << "aHQ playback failure: " << failure << '\n';
+        }
+        return failures.empty() ? 0 : 1;
+    };
+    if (window == nullptr || viewport == nullptr || runtimeState == nullptr) {
+        failures.emplace_back("The playback smoke needs a live viewport.");
+        return finish();
+    }
+
+    const auto projectPath = options.projectPath.empty()
+        ? std::filesystem::path{
+              runtimeState->persistence.authoredWorkspacePath} /
+              "ExhibitionFinal_project.json"
+        : options.projectPath;
+    report["project_path"] = projectPath.string();
+    std::string loadError;
+    auto project = invisible_places::serialization::LoadProjectDocument(
+        projectPath,
+        &loadError);
+    if (!project.has_value()) {
+        failures.emplace_back("Project did not load: " + loadError);
+        return finish();
+    }
+    project->linkedHqIncludeSand = true;
+    project->linkedHqPatchSpacingMicrometres = 1'000U;
+    if (!ApplyProjectDocumentToRuntime(project.value(), runtimeState, viewport)) {
+        failures.emplace_back(
+            "Project could not be applied: " +
+            (runtimeState->errorMessage.empty()
+                 ? runtimeState->statusMessage
+                 : runtimeState->errorMessage));
+        return finish();
+    }
+    const auto animationPath = projectPath.parent_path() / "animations" /
+        "Surface_05.ipanim.json";
+    if (!LoadAnimationPathFromFile(runtimeState, animationPath) ||
+        !runtimeState->animationPanel.currentPath.has_value()) {
+        failures.emplace_back(
+            "Surface_05 did not load: " + runtimeState->errorMessage);
+        return finish();
+    }
+    const auto& animation = runtimeState->animationPanel.currentPath.value();
+    const float durationSeconds =
+        invisible_places::camera::AnimationPathDurationSeconds(animation);
+    if (durationSeconds <= 0.0F) {
+        failures.emplace_back("Surface_05 has no duration.");
+        return finish();
+    }
+    // Crosses the rock/sand section around 0.1467 with room on both sides.
+    constexpr float kPlayStartNormalized = 0.08F;
+    constexpr float kPlayEndNormalized = 0.28F;
+    report["play_start_normalized"] = kPlayStartNormalized;
+    report["play_end_normalized"] = kPlayEndNormalized;
+
+    const auto pumpFrame = [&]() {
+        window->PollEvents();
+        UpdateAnimationPlayback(runtimeState);
+        PollPendingLayerLoad(runtimeState, viewport);
+        CommitReadySceneDisplaySwitches(runtimeState, viewport);
+        StartQueuedLayerLoadIfIdle(runtimeState);
+        EnsureLinkedHqPreview(runtimeState, viewport);
+        viewport->BeginUiFrame();
+        const auto waterFrameState = ResolveWaterFrameState(runtimeState);
+        viewport->SetDiagnosticsEnabled(true);
+        viewport->SetSceneCachingEnabled(false);
+        viewport->SetLiveSceneRenderingEnabled(true);
+        viewport->SetLiveRainSimulationEnabled(false);
+        auto renderState = BuildRenderState(
+            *runtimeState,
+            *viewport,
+            durationSeconds * runtimeState->animationPanel.scrubAmount,
+            &waterFrameState,
+            nullptr,
+            true);
+        viewport->UpdateRenderState(renderState);
+        runtimeState->previewRenderStateSignatureValid = false;
+        viewport->DrawFrame();
+    };
+
+    runtimeState->animationPanel.scrubAmount = kPlayStartNormalized;
+    ApplyAnimationEvaluation(
+        runtimeState,
+        animation,
+        kPlayStartNormalized,
+        runtimeState->animationPanel.previewDepthOfField);
+    if (!SetLinkedHqPreviewMode(
+            runtimeState,
+            viewport,
+            LinkedHqPreviewMode::Adaptive)) {
+        failures.emplace_back(
+            "Could not request adaptive HQ: " +
+            runtimeState->linkedHqPreview.failureMessage);
+        return finish();
+    }
+    {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds{1200};
+        bool published = false;
+        while (std::chrono::steady_clock::now() < deadline &&
+               !window->ShouldClose()) {
+            pumpFrame();
+            const auto& hq = runtimeState->linkedHqPreview;
+            if (hq.ready && hq.enabled && hq.adaptiveEnabled &&
+                hq.request.has_value() &&
+                hq.publishedFingerprint == hq.request->fingerprint) {
+                published = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+        }
+        if (!published) {
+            failures.emplace_back(
+                "Initial aHQ did not publish at the start camera.");
+            return finish();
+        }
+    }
+    // Settle out the initial publish crossfade before timing.
+    for (std::uint32_t settle = 0U; settle < 24U; ++settle) {
+        pumpFrame();
+    }
+
+    StartAnimationPlayback(runtimeState);
+    if (!runtimeState->animationPlayback.active ||
+        !runtimeState->animationPlayback.followCamera) {
+        failures.emplace_back(
+            "Playback did not start camera-following from the aligned view.");
+        return finish();
+    }
+
+    std::vector<double> frameMilliseconds;
+    frameMilliseconds.reserve(4096U);
+    std::uint32_t uncoveredFrames = 0U;
+    std::uint32_t maxUncoveredStreak = 0U;
+    std::uint32_t currentUncoveredStreak = 0U;
+    std::uint32_t publishCount = 0U;
+    std::vector<double> publishFrameMilliseconds;
+    nlohmann::json publishBreakdowns = nlohmann::json::array();
+    auto previousFingerprint =
+        runtimeState->linkedHqPreview.publishedFingerprint;
+    const auto playbackDeadline =
+        std::chrono::steady_clock::now() + std::chrono::minutes{6};
+    auto previousFrameEnd = std::chrono::steady_clock::now();
+    while (runtimeState->animationPlayback.active &&
+           runtimeState->animationPanel.scrubAmount < kPlayEndNormalized &&
+           std::chrono::steady_clock::now() < playbackDeadline &&
+           !window->ShouldClose()) {
+        pumpFrame();
+        const auto frameEnd = std::chrono::steady_clock::now();
+        const double frameMs =
+            std::chrono::duration<double, std::milli>(
+                frameEnd - previousFrameEnd)
+                .count();
+        previousFrameEnd = frameEnd;
+        frameMilliseconds.push_back(frameMs);
+        const bool covered = LinkedHqAdaptiveGuardCoversCurrentView(
+            *runtimeState,
+            *viewport);
+        if (!covered) {
+            ++uncoveredFrames;
+            ++currentUncoveredStreak;
+            maxUncoveredStreak =
+                std::max(maxUncoveredStreak, currentUncoveredStreak);
+        } else {
+            currentUncoveredStreak = 0U;
+        }
+        const auto fingerprint =
+            runtimeState->linkedHqPreview.publishedFingerprint;
+        if (fingerprint != previousFingerprint) {
+            ++publishCount;
+            publishFrameMilliseconds.push_back(frameMs);
+            const auto& hq = runtimeState->linkedHqPreview;
+            double assemblyMs = 0.0;
+            double blockLoadMs = 0.0;
+            for (const auto& patch : hq.patches) {
+                assemblyMs += patch.adaptiveAssemblyMilliseconds;
+                blockLoadMs += patch.adaptiveBlockLoadMilliseconds;
+            }
+            publishBreakdowns.push_back({
+                {"frame_ms", frameMs},
+                {"upload_ms", hq.publishUploadMilliseconds},
+                {"guard_retention_ms",
+                 hq.publishGuardRetentionMilliseconds},
+                {"activation_ms", hq.publishActivationMilliseconds},
+                {"publish_total_ms", hq.publishTotalMilliseconds},
+                {"prep_assembly_ms", assemblyMs},
+                {"prep_block_load_ms", blockLoadMs},
+            });
+            previousFingerprint = fingerprint;
+        }
+    }
+    StopAnimationPlayback(runtimeState);
+
+    if (frameMilliseconds.size() < 60U) {
+        failures.emplace_back("Playback produced too few frames to assess.");
+        return finish();
+    }
+    auto sorted = frameMilliseconds;
+    std::sort(sorted.begin(), sorted.end());
+    const auto percentile = [&](double fraction) {
+        const auto index = std::min(
+            sorted.size() - 1U,
+            static_cast<std::size_t>(
+                fraction * static_cast<double>(sorted.size())));
+        return sorted[index];
+    };
+    const auto overFifty = static_cast<std::uint32_t>(std::count_if(
+        frameMilliseconds.begin(),
+        frameMilliseconds.end(),
+        [](double value) { return value > 50.0; }));
+    report["frames"] = frameMilliseconds.size();
+    report["frame_ms_p50"] = percentile(0.50);
+    report["frame_ms_p95"] = percentile(0.95);
+    report["frame_ms_p99"] = percentile(0.99);
+    report["frame_ms_max"] = sorted.back();
+    report["frames_over_50ms"] = overFifty;
+    report["uncovered_frames"] = uncoveredFrames;
+    report["max_uncovered_streak"] = maxUncoveredStreak;
+    report["publish_count"] = publishCount;
+    report["publish_frame_ms"] = publishFrameMilliseconds;
+    report["publish_breakdowns"] = std::move(publishBreakdowns);
+    passes.emplace_back("Timed adaptive HQ through camera-following playback.");
+    std::cout << "aHQ playback: " << frameMilliseconds.size()
+              << " frames, p50/p95/p99/max "
+              << percentile(0.50) << "/" << percentile(0.95) << "/"
+              << percentile(0.99) << "/" << sorted.back()
+              << " ms, >50ms " << overFifty << ", uncovered "
+              << uncoveredFrames << " (max streak " << maxUncoveredStreak
+              << "), publishes " << publishCount << std::endl;
+    (void)SetLinkedHqPreviewMode(
+        runtimeState,
+        viewport,
+        LinkedHqPreviewMode::Off);
+    viewport->WaitIdle();
+    return finish();
+}
+
 int RunSurfaceProfileLabSmoke(
     const GuiSmokeOptions& options,
     platform::Window* window,
@@ -140156,6 +140539,16 @@ int Application::Run(ApplicationRunOptions options) const {
                     &window,
                     &viewport.value(),
                     &runtimeState);
+            StopBackgroundWorkForShutdown(&runtimeState);
+            viewport->WaitIdle();
+            return smokeExitCode;
+        }
+        if (options.guiSmoke->scenario == "ahq-playback") {
+            const auto smokeExitCode = RunAdaptiveHqPlaybackSmoke(
+                options.guiSmoke.value(),
+                &window,
+                &viewport.value(),
+                &runtimeState);
             StopBackgroundWorkForShutdown(&runtimeState);
             viewport->WaitIdle();
             return smokeExitCode;
