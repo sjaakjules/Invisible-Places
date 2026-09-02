@@ -37,9 +37,20 @@ bool AdaptiveDensityKeepsPoint(
     }
     const float coarseWeight = smoothstep(startDepth, endDepth, viewDepth);
     const float fineWeight = 1.0 - coarseWeight;
+    // w is the publish crossfade's coarse-engage factor: during a refresh
+    // the complete coarse layer draws for coverage, and after the publish
+    // the redundant near-zone coarse points ramp out over a short window
+    // instead of vanishing in one frame. Fine points stay at full density
+    // throughout so coverage never dips.
+    const float coarseEngage = clamp(
+        uniforms.adaptiveDensityParameters.w,
+        0.0,
+        1.0);
     const float probability = role == kAdaptiveDensityFine
         ? fineWeight * fineWeight
-        : (role == kAdaptiveDensityCoarse ? coarseWeight : 1.0);
+        : (role == kAdaptiveDensityCoarse
+               ? mix(1.0, coarseWeight, coarseEngage)
+               : 1.0);
     if (probability <= 0.0) {
         return false;
     }

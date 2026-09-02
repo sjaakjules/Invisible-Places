@@ -564,6 +564,13 @@ struct PointCloudAdaptiveDensityTransition {
     // Fine source data is prepared slightly beyond the visible transition so
     // resize jitter and the cache guard cannot reveal an unloaded edge.
     float preparedFineDepthMeters = 0.0F;
+    // Runtime-only publish crossfade. While a refresh is in flight the
+    // complete coarse layer draws ungated for coverage; at 1 the published
+    // steady state removes the redundant near-zone coarse points entirely.
+    // Ramping 0 -> 1 after a publish spreads that removal across a short
+    // window instead of one visible frame. Exports never carry an adaptive
+    // transition, so this never affects rendered output.
+    float coarseEngage = 1.0F;
 
     [[nodiscard]] bool Valid() const {
         return startDepthMeters > 0.0F &&

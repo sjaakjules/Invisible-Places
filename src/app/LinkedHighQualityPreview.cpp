@@ -181,6 +181,22 @@ AdaptiveHqRetiredPatchHold ResolveAdaptiveHqRetiredPatchHold(
     return hold;
 }
 
+float ResolveAdaptiveHqPublishCoarseEngage(
+    std::chrono::nanoseconds elapsedSincePublish) {
+    if (elapsedSincePublish <= std::chrono::nanoseconds::zero()) {
+        return 0.0F;
+    }
+    const auto duration =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            kAdaptiveHqPublishCrossfadeDuration);
+    if (elapsedSincePublish >= duration) {
+        return 1.0F;
+    }
+    return static_cast<float>(
+        static_cast<double>(elapsedSincePublish.count()) /
+        static_cast<double>(duration.count()));
+}
+
 std::uint64_t AdaptiveHqResidentBlockPayloadBytes(
     const invisible_places::io::AdaptiveHqResidentBlock& block) {
     if (block.points == nullptr) {

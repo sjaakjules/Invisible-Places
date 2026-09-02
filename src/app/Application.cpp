@@ -4107,6 +4107,11 @@ struct LinkedHqPreviewRuntime {
                invisible_places::scene::kScenePointCloudRoleCount>
         publishedFiveMillimeterSessionIndices{};
     double fiveMillimeterGuardPreparationMilliseconds = 0.0;
+    // Started at each adaptive publish; drives the coarse-engage crossfade
+    // that ramps the redundant near-zone coarse points out over a short
+    // window instead of one visible frame.
+    std::chrono::steady_clock::time_point publishCrossfadeStartedAt{};
+    bool publishCrossfadeActive = false;
     // Render-thread publication breakdown for the latest publish: GPU patch
     // uploads, the coarse-guard history merge, mask activation (mode set and
     // 5 mm mask/surfel install), and the complete publish window.
@@ -60799,6 +60804,10 @@ bool PollLinkedHqPreparation(
     hq.stage = LinkedHqPreparationStage::Ready;
     hq.displayedProgress = 1.0F;
     hq.failureMessage.clear();
+    if (hq.request->mode == LinkedHqPreviewMode::Adaptive) {
+        hq.publishCrossfadeStartedAt = std::chrono::steady_clock::now();
+        hq.publishCrossfadeActive = true;
+    }
     runtimeState->previewRenderStateSignatureValid = false;
     const bool includesSand =
         hq.request.has_value() && hq.request->includeSand;
@@ -61344,6 +61353,16 @@ void EnsureLinkedHqPreview(
     }
 
     auto& hq = runtimeState->linkedHqPreview;
+    if (hq.publishCrossfadeActive) {
+        // The crossfade must render every step, so the cached render-state
+        // signature is bypassed until the coarse-engage ramp completes.
+        runtimeState->previewRenderStateSignatureValid = false;
+        if (ResolveAdaptiveHqPublishCoarseEngage(
+                std::chrono::steady_clock::now() -
+                hq.publishCrossfadeStartedAt) >= 1.0F) {
+            hq.publishCrossfadeActive = false;
+        }
+    }
     const bool adaptiveBaseGuardExpired =
         hq.adaptiveBaseGuardApplied && hq.enabled &&
         hq.adaptiveEnabled &&
@@ -121001,6 +121020,12 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
     if (linkedHqPatchDrawPolicy.applyFineAdaptiveDensity) {
         renderState.adaptiveDensityTransition =
             runtimeState.linkedHqPreview.publishedAdaptiveTransition;
+        if (runtimeState.linkedHqPreview.publishCrossfadeActive) {
+            renderState.adaptiveDensityTransition.coarseEngage =
+                ResolveAdaptiveHqPublishCoarseEngage(
+                    std::chrono::steady_clock::now() -
+                    runtimeState.linkedHqPreview.publishCrossfadeStartedAt);
+        }
     }
 
     for (std::size_t sessionIndex = 0; sessionIndex < runtimeState.sessions.size(); ++sessionIndex) {
@@ -135001,7 +135026,9 @@ int RunSurfaceStabilityFlickerSmoke(
                 beforePublish = current;
             }
             churnPublished &= sawPublish;
-            for (std::uint32_t settle = 0U; settle < 4U; ++settle) {
+            // Outlast the publish crossfade so the settled capture compares
+            // steady states rather than a mid-ramp frame.
+            for (std::uint32_t settle = 0U; settle < 12U; ++settle) {
                 (void)pumpFrame(durationSeconds * kFocusNormalized);
             }
             const auto settled = capture();

@@ -18027,12 +18027,15 @@ void VulkanViewportShell::UploadFrameUniformsToBuffer(
     };
     uniforms.inverseViewProjection = glm::inverse(renderState_.viewProjection);
     const auto& adaptive = renderState_.adaptiveDensityTransition;
+    // Shaders read x (start depth), z (end depth), and w (the publish
+    // crossfade's coarse-engage factor). preparedFineDepthMeters is a
+    // CPU-side preparation bound and is deliberately not uploaded.
     uniforms.adaptiveDensityParameters = adaptive.Valid()
         ? glm::vec4{
               adaptive.startDepthMeters,
               adaptive.switchDepthMeters,
               adaptive.endDepthMeters,
-              adaptive.preparedFineDepthMeters,
+              std::clamp(adaptive.coarseEngage, 0.0F, 1.0F),
           }
         : glm::vec4{0.0F};
 

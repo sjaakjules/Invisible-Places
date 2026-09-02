@@ -124,6 +124,18 @@ ResolveAdaptiveHqRetiredPatchHold(
     float guardDisplacementMeters,
     float preparedGuardDepthMeters);
 
+// During a refresh the complete coarse layer draws ungated so newly exposed
+// pixels are always covered; publishing then removes the redundant near-zone
+// coarse points. Measured on Surface_05, that removal flipped 20-27% of the
+// frame's pixels in a single frame at every publish. The crossfade ramps the
+// coarse-engage factor 0 -> 1 over this window instead, spreading the same
+// change across imperceptible per-frame steps; fine coverage is complete
+// from the publish frame, so no pixel ever loses coverage.
+constexpr std::chrono::milliseconds kAdaptiveHqPublishCrossfadeDuration{250};
+
+[[nodiscard]] float ResolveAdaptiveHqPublishCoarseEngage(
+    std::chrono::nanoseconds elapsedSincePublish);
+
 struct AdaptiveHqFiveMillimeterGuardRetention {
     std::vector<std::uint32_t> indices;
     std::size_t retainedHistoryPointCount = 0U;

@@ -1054,3 +1054,27 @@ TEST_CASE(
         std::numeric_limits<float>::quiet_NaN());
     CHECK(missingDepth.maximumHold == std::chrono::minutes{1});
 }
+
+TEST_CASE(
+    "Publish coarse engage ramps monotonically across the crossfade",
+    "[pointcloud][linked-hq][adaptive-hq-policy]") {
+    using invisible_places::app::ResolveAdaptiveHqPublishCoarseEngage;
+    using invisible_places::app::kAdaptiveHqPublishCrossfadeDuration;
+    CHECK(
+        ResolveAdaptiveHqPublishCoarseEngage(std::chrono::nanoseconds{-5}) ==
+        0.0F);
+    CHECK(
+        ResolveAdaptiveHqPublishCoarseEngage(std::chrono::nanoseconds{0}) ==
+        0.0F);
+    const auto half = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        kAdaptiveHqPublishCrossfadeDuration) / 2;
+    CHECK(
+        ResolveAdaptiveHqPublishCoarseEngage(half) ==
+        Catch::Approx(0.5F).margin(1.0e-3));
+    CHECK(
+        ResolveAdaptiveHqPublishCoarseEngage(
+            kAdaptiveHqPublishCrossfadeDuration) == 1.0F);
+    CHECK(
+        ResolveAdaptiveHqPublishCoarseEngage(
+            kAdaptiveHqPublishCrossfadeDuration * 3) == 1.0F);
+}
