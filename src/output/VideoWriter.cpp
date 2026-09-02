@@ -1629,6 +1629,11 @@ std::string BuildFfmpegHevcColorMp4Command(
         true);
 }
 
+// The software HQ paths use x265 "fast" rather than "slow": on the thin
+// surface profile's worst-case speckle segment both scored SSIM 0.977 at
+// CRF16 while "slow" ran 0.5 fps (an hours-long encode for a full render)
+// and "fast" 3.4 fps - faster than GPU capture, so the encoder never
+// bottlenecks the export. See docs/thin_export_encoding.md.
 std::string BuildFfmpegMp4ColorCommand(
     const std::filesystem::path& executablePath,
     std::uint32_t width,
@@ -1671,7 +1676,7 @@ std::string BuildFfmpegMp4ColorCommand(
     } else {
         command << " -vf format=" << (hq ? "yuv420p10le" : "yuv420p")
                 << " -c:v libx265"
-                << " -preset " << (hq ? "slow" : "medium")
+                << " -preset " << (hq ? "fast" : "medium")
                 << " -crf " << (hq ? "14" : "18");
         if (hq) {
             command << " -profile:v main10";
@@ -1745,7 +1750,7 @@ std::string BuildFfmpegMp4AlphaMatteCommand(
         }
     } else {
         command << " -c:v libx265"
-                << " -preset " << (hq ? "slow" : "medium")
+                << " -preset " << (hq ? "fast" : "medium")
                 << " -crf " << (hq ? "12" : "16");
         if (hq) {
             command << " -profile:v main10";
@@ -1813,7 +1818,7 @@ std::string BuildFfmpegMp4ColorAndAlphaMatteCommand(
         }
     } else {
         command << " -c:v libx265"
-                << " -preset " << (hq ? "slow" : "medium")
+                << " -preset " << (hq ? "fast" : "medium")
                 << " -crf " << (hq ? "14" : "18");
         if (hq) {
             command << " -profile:v main10";
@@ -1848,7 +1853,7 @@ std::string BuildFfmpegMp4ColorAndAlphaMatteCommand(
         }
     } else {
         command << " -c:v libx265"
-                << " -preset " << (hq ? "slow" : "medium")
+                << " -preset " << (hq ? "fast" : "medium")
                 << " -crf " << (hq ? "12" : "16");
         if (hq) {
             command << " -profile:v main10";

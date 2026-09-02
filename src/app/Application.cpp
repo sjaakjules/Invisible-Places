@@ -164,6 +164,8 @@ using PointCloudNprPreset = invisible_places::renderer::pointcloud::PointCloudNp
 using PointCloudPreviewLodMode = invisible_places::renderer::pointcloud::PointCloudPreviewLodMode;
 using PointCloudRendererMode = invisible_places::renderer::pointcloud::PointCloudRendererMode;
 using PointCloudGpuSortMode = invisible_places::renderer::pointcloud::PointCloudGpuSortMode;
+using PointCloudNormalCullReference =
+    invisible_places::renderer::pointcloud::PointCloudNormalCullReference;
 using PointCloudDepthParticipation =
     invisible_places::renderer::pointcloud::PointCloudDepthParticipation;
 using PointCloudDepthRolePolicy =
@@ -7484,6 +7486,7 @@ void HashPointStyle(std::uint64_t* seed, const PointCloudStyleState& style) {
     HashBool(seed, style.normalCullEnabled);
     HashFloat(seed, style.normalCullStartDegrees);
     HashFloat(seed, style.normalCullEndDegrees);
+    HashCombine(seed, static_cast<std::uint32_t>(style.normalCullReference));
     HashBool(seed, style.flowAnimation);
     HashBool(seed, style.waterPathView);
     HashBool(seed, style.waterTrailOverlay);
@@ -8222,14 +8225,29 @@ void SanitizePointCloudStyle(PreviewLayerSession* session) {
         std::clamp(session->pointStyle.gpuSortWindowSeconds, 0.05F, 3600.0F);
     session->pointStyle.depthWeightStrength =
         std::clamp(session->pointStyle.depthWeightStrength, 1.0F, 8.0F);
-    session->pointStyle.normalCullStartDegrees =
-        std::clamp(session->pointStyle.normalCullStartDegrees, 0.0F, 179.0F);
+    session->pointStyle.normalCullStartDegrees = std::clamp(
+        std::isfinite(session->pointStyle.normalCullStartDegrees)
+            ? session->pointStyle.normalCullStartDegrees
+            : 75.0F,
+        0.0F,
+        179.0F);
+    const float requestedNormalCullEndDegrees =
+        std::isfinite(session->pointStyle.normalCullEndDegrees)
+            ? session->pointStyle.normalCullEndDegrees
+            : 105.0F;
     session->pointStyle.normalCullEndDegrees = std::clamp(
         std::max(
-            session->pointStyle.normalCullEndDegrees,
+            requestedNormalCullEndDegrees,
             session->pointStyle.normalCullStartDegrees + 1.0F),
         1.0F,
         180.0F);
+    if (static_cast<std::uint32_t>(
+            session->pointStyle.normalCullReference) >
+        static_cast<std::uint32_t>(
+            PointCloudNormalCullReference::FixedVertical)) {
+        session->pointStyle.normalCullReference =
+            PointCloudNormalCullReference::ToCamera;
+    }
     session->pointStyle.colorizeAmount = std::clamp(session->pointStyle.colorizeAmount, 0.0F, 1.0F);
     session->pointStyle.stylisationStrength =
         std::clamp(session->pointStyle.stylisationStrength, 0.0F, 1.0F);
@@ -56579,6 +56597,31 @@ bool DrawPointCloudTransparencyDepthSection(PreviewLayerSession* session) {
             "normals (layers without them are unaffected).");
     }
     if (style.normalCullEnabled) {
+        int normalCullReferenceIndex =
+            static_cast<int>(style.normalCullReference);
+        const char* normalCullReferences[] = {
+            "Point to Camera (Perspective)",
+            "Camera Axis (Stable Pan)",
+            "World +Z (Fixed Top-Down)",
+        };
+        if (DrawRightAlignedCombo(
+                "Fade Reference",
+                &normalCullReferenceIndex,
+                normalCullReferences,
+                IM_ARRAYSIZE(normalCullReferences))) {
+            style.normalCullReference =
+                static_cast<PointCloudNormalCullReference>(
+                    std::clamp(normalCullReferenceIndex, 0, 2));
+            changed = true;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Point to Camera preserves perspective-correct fading. "
+                "Camera Axis gives every point one direction and remains "
+                "stable under a parallel pan. World +Z is independent of "
+                "the camera and pairs with Fixed Vertical sorting for "
+                "top-down animation without cull-order shimmer.");
+        }
         changed |= DrawRangedFloatControl(
             "Fade Start (deg)",
             &style.normalCullStartDegrees,
@@ -56596,7 +56639,10 @@ bool DrawPointCloudTransparencyDepthSection(PreviewLayerSession* session) {
              .hardMin = 1.0F,
              .hardMax = 180.0F});
         ImGui::TextDisabled(
-            "90 deg is edge-on; higher keeps more grazing points.");
+            style.normalCullReference ==
+                    PointCloudNormalCullReference::FixedVertical
+                ? "Fixed +Z: pair with Fixed Vertical sorting for stable top-down output."
+                : "90 deg is edge-on; higher keeps more grazing points.");
     }
     ImGui::TextDisabled("All controls are saved with the named Visual.");
 
@@ -134873,6 +134919,301 @@ int RunAdaptiveHqSurfacePerformanceSmoke(
 // median GPU frame time, mean luma, a 9x9 high-pass detail measure, and a
 // frame capture per candidate. Read-only towards project and caches; pass a
 // duplicated project via --smoke-project while a live session is editing.
+// Runs a short list of real segment exports (same GPU pipeline as the
+// production render) so codec and profile variants can be compared offline:
+// ground-truth PNG stacks, ProRes references, and MP4 replicas of the
+// delivery preset. Driven by INVISIBLE_PLACES_EXPORT_SEGMENT_SPECS, a
+// semicolon-separated list of label,visual,mode,start,end entries where
+// mode is png / prores4444xq / prores4444 / mp4hq / mp4hq-cpu. The
+// animation comes from INVISIBLE_PLACES_EXPORT_SEGMENT_ANIMATION (default
+// Surface_05a). Point the smoke at a duplicated project copy.
+int RunExportSegmentLabSmoke(
+    const GuiSmokeOptions& options,
+    platform::Window* window,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    PreviewRuntimeState* runtimeState) {
+    const auto outputDirectory = options.outputDirectory.empty()
+        ? std::filesystem::path{"build/macos-debug/export-segment-lab"}
+        : options.outputDirectory;
+    const auto reportPath = outputDirectory / "export-segment-lab.json";
+    std::vector<std::string> passes;
+    std::vector<std::string> failures;
+    nlohmann::json report{
+        {"scenario", options.scenario},
+        {"passed", false},
+    };
+    const auto finish = [&]() {
+        report["passed"] = failures.empty();
+        report["passes"] = passes;
+        report["failures"] = failures;
+        std::error_code createError;
+        std::filesystem::create_directories(outputDirectory, createError);
+        std::ofstream output{reportPath, std::ios::trunc};
+        if (!output.is_open()) {
+            std::cerr << "Could not write export-segment report: "
+                      << reportPath.string() << '\n';
+            return 1;
+        }
+        output << report.dump(2) << '\n';
+        std::cout << "Export segment lab report: " << reportPath.string()
+                  << '\n';
+        for (const auto& failure : failures) {
+            std::cerr << "Export segment lab failure: " << failure << '\n';
+        }
+        return failures.empty() ? 0 : 1;
+    };
+    if (window == nullptr || viewport == nullptr || runtimeState == nullptr) {
+        failures.emplace_back("The export segment lab needs a viewport.");
+        return finish();
+    }
+
+    struct SegmentSpec {
+        std::string label;
+        std::string visual;
+        std::string mode;
+        std::uint32_t startFrame = 0U;
+        std::uint32_t endFrame = 0U;
+        std::uint32_t temporalSamples = 0U;
+    };
+    std::vector<SegmentSpec> specs;
+    {
+        const char* specsEnv =
+            std::getenv("INVISIBLE_PLACES_EXPORT_SEGMENT_SPECS");
+        if (specsEnv == nullptr || specsEnv[0] == '\0') {
+            failures.emplace_back(
+                "INVISIBLE_PLACES_EXPORT_SEGMENT_SPECS is required.");
+            return finish();
+        }
+        std::stringstream stream{specsEnv};
+        std::string entry;
+        while (std::getline(stream, entry, ';')) {
+            std::stringstream fields{entry};
+            SegmentSpec spec;
+            std::string start;
+            std::string end;
+            if (!std::getline(fields, spec.label, ',') ||
+                !std::getline(fields, spec.visual, ',') ||
+                !std::getline(fields, spec.mode, ',') ||
+                !std::getline(fields, start, ',') ||
+                !std::getline(fields, end, ',')) {
+                failures.emplace_back("Unparseable spec entry: " + entry);
+                return finish();
+            }
+            spec.startFrame =
+                static_cast<std::uint32_t>(std::strtoul(start.c_str(), nullptr, 10));
+            spec.endFrame =
+                static_cast<std::uint32_t>(std::strtoul(end.c_str(), nullptr, 10));
+            std::string extra;
+            if (std::getline(fields, extra, ',') &&
+                extra.rfind("ts", 0U) == 0U) {
+                spec.temporalSamples = static_cast<std::uint32_t>(
+                    std::strtoul(extra.c_str() + 2, nullptr, 10));
+            }
+            specs.push_back(std::move(spec));
+        }
+    }
+
+    const auto projectPath = options.projectPath;
+    if (projectPath.empty()) {
+        failures.emplace_back(
+            "Pass a duplicated project via --smoke-project.");
+        return finish();
+    }
+    report["project_path"] = projectPath.string();
+    std::string loadError;
+    auto project = invisible_places::serialization::LoadProjectDocument(
+        projectPath,
+        &loadError);
+    if (!project.has_value()) {
+        failures.emplace_back("Project did not load: " + loadError);
+        return finish();
+    }
+    if (!ApplyProjectDocumentToRuntime(project.value(), runtimeState, viewport)) {
+        failures.emplace_back(
+            "Project could not be applied: " +
+            (runtimeState->errorMessage.empty()
+                 ? runtimeState->statusMessage
+                 : runtimeState->errorMessage));
+        return finish();
+    }
+    const char* animationEnv =
+        std::getenv("INVISIBLE_PLACES_EXPORT_SEGMENT_ANIMATION");
+    const std::string animationName =
+        animationEnv != nullptr && animationEnv[0] != '\0'
+            ? animationEnv
+            : "Surface_05a";
+    const auto animationPath =
+        std::filesystem::path{
+            runtimeState->persistence.authoredWorkspacePath} /
+        "animations" / (animationName + ".ipanim.json");
+    report["animation_path"] = animationPath.string();
+    if (!LoadAnimationPathFromFile(runtimeState, animationPath)) {
+        failures.emplace_back(
+            animationName + " did not load: " + runtimeState->errorMessage);
+        return finish();
+    }
+    if (!WaitForExportBenchmarkIdle(
+            window,
+            runtimeState,
+            viewport,
+            std::chrono::minutes{30})) {
+        failures.emplace_back("Startup loads did not settle.");
+        return finish();
+    }
+
+    const auto resolveMode = [&](const std::string& mode)
+        -> std::optional<ExportBenchmarkVariant> {
+        using invisible_places::output::AnimationExportMode;
+        using invisible_places::output::AnimationExportQuality;
+        if (mode == "png") {
+            return ExportBenchmarkVariant{
+                .mode = AnimationExportMode::PngStack,
+                .quality = AnimationExportQuality::Hq,
+                .useVideoToolbox = false,
+            };
+        }
+        if (mode == "prores4444xq") {
+            return ExportBenchmarkVariant{
+                .mode = AnimationExportMode::ProRes4444XqMov,
+                .quality = AnimationExportQuality::Xq,
+                .useVideoToolbox = false,
+            };
+        }
+        if (mode == "prores4444") {
+            return ExportBenchmarkVariant{
+                .mode = AnimationExportMode::ProRes4444Mov,
+                .quality = AnimationExportQuality::Normal,
+                .useVideoToolbox = false,
+            };
+        }
+        if (mode == "mp4hq") {
+            return ExportBenchmarkVariant{
+                .mode = AnimationExportMode::FastPreviewMp4,
+                .quality = AnimationExportQuality::Hq,
+                .useVideoToolbox = true,
+            };
+        }
+        if (mode == "mp4hq-cpu") {
+            return ExportBenchmarkVariant{
+                .mode = AnimationExportMode::FastPreviewMp4,
+                .quality = AnimationExportQuality::Hq,
+                .useVideoToolbox = false,
+            };
+        }
+        return std::nullopt;
+    };
+
+    nlohmann::json results = nlohmann::json::array();
+    for (const auto& spec : specs) {
+        const auto variant = resolveMode(spec.mode);
+        if (!variant.has_value()) {
+            failures.emplace_back("Unknown mode: " + spec.mode);
+            break;
+        }
+        const auto lookdevIndex =
+            ResolveVisiblePointCloudLookdevIndex(*runtimeState);
+        if (!lookdevIndex.has_value() ||
+            lookdevIndex.value() >= runtimeState->sessions.size()) {
+            failures.emplace_back("No visible scene session for visuals.");
+            break;
+        }
+        const auto warning = SelectProjectPointVisualForScene(
+            runtimeState,
+            runtimeState->sessions[lookdevIndex.value()],
+            spec.visual);
+        if (!warning.empty()) {
+            std::cout << "Visual '" << spec.visual << "' warning: "
+                      << warning << std::endl;
+        }
+        const auto segmentDirectory = outputDirectory / spec.label;
+        std::error_code createError;
+        std::filesystem::create_directories(segmentDirectory, createError);
+        auto preset = MakeExportBenchmarkPreset(
+            variant.value(),
+            segmentDirectory,
+            spec.label);
+        preset.settings.startFrame = spec.startFrame;
+        preset.settings.endFrame = spec.endFrame;
+        if (spec.temporalSamples > 1U) {
+            preset.settings.temporalSupersampling = true;
+            preset.settings.temporalSampleCount = spec.temporalSamples;
+        }
+        runtimeState->animationPanel.editedExportPreset = preset;
+        runtimeState->animationPanel.selectedExportPresetName = preset.name;
+        runtimeState->animationPanel.exportPresetNameBuffer = preset.name;
+        runtimeState->renderSettings = preset.settings;
+        runtimeState->errorMessage.clear();
+        const auto startedAt = std::chrono::steady_clock::now();
+        // The first start typically queues the full-density export sources
+        // (the complete 1 mm bundle); wait the loads out and retry like the
+        // codec benchmark does.
+        bool started = false;
+        for (int attempt = 0; attempt < 6 && !window->ShouldClose();
+             ++attempt) {
+            StartAnimationExportJob(runtimeState, viewport);
+            if (runtimeState->offlineRenderJob.active) {
+                started = true;
+                break;
+            }
+            if (!runtimeState->pendingLoad.has_value() &&
+                runtimeState->persistence.queuedLoads.empty()) {
+                break;
+            }
+            if (!WaitForExportBenchmarkIdle(
+                    window,
+                    runtimeState,
+                    viewport,
+                    std::chrono::minutes{30})) {
+                break;
+            }
+        }
+        if (!started) {
+            failures.emplace_back(
+                spec.label + " did not start: " +
+                (runtimeState->errorMessage.empty()
+                     ? runtimeState->statusMessage
+                     : runtimeState->errorMessage));
+            break;
+        }
+        while (runtimeState->offlineRenderJob.active &&
+               !window->ShouldClose()) {
+            PumpExportBenchmarkFrame(window, runtimeState, viewport);
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        }
+        const auto& job = runtimeState->offlineRenderJob;
+        const double seconds =
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - startedAt)
+                .count();
+        results.push_back({
+            {"label", spec.label},
+            {"visual", spec.visual},
+            {"mode", spec.mode},
+            {"start_frame", spec.startFrame},
+            {"end_frame", spec.endFrame},
+            {"seconds", seconds},
+            {"status",
+             runtimeState->errorMessage.empty()
+                 ? std::string{"complete"}
+                 : runtimeState->errorMessage},
+            {"color_path", job.videoOutputPath.string()},
+            {"alpha_path", job.alphaMatteVideoPath.string()},
+            {"output_directory", segmentDirectory.string()},
+            {"bytes", WrittenOutputByteCount(job)},
+        });
+        std::cout << "Segment " << spec.label << " (" << spec.visual
+                  << ", " << spec.mode << ") finished in "
+                  << FormatFixed(static_cast<float>(seconds), 1) << " s."
+                  << std::endl;
+    }
+    report["results"] = std::move(results);
+    if (failures.empty()) {
+        passes.emplace_back("Exported every requested segment.");
+    }
+    viewport->WaitIdle();
+    return finish();
+}
+
 // Measures adaptive-HQ behaviour during real camera-following playback: the
 // user's complaint is that guard refreshes start only after the camera has
 // left the published union (a visible gap of missing fine points) and that
@@ -140539,6 +140880,16 @@ int Application::Run(ApplicationRunOptions options) const {
                     &window,
                     &viewport.value(),
                     &runtimeState);
+            StopBackgroundWorkForShutdown(&runtimeState);
+            viewport->WaitIdle();
+            return smokeExitCode;
+        }
+        if (options.guiSmoke->scenario == "export-segment-lab") {
+            const auto smokeExitCode = RunExportSegmentLabSmoke(
+                options.guiSmoke.value(),
+                &window,
+                &viewport.value(),
+                &runtimeState);
             StopBackgroundWorkForShutdown(&runtimeState);
             viewport->WaitIdle();
             return smokeExitCode;
