@@ -360,6 +360,18 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
                     LABELS "pointcloud;python"
                     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
             )
+            add_test(
+                NAME surface-composite-analysis-tests
+                COMMAND
+                    "${INVISIBLE_PLACES_PATCH_PYTHON_EXECUTABLE}" -m unittest
+                    tests/test_analyze_surface_composites.py -v
+            )
+            set_tests_properties(
+                surface-composite-analysis-tests
+                PROPERTIES
+                    LABELS "pointcloud;python"
+                    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+            )
         endif()
     endif()
 

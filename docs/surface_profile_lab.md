@@ -54,15 +54,37 @@ freshly merged `*_v2` entries.
 * Scaling the Base surfelDiameter Density map by 1.5x (4→2 mm becomes
   6→3 mm) fills and smooths the sand plains (high-pass 15.3→12.9 at the
   mid camera) for a mixed cost; 2.0x adds little over 1.5x.
-* For the Thin detail pass, 0.7x size (4.2→2.8 mm map) plus Gaussian
-  sharpness 24 raises the high-pass detail measure ~40–60% at the near
-  cameras. Stable culling on Thin costs ~2.3x GPU for no detail gain —
-  the detail pass ships without it.
+* Stable culling on Thin costs ~2.3x GPU for no detail gain — the
+  detail pass ships without it.
 * Rim falloff floods luma and erases detail; SoftDisc reads grainier
   than Gaussian on the Base. Both rejected.
 * Sorted + Saturated on the x-ray profile costs +82% GPU and flattens
   the accumulated glow; the authored unsorted Accumulated response is
   the right rendering for that look.
+
+## Composite-aware assessment (the metric that actually matters)
+
+The detail export is applied over the base in After Effects with its own
+luma as alpha (luma matte) and Multiply blend:
+
+    out = base * (1 - luma(thin) * (1 - thin))
+
+Pure black detail pixels vanish (alpha 0) and pure white multiplies by
+one — only midtones carve into the base. An isolated high-pass metric on
+the thin frame therefore counts the black gaps between small points as
+"detail" even though they never reach the composite: measured on the lab
+captures, **83–114% of the isolated detail reading was false** in that
+sense. `scripts/analyze_surface_composites.py` implements the composite
+model and reports the surviving detail gain, the false-detail fraction,
+and the mean darkening of the base; base candidates are scored on
+speckle (want low), mid-band structure (want high — smooth must not mean
+blurry) and coverage consistency.
+
+Ranked on composite gain, the thin winner moved from 0.7x+sharp24 to
+**0.5x size (3→2 mm Density map) + Gaussian sharpness 32**: about twice
+the surviving detail of the 0.7x pick with the least base-darkening, and
+faster than the authored Thin. The base pick was confirmed by the
+composite axes (size 1.5x lowers speckle while *raising* structure).
 
 The composed profiles live as `Surface_05_Base_v2`, `Surface_05_Thin_v2`
 and `Projector-01-Wind_v2` (the x-ray v2 only enables the normal-cull
