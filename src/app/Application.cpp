@@ -134549,6 +134549,483 @@ int RunAdaptiveHqSurfacePerformanceSmoke(
 // over-culling holes versus the Draw All reference. Read-only towards
 // project and caches; pass a duplicated project via --smoke-project so a
 // live editing session stays untouched.
+// Profile laboratory for the Surface_05 two-export workflow (a smooth base
+// pass and a small-point detail pass composited as luma mattes) plus the
+// Projector x-ray look. Renders the complete 1 mm bundle — the exact export
+// content — at several authored cameras for each candidate style, recording
+// median GPU frame time, mean luma, a 9x9 high-pass detail measure, and a
+// frame capture per candidate. Read-only towards project and caches; pass a
+// duplicated project via --smoke-project while a live session is editing.
+int RunSurfaceProfileLabSmoke(
+    const GuiSmokeOptions& options,
+    platform::Window* window,
+    invisible_places::renderer::core::VulkanViewportShell* viewport,
+    PreviewRuntimeState* runtimeState) {
+    const auto outputDirectory = options.outputDirectory.empty()
+        ? std::filesystem::path{"build/macos-debug/surface-profile-lab"}
+        : options.outputDirectory;
+    const auto reportPath = outputDirectory / "surface-profile-lab.json";
+    std::vector<std::string> passes;
+    std::vector<std::string> failures;
+    nlohmann::json report{
+        {"scenario", options.scenario},
+        {"passed", false},
+    };
+    const auto finish = [&]() {
+        report["passed"] = failures.empty();
+        report["passes"] = passes;
+        report["failures"] = failures;
+        std::error_code createError;
+        std::filesystem::create_directories(outputDirectory, createError);
+        std::ofstream output{reportPath, std::ios::trunc};
+        if (!output.is_open()) {
+            std::cerr << "Could not write profile-lab report: "
+                      << reportPath.string() << '\n';
+            return 1;
+        }
+        output << report.dump(2) << '\n';
+        std::cout << "Surface profile lab report: " << reportPath.string()
+                  << '\n';
+        for (const auto& failure : failures) {
+            std::cerr << "Surface profile lab failure: " << failure << '\n';
+        }
+        return failures.empty() ? 0 : 1;
+    };
+    if (window == nullptr || viewport == nullptr || runtimeState == nullptr) {
+        failures.emplace_back("The profile lab needs a live viewport.");
+        return finish();
+    }
+
+    const auto projectPath = options.projectPath.empty()
+        ? std::filesystem::path{
+              runtimeState->persistence.authoredWorkspacePath} /
+              "ExhibitionFinal_project.json"
+        : options.projectPath;
+    report["project_path"] = projectPath.string();
+    std::string loadError;
+    auto project = invisible_places::serialization::LoadProjectDocument(
+        projectPath,
+        &loadError);
+    if (!project.has_value()) {
+        failures.emplace_back("Project did not load: " + loadError);
+        return finish();
+    }
+    if (!ApplyProjectDocumentToRuntime(project.value(), runtimeState, viewport)) {
+        failures.emplace_back(
+            "Project could not be applied: " +
+            (runtimeState->errorMessage.empty()
+                 ? runtimeState->statusMessage
+                 : runtimeState->errorMessage));
+        return finish();
+    }
+    const auto animationPath = projectPath.parent_path() / "animations" /
+        "Surface_05.ipanim.json";
+    report["animation_path"] = animationPath.string();
+    if (!LoadAnimationPathFromFile(runtimeState, animationPath) ||
+        !runtimeState->animationPanel.currentPath.has_value()) {
+        failures.emplace_back(
+            "Surface_05 did not load: " + runtimeState->errorMessage);
+        return finish();
+    }
+    const auto& animation = runtimeState->animationPanel.currentPath.value();
+
+    const auto pumpFrame = [&]() {
+        window->PollEvents();
+        PollPendingLayerLoad(runtimeState, viewport);
+        PollPendingScalarFieldLoad(runtimeState, viewport);
+        EnsureRequiredScalarFieldsResident(runtimeState, viewport);
+        CommitReadySceneDisplaySwitches(runtimeState, viewport);
+        StartQueuedLayerLoadIfIdle(runtimeState);
+        viewport->BeginUiFrame();
+        const auto waterFrameState = ResolveWaterFrameState(runtimeState);
+        viewport->SetDiagnosticsEnabled(true);
+        viewport->SetSceneCachingEnabled(false);
+        viewport->SetLiveSceneRenderingEnabled(true);
+        viewport->SetLiveRainSimulationEnabled(false);
+        auto renderState = BuildRenderState(
+            *runtimeState,
+            *viewport,
+            0.0F,
+            &waterFrameState,
+            nullptr,
+            true);
+        viewport->UpdateRenderState(renderState);
+        runtimeState->previewRenderStateSignatureValid = false;
+        viewport->DrawFrame();
+        return renderState;
+    };
+
+    // The export predicate renders the finest complete bundle, so the lab
+    // switches the committed display to 1 mm before measuring.
+    const auto sceneIt = std::find_if(
+        runtimeState->pointCloudScenes.begin(),
+        runtimeState->pointCloudScenes.end(),
+        [](const auto& candidate) {
+            return candidate.sceneGroupName == "Scene3";
+        });
+    if (sceneIt == runtimeState->pointCloudScenes.end()) {
+        failures.emplace_back("Scene3 was not discovered.");
+        return finish();
+    }
+    auto* scene = &*sceneIt;
+    {
+        const auto settleDeadline =
+            std::chrono::steady_clock::now() + std::chrono::minutes{25};
+        while (std::chrono::steady_clock::now() < settleDeadline &&
+               (scene->pendingDisplaySpacingMicrometres.has_value() ||
+                scene->pendingMixedDisplay) &&
+               !window->ShouldClose()) {
+            (void)pumpFrame();
+        }
+        if (scene->committedDisplaySpacingMicrometres != 1'000U) {
+            if (!RequestSceneDisplaySwitch(
+                    runtimeState,
+                    viewport,
+                    scene,
+                    1'000U)) {
+                failures.emplace_back(
+                    "Could not request the 1 mm bundle: " +
+                    (scene->switchError.empty()
+                         ? runtimeState->errorMessage
+                         : scene->switchError));
+                return finish();
+            }
+            StartQueuedLayerLoadIfIdle(runtimeState);
+        }
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::minutes{25};
+        while (std::chrono::steady_clock::now() < deadline &&
+               !window->ShouldClose()) {
+            (void)pumpFrame();
+            const bool ready = scene->displayLoaded && scene->displayVisible &&
+                scene->committedDisplaySpacingMicrometres == 1'000U &&
+                std::all_of(
+                    scene->committedDisplaySessionIndices.begin(),
+                    scene->committedDisplaySessionIndices.end(),
+                    [&](const auto& index) {
+                        return index.has_value() &&
+                               index.value() < runtimeState->sessions.size() &&
+                               runtimeState->sessions[index.value()]
+                                   .gpuResident;
+                    });
+            if (ready) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+        }
+        if (scene->committedDisplaySpacingMicrometres != 1'000U ||
+            !scene->displayLoaded) {
+            failures.emplace_back("The 1 mm bundle did not become ready.");
+            return finish();
+        }
+    }
+
+    struct CapturedRgba {
+        std::uint32_t width = 0U;
+        std::uint32_t height = 0U;
+        std::vector<std::uint8_t> rgba;
+    };
+    const bool captureWasEnabled =
+        viewport->LiveSceneReadbackCaptureEnabled();
+    viewport->SetLiveSceneReadbackCaptureEnabled(true);
+    const auto capture = [&]() -> std::optional<CapturedRgba> {
+        try {
+            const auto frame = viewport->ReadLiveSceneFrame();
+            if (frame.width == 0U || frame.height == 0U ||
+                frame.colorRgba8.size() !=
+                    static_cast<std::size_t>(frame.width) * frame.height *
+                        4U) {
+                return std::nullopt;
+            }
+            return CapturedRgba{
+                .width = frame.width,
+                .height = frame.height,
+                .rgba = frame.colorRgba8,
+            };
+        } catch (...) {
+            return std::nullopt;
+        }
+    };
+    const auto lumaMetrics = [](const CapturedRgba& image) {
+        // Mean luma plus the 9x9 high-pass standard deviation used by the
+        // fixed-HQ density comparisons: high values mean retained fine
+        // texture, low values a smoother wash.
+        const std::size_t width = image.width;
+        const std::size_t height = image.height;
+        std::vector<float> luma(width * height);
+        for (std::size_t pixel = 0U; pixel < luma.size(); ++pixel) {
+            const auto offset = pixel * 4U;
+            luma[pixel] = 0.2126F * image.rgba[offset] +
+                0.7152F * image.rgba[offset + 1U] +
+                0.0722F * image.rgba[offset + 2U];
+        }
+        double lumaSum = 0.0;
+        for (const float value : luma) {
+            lumaSum += value;
+        }
+        const double mean = luma.empty()
+            ? 0.0
+            : lumaSum / static_cast<double>(luma.size());
+        constexpr std::size_t kRadius = 4U;
+        double highPassSquares = 0.0;
+        std::size_t highPassCount = 0U;
+        for (std::size_t y = kRadius; y + kRadius < height; y += 3U) {
+            for (std::size_t x = kRadius; x + kRadius < width; x += 3U) {
+                double neighbourhood = 0.0;
+                for (std::size_t dy = y - kRadius; dy <= y + kRadius; ++dy) {
+                    for (std::size_t dx = x - kRadius;
+                         dx <= x + kRadius;
+                         ++dx) {
+                        neighbourhood += luma[dy * width + dx];
+                    }
+                }
+                neighbourhood /= 81.0;
+                const double difference =
+                    luma[y * width + x] - neighbourhood;
+                highPassSquares += difference * difference;
+                ++highPassCount;
+            }
+        }
+        const double highPass = highPassCount > 0U
+            ? std::sqrt(highPassSquares / highPassCount)
+            : 0.0;
+        return std::pair{mean, highPass};
+    };
+    const auto savePpm = [&](const CapturedRgba& image,
+                             const std::string& stem) {
+        std::error_code createError;
+        std::filesystem::create_directories(outputDirectory, createError);
+        std::ofstream output{
+            outputDirectory / (stem + ".ppm"),
+            std::ios::binary | std::ios::trunc};
+        if (!output.is_open()) {
+            return;
+        }
+        output << "P6\n" << image.width << ' ' << image.height << "\n255\n";
+        for (std::size_t pixel = 0U;
+             pixel < image.rgba.size() / 4U;
+             ++pixel) {
+            output.put(static_cast<char>(image.rgba[pixel * 4U]));
+            output.put(static_cast<char>(image.rgba[pixel * 4U + 1U]));
+            output.put(static_cast<char>(image.rgba[pixel * 4U + 2U]));
+        }
+    };
+
+    using StabilityMode =
+        invisible_places::renderer::pointcloud::PointCloudSurfaceStabilityMode;
+    struct ProfileCandidate {
+        std::string name;
+        std::string baseVisual;
+        std::function<void(PointCloudStyleState*)> adjust;
+    };
+    const auto stableCulling = [](PointCloudStyleState* style,
+                                  float influence) {
+        style->gpuBackToFrontSorting = true;
+        style->gpuSortMode = invisible_places::renderer::pointcloud::
+            PointCloudGpuSortMode::FullAnimation;
+        style->depthPrepassEnabled = true;
+        style->depthRolePolicy = invisible_places::renderer::pointcloud::
+            PointCloudDepthRolePolicy::RockOccluder;
+        style->surfaceStabilityPolicy =
+            invisible_places::renderer::pointcloud::
+                PointCloudSurfaceStabilityPolicy::Custom;
+        style->rockSurfaceStabilityMode = StabilityMode::DrawAll;
+        style->sandSurfaceStabilityMode = StabilityMode::SoftSeparation;
+        style->vegetationSurfaceStabilityMode = StabilityMode::Original;
+        style->surfaceStabilityInfluence = influence;
+    };
+    // All five saved profiles are world-millimetre screen sprites whose size
+    // rides the surfelDiameter binding (metres). Thin and Base map it from
+    // Density (denser -> smaller), so a size experiment scales the whole
+    // mapping rather than flattening it to a constant.
+    const auto scaleSurfelDiameter = [](PointCloudStyleState* style,
+                                        float factor) {
+        auto& binding = style->surfelDiameter;
+        binding.constantValue[0] =
+            std::max(1.0e-5F, binding.constantValue[0] * factor);
+        binding.fieldMap.outputMin *= factor;
+        binding.fieldMap.outputMax *= factor;
+    };
+    const auto scaleOpacityRange = [](PointCloudStyleState* style,
+                                      float scale) {
+        auto& map = style->opacity.fieldMap;
+        map.outputMin = std::clamp(map.outputMin * scale, 0.0F, 1.0F);
+        map.outputMax = std::clamp(map.outputMax * scale, 0.0F, 1.0F);
+    };
+    const std::vector<ProfileCandidate> candidates{
+        {"base-current", "Surface_05_Base", [](PointCloudStyleState*) {}},
+        {"base-culled", "Surface_05_Base",
+         [&](PointCloudStyleState* style) { stableCulling(style, 1.0F); }},
+        {"base-culled-mix054", "Surface_05_Base",
+         [&](PointCloudStyleState* style) { stableCulling(style, 0.54F); }},
+        {"base-culled-size150", "Surface_05_Base",
+         [&](PointCloudStyleState* style) {
+             stableCulling(style, 1.0F);
+             scaleSurfelDiameter(style, 1.5F);
+         }},
+        {"base-culled-size200", "Surface_05_Base",
+         [&](PointCloudStyleState* style) {
+             stableCulling(style, 1.0F);
+             scaleSurfelDiameter(style, 2.0F);
+         }},
+        {"base-culled-sharp1", "Surface_05_Base",
+         [&](PointCloudStyleState* style) {
+             stableCulling(style, 1.0F);
+             style->gaussianSharpness = 1.0F;
+         }},
+        {"base-culled-softdisc", "Surface_05_Base",
+         [&](PointCloudStyleState* style) {
+             stableCulling(style, 1.0F);
+             style->falloffProfile = invisible_places::renderer::pointcloud::
+                 PointCloudFalloffProfile::SoftDisc;
+         }},
+        {"base-culled-op115", "Surface_05_Base",
+         [&](PointCloudStyleState* style) {
+             stableCulling(style, 1.0F);
+             scaleOpacityRange(style, 1.15F);
+         }},
+        {"thin-current", "Surface_05_Thin", [](PointCloudStyleState*) {}},
+        {"thin-stable", "Surface_05_Thin",
+         [&](PointCloudStyleState* style) { stableCulling(style, 1.0F); }},
+        {"thin-size070", "Surface_05_Thin",
+         [&](PointCloudStyleState* style) {
+             scaleSurfelDiameter(style, 0.7F);
+         }},
+        {"thin-size050", "Surface_05_Thin",
+         [&](PointCloudStyleState* style) {
+             scaleSurfelDiameter(style, 0.5F);
+         }},
+        {"thin-size070-sharp24", "Surface_05_Thin",
+         [&](PointCloudStyleState* style) {
+             scaleSurfelDiameter(style, 0.7F);
+             style->gaussianSharpness = 24.0F;
+         }},
+        {"thin-size070-stable", "Surface_05_Thin",
+         [&](PointCloudStyleState* style) {
+             scaleSurfelDiameter(style, 0.7F);
+             stableCulling(style, 1.0F);
+         }},
+        {"thin-rim", "Surface_05_Thin",
+         [&](PointCloudStyleState* style) {
+             style->falloffProfile = invisible_places::renderer::pointcloud::
+                 PointCloudFalloffProfile::Rim;
+         }},
+        {"xray-current", "Projector-01-Wind", [](PointCloudStyleState*) {}},
+        {"xray-sorted", "Projector-01-Wind",
+         [&](PointCloudStyleState* style) {
+             style->gpuBackToFrontSorting = true;
+             style->gpuSortMode = invisible_places::renderer::pointcloud::
+                 PointCloudGpuSortMode::FullAnimation;
+             style->emissionResponse = invisible_places::renderer::
+                 pointcloud::PointCloudEmissionResponse::Saturated;
+         }},
+    };
+    constexpr std::array<float, 3U> kCameraPositions{0.15F, 0.50F, 0.85F};
+
+    nlohmann::json results = nlohmann::json::array();
+    for (const auto& candidate : candidates) {
+        const auto baseStyle = ProjectPointVisualStyleByName(
+            runtimeState->pointVisualLibrary,
+            candidate.baseVisual);
+        if (!baseStyle.has_value()) {
+            failures.emplace_back(
+                "Missing base visual: " + candidate.baseVisual);
+            break;
+        }
+        auto style = baseStyle.value();
+        candidate.adjust(&style);
+        for (auto& session : runtimeState->sessions) {
+            if (session.kind != LayerKind::PointCloud ||
+                !IsSceneGroupedPointCloud(session)) {
+                continue;
+            }
+            session.pointStyle = style;
+            SanitizePointCloudStyle(&session);
+        }
+        runtimeState->previewRenderStateSignatureValid = false;
+        // Let any newly referenced scalar fields stream in before measuring.
+        const auto fieldDeadline =
+            std::chrono::steady_clock::now() + std::chrono::minutes{4};
+        while (std::chrono::steady_clock::now() < fieldDeadline &&
+               !window->ShouldClose()) {
+            (void)pumpFrame();
+            bool missingField = false;
+            for (const auto& session : runtimeState->sessions) {
+                if (session.kind != LayerKind::PointCloud ||
+                    !IsSceneGroupedPointCloud(session) ||
+                    !session.gpuResident) {
+                    continue;
+                }
+                missingField |= SessionMissingRequiredScalarFieldName(
+                                    *runtimeState,
+                                    session)
+                                    .has_value();
+            }
+            if (!missingField &&
+                !runtimeState->pendingScalarFieldLoad.has_value()) {
+                break;
+            }
+        }
+        nlohmann::json cameraResults = nlohmann::json::array();
+        for (const float position : kCameraPositions) {
+            runtimeState->animationPanel.scrubAmount = position;
+            ApplyAnimationEvaluation(
+                runtimeState,
+                animation,
+                position,
+                runtimeState->animationPanel.previewDepthOfField);
+            std::vector<double> gpuTotals;
+            for (std::uint32_t frame = 0U; frame < 12U; ++frame) {
+                (void)pumpFrame();
+                const auto& diagnostics = viewport->Diagnostics();
+                if (frame >= 3U && diagnostics.gpuTimestampResultsAvailable &&
+                    diagnostics.gpuTotal.milliseconds > 0.0) {
+                    gpuTotals.push_back(diagnostics.gpuTotal.milliseconds);
+                }
+            }
+            std::sort(gpuTotals.begin(), gpuTotals.end());
+            const double medianGpu = gpuTotals.empty()
+                ? 0.0
+                : gpuTotals[gpuTotals.size() / 2U];
+            const auto frameCapture = capture();
+            double meanLuma = 0.0;
+            double highPass = 0.0;
+            if (frameCapture.has_value()) {
+                const auto metrics = lumaMetrics(frameCapture.value());
+                meanLuma = metrics.first;
+                highPass = metrics.second;
+                savePpm(
+                    frameCapture.value(),
+                    candidate.name + "-cam" +
+                        std::to_string(static_cast<int>(position * 100.0F)));
+            }
+            cameraResults.push_back({
+                {"camera", position},
+                {"gpu_median_ms", medianGpu},
+                {"mean_luma", meanLuma},
+                {"high_pass_detail", highPass},
+            });
+            std::cout << "Profile " << candidate.name << " cam " << position
+                      << ": gpu " << medianGpu << " ms, luma " << meanLuma
+                      << ", detail " << highPass << std::endl;
+        }
+        results.push_back({
+            {"name", candidate.name},
+            {"base_visual", candidate.baseVisual},
+            {"cameras", std::move(cameraResults)},
+        });
+    }
+    report["candidates"] = std::move(results);
+    if (!report["candidates"].empty()) {
+        passes.emplace_back("Measured the surface profile candidate matrix.");
+    }
+    if (!captureWasEnabled) {
+        viewport->SetLiveSceneReadbackCaptureEnabled(false);
+    }
+    viewport->WaitIdle();
+    return finish();
+}
+
 int RunSurfaceStabilityFlickerSmoke(
     const GuiSmokeOptions& options,
     platform::Window* window,
@@ -139357,6 +139834,16 @@ int Application::Run(ApplicationRunOptions options) const {
                     &window,
                     &viewport.value(),
                     &runtimeState);
+            StopBackgroundWorkForShutdown(&runtimeState);
+            viewport->WaitIdle();
+            return smokeExitCode;
+        }
+        if (options.guiSmoke->scenario == "surface-profile-lab") {
+            const auto smokeExitCode = RunSurfaceProfileLabSmoke(
+                options.guiSmoke.value(),
+                &window,
+                &viewport.value(),
+                &runtimeState);
             StopBackgroundWorkForShutdown(&runtimeState);
             viewport->WaitIdle();
             return smokeExitCode;
