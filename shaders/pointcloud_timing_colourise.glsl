@@ -150,7 +150,12 @@ const uint kTimingColouriseBlendScreen = 2u;
 const uint kTimingColouriseBlendAdd = 3u;
 const uint kTimingColouriseBlendDivide = 4u;
 const uint kTimingColouriseBlendVividLight = 5u;
-// Keep in lockstep with kTimingColouriseBlendDivisorFloor in
+const uint kTimingColouriseBlendColorBurn = 6u;
+const uint kTimingColouriseBlendPrimaryOnly = 0u;
+const uint kTimingColouriseBlendCrossfade = 1u;
+const uint kTimingColouriseBlendApplyAfter = 2u;
+// Divide, Vivid Light, and Color Burn share this finite divisor floor. Keep
+// it in lockstep with kTimingColouriseBlendDivisorFloor in
 // PointCloudPreviewState.hpp.
 const float kTimingColouriseBlendDivisorFloor = 1.0e-3;
 
@@ -159,14 +164,13 @@ const float kTimingColouriseBlendDivisorFloor = 1.0e-3;
 // is known (Vivid Light branches on the wash, never the base). Mirrors
 // ComposeTimingColouriseBlendStep in PointCloudPreviewState.hpp; the two
 // must stay identical.
-void FoldTimingColouriseBlendStep(
+void ResolveTimingColouriseBlendCoefficients(
     uint blendMode,
     vec3 wash,
-    float amount,
-    inout vec3 scale,
-    inout vec3 offsetColour) {
-    vec3 branchScale = vec3(0.0);
-    vec3 branchOffset = wash;
+    out vec3 branchScale,
+    out vec3 branchOffset) {
+    branchScale = vec3(0.0);
+    branchOffset = wash;
     if (blendMode == kTimingColouriseBlendMultiply) {
         branchScale = wash;
         branchOffset = vec3(0.0);
@@ -192,11 +196,80 @@ void FoldTimingColouriseBlendStep(
             vec3(0.0),
             vec3(1.0) - burnScale,
             vec3(burns));
+    } else if (blendMode == kTimingColouriseBlendColorBurn) {
+        branchScale = vec3(1.0) /
+            max(wash, vec3(kTimingColouriseBlendDivisorFloor));
+        branchOffset = vec3(1.0) - branchScale;
     }
+}
+
+void FoldTimingColouriseResolvedBlendStep(
+    vec3 branchScale,
+    vec3 branchOffset,
+    float amount,
+    inout vec3 scale,
+    inout vec3 offsetColour) {
     const vec3 stepScale = vec3(1.0 - amount) + amount * branchScale;
     const vec3 stepOffset = amount * branchOffset;
     scale *= stepScale;
     offsetColour = offsetColour * stepScale + stepOffset;
+}
+
+void FoldTimingColouriseSingleBlendStep(
+    uint blendMode,
+    vec3 wash,
+    float amount,
+    inout vec3 scale,
+    inout vec3 offsetColour) {
+    vec3 branchScale;
+    vec3 branchOffset;
+    ResolveTimingColouriseBlendCoefficients(
+        blendMode, wash, branchScale, branchOffset);
+    FoldTimingColouriseResolvedBlendStep(
+        branchScale, branchOffset, amount, scale, offsetColour);
+}
+
+void FoldTimingColouriseBlendStep(
+    uint primaryBlendMode,
+    uint secondaryBlendMode,
+    uint compositionMode,
+    float blendMix,
+    vec3 wash,
+    float amount,
+    inout vec3 scale,
+    inout vec3 offsetColour) {
+    const float safeMix = clamp(blendMix, 0.0, 1.0);
+    if (compositionMode == kTimingColouriseBlendPrimaryOnly) {
+        FoldTimingColouriseSingleBlendStep(
+            primaryBlendMode, wash, amount, scale, offsetColour);
+        return;
+    }
+    if (compositionMode == kTimingColouriseBlendApplyAfter) {
+        FoldTimingColouriseSingleBlendStep(
+            primaryBlendMode, wash, amount, scale, offsetColour);
+        FoldTimingColouriseSingleBlendStep(
+            secondaryBlendMode,
+            wash,
+            amount * safeMix,
+            scale,
+            offsetColour);
+        return;
+    }
+
+    vec3 primaryScale;
+    vec3 primaryOffset;
+    vec3 secondaryScale;
+    vec3 secondaryOffset;
+    ResolveTimingColouriseBlendCoefficients(
+        primaryBlendMode, wash, primaryScale, primaryOffset);
+    ResolveTimingColouriseBlendCoefficients(
+        secondaryBlendMode, wash, secondaryScale, secondaryOffset);
+    FoldTimingColouriseResolvedBlendStep(
+        mix(primaryScale, secondaryScale, safeMix),
+        mix(primaryOffset, secondaryOffset, safeMix),
+        amount,
+        scale,
+        offsetColour);
 }
 
 void ResolveTimingColouriseTransform(
@@ -231,10 +304,19 @@ void ResolveTimingColouriseTransform(
             }
             continue;
         }
-        const uint blendMode = uint(
+        const uint primaryBlendMode = uint(
             styleData.timingColouriseRanges[effectIndex].z + 0.5);
+        const uint secondaryBlendMode = uint(
+            styleData.timingColouriseRanges[effectIndex].w + 0.5);
+        const uint compositionMode = uint(
+            styleData.timingColouriseFades[effectIndex].z + 0.5);
+        const float blendMix =
+            styleData.timingColouriseFades[effectIndex].w;
         FoldTimingColouriseBlendStep(
-            blendMode,
+            primaryBlendMode,
+            secondaryBlendMode,
+            compositionMode,
+            blendMix,
             clamp(effect.rgb, 0.0, 1.0),
             clamp(effect.a, 0.0, 1.0),
             retained,

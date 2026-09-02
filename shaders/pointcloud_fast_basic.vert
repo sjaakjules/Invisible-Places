@@ -101,6 +101,10 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 additionalShorelineParams4[4];
     vec4 additionalShorelineParams5[4];
     vec4 additionalShorelineTint[4];
+    vec4 depthCompositingParams;
+    vec4 emissionNormalControl;
+    uvec4 surfaceStabilityControl;
+    vec4 surfaceStabilityParams;
 } styleData;
 
 #include "pointcloud_adaptive_density.glsl"
@@ -149,6 +153,8 @@ float LoadScalarFieldValueForPoint(uint fieldSlot, uint pointIndex) {
     }
     return scalarFieldValues.values[(fieldSlot * styleData.pointMeta.x) + pointIndex];
 }
+
+#include "pointcloud_surface_stability.glsl"
 
 bool WaterTrailOverlayEnabled() {
     return styleData.pointMeta.w == 3u && styleData.globalControl.z > kWaterTrailTangentZFieldSlot;
@@ -484,7 +490,8 @@ void main() {
     if (!AdaptiveDensityKeepsPoint(
             worldPosition.xyz,
             pointIndex,
-            viewDepth)) {
+            viewDepth) ||
+        !PointCloudSurfaceStabilityKeepsOpaquePoint(pointIndex, inPosition)) {
         gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
         gl_PointSize = 0.0;
         outSourceColor = inColor;

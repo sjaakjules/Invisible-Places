@@ -33,6 +33,9 @@ struct OfflinePointLayer {
     bool roughnessMotionFullLayer = false;
     std::size_t roughnessMotionFieldSlot = std::numeric_limits<std::size_t>::max();
     std::size_t groundIdMotionFieldSlot = std::numeric_limits<std::size_t>::max();
+    // Resolved once per layer; the surface-stability weight is evaluated per
+    // point, so it must not re-scan field names inside the draw loops.
+    std::size_t surfaceStabilityFieldSlot = std::numeric_limits<std::size_t>::max();
     invisible_places::water::WaterSeepageSpatialGrid seepageGrid;
     invisible_places::water::WaterSurfaceRole rainCollisionRole =
         invisible_places::water::WaterSurfaceRole::None;
@@ -100,6 +103,7 @@ struct OfflinePointRenderScratch {
     std::vector<float> emissionG;
     std::vector<float> emissionB;
     std::vector<float> emissionA;
+    std::vector<float> prepassDepth;
 };
 
 void InitializeExrImage(ExrImage* image, std::uint32_t width, std::uint32_t height);

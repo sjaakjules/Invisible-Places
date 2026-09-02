@@ -55,6 +55,8 @@ struct ViewportDiagnostics {
     std::uint64_t pointSubmittedCount = 0;
     std::uint64_t pointPassSubmittedCount = 0;
     std::uint32_t pointDepthLayerCount = 0;
+    std::uint64_t pointDepthSortDispatchCount = 0U;
+    std::uint64_t pointDepthSortCacheReuseCount = 0U;
     std::uint32_t pointAccumulationLayerCount = 0;
     std::uint32_t pointStyleUploadCount = 0;
     std::uint32_t pointSkippedInactiveBindings = 0;
@@ -247,6 +249,13 @@ struct SceneRenderState {
         float worldMinZ = 0.0F;
         float worldMaxZ = 0.0F;
         std::uint32_t drawPointCount = 0;
+        // Animation-aware sort reference. Invalid retains the current-frame
+        // camera; valid is a complete-path or moving-window average supplied
+        // by the application. Only the depth row is consumed by the sorter.
+        glm::mat4 depthSortView{1.0F};
+        float depthSortNearPlane = 0.01F;
+        float depthSortFarPlane = 1000.0F;
+        bool depthSortViewValid = false;
         renderer::pointcloud::PointCloudDensityCompensation densityCompensation{};
         renderer::pointcloud::PointCloudAdaptiveDensityRole adaptiveDensityRole =
             renderer::pointcloud::PointCloudAdaptiveDensityRole::Disabled;
@@ -776,6 +785,24 @@ class VulkanViewportShell {
         BufferAllocation sampledSurfelIndexBuffer{};
         BufferAllocation interactiveSampledIndexBuffer{};
         BufferAllocation interactiveSurfelIndexBuffer{};
+        // Lazily allocated only for visuals that opt into GPU transparency
+        // sorting. One output is reused in queue order by preview and export.
+        BufferAllocation depthSortedIndexBuffer{};
+        BufferAllocation depthSortScratchBuffer{};
+        VkDescriptorPool depthSortDescriptorPool = VK_NULL_HANDLE;
+        VkDescriptorSet depthSortDescriptorSet = VK_NULL_HANDLE;
+        // Key for the last sort recorded into depthSortedIndexBuffer. Queue
+        // ordering lets identical later frames reuse it without another
+        // compute dispatch, making a path-locked sort exactly temporally
+        // stable as well as cheaper.
+        std::uint64_t depthSortCacheKey = 0U;
+        bool depthSortCacheValid = false;
+        // Upload-time world Z extent. The Fixed Vertical sort mode derives
+        // its camera-independent depth axis from these, so it works in every
+        // render path without per-frame layer-state plumbing.
+        float worldBoundsMinZ = 0.0F;
+        float worldBoundsMaxZ = 0.0F;
+        bool worldBoundsValid = false;
         std::uint32_t pointCount = 0;
         // GPU Flow keeps a geometrically settled result independent from the
         // current point-budget draw subset. Unlike activePointCount, this does
@@ -975,6 +1002,10 @@ class VulkanViewportShell {
         VkPipeline pointConstantSimpleAccumulationPipeline = VK_NULL_HANDLE;
         VkPipeline pointFastBasicDepthPipeline = VK_NULL_HANDLE;
         VkPipeline pointFastBasicPipeline = VK_NULL_HANDLE;
+        VkPipeline pointSortedDepthAovPipeline = VK_NULL_HANDLE;
+        VkPipeline pointSortedAlphaPipeline = VK_NULL_HANDLE;
+        VkPipeline pointSortedAlphaHybridPipeline = VK_NULL_HANDLE;
+        VkPipeline pointSortedEmissionCompositePipeline = VK_NULL_HANDLE;
         VkPipeline surfelDepthPipeline = VK_NULL_HANDLE;
         VkPipeline surfelAccumulationPipeline = VK_NULL_HANDLE;
         VkPipeline surfelConstantSimpleAccumulationPipeline = VK_NULL_HANDLE;
@@ -1133,6 +1164,7 @@ class VulkanViewportShell {
     void CreateRenderPass();
     void CreatePresentRenderPass();
     void CreatePointDescriptorSetLayout();
+    void CreatePointDepthSortDescriptorSetLayout();
     void CreateDynamicMeshFlowDescriptorSetLayout();
     void CreateWaterFlowSourceDescriptorSetLayout();
     void CreateRainDescriptorSetLayout();
@@ -1147,6 +1179,7 @@ class VulkanViewportShell {
     void CreateUniformResources();
     void CreateRainResources();
     void CreatePointPipelines();
+    void CreatePointDepthSortPipeline();
     void CreateDynamicMeshFlowComputePipeline();
     void CreateWaterFlowSourceComputePipelines();
     void CreateRainPipelines();
@@ -1270,6 +1303,14 @@ class VulkanViewportShell {
     void CleanupSwapchain();
     void CleanupPointCloudResources(ActivePointCloudResources* resources);
     void CleanupPointHighlightResources(ActivePointCloudResources::PointHighlightResources* highlight);
+    void EnsurePointDepthSortResources(
+        ActivePointCloudResources* resources,
+        std::uint32_t requiredPointCount);
+    void UpdatePointDepthSortDescriptorSet(ActivePointCloudResources* resources);
+    [[nodiscard]] bool RecordPointDepthSort(
+        VkCommandBuffer commandBuffer,
+        const SceneRenderState::PointCloudLayerState& layer,
+        bool forceFullSource);
     void CleanupGaussianSplatResources(ActiveGaussianSplatResources* resources);
     void CleanupHighQualityGaussianScene();
     void DestroyExrExportResources(ExrExportResources* resources);
@@ -1375,6 +1416,7 @@ class VulkanViewportShell {
     VkRenderPass renderPass_ = VK_NULL_HANDLE;
     VkRenderPass presentRenderPass_ = VK_NULL_HANDLE;
     VkPipelineLayout pointPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout pointDepthSortPipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout dynamicMeshFlowPipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout waterFlowSourcePipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout rainPipelineLayout_ = VK_NULL_HANDLE;
@@ -1390,6 +1432,11 @@ class VulkanViewportShell {
     VkPipeline pointConstantSimpleAccumulationPipeline_ = VK_NULL_HANDLE;
     VkPipeline pointOpaqueHardDiscPipeline_ = VK_NULL_HANDLE;
     VkPipeline pointFastBasicPipeline_ = VK_NULL_HANDLE;
+    VkPipeline pointSortedDepthAovPipeline_ = VK_NULL_HANDLE;
+    VkPipeline pointSortedAlphaPipeline_ = VK_NULL_HANDLE;
+    VkPipeline pointSortedAlphaHybridPipeline_ = VK_NULL_HANDLE;
+    VkPipeline pointSortedEmissionCompositePipeline_ = VK_NULL_HANDLE;
+    VkPipeline pointDepthSortPipeline_ = VK_NULL_HANDLE;
     VkPipeline dynamicMeshFlowComputePipeline_ = VK_NULL_HANDLE;
     VkPipeline waterFlowRouteComputePipeline_ = VK_NULL_HANDLE;
     VkPipeline waterFlowTrailComputePipeline_ = VK_NULL_HANDLE;
@@ -1407,6 +1454,7 @@ class VulkanViewportShell {
     VkPipeline postProcessPipeline_ = VK_NULL_HANDLE;
     VkPipeline eyeDomeLightingExportPipeline_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout pointDescriptorSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout pointDepthSortDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout dynamicMeshFlowDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout waterFlowSourceDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout rainDescriptorSetLayout_ = VK_NULL_HANDLE;

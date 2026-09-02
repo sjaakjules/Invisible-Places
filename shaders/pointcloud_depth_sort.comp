@@ -1,0 +1,156 @@
+#version 450
+
+// A high-throughput approximate transparency sort. Quantising view depth into
+// many buckets avoids the serial cost and temporary storage of an exact radix
+// sort while preserving the important far-to-near ordering between surfaces.
+//
+// The scatter phase allocates within-bucket slots with atomics, so two points
+// in the same bucket land in scheduler order — a different permutation every
+// dispatch, which reads as flicker wherever overlapping points share a
+// bucket. Two measures keep that raciness invisible: depth occupies enough
+// key bits that only near-coplanar points can tie, and a per-point hash
+// occupies the lowest key bits so even coplanar overlapping neighbours keep
+// one fixed relative order across re-sorts and camera angles.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer PointPositions {
+    vec4 positions[];
+} pointPositions;
+
+layout(set = 0, binding = 1, std430) readonly buffer BudgetIndices {
+    uint indices[];
+} budgetIndices;
+
+layout(set = 0, binding = 2, std430) readonly buffer InteractiveIndices {
+    uint indices[];
+} interactiveIndices;
+
+layout(set = 0, binding = 3, std430) buffer SortedIndices {
+    uint indices[];
+} sortedIndices;
+
+// [0, bucketCount) is the histogram. [bucketCount, 2*bucketCount)
+// becomes far-to-near offsets and then atomic scatter cursors.
+layout(set = 0, binding = 4, std430) buffer SortScratch {
+    uint values[];
+} scratchData;
+
+layout(push_constant) uniform SortPushConstants {
+    mat4 view;
+    // x: phase (0 histogram, 1 prefix, 2 scatter), y: point count,
+    // z: source mode (0 sequential, 1 budget, 2 interactive), w: buckets.
+    uvec4 control;
+    // x/y: near/far view depth.
+    vec4 depth;
+} sortData;
+
+// The low bits of every bucket key hold a point-identity hash rather than
+// depth. Must match the C++ mirror next to kPointDepthSortBucketCount.
+const uint kIndexHashBucketBits = 3u;
+
+shared uint prefixLanePartialSums[gl_WorkGroupSize.x];
+
+uint SourcePointIndex(uint drawIndex) {
+    if (sortData.control.z == 1u) {
+        return budgetIndices.indices[drawIndex];
+    }
+    if (sortData.control.z == 2u) {
+        return interactiveIndices.indices[drawIndex];
+    }
+    return drawIndex;
+}
+
+uint SortBucket(uint pointIndex) {
+    const float viewDepth =
+        -(sortData.view * pointPositions.positions[pointIndex]).z;
+    const float nearDepth = sortData.depth.x;
+    const float farDepth = max(nearDepth + 1.0e-5, sortData.depth.y);
+    // Logarithmic buckets concentrate ordering precision around the camera,
+    // where millimetre/centimetre point overlap is visible, while retaining
+    // the complete authored far range for aerial geometry.
+    const float clampedDepth = clamp(viewDepth, nearDepth, farDepth);
+    const float normalizedDepth = clamp(
+        log2(clampedDepth / nearDepth) /
+            max(1.0e-5, log2(farDepth / nearDepth)),
+        0.0,
+        1.0);
+    const uint depthBucketCount =
+        sortData.control.w >> kIndexHashBucketBits;
+    const uint depthBucket = min(
+        uint(normalizedDepth * float(depthBucketCount - 1u)),
+        depthBucketCount - 1u);
+    // Knuth multiplicative hash: decorrelates the tiebreak from upload order
+    // so overlapping neighbours almost never share a full key, whichever
+    // source-index pattern produced them.
+    const uint indexHash =
+        (pointIndex * 2654435761u) >> (32u - kIndexHashBucketBits);
+    return (depthBucket << kIndexHashBucketBits) | indexHash;
+}
+
+void main() {
+    const uint phase = sortData.control.x;
+    // Flatten a 2-D dispatch so full 100M+ source clouds do not exceed
+    // Vulkan's guaranteed 65,535 workgroups on any single axis.
+    const uint workgroupIndex =
+        gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    const uint drawIndex =
+        workgroupIndex * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    const uint pointCount = sortData.control.y;
+    const uint bucketCount = sortData.control.w;
+
+    if (phase == 1u) {
+        // Far-to-near offsets over the full bucket table, computed by the one
+        // dispatched workgroup. Each lane owns a contiguous run of the
+        // descending bucket ordinals; lane partial sums stitch the runs into
+        // one exclusive prefix.
+        const uint lane = gl_LocalInvocationID.x;
+        const uint laneCount = gl_WorkGroupSize.x;
+        const uint ordinalsPerLane =
+            (bucketCount + laneCount - 1u) / laneCount;
+        const uint firstOrdinal = lane * ordinalsPerLane;
+        uint laneSum = 0u;
+        for (uint step = 0u; step < ordinalsPerLane; ++step) {
+            const uint ordinal = firstOrdinal + step;
+            if (ordinal >= bucketCount) {
+                break;
+            }
+            laneSum += scratchData.values[bucketCount - 1u - ordinal];
+        }
+        prefixLanePartialSums[lane] = laneSum;
+        barrier();
+        if (lane == 0u) {
+            uint runningOffset = 0u;
+            for (uint laneIndex = 0u; laneIndex < laneCount; ++laneIndex) {
+                const uint laneTotal = prefixLanePartialSums[laneIndex];
+                prefixLanePartialSums[laneIndex] = runningOffset;
+                runningOffset += laneTotal;
+            }
+        }
+        barrier();
+        uint offset = prefixLanePartialSums[lane];
+        for (uint step = 0u; step < ordinalsPerLane; ++step) {
+            const uint ordinal = firstOrdinal + step;
+            if (ordinal >= bucketCount) {
+                break;
+            }
+            const uint bucket = bucketCount - 1u - ordinal;
+            scratchData.values[bucketCount + bucket] = offset;
+            offset += scratchData.values[bucket];
+        }
+        return;
+    }
+
+    if (drawIndex >= pointCount) {
+        return;
+    }
+    const uint pointIndex = SourcePointIndex(drawIndex);
+    const uint bucket = SortBucket(pointIndex);
+    if (phase == 0u) {
+        atomicAdd(scratchData.values[bucket], 1u);
+        return;
+    }
+    const uint destination = atomicAdd(
+        scratchData.values[bucketCount + bucket],
+        1u);
+    sortedIndices.indices[destination] = pointIndex;
+}

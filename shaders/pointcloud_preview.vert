@@ -15,10 +15,10 @@ layout(location = 3) out float outEmissive;
 layout(location = 5) out float outDepthFade;
 layout(location = 6) out float outViewDepth;
 layout(location = 7) flat out uint outPointIndex;
+layout(location = 10) out float outKernelSpriteRatio;
 #ifndef DEPTH_PREPASS
 layout(location = 8) out float outSurfaceAngleMask;
 layout(location = 9) out vec3 outAovNormal;
-layout(location = 10) out float outKernelSpriteRatio;
 layout(location = 11) out vec4 outWaterColourTransform;
 layout(location = 12) flat out vec4 outTimingColouriseTransform;
 layout(location = 13) flat out vec4 outTimingColouriseScale;
@@ -112,6 +112,10 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 additionalShorelineParams4[4];
     vec4 additionalShorelineParams5[4];
     vec4 additionalShorelineTint[4];
+    vec4 depthCompositingParams;
+    vec4 emissionNormalControl;
+    uvec4 surfaceStabilityControl;
+    vec4 surfaceStabilityParams;
 } styleData;
 
 #include "pointcloud_adaptive_density.glsl"
@@ -183,6 +187,8 @@ float LoadScalarFieldValueForPoint(uint fieldSlot, uint pointIndex) {
 float LoadScalarFieldValue(uint fieldSlot) {
     return LoadScalarFieldValueForPoint(fieldSlot, uint(gl_VertexIndex));
 }
+
+#include "pointcloud_surface_stability.glsl"
 
 bool HasWaterParticleFields() {
     if (styleData.pointMeta.w == 3u) {
@@ -1032,6 +1038,7 @@ void main() {
             viewDepth)) {
         gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
         gl_PointSize = 0.0;
+        outKernelSpriteRatio = 1.0;
         outOpacity = 0.0;
         outDepthFade = 0.0;
         outViewDepth = viewDepth;
@@ -1052,9 +1059,7 @@ void main() {
         gl_Position.z < -0.05 * gl_Position.w ||
         gl_Position.z > effectCullLimit) {
         gl_PointSize = max(1.0, styleData.renderParams3.y);
-#ifndef DEPTH_PREPASS
         outKernelSpriteRatio = 1.0;
-#endif
         outOpacity = 0.0;
         outDepthFade = 0.0;
         outViewDepth = viewDepth;
@@ -1150,12 +1155,10 @@ void main() {
     const float kernelEnergyScale = floorEnergyRatio * floorEnergyRatio;
     const float dofKernelSize =
         pointSizeBeforeDepthOfField + ResolveDepthOfFieldBlurPixels(viewDepth);
-#ifndef DEPTH_PREPASS
     outKernelSpriteRatio =
         !RippleFiniteFloat(resolvedPointSize) || resolvedPointSize <= minPointSize
             ? 1.0
             : clamp(dofKernelSize / gl_PointSize, 1.0e-3, 1.0);
-#endif
 
 #ifndef DEPTH_PREPASS
     ResolveTimingColouriseTransform(
@@ -1217,7 +1220,33 @@ void main() {
              meshFlowContact.opacityAdd) * flowEffectVisibility;
     outOpacity = (RippleFiniteFloat(resolvedOpacity)
         ? clamp(resolvedOpacity, 0.0, 4.0)
-        : safeBaseOpacity) * kernelEnergyScale;
+        : safeBaseOpacity) * kernelEnergyScale *
+        ResolvePointCloudSurfaceStabilityWeight(pointIndex);
+    // Optional back-face fade: points whose stored normal faces away from
+    // the camera fade out over the authored angular band — for example
+    // returns beneath an overhang seen from above. Zero-length normals
+    // (missing normals, trail/particle points) are never culled, and the
+    // depth-prepass variant applies the same fade so culled points stop
+    // occluding as well as stop drawing.
+    if (styleData.emissionNormalControl.y > 0.5 &&
+        dot(aovNormal, aovNormal) > 1.0e-8) {
+        const vec3 toCamera = uniforms.cameraPosition.xyz - worldPosition.xyz;
+        const float toCameraLengthSquared = dot(toCamera, toCamera);
+        if (toCameraLengthSquared > 1.0e-12) {
+            const float facingCosine = dot(
+                normalize(aovNormal),
+                toCamera * inversesqrt(toCameraLengthSquared));
+            const float facingFade = smoothstep(
+                styleData.emissionNormalControl.w,
+                styleData.emissionNormalControl.z,
+                facingCosine);
+            if (facingFade <= 1.0e-4) {
+                gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+                gl_PointSize = 0.0;
+            }
+            outOpacity *= facingFade;
+        }
+    }
 #ifndef DEPTH_PREPASS
     const float resolvedEmissive =
         animatedFlow.y +

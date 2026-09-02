@@ -85,6 +85,23 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 rainImpactSandBand;
     vec4 rainImpactResponse;
     uvec4 timingColouriseControl;
+    uvec4 timingColouriseSources[8];
+    vec4 timingColouriseRanges[8];
+    vec4 timingColouriseFades[8];
+    vec4 timingColouriseLut[512];
+    uvec4 additionalShorelineCount;
+    uvec4 additionalShorelineControl[4];
+    vec4 additionalShorelineParams0[4];
+    vec4 additionalShorelineParams1[4];
+    vec4 additionalShorelineParams2[4];
+    vec4 additionalShorelineParams3[4];
+    vec4 additionalShorelineParams4[4];
+    vec4 additionalShorelineParams5[4];
+    vec4 additionalShorelineTint[4];
+    vec4 depthCompositingParams;
+    vec4 emissionNormalControl;
+    uvec4 surfaceStabilityControl;
+    vec4 surfaceStabilityParams;
 } styleData;
 
 #include "pointcloud_stylisation.glsl"
@@ -92,6 +109,7 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
 #include "pointcloud_timing_colourise.glsl"
 
 layout(input_attachment_index = 0, set = 0, binding = 3) uniform subpassInput sceneDepthInput;
+#include "pointcloud_depth_compositing.glsl"
 
 vec3 ResolveBaseColor() {
     vec3 baseColor = inSourceColor.rgb;
@@ -201,23 +219,6 @@ float AlphaClampMax() {
     return styleData.renderControl.w != 0u ? 1.0 : 0.995;
 }
 
-float WeightedAlphaWeight(float alpha) {
-    const float depthNorm = clamp(
-        (inViewDepth - uniforms.depthParameters.y) /
-        max(1e-5, uniforms.depthParameters.z - uniforms.depthParameters.y),
-        0.0,
-        1.0);
-    const float opacityBase = min(1.0, alpha * 8.0) + 0.01;
-    const float opacityWeight = opacityBase * opacityBase * opacityBase;
-    const float frontBase = 1.0 - depthNorm;
-    const float frontSquared = frontBase * frontBase;
-    const float frontWeight = frontSquared * frontSquared;
-    return clamp(
-        (opacityWeight * 0.5) + (opacityWeight * frontWeight * 128.0),
-        1e-3,
-        256.0);
-}
-
 float ResolveDepthFadeAlpha(float depthFade) {
     const float depthNorm = clamp(
         (inViewDepth - uniforms.depthParameters.y) /
@@ -253,6 +254,9 @@ void main() {
     if (alpha <= 1e-5) {
         discard;
     }
+    if (PointCloudDepthPrepassRejectsFragment()) {
+        discard;
+    }
 
     const vec3 timingColour =
         ApplyTimingColouriseStack(ApplyColorize(ResolveBaseColor()));
@@ -268,22 +272,32 @@ void main() {
     outEmission = vec4(0.0);
     outNormalAccumulation = vec4(0.0);
     outAlbedoAccumulation = vec4(0.0);
-    const float weightedAlpha = clamp(alpha, 0.0, AlphaClampMax());
-    const float weight = WeightedAlphaWeight(weightedAlpha);
-    const float aovWeight = weightedAlpha * weight;
-    outAccumulation = vec4(baseColor * aovWeight, aovWeight);
-    outRevealage = weightedAlpha;
-    WriteAovs(baseColor, inAovNormal, aovWeight);
-
     float resolvedEmissive = max(0.0, inEmissive);
     const float timingEmissionAdd = ResolveTimingColouriseEmissionAdd();
     if (timingEmissionAdd > 0.0) {
         resolvedEmissive += timingEmissionAdd;
     }
     const float emissionGain = resolvedEmissive * max(0.0, styleData.renderParams0.x);
+    vec3 accumulationColor = baseColor;
     if (emissionGain > 1e-5) {
-        outEmission += vec4(
-            baseColor * compensatedRawAlpha * emissionGain,
-            compensatedRawAlpha * emissionGain);
+        if (PointCloudSaturatedEmissionEnabled()) {
+            accumulationColor = PointCloudSaturatedEmissionColor(
+                baseColor,
+                compensatedRawAlpha,
+                alpha,
+                emissionGain);
+        } else {
+            outEmission = vec4(
+                baseColor * compensatedRawAlpha * emissionGain,
+                compensatedRawAlpha * emissionGain);
+        }
     }
+    const float weightedAlpha = clamp(alpha, 0.0, AlphaClampMax());
+    const float weight = PointCloudWeightedAlphaWeight(weightedAlpha);
+    const float aovWeight = weightedAlpha * weight;
+    outAccumulation = vec4(accumulationColor * aovWeight, aovWeight);
+    outRevealage = weightedAlpha;
+    // AOVs stay at the unlit base colour; the saturated fold is a beauty
+    // response, not albedo.
+    WriteAovs(baseColor, inAovNormal, aovWeight);
 }

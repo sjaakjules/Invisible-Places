@@ -101,6 +101,10 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 additionalShorelineParams4[4];
     vec4 additionalShorelineParams5[4];
     vec4 additionalShorelineTint[4];
+    vec4 depthCompositingParams;
+    vec4 emissionNormalControl;
+    uvec4 surfaceStabilityControl;
+    vec4 surfaceStabilityParams;
 } styleData;
 
 #include "pointcloud_adaptive_density.glsl"
@@ -194,6 +198,12 @@ float LoadScalarFieldValue(uint fieldSlot, uint pointIndex) {
     const uint scalarIndex = (fieldSlot * styleData.pointMeta.x) + pointIndex;
     return scalarFieldValues.values[scalarIndex];
 }
+
+float LoadScalarFieldValueForPoint(uint fieldSlot, uint pointIndex) {
+    return LoadScalarFieldValue(fieldSlot, pointIndex);
+}
+
+#include "pointcloud_surface_stability.glsl"
 
 bool HasWaterParticleFields() {
     if (styleData.pointMeta.w == 3u) {
@@ -1254,7 +1264,7 @@ void main() {
              rainImpact.opacityAdd +
              meshFlowContact.opacityAdd) * flowEffectVisibility,
         0.0,
-        4.0);
+        4.0) * ResolvePointCloudSurfaceStabilityWeight(pointIndex);
 #ifndef DEPTH_PREPASS
     outEmissive =
         animatedFlow.y +

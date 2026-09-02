@@ -518,6 +518,117 @@ TEST_CASE("Water Flow runtime speed scale is safe and survives Fast Basic stylin
     CHECK(MakeFastBasicPointCloudStyle(style, true).waterFlowSpeedScale == Catch::Approx(1.75F));
 }
 
+TEST_CASE(
+    "Fast Basic keeps only generated Flow trails on Beauty",
+    "[pointcloud][renderer][fast-basic][water]") {
+    using invisible_places::renderer::pointcloud::PointCloudRendererMode;
+    using invisible_places::renderer::pointcloud::PointCloudStyleState;
+    using invisible_places::renderer::pointcloud::ResolvePointCloudLayerRendererMode;
+
+    PointCloudStyleState style;
+    CHECK(
+        ResolvePointCloudLayerRendererMode(
+            PointCloudRendererMode::FastBasic,
+            false,
+            style) == PointCloudRendererMode::FastBasic);
+
+    style.waterTrailOverlay = true;
+    CHECK(
+        ResolvePointCloudLayerRendererMode(
+            PointCloudRendererMode::FastBasic,
+            false,
+            style) == PointCloudRendererMode::FastBasic);
+    CHECK(
+        ResolvePointCloudLayerRendererMode(
+            PointCloudRendererMode::FastBasic,
+            true,
+            style) == PointCloudRendererMode::Beauty);
+    CHECK(
+        ResolvePointCloudLayerRendererMode(
+            PointCloudRendererMode::Beauty,
+            true,
+            style) == PointCloudRendererMode::Beauty);
+
+    style.waterTrailOverlay = false;
+    style.flowAnimation = true;
+    CHECK(
+        ResolvePointCloudLayerRendererMode(
+            PointCloudRendererMode::FastBasic,
+            true,
+            style) == PointCloudRendererMode::FastBasic);
+}
+
+TEST_CASE(
+    "Offline mixed renderer keeps Fast Basic and Beauty layers on separate paths",
+    "[output][offline][pointcloud][fast-basic][mixed]") {
+    invisible_places::io::LoadedPointCloud fastCloud;
+    fastCloud.positions = {{-0.35F, 0.0F, 0.0F}};
+    fastCloud.packedColors = {0xFFFFFFFFU};
+    fastCloud.hasSourceRgb = true;
+
+    invisible_places::io::LoadedPointCloud beautyCloud;
+    beautyCloud.positions = {{0.35F, 0.0F, 0.0F}};
+    beautyCloud.packedColors = {0xFFFFFFFFU};
+    beautyCloud.hasSourceRgb = true;
+
+    invisible_places::renderer::pointcloud::PointCloudStyleState fastStyle;
+    fastStyle.colorMode =
+        invisible_places::renderer::pointcloud::PointCloudColorMode::SolidColor;
+    fastStyle.solidColor = {1.0F, 0.0F, 0.0F, 1.0F};
+    fastStyle.falloffProfile =
+        invisible_places::renderer::pointcloud::PointCloudFalloffProfile::HardDisc;
+    invisible_places::style::SetScalarConstant(&fastStyle.pointSize, 5.0F);
+    invisible_places::style::SetScalarConstant(&fastStyle.opacity, 0.1F);
+
+    auto beautyStyle = fastStyle;
+    beautyStyle.solidColor = {0.0F, 0.0F, 1.0F, 1.0F};
+    invisible_places::style::SetScalarConstant(&beautyStyle.opacity, 0.25F);
+
+    const std::vector<invisible_places::output::OfflinePointLayer> layers{
+        {.cloud = &fastCloud,
+         .style = fastStyle,
+         .hasSourceRgb = true,
+         .fastBasic = true,
+         .localToWorld = glm::mat4{1.0F}},
+        {.cloud = &beautyCloud,
+         .style = beautyStyle,
+         .hasSourceRgb = true,
+         .fastBasic = false,
+         .localToWorld = glm::mat4{1.0F}},
+    };
+
+    invisible_places::camera::CameraState cameraState;
+    cameraState.position = {0.0F, 0.0F, 5.0F};
+    cameraState.target = {0.0F, 0.0F, 0.0F};
+    cameraState.nearPlane = 0.1F;
+    cameraState.farPlane = 20.0F;
+
+    invisible_places::output::ExrImage image;
+    invisible_places::output::InitializeExrImage(&image, 32U, 32U);
+    invisible_places::output::OfflinePointRenderDiagnostics diagnostics;
+    invisible_places::output::RenderPointCloudTile(
+        layers,
+        cameraState,
+        invisible_places::output::OfflineRenderTile{0U, 0U, 32U, 32U},
+        &image,
+        &diagnostics);
+
+    float fastAlpha = 0.0F;
+    float beautyAlpha = 0.0F;
+    for (std::size_t index = 0U; index < image.alpha.size(); ++index) {
+        if (image.beautyR[index] > image.beautyB[index]) {
+            fastAlpha = std::max(fastAlpha, image.alpha[index]);
+        } else if (image.beautyB[index] > image.beautyR[index]) {
+            beautyAlpha = std::max(beautyAlpha, image.alpha[index]);
+        }
+    }
+
+    CHECK(fastAlpha == Catch::Approx(1.0F));
+    CHECK(beautyAlpha == Catch::Approx(0.25F).margin(1.0e-4F));
+    CHECK(diagnostics.depthPassLayers == 1U);
+    CHECK(diagnostics.accumulationPassLayers == 2U);
+}
+
 TEST_CASE("Offline Water Flow speed scale changes travel without scalar edits", "[output][offline][water][speed]") {
     const auto frozen = RenderMovingWaterTrail(0.0F);
     const auto moving = RenderMovingWaterTrail(1.0F);
@@ -1065,4 +1176,77 @@ TEST_CASE(
         CHECK(dual.alpha[kCenter] ==
               Catch::Approx(base.alpha[kCenter]).margin(1.0e-6F));
     }
+}
+
+TEST_CASE(
+    "Soft-edge depth prepass rejects deep points but preserves its tolerance band",
+    "[output][offline][pointcloud][depth-prepass]") {
+    auto render = [](bool depthPrepassEnabled,
+                     float toleranceMeters,
+                     float depthWeightStrength) {
+        invisible_places::io::LoadedPointCloud cloud;
+        cloud.positions = {
+            {0.0F, 0.0F, 0.0F},
+            {0.0F, 0.0F, -5.0F},
+        };
+        cloud.packedColors = {
+            0xFF0000FFU,
+            0xFFFF0000U,
+        };
+        cloud.hasSourceRgb = true;
+
+        invisible_places::renderer::pointcloud::PointCloudStyleState style;
+        style.colorMode = invisible_places::renderer::pointcloud::PointCloudColorMode::SourceRgb;
+        style.falloffProfile =
+            invisible_places::renderer::pointcloud::PointCloudFalloffProfile::Gaussian;
+        style.gaussianSharpness = 4.0F;
+        style.depthPrepassEnabled = depthPrepassEnabled;
+        style.depthPrepassAlphaThreshold = 0.35F;
+        style.depthPrepassToleranceMeters = toleranceMeters;
+        style.depthWeightStrength = depthWeightStrength;
+        invisible_places::style::SetScalarConstant(&style.pointSize, 9.0F);
+        invisible_places::style::SetScalarConstant(&style.opacity, 0.8F);
+
+        const invisible_places::output::OfflinePointLayer layer{
+            .cloud = &cloud,
+            .style = style,
+            .hasSourceRgb = true,
+            .localToWorld = glm::mat4{1.0F},
+        };
+        invisible_places::camera::CameraState cameraState;
+        cameraState.position = {0.0F, 0.0F, 5.0F};
+        cameraState.target = {0.0F, 0.0F, 0.0F};
+        cameraState.nearPlane = 0.1F;
+        cameraState.farPlane = 1000.0F;
+
+        invisible_places::output::ExrImage image;
+        invisible_places::output::InitializeExrImage(&image, 17U, 17U);
+        invisible_places::output::RenderPointCloudTile(
+            {layer},
+            cameraState,
+            invisible_places::output::OfflineRenderTile{0U, 0U, 17U, 17U},
+            &image);
+        return image;
+    };
+
+    constexpr std::size_t kCenter = 8U * 17U + 8U;
+    const auto original = render(false, 0.0F, 1.0F);
+    const auto culled = render(true, 0.05F, 1.0F);
+    const auto tolerated = render(true, 5.01F, 1.0F);
+    const auto strongerWeight = render(false, 0.0F, 8.0F);
+
+    REQUIRE(original.beautyR[kCenter] > 0.0F);
+    REQUIRE(original.beautyB[kCenter] > 0.0F);
+    CHECK(culled.beautyR[kCenter] > 0.0F);
+    CHECK(culled.beautyB[kCenter] == Catch::Approx(0.0F).margin(1.0e-6F));
+    CHECK(tolerated.beautyR[kCenter] ==
+          Catch::Approx(original.beautyR[kCenter]).margin(1.0e-5F));
+    CHECK(tolerated.beautyB[kCenter] ==
+          Catch::Approx(original.beautyB[kCenter]).margin(1.0e-5F));
+
+    const float originalFrontToBack =
+        original.beautyR[kCenter] / original.beautyB[kCenter];
+    const float strongerFrontToBack =
+        strongerWeight.beautyR[kCenter] / strongerWeight.beautyB[kCenter];
+    CHECK(strongerFrontToBack > originalFrontToBack * 1.5F);
 }

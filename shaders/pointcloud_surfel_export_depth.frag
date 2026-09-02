@@ -99,6 +99,7 @@ void main() {
         AlphaClampMax());
     if (alpha <= 1e-5 ||
         styleData.renderControl.x == 0u ||
+        styleData.renderControl.x == 3u ||
         (styleData.renderControl.x == 1u && alpha < clamp(styleData.renderParams3.x, 0.0, 1.0)) ||
         (styleData.renderControl.x == 2u && !PointCloudDepthCoveragePasses(inDiscCoord, styleData.renderParams2.x))) {
         discard;

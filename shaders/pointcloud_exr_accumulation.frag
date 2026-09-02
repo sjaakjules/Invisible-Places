@@ -17,11 +17,18 @@ layout(location = 11) in vec4 inWaterColourTransform;
 layout(location = 12) flat in vec4 inTimingColouriseTransform;
 layout(location = 13) flat in vec4 inTimingColouriseScale;
 
+#ifdef POINTCLOUD_SORTED_ALPHA
+layout(location = 0) out vec4 outSortedColor;
+layout(location = 1) out vec4 outSortedNormal;
+layout(location = 2) out vec4 outSortedAlbedo;
+layout(location = 3) out vec4 outSortedEmission;
+#else
 layout(location = 0) out vec4 outAccumulation;
 layout(location = 1) out float outRevealage;
 layout(location = 2) out vec4 outEmission;
 layout(location = 3) out vec4 outNormalAccumulation;
 layout(location = 4) out vec4 outAlbedoAccumulation;
+#endif
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 viewProjection;
@@ -85,6 +92,23 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
     vec4 rainImpactSandBand;
     vec4 rainImpactResponse;
     uvec4 timingColouriseControl;
+    uvec4 timingColouriseSources[8];
+    vec4 timingColouriseRanges[8];
+    vec4 timingColouriseFades[8];
+    vec4 timingColouriseLut[512];
+    uvec4 additionalShorelineCount;
+    uvec4 additionalShorelineControl[4];
+    vec4 additionalShorelineParams0[4];
+    vec4 additionalShorelineParams1[4];
+    vec4 additionalShorelineParams2[4];
+    vec4 additionalShorelineParams3[4];
+    vec4 additionalShorelineParams4[4];
+    vec4 additionalShorelineParams5[4];
+    vec4 additionalShorelineTint[4];
+    vec4 depthCompositingParams;
+    vec4 emissionNormalControl;
+    uvec4 surfaceStabilityControl;
+    vec4 surfaceStabilityParams;
 } styleData;
 
 #include "pointcloud_stylisation.glsl"
@@ -92,6 +116,7 @@ layout(set = 0, binding = 2, std140) uniform PointStyleData {
 #include "pointcloud_timing_colourise.glsl"
 
 layout(input_attachment_index = 0, set = 0, binding = 3) uniform subpassInput sceneDepthInput;
+#include "pointcloud_depth_compositing.glsl"
 
 vec3 ResolveBaseColor() {
     vec3 baseColor = inSourceColor.rgb;
@@ -201,23 +226,6 @@ float AlphaClampMax() {
     return styleData.renderControl.w != 0u ? 1.0 : 0.995;
 }
 
-float WeightedAlphaWeight(float alpha) {
-    const float depthNorm = clamp(
-        (inViewDepth - uniforms.depthParameters.y) /
-        max(1e-5, uniforms.depthParameters.z - uniforms.depthParameters.y),
-        0.0,
-        1.0);
-    const float opacityBase = min(1.0, alpha * 8.0) + 0.01;
-    const float opacityWeight = opacityBase * opacityBase * opacityBase;
-    const float frontBase = 1.0 - depthNorm;
-    const float frontSquared = frontBase * frontBase;
-    const float frontWeight = frontSquared * frontSquared;
-    return clamp(
-        (opacityWeight * 0.5) + (opacityWeight * frontWeight * 128.0),
-        1e-3,
-        256.0);
-}
-
 float ResolveDepthFadeAlpha(float depthFade) {
     const float depthNorm = clamp(
         (inViewDepth - uniforms.depthParameters.y) /
@@ -227,6 +235,7 @@ float ResolveDepthFadeAlpha(float depthFade) {
     return mix(1.0, 1.0 - depthNorm, clamp(depthFade, 0.0, 1.0));
 }
 
+#ifndef POINTCLOUD_SORTED_ALPHA
 void WriteAovs(vec3 albedo, vec3 normal, float aovWeight) {
     outNormalAccumulation = vec4(0.0);
     outAlbedoAccumulation = vec4(albedo * aovWeight, aovWeight);
@@ -234,6 +243,7 @@ void WriteAovs(vec3 albedo, vec3 normal, float aovWeight) {
         outNormalAccumulation = vec4(normalize(normal) * aovWeight, aovWeight);
     }
 }
+#endif
 
 void main() {
     vec2 centered = (gl_PointCoord * 2.0) - 1.0;
@@ -259,6 +269,9 @@ void main() {
     if (alpha <= 1e-5) {
         discard;
     }
+    if (PointCloudDepthPrepassRejectsFragment()) {
+        discard;
+    }
 
     const vec3 timingColour =
         ApplyTimingColouriseStack(ApplyColorize(ResolveBaseColor()));
@@ -269,27 +282,74 @@ void main() {
         radius,
         inPointIndex,
         inSurfaceAngleMask);
+#ifdef POINTCLOUD_SORTED_ALPHA
+    // Emission honours the per-visual response. Accumulated routes it into
+    // the shared emission attachment, so the sorted emission composite
+    // subpass reproduces the weighted path's exponential response exactly.
+    // Saturated folds the bounded per-fragment response into the blended
+    // colour — the response the sorted path originally shipped with.
+    outSortedEmission = vec4(0.0);
+    vec3 sortedColor = baseColor;
+    float resolvedEmissive = max(0.0, inEmissive);
+    const float timingEmissionAdd = ResolveTimingColouriseEmissionAdd();
+    if (timingEmissionAdd > 0.0) {
+        resolvedEmissive += timingEmissionAdd;
+    }
+    const float emissionGain =
+        resolvedEmissive * max(0.0, styleData.renderParams0.x);
+    if (emissionGain > 1e-5) {
+        if (PointCloudSaturatedEmissionEnabled()) {
+            sortedColor = PointCloudSaturatedEmissionColor(
+                baseColor,
+                compensatedRawAlpha,
+                alpha,
+                emissionGain);
+        } else {
+            outSortedEmission = vec4(
+                baseColor * compensatedRawAlpha * emissionGain,
+                compensatedRawAlpha * emissionGain);
+        }
+    }
+    outSortedColor = vec4(sortedColor, alpha);
+    outSortedNormal = vec4(
+        dot(inAovNormal, inAovNormal) > 1.0e-8
+            ? normalize(inAovNormal)
+            : vec3(0.0),
+        alpha);
+    outSortedAlbedo = vec4(baseColor, alpha);
+#else
     outAccumulation = vec4(0.0);
     outRevealage = 0.0;
     outEmission = vec4(0.0);
     outNormalAccumulation = vec4(0.0);
     outAlbedoAccumulation = vec4(0.0);
-    const float weightedAlpha = clamp(alpha, 0.0, AlphaClampMax());
-    const float weight = WeightedAlphaWeight(weightedAlpha);
-    const float aovWeight = weightedAlpha * weight;
-    outAccumulation = vec4(baseColor * aovWeight, aovWeight);
-    outRevealage = weightedAlpha;
-    WriteAovs(baseColor, inAovNormal, aovWeight);
-
     float resolvedEmissive = max(0.0, inEmissive);
     const float timingEmissionAdd = ResolveTimingColouriseEmissionAdd();
     if (timingEmissionAdd > 0.0) {
         resolvedEmissive += timingEmissionAdd;
     }
     const float emissionGain = resolvedEmissive * max(0.0, styleData.renderParams0.x);
+    vec3 accumulationColor = baseColor;
     if (emissionGain > 1e-5) {
-        outEmission += vec4(
-            baseColor * compensatedRawAlpha * emissionGain,
-            compensatedRawAlpha * emissionGain);
+        if (PointCloudSaturatedEmissionEnabled()) {
+            accumulationColor = PointCloudSaturatedEmissionColor(
+                baseColor,
+                compensatedRawAlpha,
+                alpha,
+                emissionGain);
+        } else {
+            outEmission = vec4(
+                baseColor * compensatedRawAlpha * emissionGain,
+                compensatedRawAlpha * emissionGain);
+        }
     }
+    const float weightedAlpha = clamp(alpha, 0.0, AlphaClampMax());
+    const float weight = PointCloudWeightedAlphaWeight(weightedAlpha);
+    const float aovWeight = weightedAlpha * weight;
+    outAccumulation = vec4(accumulationColor * aovWeight, aovWeight);
+    outRevealage = weightedAlpha;
+    // AOVs stay at the unlit base colour; the saturated fold is a beauty
+    // response, not albedo.
+    WriteAovs(baseColor, inAovNormal, aovWeight);
+#endif
 }

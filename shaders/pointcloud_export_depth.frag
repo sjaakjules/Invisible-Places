@@ -6,6 +6,7 @@ layout(location = 2) in float inOpacity;
 layout(location = 5) in float inDepthFade;
 layout(location = 6) in float inViewDepth;
 layout(location = 7) flat in uint inPointIndex;
+layout(location = 10) in float inKernelSpriteRatio;
 
 layout(location = 0) out float outLinearDepth;
 
@@ -85,7 +86,9 @@ void main() {
         discard;
     }
 
-    const float radiusSquared = dot(centered, centered);
+    const vec2 kernelCentered =
+        centered / max(1.0e-3, inKernelSpriteRatio);
+    const float radiusSquared = dot(kernelCentered, kernelCentered);
     const float radius = sqrt(radiusSquared);
     const float rawAlpha =
         clamp(inOpacity, 0.0, 1.0) *
@@ -99,6 +102,7 @@ void main() {
         AlphaClampMax());
     if (alpha <= 1e-5 ||
         styleData.renderControl.x == 0u ||
+        styleData.renderControl.x == 3u ||
         (styleData.renderControl.x == 1u && alpha < clamp(styleData.renderParams3.x, 0.0, 1.0)) ||
         (styleData.renderControl.x == 2u && !PointCloudDepthCoveragePasses(centered, styleData.renderParams2.x))) {
         discard;

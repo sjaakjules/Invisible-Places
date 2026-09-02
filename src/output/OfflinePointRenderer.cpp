@@ -1,5 +1,6 @@
 #include "output/OfflinePointRenderer.hpp"
 
+#include "io/SceneDisplayDensityCache.hpp"
 #include "renderer/pointcloud/Colormap.hpp"
 
 #include "camera/OrbitCamera.hpp"
@@ -7,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -1041,6 +1043,9 @@ glm::vec3 ApplyTimingColourise(
             const auto blended = invisible_places::renderer::pointcloud::
                 ApplyTimingColouriseBlendStep(
                     effect.blendMode,
+                    effect.secondaryBlendMode,
+                    effect.blendCompositionMode,
+                    effect.blendMix,
                     {baseColor.x, baseColor.y, baseColor.z},
                     {Clamp01(lut.x), Clamp01(lut.y), Clamp01(lut.z)},
                     amount);
@@ -1264,6 +1269,51 @@ float PointHash01(std::uint32_t value) {
     value *= 0x846ca68bU;
     value ^= value >> 16U;
     return static_cast<float>(value & 0x00ffffffU) / 16777215.0F;
+}
+
+// Fast Basic surface-selection keep decision, mirroring
+// PointCloudSurfaceStabilityHash01 in pointcloud_surface_stability.glsl
+// bit-for-bit. Hashing the quantized cloud-space position keeps the same
+// physical point's verdict stable across aHQ republishes, density switches,
+// and between live preview and this CPU export path.
+float SurfaceStabilityPositionHash01(
+    const invisible_places::io::Float3& position) {
+    const auto cell = [](float value) {
+        return static_cast<std::uint32_t>(
+            static_cast<std::int32_t>(std::floor(value * 2048.0F)));
+    };
+    std::uint32_t value = (cell(position.x) * 0x8da6b343U) ^
+                          (cell(position.y) * 0xd8163841U) ^
+                          (cell(position.z) * 0xcb1ab31fU);
+    value ^= value >> 16U;
+    value *= 0x7feb352dU;
+    value ^= value >> 15U;
+    value *= 0x846ca68bU;
+    value ^= value >> 16U;
+    return static_cast<float>(value & 0x00ffffffU) / 16777215.0F;
+}
+
+float SurfaceStabilityWeight(
+    const OfflinePointLayer& layer,
+    std::size_t pointIndex) {
+    if (layer.cloud == nullptr ||
+        layer.surfaceStabilityFieldSlot >= layer.cloud->scalarFields.size() ||
+        static_cast<std::uint32_t>(
+            layer.style.effectiveSurfaceStabilityMode) <
+            static_cast<std::uint32_t>(
+                invisible_places::renderer::pointcloud::
+                    PointCloudSurfaceStabilityMode::DensityContinuity)) {
+        return 1.0F;
+    }
+    const float encoded = ScalarFieldValueBySlot(
+        *layer.cloud,
+        layer.surfaceStabilityFieldSlot,
+        pointIndex);
+    return invisible_places::renderer::pointcloud::
+        ResolvePointCloudSurfaceStabilityWeight(
+            layer.style.effectiveSurfaceStabilityMode,
+            std::bit_cast<std::uint32_t>(encoded),
+            layer.style.surfaceStabilityInfluence);
 }
 
 float PointCoordNoise(glm::vec2 coord, std::uint32_t pointIndex) {
@@ -1560,18 +1610,46 @@ glm::vec3 ApplyPointStylisationColor(
 float WeightedAlphaWeight(
     float alpha,
     float viewDepth,
-    const invisible_places::camera::CameraState& cameraState) {
-    const float depthNorm = std::clamp(
+    const invisible_places::camera::CameraState& cameraState,
+    float depthWeightStrength = 1.0F) {
+    const float nearDepth = std::max(1.0e-5F, cameraState.nearPlane);
+    const float farDepth = std::max(nearDepth + 1.0e-5F, cameraState.farPlane);
+    const float linearDepthNorm = std::clamp(
         (viewDepth - cameraState.nearPlane) /
             std::max(1.0e-5F, cameraState.farPlane - cameraState.nearPlane),
         0.0F,
         1.0F);
+    // The GPU path only ever sees the shell-clamped uniform; this CPU path
+    // takes the style value directly, so a non-finite strength must not
+    // poison the lerp below.
+    const float strength = std::isfinite(depthWeightStrength)
+        ? std::clamp(depthWeightStrength, 1.0F, 8.0F)
+        : 1.0F;
     const float opacityBase = std::min(1.0F, alpha * 8.0F) + 0.01F;
     const float opacityWeight = opacityBase * opacityBase * opacityBase;
-    const float frontBase = 1.0F - depthNorm;
-    const float frontSquared = frontBase * frontBase;
-    const float frontWeight = frontSquared * frontSquared;
-    return std::clamp((opacityWeight * 0.5F) + (opacityWeight * frontWeight * 128.0F), 1.0e-3F, 256.0F);
+    const auto weightForDepth = [opacityWeight](float depthNorm) {
+        const float frontBase = 1.0F - depthNorm;
+        const float frontSquared = frontBase * frontBase;
+        const float frontWeight = frontSquared * frontSquared;
+        return std::clamp(
+            (opacityWeight * 0.5F) +
+                (opacityWeight * frontWeight * 128.0F),
+            1.0e-3F,
+            256.0F);
+    };
+    if (strength <= 1.0001F) {
+        return weightForDepth(linearDepthNorm);
+    }
+    const float logarithmicDepthNorm = std::clamp(
+        std::log2(std::max(1.0F, viewDepth / nearDepth)) /
+            std::max(1.0e-5F, std::log2(farDepth / nearDepth)),
+        0.0F,
+        1.0F);
+    const float depthNorm = std::lerp(
+        linearDepthNorm,
+        logarithmicDepthNorm,
+        (strength - 1.0F) / 7.0F);
+    return weightForDepth(depthNorm);
 }
 
 glm::vec3 CameraRight(const invisible_places::camera::OrbitCameraMatrices& matrices) {
@@ -2003,12 +2081,51 @@ bool BuildOfflinePointSample(
              seepage.opacityMultiply) +
         seepage.opacityAdd +
         rainImpact.opacity);
-    sample->opacity *= kernelEnergyScale;
+    sample->opacity *=
+        kernelEnergyScale * SurfaceStabilityWeight(layer, pointIndex);
     if (waterTrails) {
         sample->opacity *= waterTrailVisibility * waterFlowActivity.appearance;
     }
     if (waterParticles) {
         sample->opacity *= WaterParticleFade(cloud, pointIndex, stylisationTimeSeconds);
+    }
+    // Back-face fade, matching the GPU vertex path: points whose stored
+    // normal faces away from the camera fade over the authored angular band.
+    // Screen sprites only (the surfel vertex path has no fade), and points
+    // without normals are never culled.
+    if (layer.style.normalCullEnabled &&
+        layer.style.geometryMode ==
+            invisible_places::renderer::pointcloud::PointCloudGeometryMode::
+                ScreenSprites &&
+        cloud.hasNormals &&
+        pointIndex < cloud.normals.size()) {
+        const auto localNormal = ToGlm(cloud.normals[pointIndex]);
+        if (glm::dot(localNormal, localNormal) > 1.0e-8F) {
+            const glm::vec3 worldNormal = glm::normalize(
+                glm::transpose(glm::inverse(glm::mat3{layer.localToWorld})) *
+                localNormal);
+            const glm::vec3 toCamera = matrices.position - sample->worldCenter;
+            const float toCameraLengthSquared = glm::dot(toCamera, toCamera);
+            if (toCameraLengthSquared > 1.0e-12F) {
+                const float facingCosine = glm::dot(
+                    worldNormal,
+                    toCamera / std::sqrt(toCameraLengthSquared));
+                const float startDegrees = std::clamp(
+                    layer.style.normalCullStartDegrees,
+                    0.0F,
+                    179.0F);
+                const float endDegrees = std::clamp(
+                    std::max(
+                        layer.style.normalCullEndDegrees,
+                        startDegrees + 1.0F),
+                    1.0F,
+                    180.0F);
+                sample->opacity *= SmoothStep(
+                    std::cos(glm::radians(endDegrees)),
+                    std::cos(glm::radians(startDegrees)),
+                    facingCosine);
+            }
+        }
     }
     sample->depthFade = Clamp01(
         EvaluateBindingOrDefault(
@@ -2578,7 +2695,9 @@ void RenderFastBasicPointCloudTile(
 
     const auto start = std::chrono::steady_clock::now();
     for (const auto& layer : layers) {
-        if (layer.cloud == nullptr || layer.cloud->positions.empty()) {
+        if (!layer.fastBasic ||
+            layer.cloud == nullptr ||
+            layer.cloud->positions.empty()) {
             continue;
         }
         if (diagnostics != nullptr) {
@@ -2611,6 +2730,15 @@ void RenderFastBasicPointCloudTile(
                           static_cast<std::uint64_t>(drawPointCount))
                     : sampleIndex;
             if (waterTrails && ScalarFieldValueBySlot(cloud, kWaterTrailRoleFieldSlot, pointIndex) < 0.5F) {
+                continue;
+            }
+            const float surfaceStabilityWeight =
+                SurfaceStabilityWeight(layer, pointIndex);
+            if (surfaceStabilityWeight <= 0.0F ||
+                (surfaceStabilityWeight < 0.99999F &&
+                 SurfaceStabilityPositionHash01(
+                     cloud.positions[pointIndex]) >=
+                     surfaceStabilityWeight)) {
                 continue;
             }
             glm::vec3 localPosition = ToGlm(cloud.positions[pointIndex]);
@@ -2798,7 +2926,7 @@ void RenderFastBasicPointCloudTile(
     }
 
     if (diagnostics != nullptr) {
-        diagnostics->accumulationPassMs =
+        diagnostics->accumulationPassMs +=
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     }
 }
@@ -2826,12 +2954,18 @@ void RenderPointCloudTile(
     const std::uint32_t tileWidth = tile.x1 - tile.x0;
     const std::uint32_t tileHeight = tile.y1 - tile.y0;
     const auto tilePixelCount = static_cast<std::size_t>(tileWidth) * static_cast<std::size_t>(tileHeight);
-    const bool fastBasicOnly = !layers.empty() && std::all_of(
+    const bool hasFastBasicLayers = std::any_of(
         layers.begin(),
         layers.end(),
         [](const OfflinePointLayer& layer) { return layer.fastBasic; });
-    if (fastBasicOnly) {
+    const bool hasBeautyLayers = std::any_of(
+        layers.begin(),
+        layers.end(),
+        [](const OfflinePointLayer& layer) { return !layer.fastBasic; });
+    if (hasFastBasicLayers) {
         RenderFastBasicPointCloudTile(layers, matrices, tile, image, diagnostics, stylisationTimeSeconds);
+    }
+    if (!hasBeautyLayers) {
         CompositeOfflineRainDirect(rainFrame, matrices, tile, image);
         return;
     }
@@ -2847,6 +2981,23 @@ void RenderPointCloudTile(
     activeScratch.emissionG.assign(tilePixelCount, 0.0F);
     activeScratch.emissionB.assign(tilePixelCount, 0.0F);
     activeScratch.emissionA.assign(tilePixelCount, 0.0F);
+    activeScratch.prepassDepth.resize(tilePixelCount);
+    for (std::uint32_t y = tile.y0; y < tile.y1; ++y) {
+        for (std::uint32_t x = tile.x0; x < tile.x1; ++x) {
+            const auto localIndex =
+                static_cast<std::size_t>(y - tile.y0) *
+                    static_cast<std::size_t>(tileWidth) +
+                static_cast<std::size_t>(x - tile.x0);
+            const auto pixelIndex =
+                static_cast<std::size_t>(y) *
+                    static_cast<std::size_t>(image->width) +
+                static_cast<std::size_t>(x);
+            activeScratch.prepassDepth[localIndex] =
+                pixelIndex < image->depth.size()
+                    ? image->depth[pixelIndex]
+                    : std::numeric_limits<float>::infinity();
+        }
+    }
 
     auto& accumR = activeScratch.accumR;
     auto& accumG = activeScratch.accumG;
@@ -2857,10 +3008,12 @@ void RenderPointCloudTile(
     auto& emissionG = activeScratch.emissionG;
     auto& emissionB = activeScratch.emissionB;
     auto& emissionA = activeScratch.emissionA;
+    auto& prepassDepth = activeScratch.prepassDepth;
 
     const auto depthStart = std::chrono::steady_clock::now();
     for (const auto& layer : layers) {
-        if (layer.cloud == nullptr ||
+        if (layer.fastBasic ||
+            layer.cloud == nullptr ||
             layer.cloud->positions.empty()) {
             continue;
         }
@@ -2903,7 +3056,7 @@ void RenderPointCloudTile(
                     stylisationTimeSeconds,
                     [&](std::uint32_t x,
                         std::uint32_t y,
-                        std::size_t,
+                        std::size_t localIndex,
                         float falloff,
                         glm::vec2,
                         float coveredViewDepth) {
@@ -2924,6 +3077,16 @@ void RenderPointCloudTile(
                                 alpha)) {
                             image->depth[pixelIndex] = coveredViewDepth;
                         }
+                        if (invisible_places::renderer::pointcloud::
+                                PointCloudDepthPrepassWrites(layer.style) &&
+                            localIndex < prepassDepth.size() &&
+                            alpha >= std::clamp(
+                                         layer.style.depthPrepassAlphaThreshold,
+                                         0.0F,
+                                         1.0F) &&
+                            coveredViewDepth < prepassDepth[localIndex]) {
+                            prepassDepth[localIndex] = coveredViewDepth;
+                        }
                         if (diagnostics != nullptr) {
                             ++diagnostics->depthCoveredPixels;
                         }
@@ -2939,7 +3102,9 @@ void RenderPointCloudTile(
 
     const auto accumulationStart = std::chrono::steady_clock::now();
     for (const auto& layer : layers) {
-        if (layer.cloud == nullptr || layer.cloud->positions.empty()) {
+        if (layer.fastBasic ||
+            layer.cloud == nullptr ||
+            layer.cloud->positions.empty()) {
             continue;
         }
         if (diagnostics != nullptr) {
@@ -3005,6 +3170,17 @@ void RenderPointCloudTile(
                         if (alpha <= 1.0e-5F) {
                             return;
                         }
+                        if (invisible_places::renderer::pointcloud::
+                                PointCloudDepthPrepassTests(layer.style) &&
+                            localIndex < prepassDepth.size() &&
+                            coveredViewDepth >
+                                prepassDepth[localIndex] +
+                                    std::clamp(
+                                        layer.style.depthPrepassToleranceMeters,
+                                        0.0F,
+                                        10.0F)) {
+                            return;
+                        }
                         if (diagnostics != nullptr) {
                             ++diagnostics->accumulationCoveredPixels;
                         }
@@ -3020,20 +3196,41 @@ void RenderPointCloudTile(
                             alpha,
                             0.0F,
                             AlphaClampMax(layer.style));
-                        const float weight = WeightedAlphaWeight(weightedAlpha, coveredViewDepth, cameraState);
-                        accumR[localIndex] += stylisedColor.r * weightedAlpha * weight;
-                        accumG[localIndex] += stylisedColor.g * weightedAlpha * weight;
-                        accumB[localIndex] += stylisedColor.b * weightedAlpha * weight;
+                        const float weight = WeightedAlphaWeight(
+                            weightedAlpha,
+                            coveredViewDepth,
+                            cameraState,
+                            layer.style.depthWeightStrength);
+                        const float emissionGain = sample.emissive * std::max(0.0F, layer.style.exposure);
+                        glm::vec3 accumulationColor = stylisedColor;
+                        if (emissionGain > 1.0e-5F) {
+                            if (layer.style.emissionResponse ==
+                                invisible_places::renderer::pointcloud::
+                                    PointCloudEmissionResponse::Saturated) {
+                                // Bounded per-fragment response folded into
+                                // the blended colour, matching the GPU
+                                // shaders' saturated mode.
+                                const glm::vec3 emissionContribution =
+                                    glm::vec3{1.0F} -
+                                    glm::exp(
+                                        -glm::max(stylisedColor, glm::vec3{0.0F}) *
+                                        compensatedRawAlpha * emissionGain);
+                                accumulationColor =
+                                    stylisedColor +
+                                    emissionContribution /
+                                        std::max(alpha, 1.0e-5F);
+                            } else {
+                                emissionR[localIndex] += stylisedColor.r * compensatedRawAlpha * emissionGain;
+                                emissionG[localIndex] += stylisedColor.g * compensatedRawAlpha * emissionGain;
+                                emissionB[localIndex] += stylisedColor.b * compensatedRawAlpha * emissionGain;
+                                emissionA[localIndex] += compensatedRawAlpha * emissionGain;
+                            }
+                        }
+                        accumR[localIndex] += accumulationColor.r * weightedAlpha * weight;
+                        accumG[localIndex] += accumulationColor.g * weightedAlpha * weight;
+                        accumB[localIndex] += accumulationColor.b * weightedAlpha * weight;
                         accumA[localIndex] += weightedAlpha * weight;
                         revealage[localIndex] *= (1.0F - weightedAlpha);
-
-                        const float emissionGain = sample.emissive * std::max(0.0F, layer.style.exposure);
-                        if (emissionGain > 1.0e-5F) {
-                            emissionR[localIndex] += stylisedColor.r * compensatedRawAlpha * emissionGain;
-                            emissionG[localIndex] += stylisedColor.g * compensatedRawAlpha * emissionGain;
-                            emissionB[localIndex] += stylisedColor.b * compensatedRawAlpha * emissionGain;
-                            emissionA[localIndex] += compensatedRawAlpha * emissionGain;
-                        }
 
                     });
             }
@@ -3067,7 +3264,7 @@ void RenderPointCloudTile(
 
     const auto accumulationEnd = std::chrono::steady_clock::now();
     if (diagnostics != nullptr) {
-        diagnostics->accumulationPassMs =
+        diagnostics->accumulationPassMs +=
             std::chrono::duration<double, std::milli>(accumulationEnd - accumulationStart).count();
     }
 

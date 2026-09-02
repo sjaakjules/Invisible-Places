@@ -65,6 +65,8 @@ set(INVISIBLE_PLACES_SHADER_SOURCES
     shaders/pointcloud_surfel_exr_constant_simple_accumulation.frag
     shaders/pointcloud_surfel_opaque_hard_disc.frag
     shaders/pointcloud_surfel_export_depth.frag
+    shaders/pointcloud_depth_sort.comp
+    shaders/pointcloud_sorted_emission_composite.frag
     shaders/dynamic_mesh_flow.comp
     shaders/water_flow_routes.comp
     shaders/water_flow_trails.comp
@@ -86,6 +88,8 @@ set(INVISIBLE_PLACES_SHADER_SOURCES
 set(INVISIBLE_PLACES_SHADER_INCLUDES
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_adaptive_density.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_coverage.glsl"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_depth_compositing.glsl"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_surface_stability.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_colormaps.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_timing_colourise.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_sparse_ripple.glsl"
@@ -130,6 +134,28 @@ add_custom_command(
     COMMAND "${GLSLANG_VALIDATOR_EXECUTABLE}" -V --target-env vulkan1.2 -DDEPTH_PREPASS=1 -I"${CMAKE_CURRENT_SOURCE_DIR}/shaders" -o "${SHADER_OUTPUT}" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_surfel.vert"
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_surfel.vert" ${INVISIBLE_PLACES_SHADER_INCLUDES}
     COMMENT "Compiling shader shaders/pointcloud_surfel.vert (depth prepass)"
+    VERBATIM
+)
+list(APPEND INVISIBLE_PLACES_SHADER_OUTPUTS "${SHADER_OUTPUT}")
+
+set(SHADER_OUTPUT "${INVISIBLE_PLACES_SHADER_OUTPUT_DIR}/pointcloud_sorted_alpha.frag.spv")
+add_custom_command(
+    OUTPUT "${SHADER_OUTPUT}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${INVISIBLE_PLACES_SHADER_OUTPUT_DIR}"
+    COMMAND "${GLSLANG_VALIDATOR_EXECUTABLE}" -V --target-env vulkan1.2 -DPOINTCLOUD_SORTED_ALPHA=1 -I"${CMAKE_CURRENT_SOURCE_DIR}/shaders" -o "${SHADER_OUTPUT}" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_accumulation.frag"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_accumulation.frag" ${INVISIBLE_PLACES_SHADER_INCLUDES}
+    COMMENT "Compiling shader shaders/pointcloud_accumulation.frag (sorted alpha)"
+    VERBATIM
+)
+list(APPEND INVISIBLE_PLACES_SHADER_OUTPUTS "${SHADER_OUTPUT}")
+
+set(SHADER_OUTPUT "${INVISIBLE_PLACES_SHADER_OUTPUT_DIR}/pointcloud_exr_sorted_alpha.frag.spv")
+add_custom_command(
+    OUTPUT "${SHADER_OUTPUT}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${INVISIBLE_PLACES_SHADER_OUTPUT_DIR}"
+    COMMAND "${GLSLANG_VALIDATOR_EXECUTABLE}" -V --target-env vulkan1.2 -DPOINTCLOUD_SORTED_ALPHA=1 -I"${CMAKE_CURRENT_SOURCE_DIR}/shaders" -o "${SHADER_OUTPUT}" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_exr_accumulation.frag"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_exr_accumulation.frag" ${INVISIBLE_PLACES_SHADER_INCLUDES}
+    COMMENT "Compiling shader shaders/pointcloud_exr_accumulation.frag (sorted alpha)"
     VERBATIM
 )
 list(APPEND INVISIBLE_PLACES_SHADER_OUTPUTS "${SHADER_OUTPUT}")
@@ -373,6 +399,21 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
     endif()
 
     if(INVISIBLE_PLACES_ENABLE_GUI_SMOKE_TESTS)
+        add_test(
+            NAME point-depth-options-gui-smoke
+            COMMAND
+                $<TARGET_FILE:invisible_places>
+                "${CMAKE_CURRENT_SOURCE_DIR}/Data"
+                --gui-smoke point-depth-options
+        )
+        set_tests_properties(
+            point-depth-options-gui-smoke
+            PROPERTIES
+                LABELS "gui_smoke;pointcloud;transparency"
+                RUN_SERIAL TRUE
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                TIMEOUT 120
+        )
         add_test(
             NAME scene3-patch-boundaries-gui-smoke
             COMMAND
