@@ -20,6 +20,12 @@ invisible_places::io::ScalarFieldStats Field(std::string name) {
     return field;
 }
 
+invisible_places::io::ScalarFieldStats InternalField(std::string name) {
+    auto field = Field(std::move(name));
+    field.authoringVisible = false;
+    return field;
+}
+
 invisible_places::style::RenderParameterBinding MappedBinding(
     std::int32_t slot,
     std::string name) {
@@ -191,6 +197,40 @@ TEST_CASE(
         1.0F);
     CHECK(untouched.fieldMap.fieldSlot == 3);
     CHECK(untouched.fieldMap.fieldName == "Interest");
+}
+
+TEST_CASE(
+    "Renderer-internal scalar columns cannot become authored bindings",
+    "[style][field-binding][internal]") {
+    auto binding = MappedBinding(-1, "");
+    const std::vector internalOnly{InternalField("__surface_stability")};
+
+    invisible_places::style::EnsureFieldMappedBindingDefaults(
+        &binding,
+        internalOnly,
+        0.0F,
+        1.0F);
+    CHECK(binding.fieldMap.fieldSlot == -1);
+    CHECK(binding.fieldMap.fieldName.empty());
+
+    const std::vector withAuthoringField{
+        InternalField("__surface_stability"),
+        Field("Recession"),
+    };
+    invisible_places::style::EnsureFieldMappedBindingDefaults(
+        &binding,
+        withAuthoringField,
+        0.0F,
+        1.0F);
+    CHECK(binding.fieldMap.fieldSlot == 1);
+    CHECK(binding.fieldMap.fieldName == "Recession");
+
+    auto staleInternal = MappedBinding(0, "__surface_stability");
+    invisible_places::style::SyncBindingFieldReference(
+        &staleInternal,
+        withAuthoringField);
+    CHECK(staleInternal.fieldMap.fieldSlot == -1);
+    CHECK(staleInternal.fieldMap.fieldName == "__surface_stability");
 }
 
 TEST_CASE("Manual input bounds survive switching fields and back", "[style][field-binding]") {

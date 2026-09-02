@@ -47,6 +47,7 @@ VisualFeatureTimelineSnapDomainFor(
                 return VisualFeatureTimelineSnapDomain::Skew;
             case timing::TimingColouriseEffectParameter::PalettePhase:
             case timing::TimingColouriseEffectParameter::AmountOverride:
+            case timing::TimingColouriseEffectParameter::BlendMix:
                 return VisualFeatureTimelineSnapDomain::Palette;
             case timing::TimingColouriseEffectParameter::EmissiveLevel:
                 return VisualFeatureTimelineSnapDomain::Intensity;

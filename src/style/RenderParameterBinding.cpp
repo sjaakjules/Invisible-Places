@@ -247,7 +247,8 @@ void SyncBindingFieldReference(
             scalarFields.begin(),
             scalarFields.end(),
             [&binding](const invisible_places::io::ScalarFieldStats& field) {
-                return field.name == binding->fieldMap.fieldName;
+                return field.authoringVisible &&
+                       field.name == binding->fieldMap.fieldName;
             });
         if (exactIt != scalarFields.end()) {
             binding->fieldMap.fieldSlot = static_cast<std::int32_t>(
@@ -259,6 +260,9 @@ void SyncBindingFieldReference(
         const auto normalizedTarget = NormalizedFieldName(binding->fieldMap.fieldName);
         std::optional<std::size_t> normalizedMatch;
         for (std::size_t index = 0; index < scalarFields.size(); ++index) {
+            if (!scalarFields[index].authoringVisible) {
+                continue;
+            }
             if (NormalizedFieldName(scalarFields[index].name) != normalizedTarget) {
                 continue;
             }
@@ -282,7 +286,9 @@ void SyncBindingFieldReference(
 
     // Slot-only bindings are legacy data. Populate their durable name once.
     if (binding->fieldMap.fieldSlot >= 0 &&
-        static_cast<std::size_t>(binding->fieldMap.fieldSlot) < scalarFields.size()) {
+        static_cast<std::size_t>(binding->fieldMap.fieldSlot) < scalarFields.size() &&
+        scalarFields[static_cast<std::size_t>(binding->fieldMap.fieldSlot)]
+            .authoringVisible) {
         binding->fieldMap.fieldName = scalarFields[static_cast<std::size_t>(binding->fieldMap.fieldSlot)].name;
     } else {
         binding->fieldMap.fieldSlot = -1;
@@ -317,16 +323,28 @@ void EnsureFieldMappedBindingDefaults(
         return;
     }
 
+    const auto defaultField = std::find_if(
+        scalarFields.begin(),
+        scalarFields.end(),
+        [](const invisible_places::io::ScalarFieldStats& field) {
+            return field.authoringVisible;
+        });
+    if (defaultField == scalarFields.end()) {
+        return;
+    }
+
     // Only a binding with no authored target (a fresh switch to
     // Field-Mapped, or unresolvable legacy slot-only data) receives the
-    // first resident field as its starting default.
+    // first authoring-visible resident field as its starting default.
+    const auto defaultSlot = static_cast<std::int32_t>(
+        std::distance(scalarFields.begin(), defaultField));
     ConfigureFieldMapFromStats(
         binding,
-        0,
-        scalarFields[0].name,
+        defaultSlot,
+        defaultField->name,
         defaultOutputMin,
         defaultOutputMax,
-        &scalarFields[0]);
+        &*defaultField);
 }
 
 float ResolveBindingInputMinimum(

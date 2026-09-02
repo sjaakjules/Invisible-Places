@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -58,11 +59,18 @@ enum class TimingColouriseBlendMode : std::uint32_t {
     Add = 3U,
     Divide = 4U,
     VividLight = 5U,
+    ColorBurn = 6U,
 };
 
-// Divisors in the Divide and Vivid Light modes are floored here so the fold
-// stays finite; the hard clip this produces at extreme wash values matches
-// the After Effects float-space look once the output clamps.
+enum class TimingColouriseBlendCompositionMode : std::uint32_t {
+    PrimaryOnly = 0U,
+    Crossfade = 1U,
+    ApplyAfter = 2U,
+};
+
+// Divisors in Divide, Vivid Light, and Color Burn are floored here so the
+// fold stays finite; the hard clip this produces at extreme wash values
+// matches the After Effects float-space look once the output clamps.
 inline constexpr float kTimingColouriseBlendDivisorFloor = 1.0e-3F;
 
 // One colourise step is blended = base * scale + offset for every supported
@@ -71,63 +79,139 @@ inline constexpr float kTimingColouriseBlendDivisorFloor = 1.0e-3F;
 // whole stack foldable into one per-channel scale/offset pair across the
 // vertex->fragment interface. Mirrored by FoldTimingColouriseBlendStep in
 // shaders/pointcloud_timing_colourise.glsl; the two must stay identical.
+inline void ResolveTimingColouriseBlendCoefficients(
+    TimingColouriseBlendMode mode,
+    const std::array<float, 3>& wash,
+    std::array<float, 3>* branchScale,
+    std::array<float, 3>* branchOffset) {
+    for (std::size_t channel = 0U; channel < 3U; ++channel) {
+        const float washValue = wash[channel];
+        float resolvedScale = 0.0F;
+        float resolvedOffset = washValue;
+        switch (mode) {
+            case TimingColouriseBlendMode::Normal:
+                break;
+            case TimingColouriseBlendMode::Multiply:
+                resolvedScale = washValue;
+                resolvedOffset = 0.0F;
+                break;
+            case TimingColouriseBlendMode::Screen:
+                resolvedScale = 1.0F - washValue;
+                resolvedOffset = washValue;
+                break;
+            case TimingColouriseBlendMode::Add:
+                resolvedScale = 1.0F;
+                resolvedOffset = washValue;
+                break;
+            case TimingColouriseBlendMode::Divide:
+                resolvedScale = 1.0F /
+                              std::max(
+                                  washValue,
+                                  kTimingColouriseBlendDivisorFloor);
+                resolvedOffset = 0.0F;
+                break;
+            case TimingColouriseBlendMode::VividLight:
+                if (washValue < 0.5F) {
+                    resolvedScale =
+                        1.0F /
+                        std::max(
+                            2.0F * washValue,
+                            kTimingColouriseBlendDivisorFloor);
+                    resolvedOffset = 1.0F - resolvedScale;
+                } else {
+                    resolvedScale =
+                        1.0F /
+                        std::max(
+                            2.0F * (1.0F - washValue),
+                            kTimingColouriseBlendDivisorFloor);
+                    resolvedOffset = 0.0F;
+                }
+                break;
+            case TimingColouriseBlendMode::ColorBurn:
+                resolvedScale =
+                    1.0F /
+                    std::max(
+                        washValue,
+                        kTimingColouriseBlendDivisorFloor);
+                resolvedOffset = 1.0F - resolvedScale;
+                break;
+        }
+        (*branchScale)[channel] = resolvedScale;
+        (*branchOffset)[channel] = resolvedOffset;
+    }
+}
+
+inline void ComposeTimingColouriseResolvedBlendStep(
+    const std::array<float, 3>& branchScale,
+    const std::array<float, 3>& branchOffset,
+    float amount,
+    std::array<float, 3>* scale,
+    std::array<float, 3>* offset) {
+    for (std::size_t channel = 0U; channel < 3U; ++channel) {
+        const float stepScale =
+            (1.0F - amount) + amount * branchScale[channel];
+        const float stepOffset = amount * branchOffset[channel];
+        (*scale)[channel] *= stepScale;
+        (*offset)[channel] =
+            (*offset)[channel] * stepScale + stepOffset;
+    }
+}
+
 inline void ComposeTimingColouriseBlendStep(
     TimingColouriseBlendMode mode,
     const std::array<float, 3>& wash,
     float amount,
     std::array<float, 3>* scale,
     std::array<float, 3>* offset) {
-    for (std::size_t channel = 0U; channel < 3U; ++channel) {
-        const float washValue = wash[channel];
-        float branchScale = 0.0F;
-        float branchOffset = washValue;
-        switch (mode) {
-            case TimingColouriseBlendMode::Normal:
-                break;
-            case TimingColouriseBlendMode::Multiply:
-                branchScale = washValue;
-                branchOffset = 0.0F;
-                break;
-            case TimingColouriseBlendMode::Screen:
-                branchScale = 1.0F - washValue;
-                branchOffset = washValue;
-                break;
-            case TimingColouriseBlendMode::Add:
-                branchScale = 1.0F;
-                branchOffset = washValue;
-                break;
-            case TimingColouriseBlendMode::Divide:
-                branchScale = 1.0F /
-                              std::max(
-                                  washValue,
-                                  kTimingColouriseBlendDivisorFloor);
-                branchOffset = 0.0F;
-                break;
-            case TimingColouriseBlendMode::VividLight:
-                if (washValue < 0.5F) {
-                    branchScale =
-                        1.0F /
-                        std::max(
-                            2.0F * washValue,
-                            kTimingColouriseBlendDivisorFloor);
-                    branchOffset = 1.0F - branchScale;
-                } else {
-                    branchScale =
-                        1.0F /
-                        std::max(
-                            2.0F * (1.0F - washValue),
-                            kTimingColouriseBlendDivisorFloor);
-                    branchOffset = 0.0F;
-                }
-                break;
-        }
-        const float stepScale =
-            (1.0F - amount) + amount * branchScale;
-        const float stepOffset = amount * branchOffset;
-        (*scale)[channel] *= stepScale;
-        (*offset)[channel] =
-            (*offset)[channel] * stepScale + stepOffset;
+    std::array<float, 3> branchScale{};
+    std::array<float, 3> branchOffset{};
+    ResolveTimingColouriseBlendCoefficients(
+        mode, wash, &branchScale, &branchOffset);
+    ComposeTimingColouriseResolvedBlendStep(
+        branchScale, branchOffset, amount, scale, offset);
+}
+
+inline void ComposeTimingColouriseBlendStep(
+    TimingColouriseBlendMode primaryMode,
+    TimingColouriseBlendMode secondaryMode,
+    TimingColouriseBlendCompositionMode compositionMode,
+    float blendMix,
+    const std::array<float, 3>& wash,
+    float amount,
+    std::array<float, 3>* scale,
+    std::array<float, 3>* offset) {
+    const float safeMix = std::clamp(blendMix, 0.0F, 1.0F);
+    if (compositionMode ==
+        TimingColouriseBlendCompositionMode::PrimaryOnly) {
+        ComposeTimingColouriseBlendStep(
+            primaryMode, wash, amount, scale, offset);
+        return;
     }
+    if (compositionMode ==
+        TimingColouriseBlendCompositionMode::ApplyAfter) {
+        ComposeTimingColouriseBlendStep(
+            primaryMode, wash, amount, scale, offset);
+        ComposeTimingColouriseBlendStep(
+            secondaryMode, wash, amount * safeMix, scale, offset);
+        return;
+    }
+
+    std::array<float, 3> primaryScale{};
+    std::array<float, 3> primaryOffset{};
+    std::array<float, 3> secondaryScale{};
+    std::array<float, 3> secondaryOffset{};
+    ResolveTimingColouriseBlendCoefficients(
+        primaryMode, wash, &primaryScale, &primaryOffset);
+    ResolveTimingColouriseBlendCoefficients(
+        secondaryMode, wash, &secondaryScale, &secondaryOffset);
+    for (std::size_t channel = 0U; channel < 3U; ++channel) {
+        primaryScale[channel] = std::lerp(
+            primaryScale[channel], secondaryScale[channel], safeMix);
+        primaryOffset[channel] = std::lerp(
+            primaryOffset[channel], secondaryOffset[channel], safeMix);
+    }
+    ComposeTimingColouriseResolvedBlendStep(
+        primaryScale, primaryOffset, amount, scale, offset);
 }
 
 // Sequential form of the same step for callers that hold the base colour
@@ -140,6 +224,32 @@ inline std::array<float, 3> ApplyTimingColouriseBlendStep(
     std::array<float, 3> scale{1.0F, 1.0F, 1.0F};
     std::array<float, 3> offset{0.0F, 0.0F, 0.0F};
     ComposeTimingColouriseBlendStep(mode, wash, amount, &scale, &offset);
+    return {
+        base[0] * scale[0] + offset[0],
+        base[1] * scale[1] + offset[1],
+        base[2] * scale[2] + offset[2],
+    };
+}
+
+inline std::array<float, 3> ApplyTimingColouriseBlendStep(
+    TimingColouriseBlendMode primaryMode,
+    TimingColouriseBlendMode secondaryMode,
+    TimingColouriseBlendCompositionMode compositionMode,
+    float blendMix,
+    const std::array<float, 3>& base,
+    const std::array<float, 3>& wash,
+    float amount) {
+    std::array<float, 3> scale{1.0F, 1.0F, 1.0F};
+    std::array<float, 3> offset{0.0F, 0.0F, 0.0F};
+    ComposeTimingColouriseBlendStep(
+        primaryMode,
+        secondaryMode,
+        compositionMode,
+        blendMix,
+        wash,
+        amount,
+        &scale,
+        &offset);
     return {
         base[0] * scale[0] + offset[0],
         base[1] * scale[1] + offset[1],
@@ -166,6 +276,11 @@ struct ResolvedTimingColouriseEffect {
     // Compositing mode against the colour beneath this slot. Emissive
     // output ignores it.
     TimingColouriseBlendMode blendMode = TimingColouriseBlendMode::Normal;
+    TimingColouriseBlendMode secondaryBlendMode =
+        TimingColouriseBlendMode::Multiply;
+    TimingColouriseBlendCompositionMode blendCompositionMode =
+        TimingColouriseBlendCompositionMode::PrimaryOnly;
+    float blendMix = 1.0F;
     // RGB is the tint and A is colourise amount. Alpha never changes point
     // opacity.
     std::array<std::array<float, 4>, kTimingColouriseLutSamples> rgbaLut{};
@@ -236,6 +351,67 @@ enum class PointCloudPreviewLodMode {
 enum class PointCloudRendererMode {
     Beauty,
     FastBasic
+};
+
+// Chooses the camera direction used by the optional GPU transparency sort.
+// PerFrame preserves the original behaviour. FullAnimation and MovingAverage
+// are resolved by animation-aware callers and fall back to PerFrame when no
+// animation path is available. FixedVertical sorts bottom-up along world Z
+// from the cloud's own bounds — camera-independent, so aerial/top-down work
+// reuses a single cached ordering with no animation path required.
+enum class PointCloudGpuSortMode : std::uint32_t {
+    PerFrame = 0U,
+    FullAnimation = 1U,
+    MovingAverage = 2U,
+    FixedVertical = 3U,
+};
+
+// Saved policy for deciding which semantic scene roles contribute to and
+// consume the soft-edge depth surface. Uniform preserves the historical
+// behaviour. RockOccluder keeps ROCK self-occlusion, lets SAND receive that
+// occlusion without allowing overlapping sand scans to fight for ownership,
+// and leaves sparse VEG as a transparent overlay. Custom exposes every role.
+enum class PointCloudDepthRolePolicy : std::uint32_t {
+    Uniform = 0U,
+    RockOccluder = 1U,
+    Custom = 2U,
+};
+
+enum class PointCloudDepthParticipation : std::uint32_t {
+    Disabled = 0U,
+    TestOnly = 1U,
+    WriteAndTest = 2U,
+};
+
+// Optional cache-backed opacity selection for overlapping survey passes.
+// DrawAll is an explicit comparison mode; Original also avoids a sidecar
+// lookup when an older cache or an ordinary point cloud is used.
+enum class PointCloudSurfaceStabilityMode : std::uint32_t {
+    Original = 0U,
+    DrawAll = 1U,
+    DensityContinuity = 2U,
+    PreferLower = 3U,
+    PreferUpper = 4U,
+    SoftSeparation = 5U,
+};
+
+enum class PointCloudSurfaceStabilityPolicy : std::uint32_t {
+    Uniform = 0U,
+    StableRoles = 1U,
+    Custom = 2U,
+};
+
+// How emission resolves against overlapping fragments. Accumulated preserves
+// the established weighted-blended behaviour: every fragment's linear
+// emission energy (including density compensation) sums before one
+// exponential response, so deep stacks keep brightening. Saturated applies
+// the exponential response per fragment and folds it into the blended
+// colour, bounding glow at the front surface — the response the GPU sorted
+// path originally shipped with. Both transparency paths honour the choice
+// identically.
+enum class PointCloudEmissionResponse : std::uint32_t {
+    Accumulated = 0U,
+    Saturated = 1U,
 };
 
 enum class PointCloudMaterialVariant {
@@ -454,6 +630,66 @@ struct PointCloudStyleState {
     // out of the stream scalar payload so speed-only edits can be uniform-only.
     float waterFlowSpeedScale = 1.0F;
     bool solidCenters = true;
+    // Advanced transparency controls are deliberately opt-in so existing
+    // named visuals retain their established weighted-blended appearance and
+    // render cost. GPU sorting currently applies to screen-sprite geometry;
+    // surfel geometry keeps weighted blended transparency.
+    bool gpuBackToFrontSorting = false;
+    PointCloudGpuSortMode gpuSortMode = PointCloudGpuSortMode::PerFrame;
+    // Symmetric animation-time window used by MovingAverage. Seconds keep the
+    // authored result independent of preview/export frame rate.
+    float gpuSortWindowSeconds = 1.0F;
+    // Writes only sufficiently opaque point cores to the depth prepass, then
+    // admits nearby fragments within depthPrepassToleranceMeters. This keeps
+    // soft/Gaussian neighbours blendable while rejecting genuinely deeper
+    // surfaces (for example the ground below an overhang).
+    bool depthPrepassEnabled = false;
+    float depthPrepassAlphaThreshold = 0.35F;
+    float depthPrepassToleranceMeters = 0.02F;
+    PointCloudDepthRolePolicy depthRolePolicy =
+        PointCloudDepthRolePolicy::Uniform;
+    PointCloudDepthParticipation rockDepthParticipation =
+        PointCloudDepthParticipation::WriteAndTest;
+    PointCloudDepthParticipation sandDepthParticipation =
+        PointCloudDepthParticipation::WriteAndTest;
+    PointCloudDepthParticipation vegetationDepthParticipation =
+        PointCloudDepthParticipation::WriteAndTest;
+    // Runtime-only role resolution. Saved visuals persist the policy and
+    // custom role values above; MakePointCloudStyleForSceneRole resolves this
+    // field for each ROCK/SAND/VEG layer before it reaches a renderer.
+    PointCloudDepthParticipation effectiveDepthParticipation =
+        PointCloudDepthParticipation::WriteAndTest;
+    // Stable Roles softly culls ROCK, selects a density/continuity SAND
+    // surface, and leaves sparse VEG untouched. Custom exposes all roles.
+    PointCloudSurfaceStabilityPolicy surfaceStabilityPolicy =
+        PointCloudSurfaceStabilityPolicy::Uniform;
+    PointCloudSurfaceStabilityMode uniformSurfaceStabilityMode =
+        PointCloudSurfaceStabilityMode::Original;
+    PointCloudSurfaceStabilityMode rockSurfaceStabilityMode =
+        PointCloudSurfaceStabilityMode::SoftSeparation;
+    PointCloudSurfaceStabilityMode sandSurfaceStabilityMode =
+        PointCloudSurfaceStabilityMode::DensityContinuity;
+    PointCloudSurfaceStabilityMode vegetationSurfaceStabilityMode =
+        PointCloudSurfaceStabilityMode::DrawAll;
+    // Runtime-only role resolution.
+    PointCloudSurfaceStabilityMode effectiveSurfaceStabilityMode =
+        PointCloudSurfaceStabilityMode::Original;
+    // Zero preserves authored opacity; one applies the complete sidecar
+    // weight, with intermediate values useful for safe A/B comparisons.
+    float surfaceStabilityInfluence = 1.0F;
+    // 1.0 exactly preserves the historical WBOIT depth weighting. Higher
+    // values progressively favour nearer fragments using logarithmic depth.
+    float depthWeightStrength = 1.0F;
+    PointCloudEmissionResponse emissionResponse =
+        PointCloudEmissionResponse::Accumulated;
+    // Fades points whose stored normal faces away from the camera — for
+    // example back-facing survey returns seen through an overhang from
+    // above. Fully visible up to the start angle (normal vs the direction to
+    // the camera), hidden beyond the end angle, smooth between. Points
+    // without normals are never culled.
+    bool normalCullEnabled = false;
+    float normalCullStartDegrees = 75.0F;
+    float normalCullEndDegrees = 105.0F;
     bool flowAnimation = false;
     bool waterPathView = false;
     bool waterTrailOverlay = false;
@@ -531,6 +767,14 @@ std::uint64_t ClampPointBudget(std::uint64_t totalPoints, std::uint64_t requeste
 [[nodiscard]] PointCloudStyleState MakePointCloudStyleForSceneRole(
     PointCloudStyleState style,
     std::string_view sceneRole);
+[[nodiscard]] bool PointCloudDepthPrepassWrites(
+    const PointCloudStyleState& style);
+[[nodiscard]] bool PointCloudDepthPrepassTests(
+    const PointCloudStyleState& style);
+[[nodiscard]] float ResolvePointCloudSurfaceStabilityWeight(
+    PointCloudSurfaceStabilityMode mode,
+    std::uint32_t packedWeights,
+    float influence = 1.0F);
 [[nodiscard]] bool PointCloudStyleHasActiveShorelineWaves(const PointCloudStyleState& style);
 [[nodiscard]] bool PointCloudShorelineWaveSettingsHasActiveMotion(
     const PointCloudShorelineWaveSettings& settings);
@@ -582,6 +826,13 @@ FindPointCloudShorelineWaveProfile(
     float viewDepth,
     float projectionScaleY,
     float viewportHeight);
+// Fast Basic is the scene/default renderer, but generated Flow trails retain
+// their authored Beauty material. This keeps the expensive material path
+// scoped to the overlay instead of silently promoting the entire scene.
+[[nodiscard]] PointCloudRendererMode ResolvePointCloudLayerRendererMode(
+    PointCloudRendererMode requestedMode,
+    bool generatedWaterOverlay,
+    const PointCloudStyleState& style);
 [[nodiscard]] PointCloudStyleState MakeFastBasicPointCloudStyle(
     const PointCloudStyleState& sourceStyle,
     bool hasSourceRgb);

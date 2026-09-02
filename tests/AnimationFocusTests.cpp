@@ -4952,3 +4952,50 @@ TEST_CASE(
     CHECK(mergedKey->cameraPosition[2U] ==
           Approx(correctedKey.cameraPosition[2U]).margin(1.0e-5F));
 }
+
+TEST_CASE(
+    "Animation view averaging keeps a fixed-direction aerial pan stable",
+    "[camera][animation][sort]") {
+    invisible_places::camera::AnimationPath path;
+    path.durationFrames = 60U;
+    path.keys = {
+        {.cameraPosition = {0.0F, 0.0F, 10.0F},
+         .focusPoint = {0.0F, 0.0F, 0.0F},
+         .nearPlane = 0.10F,
+         .farPlane = 100.0F,
+         .durationFrames = 60U},
+        {.cameraPosition = {10.0F, 0.0F, 10.0F},
+         .focusPoint = {10.0F, 0.0F, 0.0F},
+         .nearPlane = 0.20F,
+         .farPlane = 250.0F,
+         .durationFrames = 60U},
+    };
+    const auto prepared = invisible_places::camera::
+        PrepareAnimationPathEvaluation(path);
+    REQUIRE(prepared.valid);
+
+    const auto complete = invisible_places::camera::
+        AveragePreparedAnimationPathView(
+            prepared,
+            0.0F,
+            prepared.durationSeconds,
+            65U);
+    REQUIRE(complete.valid);
+    CHECK(complete.viewDirection[0U] == Approx(0.0F).margin(1.0e-5F));
+    CHECK(complete.viewDirection[1U] == Approx(0.0F).margin(1.0e-5F));
+    CHECK(complete.viewDirection[2U] == Approx(-1.0F).margin(1.0e-5F));
+    CHECK(complete.cameraPosition[0U] == Approx(5.0F).margin(2.0e-2F));
+    CHECK(complete.cameraPosition[2U] == Approx(10.0F).margin(1.0e-5F));
+    CHECK(complete.nearPlane == Approx(0.10F));
+    CHECK(complete.farPlane == Approx(250.0F));
+
+    const auto earlyWindow = invisible_places::camera::
+        AveragePreparedAnimationPathView(
+            prepared,
+            0.0F,
+            prepared.durationSeconds * 0.25F,
+            33U);
+    REQUIRE(earlyWindow.valid);
+    CHECK(earlyWindow.cameraPosition[0U] < complete.cameraPosition[0U]);
+    CHECK(earlyWindow.viewDirection[2U] == Approx(-1.0F).margin(1.0e-5F));
+}

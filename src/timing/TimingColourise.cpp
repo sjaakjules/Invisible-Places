@@ -363,6 +363,31 @@ bool IsValidAmountOverrideMode(
     return false;
 }
 
+bool IsValidBlendMode(TimingColouriseBlendMode mode) {
+    switch (mode) {
+        case TimingColouriseBlendMode::Normal:
+        case TimingColouriseBlendMode::Multiply:
+        case TimingColouriseBlendMode::Screen:
+        case TimingColouriseBlendMode::Add:
+        case TimingColouriseBlendMode::Divide:
+        case TimingColouriseBlendMode::VividLight:
+        case TimingColouriseBlendMode::ColorBurn:
+            return true;
+    }
+    return false;
+}
+
+bool IsValidBlendCompositionMode(
+    TimingColouriseBlendCompositionMode mode) {
+    switch (mode) {
+        case TimingColouriseBlendCompositionMode::PrimaryOnly:
+        case TimingColouriseBlendCompositionMode::Crossfade:
+        case TimingColouriseBlendCompositionMode::ApplyAfter:
+            return true;
+    }
+    return false;
+}
+
 bool IsValidEffectParameter(
     TimingColouriseEffectParameter parameter) {
     switch (parameter) {
@@ -375,6 +400,7 @@ bool IsValidEffectParameter(
         case TimingColouriseEffectParameter::PaletteSkewSpread:
         case TimingColouriseEffectParameter::EmissiveSkewCentre:
         case TimingColouriseEffectParameter::EmissiveSkewSpread:
+        case TimingColouriseEffectParameter::BlendMix:
             return true;
     }
     return false;
@@ -680,6 +706,8 @@ float EffectParameterBaseValue(
             return effect.emissiveSkewCentre;
         case TimingColouriseEffectParameter::EmissiveSkewSpread:
             return effect.emissiveSkewSpread;
+        case TimingColouriseEffectParameter::BlendMix:
+            return effect.blendMix;
         // Legacy per-side skews; sanitize retags their keys onto Spread,
         // so nothing evaluates them.
         case TimingColouriseEffectParameter::PaletteSkewLower:
@@ -696,6 +724,7 @@ float SanitizeEffectParameterValue(
         case TimingColouriseEffectParameter::PalettePhase:
             return ClampPalettePhaseDelta(value);
         case TimingColouriseEffectParameter::AmountOverride:
+        case TimingColouriseEffectParameter::BlendMix:
             return Clamp01(value);
         case TimingColouriseEffectParameter::EmissiveLevel:
             return FiniteOr(value, 1.0F);
@@ -3210,31 +3239,11 @@ bool ReverseTimingColourisePaletteAtPosition(
 
     const auto reversed = ReverseTimingColourisePalette(
         EvaluateTimingColourisePalette(updated, position));
-    for (const auto& stop : reversed.stops) {
-        const auto existing = std::find_if(
-            updated.paletteStopParameterKeys.begin(),
-            updated.paletteStopParameterKeys.end(),
-            [&](const TimingColourisePaletteStopParameterKey& key) {
-                return key.stopId == stop.id &&
-                       key.parameter ==
-                           TimingColourisePaletteStopParameter::Position &&
-                       std::abs(key.position - position) <=
-                           kTimingColouriseKeyTolerance;
-            });
-        const auto interpolation =
-            existing != updated.paletteStopParameterKeys.end()
-                ? existing->interpolation
-                : invisible_places::water::
-                      WaterScenarioInterpolation::SmoothVelocity;
-        if (!AddOrUpdateTimingColourisePaletteStopScalarKey(
-                &updated,
-                stop.id,
-                TimingColourisePaletteStopParameter::Position,
-                position,
-                stop.position,
-                interpolation)) {
-            return false;
-        }
+    if (!AddOrUpdateTimingColourisePaletteMarkerKeys(
+            &updated,
+            position,
+            reversed)) {
+        return false;
     }
     *effect = SanitizeTimingColouriseEffect(std::move(updated));
     return true;
@@ -3992,6 +4001,7 @@ bool TimingEffectParameterIsSupported(
         case TimingColouriseEffectParameter::AmountOverride:
         case TimingColouriseEffectParameter::PaletteSkewCentre:
         case TimingColouriseEffectParameter::PaletteSkewSpread:
+        case TimingColouriseEffectParameter::BlendMix:
             return colouriseEnabled;
         case TimingColouriseEffectParameter::EmissiveLevel:
         case TimingColouriseEffectParameter::EmissiveSkewCentre:
@@ -4392,6 +4402,17 @@ TimingColouriseEffect SanitizeTimingColouriseEffect(
         effect.colourKeyInterpolationSpace =
             TimingColouriseColourSpace::Srgb;
     }
+    if (!IsValidBlendMode(effect.blendMode)) {
+        effect.blendMode = TimingColouriseBlendMode::Normal;
+    }
+    if (!IsValidBlendMode(effect.secondaryBlendMode)) {
+        effect.secondaryBlendMode = TimingColouriseBlendMode::Multiply;
+    }
+    if (!IsValidBlendCompositionMode(effect.blendCompositionMode)) {
+        effect.blendCompositionMode =
+            TimingColouriseBlendCompositionMode::PrimaryOnly;
+    }
+    effect.blendMix = Clamp01(FiniteOr(effect.blendMix, 1.0F));
     effect.colouriseAmountOverride = std::clamp(
         FiniteOr(effect.colouriseAmountOverride, 1.0F),
         0.0F,
@@ -4765,6 +4786,17 @@ TimingColouriseEffect SanitizeTimingColouriseEffect(
             memory.colouriseAmountOverrideMode =
                 TimingColouriseAmountOverrideMode::Maximum;
         }
+        if (!IsValidBlendMode(memory.blendMode)) {
+            memory.blendMode = TimingColouriseBlendMode::Normal;
+        }
+        if (!IsValidBlendMode(memory.secondaryBlendMode)) {
+            memory.secondaryBlendMode = TimingColouriseBlendMode::Multiply;
+        }
+        if (!IsValidBlendCompositionMode(memory.blendCompositionMode)) {
+            memory.blendCompositionMode =
+                TimingColouriseBlendCompositionMode::PrimaryOnly;
+        }
+        memory.blendMix = Clamp01(FiniteOr(memory.blendMix, 1.0F));
         memory.colouriseAmountOverride = std::clamp(
             FiniteOr(memory.colouriseAmountOverride, 1.0F),
             0.0F,
@@ -6939,6 +6971,9 @@ void StashTimingColouriseFieldVisuals(TimingColouriseEffect* effect) {
         effect->colouriseAmountOverrideMode;
     entry->colouriseAmountOverride = effect->colouriseAmountOverride;
     entry->blendMode = effect->blendMode;
+    entry->secondaryBlendMode = effect->secondaryBlendMode;
+    entry->blendCompositionMode = effect->blendCompositionMode;
+    entry->blendMix = effect->blendMix;
     entry->palettePhaseOffset = effect->palettePhaseOffset;
     entry->paletteSkewCentre = effect->paletteSkewCentre;
     entry->paletteSkewSpread = effect->paletteSkewSpread;
@@ -6989,6 +7024,10 @@ void ApplyTimingColouriseFieldSelection(
             effect->colouriseAmountOverride =
                 visualEntry->colouriseAmountOverride;
             effect->blendMode = visualEntry->blendMode;
+            effect->secondaryBlendMode = visualEntry->secondaryBlendMode;
+            effect->blendCompositionMode =
+                visualEntry->blendCompositionMode;
+            effect->blendMix = visualEntry->blendMix;
             effect->palettePhaseOffset =
                 visualEntry->palettePhaseOffset;
             effect->paletteSkewCentre = visualEntry->paletteSkewCentre;
@@ -8668,7 +8707,8 @@ bool AddOrUpdateTimingColourisePaletteMarkerKeys(
 
     const auto interpolationAt =
         [&](std::string_view stopId,
-            TimingColourisePaletteStopParameter parameter) {
+            TimingColourisePaletteStopParameter parameter,
+            float atPosition) {
             using invisible_places::water::WaterScenarioInterpolation;
             const TimingColourisePaletteStopParameterKey* first = nullptr;
             const TimingColourisePaletteStopParameterKey* previous = nullptr;
@@ -8679,11 +8719,11 @@ bool AddOrUpdateTimingColourisePaletteMarkerKeys(
                 if (first == nullptr) {
                     first = &key;
                 }
-                if (std::abs(key.position - keyPosition) <=
+                if (std::abs(key.position - atPosition) <=
                     kTimingColouriseKeyTolerance) {
                     return key.interpolation;
                 }
-                if (key.position < keyPosition) {
+                if (key.position < atPosition) {
                     previous = &key;
                 }
             }
@@ -8738,22 +8778,144 @@ bool AddOrUpdateTimingColourisePaletteMarkerKeys(
         return false;
     }
     for (const auto& baseStop : updated.basePalette.stops) {
+        if (std::none_of(
+                palette.stops.begin(),
+                palette.stops.end(),
+                [&](const TimingColourisePaletteStop& candidate) {
+                    return candidate.id == baseStop.id;
+                })) {
+            return false;
+        }
+    }
+
+    // Keep an immutable view of the old curves. Completing an old marker
+    // snapshot must capture what the project meant before this new snapshot
+    // starts influencing evaluation.
+    const auto original = updated;
+    const auto hasKeyAt =
+        [&](std::string_view stopId,
+            TimingColourisePaletteStopParameter parameter,
+            float atPosition) {
+            return std::any_of(
+                original.paletteStopParameterKeys.begin(),
+                original.paletteStopParameterKeys.end(),
+                [&](const TimingColourisePaletteStopParameterKey& key) {
+                    return key.stopId == stopId &&
+                           key.parameter == parameter &&
+                           std::abs(key.position - atPosition) <=
+                               kTimingColouriseKeyTolerance;
+                });
+        };
+    const auto hasEarlierKey =
+        [&](std::string_view stopId,
+            TimingColourisePaletteStopParameter parameter,
+            float atPosition) {
+            return std::any_of(
+                original.paletteStopParameterKeys.begin(),
+                original.paletteStopParameterKeys.end(),
+                [&](const TimingColourisePaletteStopParameterKey& key) {
+                    return key.stopId == stopId &&
+                           key.parameter == parameter &&
+                           key.position <= atPosition +
+                               kTimingColouriseKeyTolerance;
+                });
+        };
+    const auto stopById = [](
+                              const TimingColourisePalette& source,
+                              std::string_view stopId)
+        -> const TimingColourisePaletteStop* {
         const auto stop = std::find_if(
-            palette.stops.begin(),
-            palette.stops.end(),
+            source.stops.begin(),
+            source.stops.end(),
             [&](const TimingColourisePaletteStop& candidate) {
-                return candidate.id == baseStop.id;
+                return candidate.id == stopId;
             });
-        if (stop == palette.stops.end() ||
-            !AddOrUpdateTimingColourisePaletteStopScalarKey(
-                &updated,
-                stop->id,
+        return stop == source.stops.end() ? nullptr : &*stop;
+    };
+    const auto addCompleteStop =
+        [&](const TimingColourisePaletteStop& stop,
+            float atPosition,
+            bool onlyMissing) {
+            const auto addScalar =
+                [&](TimingColourisePaletteStopParameter parameter,
+                    float value) {
+                    return (onlyMissing &&
+                            hasKeyAt(stop.id, parameter, atPosition)) ||
+                           AddOrUpdateTimingColourisePaletteStopScalarKey(
+                               &updated,
+                               stop.id,
+                               parameter,
+                               atPosition,
+                               value,
+                               interpolationAt(
+                                   stop.id,
+                                   parameter,
+                                   atPosition));
+                };
+            const bool positionAdded = addScalar(
                 TimingColourisePaletteStopParameter::Position,
-                keyPosition,
-                stop->position,
-                interpolationAt(
-                    stop->id,
-                    TimingColourisePaletteStopParameter::Position))) {
+                stop.position);
+            const bool colourAdded =
+                (onlyMissing &&
+                 hasKeyAt(
+                     stop.id,
+                     TimingColourisePaletteStopParameter::Colour,
+                     atPosition)) ||
+                AddOrUpdateTimingColourisePaletteStopColourKey(
+                    &updated,
+                    stop.id,
+                    atPosition,
+                    stop.colour,
+                    interpolationAt(
+                        stop.id,
+                        TimingColourisePaletteStopParameter::Colour,
+                        atPosition));
+            const bool amountAdded = addScalar(
+                TimingColourisePaletteStopParameter::ColouriseAmount,
+                stop.colouriseAmount);
+            return positionAdded && colourAdded && amountAdded;
+        };
+
+    const auto existingMarkerPositions =
+        TimingColourisePaletteMarkerKeyPositions(original);
+    for (const float oldPosition : existingMarkerPositions) {
+        const auto evaluated = EvaluateTimingColourisePalette(
+            original,
+            oldPosition);
+        for (const auto& baseStop : original.basePalette.stops) {
+            TimingColourisePaletteStop completed = baseStop;
+            if (const auto* evaluatedStop = stopById(evaluated, baseStop.id);
+                evaluatedStop != nullptr) {
+                if (hasEarlierKey(
+                        baseStop.id,
+                        TimingColourisePaletteStopParameter::Position,
+                        oldPosition)) {
+                    completed.position = evaluatedStop->position;
+                }
+                if (hasEarlierKey(
+                        baseStop.id,
+                        TimingColourisePaletteStopParameter::Colour,
+                        oldPosition)) {
+                    completed.colour = evaluatedStop->colour;
+                }
+                if (hasEarlierKey(
+                        baseStop.id,
+                        TimingColourisePaletteStopParameter::ColouriseAmount,
+                        oldPosition)) {
+                    completed.colouriseAmount =
+                        evaluatedStop->colouriseAmount;
+                }
+            }
+            if (!addCompleteStop(completed, oldPosition, true)) {
+                return false;
+            }
+        }
+    }
+
+    for (const auto& baseStop : updated.basePalette.stops) {
+        const auto* stop = stopById(palette, baseStop.id);
+        if (stop == nullptr ||
+            !addCompleteStop(*stop, keyPosition, false)) {
             return false;
         }
     }
@@ -9561,11 +9723,9 @@ std::size_t RemoveTimingColourisePaletteMarkerKeysAtPosition(
         std::erase_if(
             effect->paletteStopParameterKeys,
             [&](const TimingColourisePaletteStopParameterKey& key) {
-                return key.parameter ==
-                           TimingColourisePaletteStopParameter::Position &&
-                       PaletteKeyPositionBelongsToCluster(
-                           key.position,
-                           cluster);
+                return PaletteKeyPositionBelongsToCluster(
+                    key.position,
+                    cluster);
             });
     }
     return previousLegacySize - effect->paletteKeys.size() +
@@ -9990,37 +10150,54 @@ bool AddTimingColourisePaletteStop(
     if (added == updated.basePalette.stops.end()) {
         return false;
     }
-    const float addedPosition = added->position;
+    const TimingColourisePaletteStop addedStop = *added;
     updated.paletteKeyModel =
         TimingColourisePaletteKeyModel::StopParameters;
 
-    // Marker Position keys are group snapshots. A stop added after animation
-    // was authored joins every existing snapshot at its base position, so a
-    // topology edit cannot create a partial or apparently missing track.
+    // Palette keys are complete snapshots. A stop added after animation was
+    // authored joins every existing snapshot with all of its base properties,
+    // so a topology edit cannot create a partial or apparently missing track.
     const auto markerPositions =
         TimingColourisePaletteMarkerKeyPositions(updated);
     for (const float keyPosition : markerPositions) {
-        auto interpolation = invisible_places::water::
-            WaterScenarioInterpolation::SmoothVelocity;
-        if (const auto source = std::find_if(
-                updated.paletteStopParameterKeys.begin(),
-                updated.paletteStopParameterKeys.end(),
-                [&](const TimingColourisePaletteStopParameterKey& key) {
-                    return key.parameter ==
-                               TimingColourisePaletteStopParameter::Position &&
-                           std::abs(key.position - keyPosition) <=
-                               kTimingColouriseKeyTolerance;
-                });
-            source != updated.paletteStopParameterKeys.end()) {
-            interpolation = source->interpolation;
-        }
+        const auto interpolationFor =
+            [&](TimingColourisePaletteStopParameter parameter) {
+                const auto source = std::find_if(
+                    updated.paletteStopParameterKeys.begin(),
+                    updated.paletteStopParameterKeys.end(),
+                    [&](const TimingColourisePaletteStopParameterKey& key) {
+                        return key.parameter == parameter &&
+                               std::abs(key.position - keyPosition) <=
+                                   kTimingColouriseKeyTolerance;
+                    });
+                return source != updated.paletteStopParameterKeys.end()
+                           ? source->interpolation
+                           : invisible_places::water::
+                                 WaterScenarioInterpolation::SmoothVelocity;
+            };
         if (!AddOrUpdateTimingColourisePaletteStopScalarKey(
                 &updated,
                 addedId,
                 TimingColourisePaletteStopParameter::Position,
                 keyPosition,
-                addedPosition,
-                interpolation)) {
+                addedStop.position,
+                interpolationFor(
+                    TimingColourisePaletteStopParameter::Position)) ||
+            !AddOrUpdateTimingColourisePaletteStopColourKey(
+                &updated,
+                addedId,
+                keyPosition,
+                addedStop.colour,
+                interpolationFor(
+                    TimingColourisePaletteStopParameter::Colour)) ||
+            !AddOrUpdateTimingColourisePaletteStopScalarKey(
+                &updated,
+                addedId,
+                TimingColourisePaletteStopParameter::ColouriseAmount,
+                keyPosition,
+                addedStop.colouriseAmount,
+                interpolationFor(
+                    TimingColourisePaletteStopParameter::ColouriseAmount))) {
             return false;
         }
     }

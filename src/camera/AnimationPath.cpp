@@ -2057,6 +2057,11 @@ PreparedAnimationPathEvaluationContext PrepareAnimationPathEvaluation(const Anim
     context.depthOfFieldEnabled = path.depthOfFieldEnabled;
     context.apertureFStops = std::max(0.1F, path.apertureFStops);
     context.depthOfFieldMaxBlurPixels = std::max(0.0F, path.depthOfFieldMaxBlurPixels);
+    context.automaticNearPlaneEnabled = path.automaticNearPlaneEnabled;
+    context.automaticNearPlaneResolvedMeters =
+        std::isfinite(path.automaticNearPlaneResolvedMeters)
+            ? std::max(0.0F, path.automaticNearPlaneResolvedMeters)
+            : 0.0F;
     context.hasOrientation = AnyKeyHasOrientation(path);
     context.hasFocusDistance = AnyKeyHasFocusDistance(path);
     context.hasApertureFStops = AnyKeyHasApertureFStops(path);
@@ -2317,6 +2322,13 @@ AnimationPathEvaluation EvaluatePreparedAnimationPath(
         evaluation.camera.fovDegrees = key.fovDegrees;
         evaluation.camera.nearPlane = key.nearPlane;
         evaluation.camera.farPlane = key.farPlane;
+        if (context.automaticNearPlaneEnabled &&
+            context.automaticNearPlaneResolvedMeters > 0.0F) {
+            evaluation.camera.nearPlane = std::clamp(
+                context.automaticNearPlaneResolvedMeters,
+                1.0e-5F,
+                std::max(1.0e-5F, evaluation.camera.farPlane - 1.0e-5F));
+        }
         evaluation.camera.hasDepthOfField = context.depthOfFieldEnabled;
         evaluation.camera.focusDistance = evaluation.focusDistance;
         evaluation.camera.apertureFStops = key.hasApertureFStops
@@ -2389,6 +2401,13 @@ AnimationPathEvaluation EvaluatePreparedAnimationPath(
         EvaluatePreparedScalarSpline(context.geometryKnots, context.nearPlane, geometryPosition);
     evaluation.camera.farPlane =
         EvaluatePreparedScalarSpline(context.geometryKnots, context.farPlane, geometryPosition);
+    if (context.automaticNearPlaneEnabled &&
+        context.automaticNearPlaneResolvedMeters > 0.0F) {
+        evaluation.camera.nearPlane = std::clamp(
+            context.automaticNearPlaneResolvedMeters,
+            1.0e-5F,
+            std::max(1.0e-5F, evaluation.camera.farPlane - 1.0e-5F));
+    }
     evaluation.camera.hasDepthOfField = context.depthOfFieldEnabled;
     evaluation.camera.focusDistance = evaluation.focusDistance;
     evaluation.camera.apertureFStops =
@@ -6481,6 +6500,93 @@ AnimationPathMotionStats MeasureAnimationPathMotion(
         PrepareAnimationPathEvaluation(path),
         normalizedTime,
         sampleCount);
+}
+
+AnimationPathViewAverage AveragePreparedAnimationPathView(
+    const PreparedAnimationPathEvaluationContext& context,
+    float startTimeSeconds,
+    float endTimeSeconds,
+    std::uint32_t sampleCount) {
+    AnimationPathViewAverage average;
+    if (!context.valid) {
+        return average;
+    }
+
+    const float durationSeconds = std::max(0.0F, context.durationSeconds);
+    float intervalStart = std::clamp(
+        std::min(startTimeSeconds, endTimeSeconds),
+        0.0F,
+        durationSeconds);
+    float intervalEnd = std::clamp(
+        std::max(startTimeSeconds, endTimeSeconds),
+        0.0F,
+        durationSeconds);
+    if (context.singleKey || durationSeconds <= 1.0e-6F) {
+        intervalStart = 0.0F;
+        intervalEnd = 0.0F;
+    }
+
+    const std::uint32_t samples = intervalEnd - intervalStart <= 1.0e-6F
+                                      ? 1U
+                                      : std::max<std::uint32_t>(2U, sampleCount);
+    glm::vec3 positionSum{0.0F};
+    glm::vec3 directionSum{0.0F};
+    float weightSum = 0.0F;
+    float minimumNear = std::numeric_limits<float>::infinity();
+    float maximumFar = 0.0F;
+    for (std::uint32_t sampleIndex = 0U;
+         sampleIndex < samples;
+         ++sampleIndex) {
+        const float amount = samples == 1U
+                                 ? 0.0F
+                                 : static_cast<float>(sampleIndex) /
+                                       static_cast<float>(samples - 1U);
+        const float timeSeconds =
+            intervalStart + (intervalEnd - intervalStart) * amount;
+        const auto evaluation =
+            EvaluatePreparedAnimationPath(context, timeSeconds);
+        // Trapezoidal endpoint weights avoid over-representing the interval
+        // ends when callers select a denser sample count.
+        const float weight =
+            samples > 1U && (sampleIndex == 0U || sampleIndex + 1U == samples)
+                ? 0.5F
+                : 1.0F;
+        positionSum += ToGlm(evaluation.camera.position) * weight;
+        directionSum +=
+            ViewDirectionFromEvaluation(context, evaluation) * weight;
+        weightSum += weight;
+        minimumNear = std::min(
+            minimumNear,
+            std::max(1.0e-5F, evaluation.camera.nearPlane));
+        maximumFar = std::max(maximumFar, evaluation.camera.farPlane);
+    }
+
+    if (weightSum <= 1.0e-6F) {
+        return average;
+    }
+    glm::vec3 direction = directionSum / weightSum;
+    if (glm::dot(direction, direction) <= 1.0e-10F) {
+        const auto midpoint = EvaluatePreparedAnimationPath(
+            context,
+            (intervalStart + intervalEnd) * 0.5F);
+        direction = ViewDirectionFromEvaluation(context, midpoint);
+    }
+    if (glm::dot(direction, direction) <= 1.0e-10F) {
+        return average;
+    }
+
+    direction = glm::normalize(direction);
+    const glm::vec3 position = positionSum / weightSum;
+    average.valid = true;
+    average.cameraPosition = {position.x, position.y, position.z};
+    average.viewDirection = {direction.x, direction.y, direction.z};
+    average.nearPlane = std::isfinite(minimumNear)
+                            ? std::max(1.0e-5F, minimumNear)
+                            : 0.01F;
+    average.farPlane = std::max(
+        average.nearPlane + 1.0e-5F,
+        maximumFar);
+    return average;
 }
 
 std::uint32_t AnimationDurationFramesForAverageSpeed(

@@ -41,8 +41,14 @@ using invisible_places::renderer::gsplat::GaussianSplatQualityMode;
 using invisible_places::renderer::gsplat::GaussianSplatStyleState;
 using invisible_places::renderer::pointcloud::PointCloudColorMode;
 using invisible_places::renderer::pointcloud::PointCloudColormapId;
+using invisible_places::renderer::pointcloud::PointCloudDepthParticipation;
+using invisible_places::renderer::pointcloud::PointCloudDepthRolePolicy;
+using invisible_places::renderer::pointcloud::PointCloudSurfaceStabilityMode;
+using invisible_places::renderer::pointcloud::PointCloudSurfaceStabilityPolicy;
 using invisible_places::renderer::pointcloud::PointCloudFalloffProfile;
 using invisible_places::renderer::pointcloud::PointCloudGeometryMode;
+using invisible_places::renderer::pointcloud::PointCloudGpuSortMode;
+using invisible_places::renderer::pointcloud::PointCloudEmissionResponse;
 using invisible_places::renderer::pointcloud::PointCloudFoamFrontsShorelineSettings;
 using invisible_places::renderer::pointcloud::PointCloudHeightFoamShorelineSettings;
 using invisible_places::renderer::pointcloud::PointCloudNprPreset;
@@ -187,6 +193,17 @@ constexpr std::uint32_t kIndependentEdgeFadeModeTracksProjectSchemaVersion =
 // presence-based: sanitize hoists any run-scoped "marks" a document still
 // carries into the take-level list, so no version gate is needed.
 constexpr std::uint32_t kTimingTakeMarksProjectSchemaVersion = 90U;
+// Schema 93 adds the "color_burn" Visual Feature blend. The value is
+// appended to the enum and Normal remains the omitted default, so every
+// earlier document remains an identity migration.
+constexpr std::uint32_t kColorBurnBlendProjectSchemaVersion = 93U;
+// Schema 94 adds a second Visual Feature blend mode plus Crossfade and
+// Apply After composition. Primary Only remains the omitted default, so
+// earlier documents retain their exact result.
+constexpr std::uint32_t kDualBlendCompositionProjectSchemaVersion = 94U;
+// Schema 95 adds saved role-specific soft-depth participation. Uniform is
+// the omitted default, preserving every earlier visual exactly.
+constexpr std::uint32_t kRoleSpecificDepthProjectSchemaVersion = 95U;
 static_assert(
     kProjectDocumentSchemaVersion >=
     kSceneScopedTimingTakesProjectSchemaVersion);
@@ -250,6 +267,15 @@ static_assert(
 static_assert(
     kProjectDocumentSchemaVersion >=
     kTimingTakeMarksProjectSchemaVersion);
+static_assert(
+    kProjectDocumentSchemaVersion >=
+    kColorBurnBlendProjectSchemaVersion);
+static_assert(
+    kProjectDocumentSchemaVersion >=
+    kDualBlendCompositionProjectSchemaVersion);
+static_assert(
+    kProjectDocumentSchemaVersion >=
+    kRoleSpecificDepthProjectSchemaVersion);
 static_assert(
     kProjectDocumentSchemaVersion >=
     kWaterFeatureRunVisibilityProjectSchemaVersion);
@@ -520,6 +546,183 @@ PointCloudRendererMode ParsePointCloudRendererMode(const json& value) {
         return PointCloudRendererMode::FastBasic;
     }
     return PointCloudRendererMode::Beauty;
+}
+
+const char* PointCloudGpuSortModeName(PointCloudGpuSortMode mode) {
+    switch (mode) {
+        case PointCloudGpuSortMode::PerFrame:
+            return "per_frame";
+        case PointCloudGpuSortMode::FullAnimation:
+            return "full_animation";
+        case PointCloudGpuSortMode::MovingAverage:
+            return "moving_average";
+        case PointCloudGpuSortMode::FixedVertical:
+            return "fixed_vertical";
+    }
+    return "per_frame";
+}
+
+PointCloudGpuSortMode ParsePointCloudGpuSortMode(const json& value) {
+    if (!value.is_string()) {
+        return PointCloudGpuSortMode::PerFrame;
+    }
+    const auto modeName = value.get<std::string>();
+    if (modeName == "full_animation" || modeName == "full_path") {
+        return PointCloudGpuSortMode::FullAnimation;
+    }
+    if (modeName == "moving_average" || modeName == "moving_window") {
+        return PointCloudGpuSortMode::MovingAverage;
+    }
+    if (modeName == "fixed_vertical" || modeName == "vertical") {
+        return PointCloudGpuSortMode::FixedVertical;
+    }
+    return PointCloudGpuSortMode::PerFrame;
+}
+
+const char* PointCloudDepthRolePolicyName(PointCloudDepthRolePolicy policy) {
+    switch (policy) {
+        case PointCloudDepthRolePolicy::Uniform:
+            return "uniform";
+        case PointCloudDepthRolePolicy::RockOccluder:
+            return "rock_occluder";
+        case PointCloudDepthRolePolicy::Custom:
+            return "custom";
+    }
+    return "uniform";
+}
+
+PointCloudDepthRolePolicy ParsePointCloudDepthRolePolicy(const json& value) {
+    if (!value.is_string()) {
+        return PointCloudDepthRolePolicy::Uniform;
+    }
+    const auto name = value.get<std::string>();
+    if (name == "rock_occluder" || name == "stable_roles") {
+        return PointCloudDepthRolePolicy::RockOccluder;
+    }
+    if (name == "custom") {
+        return PointCloudDepthRolePolicy::Custom;
+    }
+    return PointCloudDepthRolePolicy::Uniform;
+}
+
+const char* PointCloudDepthParticipationName(
+    PointCloudDepthParticipation participation) {
+    switch (participation) {
+        case PointCloudDepthParticipation::Disabled:
+            return "disabled";
+        case PointCloudDepthParticipation::TestOnly:
+            return "test_only";
+        case PointCloudDepthParticipation::WriteAndTest:
+            return "write_and_test";
+    }
+    return "write_and_test";
+}
+
+PointCloudDepthParticipation ParsePointCloudDepthParticipation(
+    const json& value) {
+    if (!value.is_string()) {
+        return PointCloudDepthParticipation::WriteAndTest;
+    }
+    const auto name = value.get<std::string>();
+    if (name == "disabled" || name == "off" || name == "overlay") {
+        return PointCloudDepthParticipation::Disabled;
+    }
+    if (name == "test_only" || name == "receiver") {
+        return PointCloudDepthParticipation::TestOnly;
+    }
+    return PointCloudDepthParticipation::WriteAndTest;
+}
+
+const char* PointCloudSurfaceStabilityModeName(
+    PointCloudSurfaceStabilityMode mode) {
+    switch (mode) {
+        case PointCloudSurfaceStabilityMode::Original:
+            return "original";
+        case PointCloudSurfaceStabilityMode::DrawAll:
+            return "draw_all";
+        case PointCloudSurfaceStabilityMode::DensityContinuity:
+            return "density_continuity";
+        case PointCloudSurfaceStabilityMode::PreferLower:
+            return "prefer_lower";
+        case PointCloudSurfaceStabilityMode::PreferUpper:
+            return "prefer_upper";
+        case PointCloudSurfaceStabilityMode::SoftSeparation:
+            return "soft_separation";
+    }
+    return "original";
+}
+
+PointCloudSurfaceStabilityMode ParsePointCloudSurfaceStabilityMode(
+    const json& value) {
+    if (!value.is_string()) {
+        return PointCloudSurfaceStabilityMode::Original;
+    }
+    const auto name = value.get<std::string>();
+    if (name == "draw_all" || name == "both") {
+        return PointCloudSurfaceStabilityMode::DrawAll;
+    }
+    if (name == "density_continuity" || name == "stable_sand") {
+        return PointCloudSurfaceStabilityMode::DensityContinuity;
+    }
+    if (name == "prefer_lower" || name == "lower") {
+        return PointCloudSurfaceStabilityMode::PreferLower;
+    }
+    if (name == "prefer_upper" || name == "upper" || name == "top") {
+        return PointCloudSurfaceStabilityMode::PreferUpper;
+    }
+    if (name == "soft_separation" || name == "soft_cull") {
+        return PointCloudSurfaceStabilityMode::SoftSeparation;
+    }
+    return PointCloudSurfaceStabilityMode::Original;
+}
+
+const char* PointCloudSurfaceStabilityPolicyName(
+    PointCloudSurfaceStabilityPolicy policy) {
+    switch (policy) {
+        case PointCloudSurfaceStabilityPolicy::Uniform:
+            return "uniform";
+        case PointCloudSurfaceStabilityPolicy::StableRoles:
+            return "stable_roles";
+        case PointCloudSurfaceStabilityPolicy::Custom:
+            return "custom";
+    }
+    return "uniform";
+}
+
+PointCloudSurfaceStabilityPolicy ParsePointCloudSurfaceStabilityPolicy(
+    const json& value) {
+    if (!value.is_string()) {
+        return PointCloudSurfaceStabilityPolicy::Uniform;
+    }
+    const auto name = value.get<std::string>();
+    if (name == "stable_roles" || name == "rock_sand_vegetation") {
+        return PointCloudSurfaceStabilityPolicy::StableRoles;
+    }
+    if (name == "custom") {
+        return PointCloudSurfaceStabilityPolicy::Custom;
+    }
+    return PointCloudSurfaceStabilityPolicy::Uniform;
+}
+
+const char* PointCloudEmissionResponseName(PointCloudEmissionResponse response) {
+    switch (response) {
+        case PointCloudEmissionResponse::Accumulated:
+            return "accumulated";
+        case PointCloudEmissionResponse::Saturated:
+            return "saturated";
+    }
+    return "accumulated";
+}
+
+PointCloudEmissionResponse ParsePointCloudEmissionResponse(const json& value) {
+    if (!value.is_string()) {
+        return PointCloudEmissionResponse::Accumulated;
+    }
+    const auto responseName = value.get<std::string>();
+    if (responseName == "saturated" || responseName == "front_surface") {
+        return PointCloudEmissionResponse::Saturated;
+    }
+    return PointCloudEmissionResponse::Accumulated;
 }
 
 const char* OrbitControlModeName(
@@ -1180,7 +1383,7 @@ void MigrateLegacyPointCloudRenderMode(
 PointCloudStyleState ParsePointCloudStyle(const json& styleJson);
 
 json SerializePointCloudStyle(const PointCloudStyleState& style) {
-    return json{
+    json styleJson{
         {"geometry_mode", PointCloudGeometryModeName(style.geometryMode)},
         {"screen_sprite_size_mode", PointCloudScreenSpriteSizeModeName(style.screenSpriteSizeMode)},
         {"falloff_profile", PointCloudFalloffProfileName(style.falloffProfile)},
@@ -1250,6 +1453,93 @@ json SerializePointCloudStyle(const PointCloudStyleState& style) {
         {"depth_fade", SerializeBinding(style.depthFade)},
         {"colormap_position", SerializeBinding(style.colormapPosition)},
     };
+    // Keep legacy named profiles structurally stable when the new opt-in
+    // controls remain at their defaults. Non-default values still travel
+    // with every saved visual and parse independently of schema provenance.
+    if (style.gpuBackToFrontSorting) {
+        styleJson["gpu_back_to_front_sorting"] = true;
+    }
+    if (style.gpuSortMode != PointCloudGpuSortMode::PerFrame) {
+        styleJson["gpu_sort_mode"] =
+            PointCloudGpuSortModeName(style.gpuSortMode);
+    }
+    if (style.gpuSortWindowSeconds != 1.0F) {
+        styleJson["gpu_sort_window_seconds"] =
+            style.gpuSortWindowSeconds;
+    }
+    if (style.depthPrepassEnabled) {
+        styleJson["depth_prepass_enabled"] = true;
+    }
+    if (style.depthPrepassAlphaThreshold != 0.35F) {
+        styleJson["depth_prepass_alpha_threshold"] =
+            style.depthPrepassAlphaThreshold;
+    }
+    if (style.depthPrepassToleranceMeters != 0.02F) {
+        styleJson["depth_prepass_tolerance_meters"] =
+            style.depthPrepassToleranceMeters;
+    }
+    if (style.depthRolePolicy != PointCloudDepthRolePolicy::Uniform) {
+        styleJson["depth_role_policy"] =
+            PointCloudDepthRolePolicyName(style.depthRolePolicy);
+    }
+    if (style.depthRolePolicy == PointCloudDepthRolePolicy::Custom) {
+        styleJson["rock_depth_participation"] =
+            PointCloudDepthParticipationName(
+                style.rockDepthParticipation);
+        styleJson["sand_depth_participation"] =
+            PointCloudDepthParticipationName(
+                style.sandDepthParticipation);
+        styleJson["vegetation_depth_participation"] =
+            PointCloudDepthParticipationName(
+                style.vegetationDepthParticipation);
+    }
+    if (style.surfaceStabilityPolicy !=
+        PointCloudSurfaceStabilityPolicy::Uniform) {
+        styleJson["surface_stability_policy"] =
+            PointCloudSurfaceStabilityPolicyName(
+                style.surfaceStabilityPolicy);
+    }
+    if (style.surfaceStabilityPolicy ==
+        PointCloudSurfaceStabilityPolicy::Uniform) {
+        if (style.uniformSurfaceStabilityMode !=
+            PointCloudSurfaceStabilityMode::Original) {
+            styleJson["surface_stability_mode"] =
+                PointCloudSurfaceStabilityModeName(
+                    style.uniformSurfaceStabilityMode);
+        }
+    } else if (style.surfaceStabilityPolicy ==
+               PointCloudSurfaceStabilityPolicy::Custom) {
+        styleJson["rock_surface_stability"] =
+            PointCloudSurfaceStabilityModeName(
+                style.rockSurfaceStabilityMode);
+        styleJson["sand_surface_stability"] =
+            PointCloudSurfaceStabilityModeName(
+                style.sandSurfaceStabilityMode);
+        styleJson["vegetation_surface_stability"] =
+            PointCloudSurfaceStabilityModeName(
+                style.vegetationSurfaceStabilityMode);
+    }
+    if (style.surfaceStabilityInfluence != 1.0F) {
+        styleJson["surface_stability_influence"] =
+            style.surfaceStabilityInfluence;
+    }
+    if (style.depthWeightStrength != 1.0F) {
+        styleJson["depth_weight_strength"] = style.depthWeightStrength;
+    }
+    if (style.emissionResponse != PointCloudEmissionResponse::Accumulated) {
+        styleJson["emission_response"] =
+            PointCloudEmissionResponseName(style.emissionResponse);
+    }
+    if (style.normalCullEnabled) {
+        styleJson["normal_cull_enabled"] = true;
+    }
+    if (style.normalCullStartDegrees != 75.0F) {
+        styleJson["normal_cull_start_degrees"] = style.normalCullStartDegrees;
+    }
+    if (style.normalCullEndDegrees != 105.0F) {
+        styleJson["normal_cull_end_degrees"] = style.normalCullEndDegrees;
+    }
+    return styleJson;
 }
 
 json SerializePointCloudVisual(const ProjectLayerDocument::PointVisual& visual) {
@@ -1914,6 +2204,104 @@ PointCloudStyleState ParsePointCloudStyle(const json& styleJson) {
     style.featherPower = styleJson.value("feather_power", style.featherPower);
     style.waterStreakAspect = std::clamp(styleJson.value("water_streak_aspect", style.waterStreakAspect), 1.0F, 32.0F);
     style.solidCenters = styleJson.value("solid_centers", style.solidCenters);
+    style.gpuBackToFrontSorting =
+        styleJson.value("gpu_back_to_front_sorting", style.gpuBackToFrontSorting);
+    if (styleJson.contains("gpu_sort_mode")) {
+        style.gpuSortMode =
+            ParsePointCloudGpuSortMode(styleJson.at("gpu_sort_mode"));
+    }
+    style.gpuSortWindowSeconds = std::clamp(
+        styleJson.value(
+            "gpu_sort_window_seconds",
+            style.gpuSortWindowSeconds),
+        0.05F,
+        3600.0F);
+    style.depthPrepassEnabled =
+        styleJson.value("depth_prepass_enabled", style.depthPrepassEnabled);
+    style.depthPrepassAlphaThreshold = std::clamp(
+        styleJson.value(
+            "depth_prepass_alpha_threshold",
+            style.depthPrepassAlphaThreshold),
+        0.0F,
+        1.0F);
+    style.depthPrepassToleranceMeters = std::clamp(
+        styleJson.value(
+            "depth_prepass_tolerance_meters",
+            style.depthPrepassToleranceMeters),
+        0.0F,
+        10.0F);
+    if (styleJson.contains("depth_role_policy")) {
+        style.depthRolePolicy = ParsePointCloudDepthRolePolicy(
+            styleJson.at("depth_role_policy"));
+    }
+    if (styleJson.contains("rock_depth_participation")) {
+        style.rockDepthParticipation = ParsePointCloudDepthParticipation(
+            styleJson.at("rock_depth_participation"));
+    }
+    if (styleJson.contains("sand_depth_participation")) {
+        style.sandDepthParticipation = ParsePointCloudDepthParticipation(
+            styleJson.at("sand_depth_participation"));
+    }
+    if (styleJson.contains("vegetation_depth_participation")) {
+        style.vegetationDepthParticipation =
+            ParsePointCloudDepthParticipation(
+                styleJson.at("vegetation_depth_participation"));
+    }
+    if (styleJson.contains("surface_stability_policy")) {
+        style.surfaceStabilityPolicy =
+            ParsePointCloudSurfaceStabilityPolicy(
+                styleJson.at("surface_stability_policy"));
+    }
+    if (styleJson.contains("surface_stability_mode")) {
+        style.uniformSurfaceStabilityMode =
+            ParsePointCloudSurfaceStabilityMode(
+                styleJson.at("surface_stability_mode"));
+    }
+    if (styleJson.contains("rock_surface_stability")) {
+        style.rockSurfaceStabilityMode =
+            ParsePointCloudSurfaceStabilityMode(
+                styleJson.at("rock_surface_stability"));
+    }
+    if (styleJson.contains("sand_surface_stability")) {
+        style.sandSurfaceStabilityMode =
+            ParsePointCloudSurfaceStabilityMode(
+                styleJson.at("sand_surface_stability"));
+    }
+    if (styleJson.contains("vegetation_surface_stability")) {
+        style.vegetationSurfaceStabilityMode =
+            ParsePointCloudSurfaceStabilityMode(
+                styleJson.at("vegetation_surface_stability"));
+    }
+    style.surfaceStabilityInfluence = std::clamp(
+        styleJson.value(
+            "surface_stability_influence",
+            style.surfaceStabilityInfluence),
+        0.0F,
+        1.0F);
+    style.depthWeightStrength = std::clamp(
+        styleJson.value("depth_weight_strength", style.depthWeightStrength),
+        1.0F,
+        8.0F);
+    if (styleJson.contains("emission_response")) {
+        style.emissionResponse = ParsePointCloudEmissionResponse(
+            styleJson.at("emission_response"));
+    }
+    style.normalCullEnabled =
+        styleJson.value("normal_cull_enabled", style.normalCullEnabled);
+    style.normalCullStartDegrees = std::clamp(
+        styleJson.value(
+            "normal_cull_start_degrees",
+            style.normalCullStartDegrees),
+        0.0F,
+        179.0F);
+    style.normalCullEndDegrees = std::clamp(
+        std::max(
+            styleJson.value(
+                "normal_cull_end_degrees",
+                style.normalCullEndDegrees),
+            style.normalCullStartDegrees + 1.0F),
+        1.0F,
+        180.0F);
     style.flowAnimation = styleJson.value("flow_animation", style.flowAnimation);
     style.waterPathView = styleJson.value("water_path_view", style.waterPathView);
     style.waterTrailOverlay = styleJson.value(
@@ -2808,6 +3196,11 @@ json SerializeAnimationPath(const AnimationPath& path) {
         {"depth_of_field_enabled", path.depthOfFieldEnabled},
         {"aperture_f_stops", path.apertureFStops},
         {"depth_of_field_max_blur_px", path.depthOfFieldMaxBlurPixels},
+        {"automatic_near_plane",
+         {{"enabled", path.automaticNearPlaneEnabled},
+          {"padding_m", path.automaticNearPlanePaddingMeters},
+          {"minimum_m", path.automaticNearPlaneMinimumMeters},
+          {"resolved_m", path.automaticNearPlaneResolvedMeters}}},
         {"export_settings", SerializeAnimationExportSettings(path.exportSettings)},
         {"selected_point_visual", path.selectedPointVisualName},
         {"selected_timing_take_id",
@@ -2886,6 +3279,32 @@ AnimationPath ParseAnimationPath(const json& pathJson) {
     path.apertureFStops = pathJson.value("aperture_f_stops", path.apertureFStops);
     path.depthOfFieldMaxBlurPixels =
         pathJson.value("depth_of_field_max_blur_px", path.depthOfFieldMaxBlurPixels);
+    if (pathJson.contains("automatic_near_plane") &&
+        pathJson.at("automatic_near_plane").is_object()) {
+        const auto& automaticNearPlane =
+            pathJson.at("automatic_near_plane");
+        path.automaticNearPlaneEnabled = automaticNearPlane.value(
+            "enabled",
+            path.automaticNearPlaneEnabled);
+        path.automaticNearPlanePaddingMeters = std::clamp(
+            automaticNearPlane.value(
+                "padding_m",
+                path.automaticNearPlanePaddingMeters),
+            0.0F,
+            1000.0F);
+        path.automaticNearPlaneMinimumMeters = std::clamp(
+            automaticNearPlane.value(
+                "minimum_m",
+                path.automaticNearPlaneMinimumMeters),
+            1.0e-5F,
+            1000.0F);
+        path.automaticNearPlaneResolvedMeters = std::clamp(
+            automaticNearPlane.value(
+                "resolved_m",
+                path.automaticNearPlaneResolvedMeters),
+            0.0F,
+            1000.0F);
+    }
     path.preferredBlendPartnerFileName = pathJson.value(
         "preferred_blend_partner_file_name",
         std::string{});
@@ -5087,6 +5506,8 @@ std::string TimingColouriseBlendModeName(
             return "divide";
         case TimingColouriseBlendMode::VividLight:
             return "vivid_light";
+        case TimingColouriseBlendMode::ColorBurn:
+            return "color_burn";
     }
     return "normal";
 }
@@ -5113,7 +5534,41 @@ ParseTimingColouriseBlendMode(const json& modeJson) {
     if (name == "vivid_light") {
         return TimingColouriseBlendMode::VividLight;
     }
+    if (name == "color_burn" || name == "colour_burn" ||
+        name == "darken") {
+        return TimingColouriseBlendMode::ColorBurn;
+    }
     return TimingColouriseBlendMode::Normal;
+}
+
+std::string TimingColouriseBlendCompositionModeName(
+    invisible_places::timing::TimingColouriseBlendCompositionMode mode) {
+    using invisible_places::timing::TimingColouriseBlendCompositionMode;
+    switch (mode) {
+        case TimingColouriseBlendCompositionMode::PrimaryOnly:
+            return "primary_only";
+        case TimingColouriseBlendCompositionMode::Crossfade:
+            return "crossfade";
+        case TimingColouriseBlendCompositionMode::ApplyAfter:
+            return "apply_after";
+    }
+    return "primary_only";
+}
+
+invisible_places::timing::TimingColouriseBlendCompositionMode
+ParseTimingColouriseBlendCompositionMode(const json& modeJson) {
+    using invisible_places::timing::TimingColouriseBlendCompositionMode;
+    if (!modeJson.is_string()) {
+        return TimingColouriseBlendCompositionMode::PrimaryOnly;
+    }
+    const auto name = modeJson.get<std::string>();
+    if (name == "crossfade") {
+        return TimingColouriseBlendCompositionMode::Crossfade;
+    }
+    if (name == "apply_after") {
+        return TimingColouriseBlendCompositionMode::ApplyAfter;
+    }
+    return TimingColouriseBlendCompositionMode::PrimaryOnly;
 }
 
 std::string TimingColouriseAmountOverrideModeName(
@@ -5188,6 +5643,8 @@ std::string TimingColouriseEffectParameterName(
             return "emissive_skew_centre";
         case TimingColouriseEffectParameter::EmissiveSkewSpread:
             return "emissive_skew_spread";
+        case TimingColouriseEffectParameter::BlendMix:
+            return "blend_mix";
     }
     return "palette_phase";
 }
@@ -5225,6 +5682,9 @@ ParseTimingColouriseEffectParameter(const json& parameterJson) {
     }
     if (name == "emissive_skew_spread") {
         return TimingColouriseEffectParameter::EmissiveSkewSpread;
+    }
+    if (name == "blend_mix") {
+        return TimingColouriseEffectParameter::BlendMix;
     }
     return std::nullopt;
 }
@@ -6034,6 +6494,23 @@ json SerializeTimingColouriseEffect(
                 memoryJson["blend_mode"] =
                     TimingColouriseBlendModeName(memory.blendMode);
             }
+            if (memory.secondaryBlendMode !=
+                invisible_places::timing::TimingColouriseBlendMode::
+                    Multiply) {
+                memoryJson["secondary_blend_mode"] =
+                    TimingColouriseBlendModeName(
+                        memory.secondaryBlendMode);
+            }
+            if (memory.blendCompositionMode !=
+                invisible_places::timing::
+                    TimingColouriseBlendCompositionMode::PrimaryOnly) {
+                memoryJson["blend_composition"] =
+                    TimingColouriseBlendCompositionModeName(
+                        memory.blendCompositionMode);
+            }
+            if (memory.blendMix != 1.0F) {
+                memoryJson["blend_mix"] = memory.blendMix;
+            }
             if (memory.colourKeyInterpolationSpace !=
                 invisible_places::timing::TimingColouriseColourSpace::
                     Srgb) {
@@ -6092,6 +6569,22 @@ json SerializeTimingColouriseEffect(
         invisible_places::timing::TimingColouriseBlendMode::Normal) {
         effectJson["blend_mode"] =
             TimingColouriseBlendModeName(sanitized.blendMode);
+    }
+    if (sanitized.secondaryBlendMode !=
+        invisible_places::timing::TimingColouriseBlendMode::Multiply) {
+        effectJson["secondary_blend_mode"] =
+            TimingColouriseBlendModeName(
+                sanitized.secondaryBlendMode);
+    }
+    if (sanitized.blendCompositionMode !=
+        invisible_places::timing::
+            TimingColouriseBlendCompositionMode::PrimaryOnly) {
+        effectJson["blend_composition"] =
+            TimingColouriseBlendCompositionModeName(
+                sanitized.blendCompositionMode);
+    }
+    if (sanitized.blendMix != 1.0F) {
+        effectJson["blend_mix"] = sanitized.blendMix;
     }
     // The keyed-colour blend space is written only away from the sRGB
     // default so untouched documents stay byte-identical.
@@ -6315,6 +6808,16 @@ ParseTimingColouriseEffect(
         effect.blendMode =
             ParseTimingColouriseBlendMode(effectJson.at("blend_mode"));
     }
+    if (effectJson.contains("secondary_blend_mode")) {
+        effect.secondaryBlendMode = ParseTimingColouriseBlendMode(
+            effectJson.at("secondary_blend_mode"));
+    }
+    if (effectJson.contains("blend_composition")) {
+        effect.blendCompositionMode =
+            ParseTimingColouriseBlendCompositionMode(
+                effectJson.at("blend_composition"));
+    }
+    effect.blendMix = effectJson.value("blend_mix", effect.blendMix);
     if (effectJson.contains("colour_key_interpolation")) {
         effect.colourKeyInterpolationSpace =
             ParseTimingColouriseColourSpace(
@@ -6570,6 +7073,17 @@ ParseTimingColouriseEffect(
                 memory.blendMode = ParseTimingColouriseBlendMode(
                     memoryJson.at("blend_mode"));
             }
+            if (memoryJson.contains("secondary_blend_mode")) {
+                memory.secondaryBlendMode = ParseTimingColouriseBlendMode(
+                    memoryJson.at("secondary_blend_mode"));
+            }
+            if (memoryJson.contains("blend_composition")) {
+                memory.blendCompositionMode =
+                    ParseTimingColouriseBlendCompositionMode(
+                        memoryJson.at("blend_composition"));
+            }
+            memory.blendMix = memoryJson.value(
+                "blend_mix", memory.blendMix);
             if (memoryJson.contains("colour_key_interpolation")) {
                 memory.colourKeyInterpolationSpace =
                     ParseTimingColouriseColourSpace(

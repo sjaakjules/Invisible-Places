@@ -21,6 +21,19 @@ namespace {
 constexpr std::uint32_t kSurfelVerticesPerPoint = 6U;
 constexpr float kMaterialEpsilon = 1.0e-5F;
 
+std::string NormalizePointCloudSceneRole(std::string_view sceneRole) {
+    std::string normalized;
+    normalized.reserve(sceneRole.size());
+    for (const char character : sceneRole) {
+        const auto byte = static_cast<unsigned char>(character);
+        if (std::isalnum(byte) == 0) {
+            continue;
+        }
+        normalized.push_back(static_cast<char>(std::tolower(byte)));
+    }
+    return normalized;
+}
+
 std::string TrimShorelineProfileName(std::string_view value) {
     std::size_t begin = 0U;
     while (begin < value.size() &&
@@ -663,16 +676,7 @@ bool PointCloudSceneRoleAllowsRoughnessMotion(std::string_view sceneRole) {
     if (sceneRole.empty()) {
         return true;
     }
-
-    std::string normalized;
-    normalized.reserve(sceneRole.size());
-    for (const char character : sceneRole) {
-        const auto byte = static_cast<unsigned char>(character);
-        if (std::isalnum(byte) == 0) {
-            continue;
-        }
-        normalized.push_back(static_cast<char>(std::tolower(byte)));
-    }
+    const auto normalized = NormalizePointCloudSceneRole(sceneRole);
     return normalized == "veg" || normalized == "vegetation";
 }
 
@@ -684,23 +688,125 @@ PointCloudStyleState MakePointCloudStyleForSceneRole(
         style.roughnessMotionStrength = 0.0F;
     }
     if (groupedSceneRole) {
-        std::string normalized;
-        normalized.reserve(sceneRole.size());
-        for (const char character : sceneRole) {
-            const auto byte = static_cast<unsigned char>(character);
-            if (std::isalnum(byte) == 0) {
-                continue;
-            }
-            normalized.push_back(static_cast<char>(std::tolower(byte)));
-        }
+        const auto normalized = NormalizePointCloudSceneRole(sceneRole);
         if (normalized != "sand") {
             style.shorelineWaveEnabled = false;
         }
         style.roughnessMotionFullLayer = normalized == "veg" || normalized == "vegetation";
+        if (style.depthRolePolicy == PointCloudDepthRolePolicy::RockOccluder) {
+            if (normalized == "rock") {
+                style.effectiveDepthParticipation =
+                    PointCloudDepthParticipation::WriteAndTest;
+            } else if (normalized == "sand") {
+                style.effectiveDepthParticipation =
+                    PointCloudDepthParticipation::TestOnly;
+            } else if (normalized == "veg" || normalized == "vegetation") {
+                style.effectiveDepthParticipation =
+                    PointCloudDepthParticipation::Disabled;
+            }
+        } else if (style.depthRolePolicy ==
+                   PointCloudDepthRolePolicy::Custom) {
+            if (normalized == "rock") {
+                style.effectiveDepthParticipation =
+                    style.rockDepthParticipation;
+            } else if (normalized == "sand") {
+                style.effectiveDepthParticipation =
+                    style.sandDepthParticipation;
+            } else if (normalized == "veg" || normalized == "vegetation") {
+                style.effectiveDepthParticipation =
+                    style.vegetationDepthParticipation;
+            }
+        } else {
+            style.effectiveDepthParticipation =
+                PointCloudDepthParticipation::WriteAndTest;
+        }
+        if (style.surfaceStabilityPolicy ==
+            PointCloudSurfaceStabilityPolicy::StableRoles) {
+            if (normalized == "rock") {
+                style.effectiveSurfaceStabilityMode =
+                    PointCloudSurfaceStabilityMode::SoftSeparation;
+            } else if (normalized == "sand") {
+                style.effectiveSurfaceStabilityMode =
+                    PointCloudSurfaceStabilityMode::DensityContinuity;
+            } else {
+                style.effectiveSurfaceStabilityMode =
+                    PointCloudSurfaceStabilityMode::DrawAll;
+            }
+        } else if (style.surfaceStabilityPolicy ==
+                   PointCloudSurfaceStabilityPolicy::Custom) {
+            if (normalized == "rock") {
+                style.effectiveSurfaceStabilityMode =
+                    style.rockSurfaceStabilityMode;
+            } else if (normalized == "sand") {
+                style.effectiveSurfaceStabilityMode =
+                    style.sandSurfaceStabilityMode;
+            } else if (normalized == "veg" || normalized == "vegetation") {
+                style.effectiveSurfaceStabilityMode =
+                    style.vegetationSurfaceStabilityMode;
+            } else {
+                style.effectiveSurfaceStabilityMode =
+                    style.uniformSurfaceStabilityMode;
+            }
+        } else {
+            style.effectiveSurfaceStabilityMode =
+                style.uniformSurfaceStabilityMode;
+        }
     } else {
         style.roughnessMotionFullLayer = false;
+        // Role policies apply only to canonical grouped scene roles. Generated
+        // overlays and ordinary standalone point clouds retain the historical
+        // write-and-test behaviour.
+        style.effectiveDepthParticipation =
+            PointCloudDepthParticipation::WriteAndTest;
+        style.effectiveSurfaceStabilityMode =
+            style.uniformSurfaceStabilityMode;
     }
     return style;
+}
+
+bool PointCloudDepthPrepassWrites(const PointCloudStyleState& style) {
+    return style.depthPrepassEnabled &&
+           style.effectiveDepthParticipation ==
+               PointCloudDepthParticipation::WriteAndTest;
+}
+
+bool PointCloudDepthPrepassTests(const PointCloudStyleState& style) {
+    return style.depthPrepassEnabled &&
+           style.effectiveDepthParticipation !=
+               PointCloudDepthParticipation::Disabled;
+}
+
+float ResolvePointCloudSurfaceStabilityWeight(
+    PointCloudSurfaceStabilityMode mode,
+    std::uint32_t packedWeights,
+    float influence) {
+    std::uint32_t channel = 0U;
+    switch (mode) {
+        case PointCloudSurfaceStabilityMode::Original:
+        case PointCloudSurfaceStabilityMode::DrawAll:
+            return 1.0F;
+        case PointCloudSurfaceStabilityMode::DensityContinuity:
+            channel = 0U;
+            break;
+        case PointCloudSurfaceStabilityMode::PreferLower:
+            channel = 1U;
+            break;
+        case PointCloudSurfaceStabilityMode::PreferUpper:
+            channel = 2U;
+            break;
+        case PointCloudSurfaceStabilityMode::SoftSeparation:
+            channel = 3U;
+            break;
+    }
+    const float selected = static_cast<float>(
+        (packedWeights >> (channel * 8U)) & 0xffU) / 255.0F;
+    return std::lerp(
+        1.0F,
+        selected,
+        std::clamp(
+            std::isfinite(influence) ? influence : 1.0F,
+            0.0F,
+            1.0F));
 }
 
 bool PointCloudStyleUsesWorldSizedScreenSprites(const PointCloudStyleState& style) {
@@ -788,6 +894,18 @@ float WorldDiameterToScreenPointSizePixels(
            (2.0F * safeDepth);
 }
 
+PointCloudRendererMode ResolvePointCloudLayerRendererMode(
+    PointCloudRendererMode requestedMode,
+    bool generatedWaterOverlay,
+    const PointCloudStyleState& style) {
+    if (requestedMode == PointCloudRendererMode::FastBasic &&
+        generatedWaterOverlay &&
+        style.waterTrailOverlay) {
+        return PointCloudRendererMode::Beauty;
+    }
+    return requestedMode;
+}
+
 PointCloudStyleState MakeFastBasicPointCloudStyle(
     const PointCloudStyleState& sourceStyle,
     bool hasSourceRgb) {
@@ -814,6 +932,33 @@ PointCloudStyleState MakeFastBasicPointCloudStyle(
     style.waterTrailStyleGeometry = sourceStyle.waterTrailStyleGeometry;
     style.waterFlowActivity = sourceStyle.waterFlowActivity;
     style.waterFlowSpeedScale = sourceStyle.waterFlowSpeedScale;
+    // Fast Basic is explicitly opaque. Beauty-only transparency controls
+    // neither change its material nor add sorting/depth passes.
+    style.gpuBackToFrontSorting = false;
+    style.depthPrepassEnabled = false;
+    style.depthPrepassAlphaThreshold = sourceStyle.depthPrepassAlphaThreshold;
+    style.depthPrepassToleranceMeters = sourceStyle.depthPrepassToleranceMeters;
+    style.depthWeightStrength = 1.0F;
+    style.emissionResponse = PointCloudEmissionResponse::Accumulated;
+    style.normalCullEnabled = false;
+    style.normalCullStartDegrees = sourceStyle.normalCullStartDegrees;
+    style.normalCullEndDegrees = sourceStyle.normalCullEndDegrees;
+    // The linked overlap analysis is a geometry selection, not a Beauty
+    // material effect. Preserve it so Fast Basic can apply the same stable
+    // choice as fixed opaque point coverage in its vertex path.
+    style.surfaceStabilityPolicy = sourceStyle.surfaceStabilityPolicy;
+    style.uniformSurfaceStabilityMode =
+        sourceStyle.uniformSurfaceStabilityMode;
+    style.rockSurfaceStabilityMode =
+        sourceStyle.rockSurfaceStabilityMode;
+    style.sandSurfaceStabilityMode =
+        sourceStyle.sandSurfaceStabilityMode;
+    style.vegetationSurfaceStabilityMode =
+        sourceStyle.vegetationSurfaceStabilityMode;
+    style.effectiveSurfaceStabilityMode =
+        sourceStyle.effectiveSurfaceStabilityMode;
+    style.surfaceStabilityInfluence =
+        sourceStyle.surfaceStabilityInfluence;
     style.flowAnimation = false;
     style.waterPathView = false;
     style.waterTrailOverlay = false;
@@ -1053,6 +1198,12 @@ PointCloudMaterialVariant ResolvePointCloudMaterialVariant(
     PointCloudDensityCompensation densityCompensation,
     bool requiresUnifiedProceduralEffects) {
     if (requiresUnifiedProceduralEffects) {
+        return PointCloudMaterialVariant::Unified;
+    }
+    if (style.gpuBackToFrontSorting || style.depthPrepassEnabled ||
+        std::abs(style.depthWeightStrength - 1.0F) > kMaterialEpsilon ||
+        style.emissionResponse != PointCloudEmissionResponse::Accumulated ||
+        style.normalCullEnabled) {
         return PointCloudMaterialVariant::Unified;
     }
     densityCompensation = SanitizePointCloudDensityCompensation(densityCompensation);

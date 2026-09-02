@@ -102,6 +102,11 @@ TEST_CASE(
         TimingColouriseEffectParameter::PalettePhase,
         std::nullopt,
         TimingColouriseEffectParameter::AmountOverride));
+    CHECK(VisualFeatureTimelineKeysCanSnap(
+        std::nullopt,
+        TimingColouriseEffectParameter::BlendMix,
+        std::nullopt,
+        TimingColouriseEffectParameter::PalettePhase));
     CHECK(VisualFeatureTimelineSnapDomainsCanSnap(
         VisualFeatureTimelineSnapDomain::Palette,
         VisualFeatureTimelineSnapDomain::Palette));
@@ -3581,7 +3586,7 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "Timing Colourise keyed reversal authors only stop positions",
+    "Timing Colourise keyed reversal authors a complete palette snapshot",
     "[timing][colourise][palette][reverse][parameters]") {
     TimingColouriseEffect effect;
     effect.basePalette = invisible_places::timing::
@@ -3630,7 +3635,7 @@ TEST_CASE(
             &effect,
             0.4F));
     CHECK_FALSE(effect.paletteEdited);
-    CHECK(effect.paletteStopParameterKeys.size() == propertyKeyCount + 1U);
+    CHECK(effect.paletteStopParameterKeys.size() == propertyKeyCount + 5U);
     CHECK(
         invisible_places::timing::
             TimingColourisePaletteStopParameterKeyCountAtPosition(
@@ -3697,13 +3702,13 @@ TEST_CASE(
     CHECK(positionsById(before, "cool") == Approx(0.2F));
     CHECK(positionsById(after, "cool") == Approx(0.2F));
 
-    // A second flip at the same animation position updates those position
-    // keys in place, while the independent colour and amount keys survive.
+    // A second flip at the same animation position updates the complete
+    // snapshot in place, while keys at other times survive.
     REQUIRE(
         invisible_places::timing::ReverseTimingColourisePaletteAtPosition(
             &effect,
             0.4F));
-    CHECK(effect.paletteStopParameterKeys.size() == propertyKeyCount + 1U);
+    CHECK(effect.paletteStopParameterKeys.size() == propertyKeyCount + 5U);
     const auto restored =
         invisible_places::timing::EvaluateTimingColourisePalette(
             effect,
@@ -4025,8 +4030,11 @@ TEST_CASE(
     };
     CHECK(positionKeyCount() == 15U);
 
-    // Colour remains independent: marker navigation ignores its time and the
-    // grouped X operation removes Positions without deleting it.
+    CHECK(effect.paletteStopParameterKeys.size() == 45U);
+
+    // Low-level independent keys from older documents remain supported.
+    // Marker navigation ignores their time, while deleting a complete
+    // snapshot removes all three properties for all five stops at that time.
     REQUIRE(
         invisible_places::timing::
             AddOrUpdateTimingColourisePaletteStopColourKey(
@@ -4053,8 +4061,9 @@ TEST_CASE(
         invisible_places::timing::
             RemoveTimingColourisePaletteMarkerKeysAtPosition(
                 &effect,
-                0.5F) == 5U);
+                0.5F) == 15U);
     CHECK(positionKeyCount() == 10U);
+    CHECK(effect.paletteStopParameterKeys.size() == 31U);
     CHECK(
         invisible_places::timing::
             TimingColourisePaletteStopParameterKeyCountAtPosition(
@@ -4099,6 +4108,140 @@ TEST_CASE(
                 &legacy,
                 0.4F) == 1U);
     CHECK(legacy.paletteStopParameterKeys.size() == 1U);
+}
+
+TEST_CASE(
+    "Timing Colourise palette snapshots interpolate every marker property",
+    "[timing][colourise][palette][parameters][snapshot]") {
+    const auto stopById = [](
+                              const TimingColourisePalette& palette,
+                              std::string_view id)
+        -> const TimingColourisePaletteStop& {
+        const auto stop = std::find_if(
+            palette.stops.begin(),
+            palette.stops.end(),
+            [&](const auto& candidate) { return candidate.id == id; });
+        REQUIRE(stop != palette.stops.end());
+        return *stop;
+    };
+
+    SECTION("a later colour edit captures all stops and interpolates") {
+        TimingColouriseEffect effect;
+        effect.basePalette = invisible_places::timing::
+            SanitizeTimingColourisePalette({
+                .stops = {
+                    {.id = "sand",
+                     .position = 0.2F,
+                     .colour = {0.2F, 0.3F, 0.4F},
+                     .colouriseAmount = 0.35F},
+                    {.id = "rock",
+                     .position = 0.8F,
+                     .colour = {0.6F, 0.5F, 0.4F},
+                     .colouriseAmount = 0.75F},
+                },
+            });
+        REQUIRE(invisible_places::timing::
+                    AddOrUpdateTimingColourisePaletteMarkerKeys(
+                        &effect,
+                        0.2F,
+                        effect.basePalette));
+
+        auto later = invisible_places::timing::
+            EvaluateTimingColourisePalette(effect, 0.8F);
+        const auto laterSand = std::find_if(
+            later.stops.begin(),
+            later.stops.end(),
+            [](const auto& stop) { return stop.id == "sand"; });
+        REQUIRE(laterSand != later.stops.end());
+        laterSand->colour = {0.8F, 0.7F, 0.6F};
+        REQUIRE(invisible_places::timing::
+                    AddOrUpdateTimingColourisePaletteMarkerKeys(
+                        &effect,
+                        0.8F,
+                        later));
+
+        CHECK(effect.paletteStopParameterKeys.size() == 12U);
+        for (const auto parameter : {
+                 TimingColourisePaletteStopParameter::Position,
+                 TimingColourisePaletteStopParameter::Colour,
+                 TimingColourisePaletteStopParameter::ColouriseAmount}) {
+            CHECK(invisible_places::timing::
+                      TimingColourisePaletteStopParameterKeyCountAtPosition(
+                          effect,
+                          "sand",
+                          parameter,
+                          0.2F) == 1U);
+            CHECK(invisible_places::timing::
+                      TimingColourisePaletteStopParameterKeyCountAtPosition(
+                          effect,
+                          "rock",
+                          parameter,
+                          0.8F) == 1U);
+        }
+
+        const auto midway = invisible_places::timing::
+            EvaluateTimingColourisePalette(effect, 0.5F);
+        const auto& midwaySand = stopById(midway, "sand");
+        CHECK(midwaySand.colour[0] == Approx(0.5F));
+        CHECK(midwaySand.colour[1] == Approx(0.5F));
+        CHECK(midwaySand.colour[2] == Approx(0.5F));
+        CHECK(midwaySand.position == Approx(0.2F));
+        CHECK(midwaySand.colouriseAmount == Approx(0.35F));
+        const std::array<float, 3> expectedRockColour{0.6F, 0.5F, 0.4F};
+        CHECK(stopById(midway, "rock").colour == expectedRockColour);
+    }
+
+    SECTION("an old position-only snapshot is completed before a new colour") {
+        TimingColouriseEffect effect;
+        effect.basePalette = invisible_places::timing::
+            SanitizeTimingColourisePalette({
+                .stops = {{.id = "legacy-stop",
+                           .position = 0.1F,
+                           .colour = {0.1F, 0.2F, 0.3F},
+                           .colouriseAmount = 0.4F}},
+            });
+        REQUIRE(invisible_places::timing::
+                    AddOrUpdateTimingColourisePaletteStopScalarKey(
+                        &effect,
+                        "legacy-stop",
+                        TimingColourisePaletteStopParameter::Position,
+                        0.2F,
+                        0.3F,
+                        WaterScenarioInterpolation::Linear));
+
+        auto later = invisible_places::timing::
+            EvaluateTimingColourisePalette(effect, 0.8F);
+        later.stops.front().colour = {0.9F, 0.6F, 0.3F};
+        REQUIRE(invisible_places::timing::
+                    AddOrUpdateTimingColourisePaletteMarkerKeys(
+                        &effect,
+                        0.8F,
+                        later));
+
+        CHECK(effect.paletteStopParameterKeys.size() == 6U);
+        CHECK(invisible_places::timing::
+                  TimingColourisePaletteStopParameterKeyCountAtPosition(
+                      effect,
+                      "legacy-stop",
+                      TimingColourisePaletteStopParameter::Colour,
+                      0.2F) == 1U);
+        CHECK(invisible_places::timing::
+                  TimingColourisePaletteStopParameterKeyCountAtPosition(
+                      effect,
+                      "legacy-stop",
+                      TimingColourisePaletteStopParameter::ColouriseAmount,
+                      0.2F) == 1U);
+
+        const auto earlier = invisible_places::timing::
+            EvaluateTimingColourisePalette(effect, 0.2F);
+        const std::array<float, 3> expectedEarlierColour{0.1F, 0.2F, 0.3F};
+        CHECK(earlier.stops.front().colour == expectedEarlierColour);
+        const auto midway = invisible_places::timing::
+            EvaluateTimingColourisePalette(effect, 0.5F);
+        CHECK(midway.stops.front().colour[0] == Approx(0.5F));
+        CHECK(midway.stops.front().colour[1] == Approx(0.4F));
+        CHECK(midway.stops.front().colour[2] == Approx(0.3F));
+    }
 }
 
 TEST_CASE(
@@ -4512,6 +4655,22 @@ TEST_CASE(
                    key.scalarValue == 0.5F;
         }));
     CHECK(middlePositionKeys == 2U);
+    CHECK(std::count_if(
+              effect.paletteStopParameterKeys.begin(),
+              effect.paletteStopParameterKeys.end(),
+              [](const auto& key) {
+                  return key.stopId == "middle" &&
+                         key.parameter ==
+                             TimingColourisePaletteStopParameter::Colour;
+              }) == 2);
+    CHECK(std::count_if(
+              effect.paletteStopParameterKeys.begin(),
+              effect.paletteStopParameterKeys.end(),
+              [](const auto& key) {
+                  return key.stopId == "middle" &&
+                         key.parameter == TimingColourisePaletteStopParameter::
+                                              ColouriseAmount;
+              }) == 2);
 
     REQUIRE(
         invisible_places::timing::
@@ -9482,13 +9641,14 @@ TEST_CASE(
 
     const std::array<float, 3> base{0.3F, 0.6F, 0.9F};
     const std::array<float, 3> wash{0.8F, 0.5F, 0.2F};
-    constexpr std::array<TimingColouriseBlendMode, 6> kModes = {
+    constexpr std::array<TimingColouriseBlendMode, 7> kModes = {
         TimingColouriseBlendMode::Normal,
         TimingColouriseBlendMode::Multiply,
         TimingColouriseBlendMode::Screen,
         TimingColouriseBlendMode::Add,
         TimingColouriseBlendMode::Divide,
         TimingColouriseBlendMode::VividLight,
+        TimingColouriseBlendMode::ColorBurn,
     };
 
     SECTION("zero amount leaves the base untouched in every mode") {
@@ -9608,6 +9768,26 @@ TEST_CASE(
             CHECK(dodged[channel] > 1.0F);
         }
     }
+
+    SECTION("Color Burn keeps white neutral and darkens with lower washes") {
+        const auto identity = ApplyTimingColouriseBlendStep(
+            TimingColouriseBlendMode::ColorBurn,
+            base,
+            {1.0F, 1.0F, 1.0F},
+            1.0F);
+        const auto burned = ApplyTimingColouriseBlendStep(
+            TimingColouriseBlendMode::ColorBurn,
+            base,
+            {0.5F, 0.5F, 0.5F},
+            1.0F);
+        for (std::size_t channel = 0; channel < 3; ++channel) {
+            CHECK(identity[channel] == Approx(base[channel]));
+            CHECK(burned[channel] <= base[channel]);
+            CHECK(
+                burned[channel] ==
+                Approx(2.0F * base[channel] - 1.0F));
+        }
+    }
 }
 
 TEST_CASE(
@@ -9627,13 +9807,14 @@ TEST_CASE(
         lcgState = lcgState * 1664525U + 1013904223U;
         return static_cast<float>((lcgState >> 8U) & 0xFFFFU) / 65535.0F;
     };
-    constexpr std::array<TimingColouriseBlendMode, 6> kModes = {
+    constexpr std::array<TimingColouriseBlendMode, 7> kModes = {
         TimingColouriseBlendMode::Normal,
         TimingColouriseBlendMode::Multiply,
         TimingColouriseBlendMode::Screen,
         TimingColouriseBlendMode::Add,
         TimingColouriseBlendMode::Divide,
         TimingColouriseBlendMode::VividLight,
+        TimingColouriseBlendMode::ColorBurn,
     };
 
     for (int trial = 0; trial < 64; ++trial) {
@@ -9647,7 +9828,7 @@ TEST_CASE(
         for (int step = 0; step < 5; ++step) {
             const auto mode = kModes
                 [static_cast<std::size_t>(
-                     nextUnit() * 5.99F) %
+                     nextUnit() * 6.99F) %
                  kModes.size()];
             const std::array<float, 3> wash{
                 nextUnit(),
@@ -9674,4 +9855,108 @@ TEST_CASE(
                 Approx(sequential[channel]).margin(1.0e-3));
         }
     }
+}
+
+TEST_CASE(
+    "Colourise blend composition crossfades or applies the second mode after",
+    "[timing][colourise][blend][composition]") {
+    using invisible_places::renderer::pointcloud::
+        ApplyTimingColouriseBlendStep;
+    using invisible_places::renderer::pointcloud::
+        ComposeTimingColouriseBlendStep;
+    using invisible_places::renderer::pointcloud::
+        TimingColouriseBlendCompositionMode;
+    using invisible_places::renderer::pointcloud::TimingColouriseBlendMode;
+
+    const std::array<float, 3> base{0.3F, 0.6F, 0.9F};
+    const std::array<float, 3> wash{0.8F, 0.5F, 0.2F};
+    constexpr float amount = 0.6F;
+    constexpr float blendMix = 0.25F;
+
+    const auto primaryFull = ApplyTimingColouriseBlendStep(
+        TimingColouriseBlendMode::Multiply, base, wash, 1.0F);
+    const auto secondaryFull = ApplyTimingColouriseBlendStep(
+        TimingColouriseBlendMode::Screen, base, wash, 1.0F);
+    const auto crossfaded = ApplyTimingColouriseBlendStep(
+        TimingColouriseBlendMode::Multiply,
+        TimingColouriseBlendMode::Screen,
+        TimingColouriseBlendCompositionMode::Crossfade,
+        blendMix,
+        base,
+        wash,
+        amount);
+    for (std::size_t channel = 0U; channel < 3U; ++channel) {
+        const float mixedModes = std::lerp(
+            primaryFull[channel], secondaryFull[channel], blendMix);
+        CHECK(crossfaded[channel] == Approx(std::lerp(
+            base[channel], mixedModes, amount)));
+    }
+
+    const auto primaryApplied = ApplyTimingColouriseBlendStep(
+        TimingColouriseBlendMode::Multiply, base, wash, amount);
+    const auto expectedAfter = ApplyTimingColouriseBlendStep(
+        TimingColouriseBlendMode::Screen,
+        primaryApplied,
+        wash,
+        amount * blendMix);
+    const auto appliedAfter = ApplyTimingColouriseBlendStep(
+        TimingColouriseBlendMode::Multiply,
+        TimingColouriseBlendMode::Screen,
+        TimingColouriseBlendCompositionMode::ApplyAfter,
+        blendMix,
+        base,
+        wash,
+        amount);
+    for (std::size_t channel = 0U; channel < 3U; ++channel) {
+        CHECK(appliedAfter[channel] == Approx(expectedAfter[channel]));
+    }
+
+    std::array<float, 3> scale{1.0F, 1.0F, 1.0F};
+    std::array<float, 3> offset{0.0F, 0.0F, 0.0F};
+    ComposeTimingColouriseBlendStep(
+        TimingColouriseBlendMode::Multiply,
+        TimingColouriseBlendMode::Screen,
+        TimingColouriseBlendCompositionMode::ApplyAfter,
+        blendMix,
+        wash,
+        amount,
+        &scale,
+        &offset);
+    for (std::size_t channel = 0U; channel < 3U; ++channel) {
+        CHECK(
+            base[channel] * scale[channel] + offset[channel] ==
+            Approx(appliedAfter[channel]));
+    }
+}
+
+TEST_CASE(
+    "Blend Mix is a sanitized animatable Visual Feature parameter",
+    "[timing][colourise][blend][animation]") {
+    using invisible_places::timing::
+        EvaluateTimingColouriseEffectParameter;
+    using invisible_places::timing::SanitizeTimingColouriseEffect;
+    using invisible_places::timing::TimingColouriseEffect;
+    using invisible_places::timing::TimingColouriseEffectParameter;
+
+    TimingColouriseEffect effect;
+    effect.blendMix = 2.0F;
+    effect.effectParameterKeys = {
+        {.parameter = TimingColouriseEffectParameter::BlendMix,
+         .position = 0.0F,
+         .value = -1.0F},
+        {.parameter = TimingColouriseEffectParameter::BlendMix,
+         .position = 1.0F,
+         .value = 2.0F},
+    };
+    effect = SanitizeTimingColouriseEffect(std::move(effect));
+    CHECK(effect.blendMix == Approx(1.0F));
+    REQUIRE(effect.effectParameterKeys.size() == 2U);
+    CHECK(effect.effectParameterKeys.front().value == Approx(0.0F));
+    CHECK(effect.effectParameterKeys.back().value == Approx(1.0F));
+    CHECK(
+        EvaluateTimingColouriseEffectParameter(
+            effect,
+            TimingColouriseEffectParameter::BlendMix,
+            0.5F,
+            false) == Approx(0.5F));
 }

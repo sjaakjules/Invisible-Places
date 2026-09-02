@@ -3295,6 +3295,69 @@ TEST_CASE("Animation selected point visual round-trips and legacy files preserve
   CHECK(loadedLegacy->selectedPointVisualName.empty());
 }
 
+TEST_CASE("Animation automatic near plane round-trips and overrides the shot lens constantly",
+          "[animation][serialization][near-plane]") {
+  using invisible_places::camera::AnimationPath;
+  using invisible_places::camera::AnimationPathKey;
+  using invisible_places::camera::EvaluatePreparedAnimationPath;
+  using invisible_places::camera::PrepareAnimationPathEvaluation;
+  using invisible_places::serialization::AnimationPathFromJson;
+  using invisible_places::serialization::AnimationPathToJson;
+
+  AnimationPath path;
+  path.durationFrames = 90U;
+  path.automaticNearPlaneEnabled = true;
+  path.automaticNearPlanePaddingMeters = 0.035F;
+  path.automaticNearPlaneMinimumMeters = 0.00075F;
+  path.automaticNearPlaneResolvedMeters = 0.125F;
+  AnimationPathKey first;
+  first.id = "first";
+  first.cameraPosition = {0.0F, 0.0F, 2.0F};
+  first.focusPoint = {0.0F, 0.0F, 0.0F};
+  first.nearPlane = 0.01F;
+  first.farPlane = 100.0F;
+  first.durationFrames = 90U;
+  auto second = first;
+  second.id = "second";
+  second.cameraPosition = {1.0F, 0.0F, 2.0F};
+  second.nearPlane = 0.25F;
+  path.keys = {first, second};
+
+  const auto json = AnimationPathToJson(path);
+  REQUIRE(json.contains("automatic_near_plane"));
+  CHECK(json.at("automatic_near_plane").at("enabled") == true);
+  CHECK(json.at("automatic_near_plane").at("resolved_m") ==
+        Catch::Approx(0.125F));
+
+  std::string error;
+  const auto loaded = AnimationPathFromJson(json, &error);
+  INFO(error);
+  REQUIRE(loaded.has_value());
+  CHECK(loaded->automaticNearPlaneEnabled);
+  CHECK(loaded->automaticNearPlanePaddingMeters == Catch::Approx(0.035F));
+  CHECK(loaded->automaticNearPlaneMinimumMeters == Catch::Approx(0.00075F));
+  CHECK(loaded->automaticNearPlaneResolvedMeters == Catch::Approx(0.125F));
+
+  const auto prepared = PrepareAnimationPathEvaluation(*loaded);
+  REQUIRE(prepared.valid);
+  const auto start = EvaluatePreparedAnimationPath(prepared, 0.0F);
+  const auto end = EvaluatePreparedAnimationPath(
+      prepared,
+      prepared.durationSeconds);
+  CHECK(start.camera.nearPlane == Catch::Approx(0.125F));
+  CHECK(end.camera.nearPlane == Catch::Approx(0.125F));
+
+  auto disabled = *loaded;
+  disabled.automaticNearPlaneEnabled = false;
+  const auto disabledPrepared = PrepareAnimationPathEvaluation(disabled);
+  CHECK(EvaluatePreparedAnimationPath(disabledPrepared, 0.0F)
+            .camera.nearPlane == Catch::Approx(0.01F));
+  CHECK(EvaluatePreparedAnimationPath(
+            disabledPrepared,
+            disabledPrepared.durationSeconds)
+            .camera.nearPlane == Catch::Approx(0.25F));
+}
+
 TEST_CASE("Animation velocity blend metadata and localized corrections round-trip",
           "[animation][serialization][velocity-blend]") {
   using invisible_places::camera::AnimationLocalizedKeyCorrection;
@@ -4662,21 +4725,24 @@ TEST_CASE("Colourise blend modes round-trip and stay omitted at Normal",
   using invisible_places::serialization::LoadProjectDocument;
   using invisible_places::serialization::ProjectDocument;
   using invisible_places::serialization::SaveProjectDocument;
+  using invisible_places::timing::TimingColouriseBlendCompositionMode;
   using invisible_places::timing::TimingColouriseBlendMode;
   using invisible_places::timing::TimingColouriseEffect;
+  using invisible_places::timing::TimingColouriseEffectParameter;
   using invisible_places::timing::TimingColouriseFieldVisualMemory;
   using invisible_places::timing::TimingTakeSceneState;
 
   ProjectDocument document;
   document.projectName = "blend-modes";
   TimingTakeSceneState state;
-  const std::array<TimingColouriseBlendMode, 6> modes = {
+  const std::array<TimingColouriseBlendMode, 7> modes = {
       TimingColouriseBlendMode::Normal,
       TimingColouriseBlendMode::Multiply,
       TimingColouriseBlendMode::Screen,
       TimingColouriseBlendMode::Add,
       TimingColouriseBlendMode::Divide,
       TimingColouriseBlendMode::VividLight,
+      TimingColouriseBlendMode::ColorBurn,
   };
   for (std::size_t index = 0; index < modes.size(); ++index) {
     TimingColouriseEffect effect;
@@ -4686,8 +4752,22 @@ TEST_CASE("Colourise blend modes round-trip and stay omitted at Normal",
   }
   TimingColouriseFieldVisualMemory memory;
   memory.selector.scalarFieldName = "Curvature";
-  memory.blendMode = TimingColouriseBlendMode::Divide;
+  memory.blendMode = TimingColouriseBlendMode::ColorBurn;
+  memory.secondaryBlendMode = TimingColouriseBlendMode::Screen;
+  memory.blendCompositionMode =
+      TimingColouriseBlendCompositionMode::ApplyAfter;
+  memory.blendMix = 0.4F;
   state.colouriseEffects.front().fieldVisualMemory = {memory};
+  state.colouriseEffects.at(2).secondaryBlendMode =
+      TimingColouriseBlendMode::ColorBurn;
+  state.colouriseEffects.at(2).blendCompositionMode =
+      TimingColouriseBlendCompositionMode::Crossfade;
+  state.colouriseEffects.at(2).blendMix = 0.25F;
+  state.colouriseEffects.at(2).effectParameterKeys.push_back({
+      .parameter = TimingColouriseEffectParameter::BlendMix,
+      .position = 0.5F,
+      .value = 0.75F,
+  });
   document.timingTakeStates = {state};
 
   TemporaryProjectFile file{"invisible_places_blend_modes.json"};
@@ -4703,7 +4783,21 @@ TEST_CASE("Colourise blend modes round-trip and stay omitted at Normal",
   }
   REQUIRE(effects.front().fieldVisualMemory.size() == 1U);
   CHECK(effects.front().fieldVisualMemory.front().blendMode ==
-        TimingColouriseBlendMode::Divide);
+        TimingColouriseBlendMode::ColorBurn);
+  CHECK(effects.front().fieldVisualMemory.front().secondaryBlendMode ==
+        TimingColouriseBlendMode::Screen);
+  CHECK(effects.front().fieldVisualMemory.front().blendCompositionMode ==
+        TimingColouriseBlendCompositionMode::ApplyAfter);
+  CHECK(effects.front().fieldVisualMemory.front().blendMix ==
+        Catch::Approx(0.4F));
+  CHECK(effects.at(2).secondaryBlendMode ==
+        TimingColouriseBlendMode::ColorBurn);
+  CHECK(effects.at(2).blendCompositionMode ==
+        TimingColouriseBlendCompositionMode::Crossfade);
+  CHECK(effects.at(2).blendMix == Catch::Approx(0.25F));
+  REQUIRE(effects.at(2).effectParameterKeys.size() == 1U);
+  CHECK(effects.at(2).effectParameterKeys.front().parameter ==
+        TimingColouriseEffectParameter::BlendMix);
 
   // Normal is the omitted default; unknown names fall back to it rather
   // than failing the load.
@@ -4713,10 +4807,25 @@ TEST_CASE("Colourise blend modes round-trip and stay omitted at Normal",
   savedInput.close();
   auto& stateJson = savedJson["timing_take_states"][0];
   CHECK_FALSE(stateJson["timing_effects"][0].contains("blend_mode"));
+  CHECK_FALSE(
+      stateJson["timing_effects"][0].contains("secondary_blend_mode"));
+  CHECK_FALSE(
+      stateJson["timing_effects"][0].contains("blend_composition"));
+  CHECK_FALSE(stateJson["timing_effects"][0].contains("blend_mix"));
   CHECK(stateJson["timing_effects"][1]["blend_mode"] == "multiply");
+  CHECK(stateJson["timing_effects"][2]["secondary_blend_mode"] ==
+        "color_burn");
+  CHECK(stateJson["timing_effects"][2]["blend_composition"] ==
+        "crossfade");
+  CHECK(stateJson["timing_effects"][2]["blend_mix"].get<float>() ==
+        Catch::Approx(0.25F));
+  CHECK(stateJson["timing_effects"][2]["effect_parameter_keys"][0]
+            ["parameter"] == "blend_mix");
   CHECK(stateJson["timing_effects"][4]["blend_mode"] == "divide");
   CHECK(stateJson["timing_effects"][5]["blend_mode"] == "vivid_light");
+  CHECK(stateJson["timing_effects"][6]["blend_mode"] == "color_burn");
   stateJson["timing_effects"][1]["blend_mode"] = "hard_mix";
+  stateJson["timing_effects"][2]["blend_composition"] = "parallel";
   {
     std::ofstream rewrite{file.path};
     REQUIRE(rewrite.is_open());
@@ -4727,6 +4836,10 @@ TEST_CASE("Colourise blend modes round-trip and stay omitted at Normal",
   REQUIRE(reloaded.has_value());
   CHECK(reloaded->timingTakeStates.at(0).colouriseEffects.at(1).blendMode ==
         TimingColouriseBlendMode::Normal);
+  CHECK(reloaded->timingTakeStates.at(0)
+            .colouriseEffects.at(2)
+            .blendCompositionMode ==
+        TimingColouriseBlendCompositionMode::PrimaryOnly);
 }
 
 TEST_CASE("Palette skew warp state round-trips and legacy sides fold",
@@ -5433,7 +5546,8 @@ TEST_CASE("Fade mode memories round-trip as independent tracks",
   const auto savedJson = nlohmann::json::parse(savedInput);
   const auto& savedEffect =
       savedJson["timing_take_states"][0]["timing_effects"][0];
-  CHECK(savedJson["schema_version"] == 90U);
+  CHECK(savedJson["schema_version"] ==
+        invisible_places::serialization::kProjectDocumentSchemaVersion);
   REQUIRE(savedEffect["edge_fade_mode_memories"].size() == 2U);
   CHECK(savedEffect["edge_fade_mode_memories"][0]["mode"] ==
         "relative_linked");

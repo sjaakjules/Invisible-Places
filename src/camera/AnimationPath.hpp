@@ -185,7 +185,7 @@ struct AnimationLinkedSeamSample {
 struct AnimationPath {
     // Original file schema retained only for application-level migration
     // bookkeeping. Serialization always writes the current schema.
-    std::uint32_t sourceSchemaVersion = 26U;
+    std::uint32_t sourceSchemaVersion = 27U;
     std::string name = "Animation";
     std::uint32_t durationFrames = 180;
     // Deprecated schema-22 migration marker. A nonzero value identifies the
@@ -202,6 +202,13 @@ struct AnimationPath {
     bool depthOfFieldEnabled = false;
     float apertureFStops = 8.0F;
     float depthOfFieldMaxBlurPixels = 24.0F;
+    // One conservative clipping plane analysed over the complete shot. A
+    // constant value avoids frame-to-frame pumping while still recovering
+    // depth-buffer precision from large unused space in front of the camera.
+    bool automaticNearPlaneEnabled = false;
+    float automaticNearPlanePaddingMeters = 0.02F;
+    float automaticNearPlaneMinimumMeters = 0.0005F;
+    float automaticNearPlaneResolvedMeters = 0.0F;
     AnimationExportSettings exportSettings{};
     // Advisory A/B editing preference, independent of reciprocal velocity
     // linkage. Filename-only storage keeps animation files portable when the
@@ -270,6 +277,8 @@ struct PreparedAnimationPathEvaluationContext {
     bool depthOfFieldEnabled = false;
     float apertureFStops = 8.0F;
     float depthOfFieldMaxBlurPixels = 24.0F;
+    bool automaticNearPlaneEnabled = false;
+    float automaticNearPlaneResolvedMeters = 0.0F;
     bool hasOrientation = false;
     bool hasFocusDistance = false;
     bool hasApertureFStops = false;
@@ -324,6 +333,18 @@ struct AnimationPathMotionStats {
     float averageTargetSpeed = 0.0F;
     float currentCameraSpeed = 0.0F;
     float currentTargetSpeed = 0.0F;
+};
+
+// A time-interval average used by temporally stable point transparency
+// sorting. Direction is camera-forward in world space; near/far cover every
+// sampled camera so a locked sort does not inherit one arbitrary frame's
+// clipping range.
+struct AnimationPathViewAverage {
+    bool valid = false;
+    std::array<float, 3> cameraPosition{0.0F, 0.0F, 0.0F};
+    std::array<float, 3> viewDirection{0.0F, 0.0F, -1.0F};
+    float nearPlane = 0.01F;
+    float farPlane = 1000.0F;
 };
 
 struct AnimationPerceivedFlowSample {
@@ -1022,6 +1043,11 @@ ResolveAnimationReciprocalLoopAlternatingMember(
     const PreparedAnimationPathEvaluationContext& context,
     float normalizedTime,
     std::uint32_t sampleCount = 240U);
+[[nodiscard]] AnimationPathViewAverage AveragePreparedAnimationPathView(
+    const PreparedAnimationPathEvaluationContext& context,
+    float startTimeSeconds,
+    float endTimeSeconds,
+    std::uint32_t sampleCount = 65U);
 [[nodiscard]] std::uint32_t AnimationDurationFramesForAverageSpeed(
     const AnimationPath& path,
     AnimationPathMotionTarget target,

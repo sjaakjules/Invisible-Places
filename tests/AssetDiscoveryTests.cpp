@@ -2905,6 +2905,36 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     pointStyle.featherPower = 2.25F;
     pointStyle.waterStreakAspect = 7.5F;
     pointStyle.solidCenters = false;
+    pointStyle.gpuBackToFrontSorting = true;
+    pointStyle.gpuSortMode = invisible_places::renderer::pointcloud::
+        PointCloudGpuSortMode::FixedVertical;
+    pointStyle.gpuSortWindowSeconds = 2.75F;
+    pointStyle.depthPrepassEnabled = true;
+    pointStyle.depthPrepassAlphaThreshold = 0.62F;
+    pointStyle.depthPrepassToleranceMeters = 0.075F;
+    pointStyle.depthWeightStrength = 5.25F;
+    pointStyle.depthRolePolicy = invisible_places::renderer::pointcloud::
+        PointCloudDepthRolePolicy::Custom;
+    pointStyle.rockDepthParticipation = invisible_places::renderer::pointcloud::
+        PointCloudDepthParticipation::WriteAndTest;
+    pointStyle.sandDepthParticipation = invisible_places::renderer::pointcloud::
+        PointCloudDepthParticipation::TestOnly;
+    pointStyle.vegetationDepthParticipation = invisible_places::renderer::pointcloud::
+        PointCloudDepthParticipation::Disabled;
+    pointStyle.surfaceStabilityPolicy = invisible_places::renderer::pointcloud::
+        PointCloudSurfaceStabilityPolicy::Custom;
+    pointStyle.rockSurfaceStabilityMode = invisible_places::renderer::pointcloud::
+        PointCloudSurfaceStabilityMode::SoftSeparation;
+    pointStyle.sandSurfaceStabilityMode = invisible_places::renderer::pointcloud::
+        PointCloudSurfaceStabilityMode::DensityContinuity;
+    pointStyle.vegetationSurfaceStabilityMode = invisible_places::renderer::pointcloud::
+        PointCloudSurfaceStabilityMode::DrawAll;
+    pointStyle.surfaceStabilityInfluence = 0.72F;
+    pointStyle.emissionResponse = invisible_places::renderer::pointcloud::
+        PointCloudEmissionResponse::Saturated;
+    pointStyle.normalCullEnabled = true;
+    pointStyle.normalCullStartDegrees = 68.0F;
+    pointStyle.normalCullEndDegrees = 122.0F;
     pointStyle.flowAnimation = true;
     pointStyle.waterTrailOverlay = true;
     invisible_places::style::ConfigureFieldMapFromStats(
@@ -2984,6 +3014,14 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
         CHECK(savedJson.find("\"blend_mode\"") != std::string::npos);
         CHECK(savedJson.find("\"active\"") != std::string::npos);
         CHECK(savedJson.find("\"solid_centers\"") != std::string::npos);
+        CHECK(savedJson.find("\"gpu_back_to_front_sorting\"") != std::string::npos);
+        CHECK(savedJson.find("\"fixed_vertical\"") != std::string::npos);
+        CHECK(savedJson.find("\"saturated\"") != std::string::npos);
+        CHECK(savedJson.find("\"normal_cull_enabled\"") != std::string::npos);
+        CHECK(savedJson.find("\"depth_prepass_enabled\"") != std::string::npos);
+        CHECK(savedJson.find("\"depth_prepass_alpha_threshold\"") != std::string::npos);
+        CHECK(savedJson.find("\"depth_prepass_tolerance_meters\"") != std::string::npos);
+        CHECK(savedJson.find("\"depth_weight_strength\"") != std::string::npos);
         CHECK(savedJson.find("\"stylisation_mode\"") != std::string::npos);
         CHECK(savedJson.find("\"pigment_animation_speed\"") != std::string::npos);
         CHECK(savedJson.find("\"brush_particles\"") != std::string::npos);
@@ -3453,6 +3491,56 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     CHECK(loadedVisual.style.featherPower == Catch::Approx(2.25F));
     CHECK(loadedVisual.style.waterStreakAspect == Catch::Approx(7.5F));
     CHECK(!loadedVisual.style.solidCenters);
+    CHECK(loadedVisual.style.gpuBackToFrontSorting);
+    CHECK(
+        loadedVisual.style.gpuSortMode ==
+        invisible_places::renderer::pointcloud::
+            PointCloudGpuSortMode::FixedVertical);
+    CHECK(loadedVisual.style.gpuSortWindowSeconds == Catch::Approx(2.75F));
+    CHECK(loadedVisual.style.depthPrepassEnabled);
+    CHECK(loadedVisual.style.depthPrepassAlphaThreshold == Catch::Approx(0.62F));
+    CHECK(loadedVisual.style.depthPrepassToleranceMeters == Catch::Approx(0.075F));
+    CHECK(loadedVisual.style.depthWeightStrength == Catch::Approx(5.25F));
+    CHECK(
+        loadedVisual.style.depthRolePolicy ==
+        invisible_places::renderer::pointcloud::
+            PointCloudDepthRolePolicy::Custom);
+    CHECK(
+        loadedVisual.style.rockDepthParticipation ==
+        invisible_places::renderer::pointcloud::
+            PointCloudDepthParticipation::WriteAndTest);
+    CHECK(
+        loadedVisual.style.sandDepthParticipation ==
+        invisible_places::renderer::pointcloud::
+            PointCloudDepthParticipation::TestOnly);
+    CHECK(
+        loadedVisual.style.vegetationDepthParticipation ==
+        invisible_places::renderer::pointcloud::
+            PointCloudDepthParticipation::Disabled);
+    CHECK(
+        loadedVisual.style.surfaceStabilityPolicy ==
+        invisible_places::renderer::pointcloud::
+            PointCloudSurfaceStabilityPolicy::Custom);
+    CHECK(
+        loadedVisual.style.rockSurfaceStabilityMode ==
+        invisible_places::renderer::pointcloud::
+            PointCloudSurfaceStabilityMode::SoftSeparation);
+    CHECK(
+        loadedVisual.style.sandSurfaceStabilityMode ==
+        invisible_places::renderer::pointcloud::
+            PointCloudSurfaceStabilityMode::DensityContinuity);
+    CHECK(
+        loadedVisual.style.vegetationSurfaceStabilityMode ==
+        invisible_places::renderer::pointcloud::
+            PointCloudSurfaceStabilityMode::DrawAll);
+    CHECK(loadedVisual.style.surfaceStabilityInfluence == Catch::Approx(0.72F));
+    CHECK(
+        loadedVisual.style.emissionResponse ==
+        invisible_places::renderer::pointcloud::
+            PointCloudEmissionResponse::Saturated);
+    CHECK(loadedVisual.style.normalCullEnabled);
+    CHECK(loadedVisual.style.normalCullStartDegrees == Catch::Approx(68.0F));
+    CHECK(loadedVisual.style.normalCullEndDegrees == Catch::Approx(122.0F));
     CHECK(loadedVisual.style.flowAnimation);
     CHECK(loadedVisual.style.waterTrailOverlay);
     CHECK(loadedVisual.style.pointSize.fieldMap.fieldSlot == 2);
@@ -14788,6 +14876,23 @@ TEST_CASE("Point-cloud defaults choose the fastest preview path", "[pointcloud][
     CHECK(ScalarConstant(style.depthFade) == Catch::Approx(0.0F));
     CHECK_FALSE(style.depthFade.active);
     CHECK(style.colorizeAmount == Catch::Approx(0.0F));
+    CHECK_FALSE(style.gpuBackToFrontSorting);
+    CHECK(
+        style.gpuSortMode ==
+        invisible_places::renderer::pointcloud::
+            PointCloudGpuSortMode::PerFrame);
+    CHECK(style.gpuSortWindowSeconds == Catch::Approx(1.0F));
+    CHECK_FALSE(style.depthPrepassEnabled);
+    CHECK(style.depthPrepassAlphaThreshold == Catch::Approx(0.35F));
+    CHECK(style.depthPrepassToleranceMeters == Catch::Approx(0.02F));
+    CHECK(style.depthWeightStrength == Catch::Approx(1.0F));
+    CHECK(
+        style.emissionResponse ==
+        invisible_places::renderer::pointcloud::
+            PointCloudEmissionResponse::Accumulated);
+    CHECK_FALSE(style.normalCullEnabled);
+    CHECK(style.normalCullStartDegrees == Catch::Approx(75.0F));
+    CHECK(style.normalCullEndDegrees == Catch::Approx(105.0F));
     CHECK(ResolvePointCloudMaterialVariant(style) == PointCloudMaterialVariant::OpaqueHardDisc);
 
     auto movingStyle = style;
@@ -14843,6 +14948,62 @@ TEST_CASE("Scene role roughness motion only animates vegetation", "[pointcloud][
     CHECK_FALSE(PointCloudStyleHasActiveShorelineWaves(staticShoreline));
 }
 
+TEST_CASE("Scene roles resolve depth participation and stable surface weights", "[pointcloud][style][scene][depth]") {
+    using namespace invisible_places::renderer::pointcloud;
+
+    PointCloudStyleState style;
+    style.depthPrepassEnabled = true;
+    style.depthRolePolicy = PointCloudDepthRolePolicy::RockOccluder;
+    style.surfaceStabilityPolicy =
+        PointCloudSurfaceStabilityPolicy::StableRoles;
+
+    const auto rock = MakePointCloudStyleForSceneRole(style, "ROCK");
+    const auto sand = MakePointCloudStyleForSceneRole(style, "SAND");
+    const auto vegetation =
+        MakePointCloudStyleForSceneRole(style, "Vegetation");
+    CHECK(PointCloudDepthPrepassWrites(rock));
+    CHECK(PointCloudDepthPrepassTests(rock));
+    CHECK_FALSE(PointCloudDepthPrepassWrites(sand));
+    CHECK(PointCloudDepthPrepassTests(sand));
+    CHECK_FALSE(PointCloudDepthPrepassWrites(vegetation));
+    CHECK_FALSE(PointCloudDepthPrepassTests(vegetation));
+    CHECK(
+        rock.effectiveSurfaceStabilityMode ==
+        PointCloudSurfaceStabilityMode::SoftSeparation);
+    CHECK(
+        sand.effectiveSurfaceStabilityMode ==
+        PointCloudSurfaceStabilityMode::DensityContinuity);
+    CHECK(
+        vegetation.effectiveSurfaceStabilityMode ==
+        PointCloudSurfaceStabilityMode::DrawAll);
+
+    // RGBA byte order in the packed uint is density/lower/upper/soft.
+    constexpr std::uint32_t packed = 0x4080C0FFU;
+    CHECK(
+        ResolvePointCloudSurfaceStabilityWeight(
+            PointCloudSurfaceStabilityMode::DensityContinuity,
+            packed) == Catch::Approx(1.0F));
+    CHECK(
+        ResolvePointCloudSurfaceStabilityWeight(
+            PointCloudSurfaceStabilityMode::PreferLower,
+            packed) == Catch::Approx(192.0F / 255.0F));
+    CHECK(
+        ResolvePointCloudSurfaceStabilityWeight(
+            PointCloudSurfaceStabilityMode::PreferUpper,
+            packed) == Catch::Approx(128.0F / 255.0F));
+    CHECK(
+        ResolvePointCloudSurfaceStabilityWeight(
+            PointCloudSurfaceStabilityMode::SoftSeparation,
+            packed,
+            0.5F) == Catch::Approx(0.5F + 0.5F * 64.0F / 255.0F));
+
+    style.depthRolePolicy = PointCloudDepthRolePolicy::Custom;
+    style.sandDepthParticipation = PointCloudDepthParticipation::Disabled;
+    const auto customSand =
+        MakePointCloudStyleForSceneRole(style, "sand");
+    CHECK_FALSE(PointCloudDepthPrepassTests(customSand));
+}
+
 TEST_CASE("World sprite diameter projects to depth-adaptive point pixels", "[pointcloud][style]") {
     using invisible_places::renderer::pointcloud::WorldDiameterToScreenPointSizePixels;
 
@@ -14887,6 +15048,19 @@ TEST_CASE("Fast Basic point-cloud style override keeps cheap colour controls", "
     SetScalarConstant(&style.emissiveStrength, 2.0F);
     SetScalarConstant(&style.depthFade, 0.5F);
     style.depthFade.active = true;
+    style.gpuBackToFrontSorting = true;
+    style.depthPrepassEnabled = true;
+    style.depthPrepassAlphaThreshold = 0.6F;
+    style.depthPrepassToleranceMeters = 0.08F;
+    style.depthWeightStrength = 6.0F;
+    style.emissionResponse = invisible_places::renderer::pointcloud::
+        PointCloudEmissionResponse::Saturated;
+    style.normalCullEnabled = true;
+    style.surfaceStabilityPolicy = invisible_places::renderer::pointcloud::
+        PointCloudSurfaceStabilityPolicy::StableRoles;
+    style.effectiveSurfaceStabilityMode = invisible_places::renderer::pointcloud::
+        PointCloudSurfaceStabilityMode::DensityContinuity;
+    style.surfaceStabilityInfluence = 0.65F;
 
     const auto fast = MakeFastBasicPointCloudStyle(style, true);
 
@@ -14905,6 +15079,25 @@ TEST_CASE("Fast Basic point-cloud style override keeps cheap colour controls", "
     CHECK(ScalarConstant(fast.emissiveStrength) == Catch::Approx(0.0F));
     CHECK(ScalarConstant(fast.depthFade) == Catch::Approx(0.0F));
     CHECK_FALSE(fast.depthFade.active);
+    CHECK_FALSE(fast.gpuBackToFrontSorting);
+    CHECK_FALSE(fast.depthPrepassEnabled);
+    CHECK(fast.depthPrepassAlphaThreshold == Catch::Approx(0.6F));
+    CHECK(fast.depthPrepassToleranceMeters == Catch::Approx(0.08F));
+    CHECK(fast.depthWeightStrength == Catch::Approx(1.0F));
+    CHECK(
+        fast.emissionResponse ==
+        invisible_places::renderer::pointcloud::
+            PointCloudEmissionResponse::Accumulated);
+    CHECK_FALSE(fast.normalCullEnabled);
+    CHECK(
+        fast.surfaceStabilityPolicy ==
+        invisible_places::renderer::pointcloud::
+            PointCloudSurfaceStabilityPolicy::StableRoles);
+    CHECK(
+        fast.effectiveSurfaceStabilityMode ==
+        invisible_places::renderer::pointcloud::
+            PointCloudSurfaceStabilityMode::DensityContinuity);
+    CHECK(fast.surfaceStabilityInfluence == Catch::Approx(0.65F));
     CHECK(fast.colorizeAmount == Catch::Approx(0.8F));
     CHECK(fast.colormapPosition.active);
     CHECK(fast.colormapPosition.fieldMap.fieldName == "Height");
@@ -14938,6 +15131,30 @@ TEST_CASE("Point-cloud material variant separates opaque, simple, and unified st
 
     PointCloudStyleState style;
     CHECK(ResolvePointCloudMaterialVariant(style) == PointCloudMaterialVariant::OpaqueHardDisc);
+
+    style.gpuBackToFrontSorting = true;
+    CHECK(ResolvePointCloudMaterialVariant(style) == PointCloudMaterialVariant::Unified);
+
+    style.gpuBackToFrontSorting = false;
+    style.emissionResponse = invisible_places::renderer::pointcloud::
+        PointCloudEmissionResponse::Saturated;
+    CHECK(ResolvePointCloudMaterialVariant(style) == PointCloudMaterialVariant::Unified);
+    style.emissionResponse = invisible_places::renderer::pointcloud::
+        PointCloudEmissionResponse::Accumulated;
+    style.normalCullEnabled = true;
+    CHECK(ResolvePointCloudMaterialVariant(style) == PointCloudMaterialVariant::Unified);
+    style.normalCullEnabled = false;
+    style.gpuBackToFrontSorting = true;
+
+    style.gpuBackToFrontSorting = false;
+    style.depthPrepassEnabled = true;
+    CHECK(ResolvePointCloudMaterialVariant(style) == PointCloudMaterialVariant::Unified);
+
+    style.depthPrepassEnabled = false;
+    style.depthWeightStrength = 2.0F;
+    CHECK(ResolvePointCloudMaterialVariant(style) == PointCloudMaterialVariant::Unified);
+
+    style.depthWeightStrength = 1.0F;
 
     style.falloffProfile = PointCloudFalloffProfile::SoftDisc;
     CHECK(ResolvePointCloudMaterialVariant(style) == PointCloudMaterialVariant::ConstantSimple);

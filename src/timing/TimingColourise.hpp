@@ -82,9 +82,10 @@ struct TimingColouriseLocalPaletteEdit {
     TimingColourisePalette palette{};
 };
 
-// Whole-palette snapshots are retained for projects authored before
-// independent stop-property keying. New effects use StopParameters: their
-// stop topology is static and each stop property owns its own curve.
+// Whole-palette snapshots are retained for older projects. New effects use
+// StopParameters: the stop topology is static and each property owns a curve,
+// while normal palette authoring writes all of those curves together as one
+// complete palette snapshot.
 enum class TimingColourisePaletteKeyModel : std::uint8_t {
     LegacySnapshots = 0,
     StopParameters,
@@ -112,6 +113,22 @@ enum class TimingColouriseBlendMode : std::uint8_t {
     Add = 3,
     Divide = 4,
     VividLight = 5,
+    // Strong darkening mode with white as the identity. Unlike min-based
+    // Darken, Color Burn remains affine in the colour beneath the feature,
+    // so the complete Visual Feature stack can retain its single-transform
+    // GPU representation.
+    ColorBurn = 6,
+};
+
+// How a Visual Feature combines its primary and secondary colour blend
+// modes. Crossfade interpolates the two mode results from the same incoming
+// colour. ApplyAfter runs the secondary mode after the primary, with
+// blendMix controlling the secondary step's strength. Values match the
+// renderer/GLSL constants.
+enum class TimingColouriseBlendCompositionMode : std::uint8_t {
+    PrimaryOnly = 0,
+    Crossfade = 1,
+    ApplyAfter = 2,
 };
 
 // Legacy discriminator retained only for parsing documents written before
@@ -139,6 +156,9 @@ enum class TimingColouriseEffectParameter : std::uint8_t {
     // span, independent of the palette's.
     EmissiveSkewCentre,
     EmissiveSkewSpread,
+    // Crossfade position, or the strength of the secondary Apply After
+    // step. Dormant keys remain available while Primary Only is selected.
+    BlendMix,
 };
 
 // One extra warp node beside the always-present centre node. The node pins
@@ -460,6 +480,11 @@ struct TimingColouriseFieldVisualMemory {
         TimingColouriseAmountOverrideMode::Maximum;
     float colouriseAmountOverride = 1.0F;
     TimingColouriseBlendMode blendMode = TimingColouriseBlendMode::Normal;
+    TimingColouriseBlendMode secondaryBlendMode =
+        TimingColouriseBlendMode::Multiply;
+    TimingColouriseBlendCompositionMode blendCompositionMode =
+        TimingColouriseBlendCompositionMode::PrimaryOnly;
+    float blendMix = 1.0F;
     float palettePhaseOffset = 0.0F;
     float paletteSkewCentre = 0.5F;
     float paletteSkewSpread = 0.0F;
@@ -538,6 +563,14 @@ struct TimingColouriseEffect {
     // Authored, non-animated compositing mode for the colourise aspect.
     // Emissive output ignores it.
     TimingColouriseBlendMode blendMode = TimingColouriseBlendMode::Normal;
+    // Optional second mode. Crossfade mixes the two mode results; Apply
+    // After composes the secondary result over the primary. blendMix is
+    // keyable, while the mode choices themselves remain authored settings.
+    TimingColouriseBlendMode secondaryBlendMode =
+        TimingColouriseBlendMode::Multiply;
+    TimingColouriseBlendCompositionMode blendCompositionMode =
+        TimingColouriseBlendCompositionMode::PrimaryOnly;
+    float blendMix = 1.0F;
     // Mirrors the sampled palette so the leftmost authored colour sits at the
     // output centre and the rightmost colour reaches both ends. Like Palette
     // Phase this changes only how the palette is sampled: the authored stops
@@ -1431,9 +1464,12 @@ void AddOrUpdateTimingColourisePaletteKey(
     std::array<float, 3> colour,
     invisible_places::water::WaterScenarioInterpolation interpolation =
         invisible_places::water::WaterScenarioInterpolation::SmoothVelocity);
-// Keys every colour marker's Position at one animation moment. Stop colour
-// and Colourise Amount remain independent tracks. Existing per-marker curve
-// styles are retained, and legacy snapshot palettes remain whole-palette keys.
+// Keys every colour marker's Position, Colour, and Colourise Amount at one
+// animation moment. Existing per-property curve styles are retained. Before
+// adding a snapshot, older Position-only marker snapshots are completed from
+// their historically evaluated/base values so a newly animated property can
+// interpolate from them instead of holding its first new value backwards.
+// Legacy snapshot palettes remain whole-palette keys.
 [[nodiscard]] bool AddOrUpdateTimingColourisePaletteMarkerKeys(
     TimingColouriseEffect* effect,
     float position,
@@ -1587,8 +1623,8 @@ NextTimingColourisePaletteMarkerKeyPosition(
 TimingColouriseAnimatedPaletteMarkerRange(
     const TimingColouriseEffect& effect);
 // Stop-parameter palettes may change topology while animated. Adding a stop
-// backfills its Position into every existing marker-group keyframe; removing
-// one also removes every property key that addresses that stable stop id.
+// backfills all of its properties into every existing palette snapshot;
+// removing one also removes every property key for that stable stop id.
 [[nodiscard]] bool AddTimingColourisePaletteStop(
     TimingColouriseEffect* effect,
     TimingColourisePaletteStop stop);
