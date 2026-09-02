@@ -651,10 +651,12 @@ class DisplayDensityCacheBuilderTests(unittest.TestCase):
         # Density+continuity and Prefer Lower retain the denser lower scan.
         self.assertTrue(np.all(sand_channels[:2, 0] == 255))
         self.assertTrue(np.all(sand_channels[:2, 1] == 255))
-        # Prefer Upper retains the highest scan and rejects a well-separated
-        # lower scan.
+        # Prefer Upper retains the highest scan. The well-separated lower
+        # scan is attenuated, but only in proportion to the upper scan's
+        # coverage: the winner holds 10 parents against the loser's 16, so
+        # the loser keeps 255 - 255 * (10 / 16) ~= 96 rather than vanishing.
         self.assertEqual(int(sand_channels[4, 2]), 255)
-        self.assertEqual(int(sand_channels[0, 2]), 0)
+        self.assertEqual(int(sand_channels[0, 2]), 96)
         # The middle scan blends rather than toggles because its separation
         # lies between the close and fully-separated thresholds.
         self.assertGreater(int(sand_channels[2, 0]), 0)
@@ -667,6 +669,29 @@ class DisplayDensityCacheBuilderTests(unittest.TestCase):
         np.testing.assert_array_equal(
             rock_channels[:, 3], rock_channels[:, 2]
         )
+
+    def test_full_coverage_winner_still_fully_attenuates_far_losers(
+        self,
+    ) -> None:
+        # A winner at least as populous as the loser (a genuine overhang
+        # sheet) keeps the historical behaviour: a loser separated beyond
+        # 35 mm fades all the way to zero. A ledge-lip fringe (the previous
+        # test) must not — that partial coverage is what closes the live
+        # "black square" holes past a rock edge.
+        cell_x = np.zeros(3, dtype=np.int64)
+        cell_y = np.zeros(3, dtype=np.int64)
+        z = np.asarray([0.000, 0.002, 0.060], dtype=np.float64)
+        parents = np.asarray([4, 4, 20], dtype=np.uint32)
+        recession = np.asarray([0.10, 0.11, 0.90], dtype=np.float64)
+        packed = cache_builder._surface_analysis_weights_for_sorted(
+            cell_x, cell_y, z, parents, recession, "SAND"
+        )
+        upper_channel = (
+            (packed >> np.uint32(16)) & np.uint32(0xFF)
+        ).astype(np.uint8)
+        self.assertEqual(int(upper_channel[2]), 255)
+        self.assertEqual(int(upper_channel[0]), 0)
+        self.assertEqual(int(upper_channel[1]), 0)
 
 
 if __name__ == "__main__":

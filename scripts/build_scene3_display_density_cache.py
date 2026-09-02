@@ -982,8 +982,10 @@ def _soft_loser_weights(
     cluster_z: np.ndarray,
     selected_cluster: np.ndarray,
     cluster_columns: np.ndarray,
+    population: np.ndarray,
 ) -> np.ndarray:
-    selected_z = cluster_z[selected_cluster[cluster_columns]]
+    selected_for_cluster = selected_cluster[cluster_columns]
+    selected_z = cluster_z[selected_for_cluster]
     gap = np.abs(cluster_z - selected_z)
     denominator = max(
         1.0e-9,
@@ -994,8 +996,21 @@ def _soft_loser_weights(
         0.0,
         1.0,
     )
-    weights = np.rint(128.0 * fade).astype(np.uint8)
-    selected_for_cluster = selected_cluster[cluster_columns]
+    faded = 128.0 * fade
+    # Only a winner that plausibly covers the loser's footprint may fully
+    # attenuate it. Along a ledge, the 20 mm column straddling the lip holds
+    # a handful of lip points above the dense base below; zeroing the base
+    # there leaves nothing visible past the edge (the live "black square"
+    # holes). The winner-to-loser parent-population ratio is a cheap
+    # occlusion-likelihood proxy: a full overhang sheet keeps its complete
+    # attenuation, a thin fringe barely dims the surface beneath it.
+    winner_population = population[selected_for_cluster]
+    coverage = np.clip(
+        winner_population / np.maximum(population, 1.0),
+        0.0,
+        1.0,
+    )
+    weights = np.rint(255.0 - (255.0 - faded) * coverage).astype(np.uint8)
     weights[np.arange(cluster_z.size) == selected_for_cluster] = np.uint8(255)
     return weights
 
@@ -1115,17 +1130,17 @@ def _surface_analysis_weights_for_sorted(
     ).astype(np.int64, copy=False)
 
     density_weight = _soft_loser_weights(
-        cluster_z, density_selected, cluster_columns
+        cluster_z, density_selected, cluster_columns, population
     )
     lower_weight = _soft_loser_weights(
-        cluster_z, lower_selected, cluster_columns
+        cluster_z, lower_selected, cluster_columns, population
     )
     upper_weight = _soft_loser_weights(
-        cluster_z, upper_selected, cluster_columns
+        cluster_z, upper_selected, cluster_columns, population
     )
     soft_selected = upper_selected if role == "ROCK" else density_selected
     soft_weight = _soft_loser_weights(
-        cluster_z, soft_selected, cluster_columns
+        cluster_z, soft_selected, cluster_columns, population
     )
 
     packed_cluster = (
@@ -1858,7 +1873,7 @@ def build_cache(config: BuildConfig) -> Path:
                     "finite-unit-circle-mean-first-parent-fallback"
                 ),
                 "surface_analysis": (
-                    "exact-parent-link-horizontal-density-recession-coherence-v1"
+                    "exact-parent-link-horizontal-density-recession-coherence-winner-coverage-v2"
                 ),
             },
             "scene": "Scene3",
