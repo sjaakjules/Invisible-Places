@@ -134852,7 +134852,7 @@ int RunSurfaceProfileLabSmoke(
         map.outputMin = std::clamp(map.outputMin * scale, 0.0F, 1.0F);
         map.outputMax = std::clamp(map.outputMax * scale, 0.0F, 1.0F);
     };
-    const std::vector<ProfileCandidate> candidates{
+    std::vector<ProfileCandidate> candidates{
         {"base-current", "Surface_05_Base", [](PointCloudStyleState*) {}},
         {"base-culled", "Surface_05_Base",
          [&](PointCloudStyleState* style) { stableCulling(style, 1.0F); }},
@@ -134920,6 +134920,41 @@ int RunSurfaceProfileLabSmoke(
                  pointcloud::PointCloudEmissionResponse::Saturated;
          }},
     };
+    // A confirmation run measures exact composed profiles instead of the
+    // exploration matrix: point the environment variable at a JSON array of
+    // {"name": ..., "base_visual": ...} entries naming library visuals (for
+    // example freshly merged *_v2 profiles) and each is measured verbatim.
+    if (const char* candidateOverride =
+            std::getenv("INVISIBLE_PLACES_PROFILE_LAB_CANDIDATES");
+        candidateOverride != nullptr && candidateOverride[0] != '\0') {
+        std::ifstream overrideStream{
+            std::filesystem::path{candidateOverride}};
+        auto parsed = nlohmann::json::parse(overrideStream, nullptr, false);
+        bool overrideValid =
+            overrideStream.is_open() && parsed.is_array() && !parsed.empty();
+        std::vector<ProfileCandidate> overrideCandidates;
+        if (overrideValid) {
+            for (const auto& entry : parsed) {
+                const auto name = entry.value("name", std::string{});
+                const auto baseVisual =
+                    entry.value("base_visual", std::string{});
+                if (name.empty() || baseVisual.empty()) {
+                    overrideValid = false;
+                    break;
+                }
+                overrideCandidates.push_back(
+                    {name, baseVisual, [](PointCloudStyleState*) {}});
+            }
+        }
+        if (!overrideValid) {
+            failures.emplace_back(
+                std::string{"Candidate override was unusable: "} +
+                candidateOverride);
+            return finish();
+        }
+        candidates = std::move(overrideCandidates);
+        report["candidate_override"] = candidateOverride;
+    }
     constexpr std::array<float, 3U> kCameraPositions{0.15F, 0.50F, 0.85F};
 
     nlohmann::json results = nlohmann::json::array();
