@@ -129,9 +129,14 @@ ResolveAdaptiveHqRetiredPatchHold(
 // coarse points. Measured on Surface_05, that removal flipped 20-27% of the
 // frame's pixels in a single frame at every publish. The crossfade ramps the
 // coarse-engage factor 0 -> 1 over this window instead, spreading the same
-// change across imperceptible per-frame steps; fine coverage is complete
-// from the publish frame, so no pixel ever loses coverage.
-constexpr std::chrono::milliseconds kAdaptiveHqPublishCrossfadeDuration{250};
+// change across per-frame steps; fine coverage is complete from the publish
+// frame, so no pixel ever loses coverage. The window must be long relative
+// to a worst-case frame time: at the original 250 ms a heavy 1 mm view
+// rendered only ~3 frames inside the ramp, so each step still moved the
+// near-zone veil by ~30% of the full 5 mm density and read as a pop
+// (captured frame-pair diffs show the veil staircase dominating the
+// transient). 700 ms keeps every step under ~15% even at 90 ms frames.
+constexpr std::chrono::milliseconds kAdaptiveHqPublishCrossfadeDuration{700};
 
 [[nodiscard]] float ResolveAdaptiveHqPublishCoarseEngage(
     std::chrono::nanoseconds elapsedSincePublish);

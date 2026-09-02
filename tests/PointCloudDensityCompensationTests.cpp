@@ -352,6 +352,17 @@ TEST_CASE(
               PointCloudAdaptiveDensityRole::Disabled,
               5.0F,
               transition) == Catch::Approx(1.0F));
+    // An outgoing fine layer's steady state is fully handed off: the
+    // complementary handoff share it draws mid-crossfade is a GPU-only
+    // runtime blend, so the CPU model reports zero.
+    CHECK(PointCloudAdaptiveDensityKeepProbability(
+              PointCloudAdaptiveDensityRole::FineOutgoing,
+              5.0F,
+              transition) == Catch::Approx(0.0F));
+    CHECK(PointCloudAdaptiveDensityKeepProbability(
+              PointCloudAdaptiveDensityRole::FineOutgoing,
+              3.0F,
+              transition) == Catch::Approx(0.0F));
 
     const auto invalid = ResolvePointCloudAdaptiveDensityTransition(
         0.0F,

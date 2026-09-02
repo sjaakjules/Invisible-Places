@@ -1137,6 +1137,12 @@ float PointCloudAdaptiveDensityKeepProbability(
     if (role == PointCloudAdaptiveDensityRole::Coarse) {
         return coarseWeight;
     }
+    // An outgoing fine layer only draws its complementary handoff share
+    // while a publish crossfade is mid-ramp (a GPU-only runtime blend); at
+    // the steady state this function models it has handed everything off.
+    if (role == PointCloudAdaptiveDensityRole::FineOutgoing) {
+        return 0.0F;
+    }
     // Squaring the remaining fine weight reduces vertex work through the
     // middle band more quickly than a linear cross-fade. The coarse points
     // ramp in concurrently, so the visual transition stays covered without

@@ -287,17 +287,60 @@ constexpr std::size_t kLinkedHqVegetationPatchLayerId =
     std::numeric_limits<std::size_t>::max() - 61U;
 constexpr std::size_t kLinkedHqSandPatchLayerId =
     std::numeric_limits<std::size_t>::max() - 60U;
+// Adaptive publishes alternate between two layer-id banks so the previous
+// fine patches can keep drawing (role FineOutgoing) while the new ones ramp
+// in during the publish crossfade; the retiring bank's GPU layers are
+// removed once the crossfade completes.
+constexpr std::size_t kLinkedHqRockPatchLayerIdB =
+    std::numeric_limits<std::size_t>::max() - 59U;
+constexpr std::size_t kLinkedHqVegetationPatchLayerIdB =
+    std::numeric_limits<std::size_t>::max() - 58U;
+constexpr std::size_t kLinkedHqSandPatchLayerIdB =
+    std::numeric_limits<std::size_t>::max() - 57U;
 constexpr std::array<std::size_t, 3U> kLinkedHqPatchLayerIds{
     kLinkedHqRockPatchLayerId,
     kLinkedHqVegetationPatchLayerId,
     kLinkedHqSandPatchLayerId,
 };
+constexpr std::array<std::size_t, 3U> kLinkedHqPatchLayerIdsB{
+    kLinkedHqRockPatchLayerIdB,
+    kLinkedHqVegetationPatchLayerIdB,
+    kLinkedHqSandPatchLayerIdB,
+};
+constexpr std::array<std::size_t, 6U> kAllLinkedHqPatchLayerIds{
+    kLinkedHqRockPatchLayerId,
+    kLinkedHqVegetationPatchLayerId,
+    kLinkedHqSandPatchLayerId,
+    kLinkedHqRockPatchLayerIdB,
+    kLinkedHqVegetationPatchLayerIdB,
+    kLinkedHqSandPatchLayerIdB,
+};
+
+// The warm retired-patch pool and the adaptive block caches identify a patch
+// by its slot, not by which bank last drew it, so bank-B ids collapse onto
+// their bank-A slot for every fingerprint/reuse comparison.
+[[nodiscard]] constexpr std::size_t NormalizeLinkedHqPatchLayerId(
+    std::size_t layerId) {
+    if (layerId == kLinkedHqRockPatchLayerIdB) {
+        return kLinkedHqRockPatchLayerId;
+    }
+    if (layerId == kLinkedHqVegetationPatchLayerIdB) {
+        return kLinkedHqVegetationPatchLayerId;
+    }
+    if (layerId == kLinkedHqSandPatchLayerIdB) {
+        return kLinkedHqSandPatchLayerId;
+    }
+    return layerId;
+}
 
 [[nodiscard]] constexpr bool IsLinkedHqPatchLayerId(
     std::size_t layerId) {
     return layerId == kLinkedHqRockPatchLayerId ||
            layerId == kLinkedHqVegetationPatchLayerId ||
-           layerId == kLinkedHqSandPatchLayerId;
+           layerId == kLinkedHqSandPatchLayerId ||
+           layerId == kLinkedHqRockPatchLayerIdB ||
+           layerId == kLinkedHqVegetationPatchLayerIdB ||
+           layerId == kLinkedHqSandPatchLayerIdB;
 }
 constexpr invisible_places::scene::PointSpacingMicrometres
     kAnimationMatchingFrameGhostSpacingMicrometres = 5'000U;
@@ -4112,6 +4155,14 @@ struct LinkedHqPreviewRuntime {
     // window instead of one visible frame.
     std::chrono::steady_clock::time_point publishCrossfadeStartedAt{};
     bool publishCrossfadeActive = false;
+    // The previous publish's fine patches, kept alive on the other layer-id
+    // bank for the crossfade window so the near zone hands over point by
+    // point (role FineOutgoing) instead of swapping in one frame. Retired
+    // into the warm pool when the crossfade completes.
+    std::vector<LinkedHqPatchRuntime> outgoingPatches;
+    // Which bank the *published* patches currently occupy; the next adaptive
+    // publish uploads into the opposite bank and then flips this.
+    bool patchBankB = false;
     // Render-thread publication breakdown for the latest publish: GPU patch
     // uploads, the coarse-guard history merge, mask activation (mode set and
     // 5 mm mask/surfel install), and the complete publish window.
@@ -59089,13 +59140,18 @@ std::optional<LinkedHqSelectionRequest> ResolveLinkedHqSelectionRequest(
         rockRole,
         vegetationRole,
     };
+    // Upload into the bank the published patches do NOT occupy, so the
+    // previous fine layers can keep drawing through the publish crossfade.
+    const auto& patchBank = runtimeState.linkedHqPreview.patchBankB
+        ? kLinkedHqPatchLayerIds
+        : kLinkedHqPatchLayerIdsB;
     request.patchLayerIds = {
-        kLinkedHqRockPatchLayerId,
-        kLinkedHqVegetationPatchLayerId,
+        patchBank[0],
+        patchBank[1],
     };
     if (request.includeSand) {
         request.patchRoles.push_back(sandRole);
-        request.patchLayerIds.push_back(kLinkedHqSandPatchLayerId);
+        request.patchLayerIds.push_back(patchBank[2]);
     }
     request.patchFieldFilters.resize(request.patchRoles.size());
     for (std::size_t patch = 0U;
@@ -59394,7 +59450,10 @@ std::optional<LinkedHqPatchRuntime> TryReclaimRetiredLinkedHqPatch(
              patch < candidate.patches.size();
              ++patch) {
             auto& retired = candidate.patches[patch];
-            if (retired.layerId != layerId ||
+            // Publishes alternate layer-id banks, so a patch retired from
+            // one bank must still satisfy a request targeting the other.
+            if (NormalizeLinkedHqPatchLayerId(retired.layerId) !=
+                    NormalizeLinkedHqPatchLayerId(layerId) ||
                 retired.adaptiveSelectionFingerprint !=
                     selectionFingerprint ||
                 retired.cloud == nullptr) {
@@ -59543,19 +59602,25 @@ void ResetLinkedHqPreview(
     if (viewport != nullptr) {
         try {
             PointCloudMutationBatchScope mutationBatch{viewport};
-            for (const auto& patch : hq.patches) {
-                const bool internalPatchLayer =
-                    IsLinkedHqPatchLayerId(patch.layerId);
-                if (internalPatchLayer &&
-                    viewport->HasPointCloudResources(patch.layerId)) {
-                    viewport->RemovePointCloud(patch.layerId);
-                }
-                if (internalPatchLayer) {
-                    ForgetWaterSeepageLayerAttachment(
-                    &runtimeState->water,
-                    patch.layerId);
-                }
-            }
+            const auto releasePatchLayers =
+                [&](const std::vector<LinkedHqPatchRuntime>& patches) {
+                    for (const auto& patch : patches) {
+                        const bool internalPatchLayer =
+                            IsLinkedHqPatchLayerId(patch.layerId);
+                        if (internalPatchLayer &&
+                            viewport->HasPointCloudResources(
+                                patch.layerId)) {
+                            viewport->RemovePointCloud(patch.layerId);
+                        }
+                        if (internalPatchLayer) {
+                            ForgetWaterSeepageLayerAttachment(
+                                &runtimeState->water,
+                                patch.layerId);
+                        }
+                    }
+                };
+            releasePatchLayers(hq.patches);
+            releasePatchLayers(hq.outgoingPatches);
             ApplyLinkedHqFiveMillimeterMasks(
                 runtimeState,
                 viewport,
@@ -59614,7 +59679,7 @@ void ResetLinkedHqPreview(
                     }
                 }
             }
-            for (const auto layerId : kLinkedHqPatchLayerIds) {
+            for (const auto layerId : kAllLinkedHqPatchLayerIds) {
                 if (!viewport->HasPointCloudResources(layerId)) {
                     continue;
                 }
@@ -59662,21 +59727,29 @@ void StartLinkedHqPreparation(
     const auto retirementShared = hq.patchRetirementShared;
     std::vector<LinkedHqAdaptiveCacheSnapshot> priorAdaptiveCaches;
     if (request.mode == LinkedHqPreviewMode::Adaptive) {
-        priorAdaptiveCaches.reserve(hq.patches.size());
-        for (const auto& patch : hq.patches) {
-            if (!patch.adaptiveCacheIndex.has_value()) {
-                continue;
-            }
-            priorAdaptiveCaches.push_back({
-                .layerId = patch.layerId,
-                .cacheFingerprint =
-                    patch.adaptiveCacheIndex->cacheFingerprint,
-                .fieldFilterFingerprint =
-                    patch.adaptiveFieldFilterFingerprint,
-                .cacheIndex = patch.adaptiveCacheIndex,
-                .residentBlocks = patch.adaptiveResidentBlocks,
-            });
-        }
+        priorAdaptiveCaches.reserve(
+            hq.patches.size() + hq.outgoingPatches.size());
+        const auto appendCacheSnapshots =
+            [&](const std::vector<LinkedHqPatchRuntime>& patches) {
+                for (const auto& patch : patches) {
+                    if (!patch.adaptiveCacheIndex.has_value()) {
+                        continue;
+                    }
+                    priorAdaptiveCaches.push_back({
+                        .layerId = patch.layerId,
+                        .cacheFingerprint =
+                            patch.adaptiveCacheIndex->cacheFingerprint,
+                        .fieldFilterFingerprint =
+                            patch.adaptiveFieldFilterFingerprint,
+                        .cacheIndex = patch.adaptiveCacheIndex,
+                        .residentBlocks = patch.adaptiveResidentBlocks,
+                    });
+                }
+            };
+        appendCacheSnapshots(hq.patches);
+        // A publish mid-crossfade can still reuse the fading bank's decoded
+        // blocks; both banks normalize to the same slot for matching.
+        appendCacheSnapshots(hq.outgoingPatches);
     }
     std::vector<std::shared_ptr<const invisible_places::io::LoadedPointCloud>>
         baseClouds(patchRoles.size());
@@ -59841,8 +59914,10 @@ void StartLinkedHqPreparation(
                             priorAdaptiveCaches.begin(),
                             priorAdaptiveCaches.end(),
                             [&](const LinkedHqAdaptiveCacheSnapshot& cache) {
-                                return cache.layerId ==
-                                           patchLayerIds[patch] &&
+                                return NormalizeLinkedHqPatchLayerId(
+                                           cache.layerId) ==
+                                           NormalizeLinkedHqPatchLayerId(
+                                               patchLayerIds[patch]) &&
                                        cache.cacheIndex.has_value() &&
                                        cache.cacheIndex->source ==
                                            sourceIdentity;
@@ -59914,7 +59989,10 @@ void StartLinkedHqPreparation(
                             priorAdaptiveCaches.begin(),
                             priorAdaptiveCaches.end(),
                             [&](const LinkedHqAdaptiveCacheSnapshot& cache) {
-                                return cache.layerId == patchLayerIds[patch] &&
+                                return NormalizeLinkedHqPatchLayerId(
+                                           cache.layerId) ==
+                                           NormalizeLinkedHqPatchLayerId(
+                                               patchLayerIds[patch]) &&
                                        cache.cacheFingerprint ==
                                            opened.index.cacheFingerprint &&
                                        cache.fieldFilterFingerprint ==
@@ -60703,7 +60781,7 @@ bool PollLinkedHqPreparation(
             rollback.Finish();
         } catch (...) {
         }
-        for (const auto layerId : kLinkedHqPatchLayerIds) {
+        for (const auto layerId : kAllLinkedHqPatchLayerIds) {
             if (viewport->HasPointCloudResources(layerId)) {
                 try {
                     viewport->RemovePointCloud(layerId);
@@ -60766,15 +60844,51 @@ bool PollLinkedHqPreparation(
             std::chrono::steady_clock::now() - guardRetentionStarted)
             .count();
 
+    if (!hq.outgoingPatches.empty()) {
+        // A publish landed before the previous crossfade finished. Its
+        // fading bank is the bank this publish just uploaded into, so the
+        // GPU layers already hold the new content; only the CPU payloads
+        // remain to retire.
+        QueueLinkedHqPatchRetirement(
+            &hq,
+            std::move(hq.outgoingPatches),
+            hq.publishedCameraPosition,
+            hq.publishedInteractionProfile,
+            hq.request->cameraPosition,
+            hq.request->adaptiveTransition.preparedFineDepthMeters);
+        hq.outgoingPatches.clear();
+    }
     auto retiredPatches = std::move(hq.patches);
     hq.patches = std::move(published);
-    QueueLinkedHqPatchRetirement(
-        &hq,
-        std::move(retiredPatches),
-        hq.publishedCameraPosition,
-        hq.publishedInteractionProfile,
-        hq.request->cameraPosition,
-        hq.request->adaptiveTransition.preparedFineDepthMeters);
+    if (hq.request->mode == LinkedHqPreviewMode::Adaptive) {
+        // Keep the previous fine patches alive on the other layer-id bank
+        // for the publish crossfade: the shader hands the shared points
+        // over one by one along the engage ramp (role FineOutgoing), and
+        // the fade-completion pump retires them into the warm pool.
+        hq.outgoingPatches = std::move(retiredPatches);
+    } else {
+        // Fixed-mode publishes do not crossfade, so the vacated bank's GPU
+        // layers must not linger and double-draw.
+        for (const auto& retired : retiredPatches) {
+            if (!IsLinkedHqPatchLayerId(retired.layerId) ||
+                !viewport->HasPointCloudResources(retired.layerId)) {
+                continue;
+            }
+            try {
+                viewport->RemovePointCloud(retired.layerId);
+            } catch (...) {
+            }
+        }
+        QueueLinkedHqPatchRetirement(
+            &hq,
+            std::move(retiredPatches),
+            hq.publishedCameraPosition,
+            hq.publishedInteractionProfile,
+            hq.request->cameraPosition,
+            hq.request->adaptiveTransition.preparedFineDepthMeters);
+    }
+    hq.patchBankB = !hq.request->patchLayerIds.empty() &&
+        hq.request->patchLayerIds.front() == kLinkedHqRockPatchLayerIdB;
     hq.fiveMillimeterGuardIndices =
         std::move(retainedFiveMillimeterGuards);
     hq.fiveMillimeterLatestGuardIndices =
@@ -61362,6 +61476,36 @@ void EnsureLinkedHqPreview(
                 hq.publishCrossfadeStartedAt) >= 1.0F) {
             hq.publishCrossfadeActive = false;
         }
+    }
+    if (!hq.publishCrossfadeActive && !hq.outgoingPatches.empty()) {
+        // The handoff ramp is complete: every shared point now draws from
+        // the incoming bank, so the outgoing bank's GPU layers can leave
+        // and the CPU payloads join the warm retired-patch pool.
+        try {
+            PointCloudMutationBatchScope mutationBatch{viewport};
+            for (const auto& outgoing : hq.outgoingPatches) {
+                if (!IsLinkedHqPatchLayerId(outgoing.layerId)) {
+                    continue;
+                }
+                if (viewport->HasPointCloudResources(outgoing.layerId)) {
+                    viewport->RemovePointCloud(outgoing.layerId);
+                }
+                ForgetWaterSeepageLayerAttachment(
+                    &runtimeState->water,
+                    outgoing.layerId);
+            }
+            mutationBatch.Finish();
+        } catch (...) {
+        }
+        QueueLinkedHqPatchRetirement(
+            &hq,
+            std::move(hq.outgoingPatches),
+            hq.publishedCameraPosition,
+            hq.publishedInteractionProfile,
+            hq.publishedCameraPosition,
+            hq.publishedAdaptiveTransition.preparedFineDepthMeters);
+        hq.outgoingPatches.clear();
+        runtimeState->previewRenderStateSignatureValid = false;
     }
     const bool adaptiveBaseGuardExpired =
         hq.adaptiveBaseGuardApplied && hq.enabled &&
@@ -121153,13 +121297,42 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
 
     if (linkedHqPatchDrawPolicy.renderFinePatches &&
         !runtimeState.offlineRenderJob.active) {
+        struct PatchEmission {
+            const LinkedHqPatchRuntime* patch = nullptr;
+            bool outgoing = false;
+        };
+        std::vector<PatchEmission> patchEmissions;
+        patchEmissions.reserve(
+            runtimeState.linkedHqPreview.patches.size() +
+            runtimeState.linkedHqPreview.outgoingPatches.size());
         for (const auto& patch : runtimeState.linkedHqPreview.patches) {
+            patchEmissions.push_back({&patch, false});
+        }
+        // The fading bank draws only while the publish crossfade is live
+        // and the fine adaptive gate applies; anywhere else it would
+        // double-draw the incoming bank's points at full density. The
+        // environment switch exists for A/B attribution in the flicker lab
+        // (veil-ramp-only versus veil ramp plus bank opacity fade).
+        static const bool outgoingBankDisabled =
+            std::getenv("INVISIBLE_PLACES_DISABLE_OUTGOING_FADE_BANK") !=
+            nullptr;
+        if (!outgoingBankDisabled &&
+            linkedHqPatchDrawPolicy.applyFineAdaptiveDensity &&
+            runtimeState.linkedHqPreview.publishCrossfadeActive) {
+            for (const auto& patch :
+                 runtimeState.linkedHqPreview.outgoingPatches) {
+                patchEmissions.push_back({&patch, true});
+            }
+        }
+        for (const auto& patchEmission : patchEmissions) {
+            const auto& patch = *patchEmission.patch;
             if (!patch.uploaded || patch.cloud == nullptr ||
                 patch.cloud->PointCount() == 0U ||
                 patch.baseSessionIndex >= runtimeState.sessions.size()) {
                 continue;
             }
-            if (linkedHqPatchDrawPolicy.retainingFineDuringRefresh &&
+            if ((linkedHqPatchDrawPolicy.retainingFineDuringRefresh ||
+                 patchEmission.outgoing) &&
                 patch.cloud->bounds.valid &&
                 !BoundsIntersectsViewFrustum(
                     patch.cloud->bounds,
@@ -121227,6 +121400,37 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                         &renderStyle,
                         resolvedShorelines.front());
             }
+            // Publish crossfade: the outgoing bank fades out while the
+            // incoming bank fades in by complementary opacity/emissive
+            // scaling, so the near zone never swaps content in one frame.
+            // Outside a crossfade the engage factor is 1, which leaves the
+            // incoming style untouched (outgoing banks are only emitted
+            // while a crossfade is live). The kill switch disables both
+            // halves together: fading the incoming bank in over nothing
+            // would open holes.
+            static const bool bankFadeDisabled =
+                std::getenv(
+                    "INVISIBLE_PLACES_DISABLE_OUTGOING_FADE_BANK") !=
+                nullptr;
+            if (!bankFadeDisabled &&
+                (runtimeState.linkedHqPreview.publishCrossfadeActive ||
+                 patchEmission.outgoing)) {
+                const float engage = std::clamp(
+                    renderState.adaptiveDensityTransition.coarseEngage,
+                    0.0F,
+                    1.0F);
+                const float fadeScale =
+                    patchEmission.outgoing ? 1.0F - engage : engage;
+                const auto scaleBindingOutput =
+                    [&](invisible_places::style::RenderParameterBinding*
+                            binding) {
+                        binding->constantValue[0] *= fadeScale;
+                        binding->fieldMap.outputMin *= fadeScale;
+                        binding->fieldMap.outputMax *= fadeScale;
+                    };
+                scaleBindingOutput(&renderStyle.opacity);
+                scaleBindingOutput(&renderStyle.emissiveStrength);
+            }
             renderState.pointCloudLayers.push_back(
                 {.layerId = patch.layerId,
                  .style = fastBasicRenderer
@@ -121267,8 +121471,10 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                      runtimeState.linkedHqPreview.request
                          ->patchSpacingMicrometres,
                      patch),
-                 .adaptiveDensityRole =
-                     linkedHqPatchDrawPolicy.applyFineAdaptiveDensity
+                 .adaptiveDensityRole = patchEmission.outgoing
+                     ? invisible_places::renderer::pointcloud::
+                           PointCloudAdaptiveDensityRole::FineOutgoing
+                     : linkedHqPatchDrawPolicy.applyFineAdaptiveDensity
                      ? invisible_places::renderer::pointcloud::
                            PointCloudAdaptiveDensityRole::Fine
                      : invisible_places::renderer::pointcloud::
@@ -121280,15 +121486,16 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
         // Preserve the role/session draw order used by the ordinary full
         // cloud. Transparent/emissive point materials can be order-sensitive,
         // so each compact patch occupies its base role's position instead of
-        // being composited after every other scene role.
+        // being composited after every other scene role. Fading outgoing
+        // patches join their role's position too (stable sort keeps each
+        // pair's incoming bank first, which the insertion below turns into
+        // outgoing drawing before incoming).
         std::vector<const LinkedHqPatchRuntime*> orderedPatches;
-        orderedPatches.reserve(
-            runtimeState.linkedHqPreview.patches.size());
-        for (const auto& patch :
-             runtimeState.linkedHqPreview.patches) {
-            orderedPatches.push_back(&patch);
+        orderedPatches.reserve(patchEmissions.size());
+        for (const auto& patchEmission : patchEmissions) {
+            orderedPatches.push_back(patchEmission.patch);
         }
-        std::sort(
+        std::stable_sort(
             orderedPatches.begin(),
             orderedPatches.end(),
             [](const auto* left, const auto* right) {
@@ -135309,6 +135516,32 @@ int RunSurfaceStabilityFlickerSmoke(
                   static_cast<double>(pixelCount)
             : 0.0;
     };
+    // Magnitude companion to changedPixelFraction: the thresholded fraction
+    // treats a gentle 4-luma ramp step and a 40-luma snap identically, so
+    // ramp designs need the average absolute luma change per frame pair to
+    // rank perceptually.
+    const auto meanAbsLumaDelta = [](const CapturedRgba& before,
+                                     const CapturedRgba& after) {
+        if (before.width != after.width || before.height != after.height ||
+            before.rgba.size() != after.rgba.size() || before.rgba.empty()) {
+            return 255.0;
+        }
+        double total = 0.0;
+        const auto pixelCount = before.rgba.size() / 4U;
+        for (std::size_t pixel = 0U; pixel < pixelCount; ++pixel) {
+            const auto offset = pixel * 4U;
+            const double beforeLuma = 0.2126 * before.rgba[offset] +
+                0.7152 * before.rgba[offset + 1U] +
+                0.0722 * before.rgba[offset + 2U];
+            const double afterLuma = 0.2126 * after.rgba[offset] +
+                0.7152 * after.rgba[offset + 1U] +
+                0.0722 * after.rgba[offset + 2U];
+            total += std::abs(afterLuma - beforeLuma);
+        }
+        return pixelCount > 0U
+            ? total / static_cast<double>(pixelCount)
+            : 0.0;
+    };
     // Holes: pixels that this configuration leaves near-black where the
     // Draw All reference is clearly lit, over the reference's lit pixels.
     const auto darkFractionVsReference = [](const CapturedRgba& reference,
@@ -135377,7 +135610,7 @@ int RunSurfaceStabilityFlickerSmoke(
         StabilityMode sand = StabilityMode::DrawAll;
         StabilityMode vegetation = StabilityMode::DrawAll;
     };
-    const std::vector<FlickerConfig> configs{
+    std::vector<FlickerConfig> configs{
         {"reference-draw-all-noprepass", false, DepthPolicy::Uniform, true,
          StabilityMode::DrawAll, StabilityMode::DrawAll,
          StabilityMode::DrawAll},
@@ -135415,6 +135648,24 @@ int RunSurfaceStabilityFlickerSmoke(
          StabilityMode::SoftSeparation, StabilityMode::DensityContinuity,
          StabilityMode::DrawAll},
     };
+    // A focused validation run (for example after publish-path changes)
+    // names the configs to keep, comma separated.
+    if (const char* configFilter =
+            std::getenv("INVISIBLE_PLACES_FLICKER_CONFIGS");
+        configFilter != nullptr && configFilter[0] != '\0') {
+        const std::string filter{configFilter};
+        std::vector<FlickerConfig> filtered;
+        for (const auto& config : configs) {
+            const auto position = filter.find(config.name);
+            if (position != std::string::npos) {
+                filtered.push_back(config);
+            }
+        }
+        if (!filtered.empty()) {
+            configs = std::move(filtered);
+            report["config_filter"] = filter;
+        }
+    }
     const auto applyConfig = [&](const FlickerConfig& config) {
         for (auto& session : runtimeState->sessions) {
             if (session.kind != LayerKind::PointCloud ||
@@ -135476,6 +135727,7 @@ int RunSurfaceStabilityFlickerSmoke(
         // warm pool reclaims identical patches), so those are measured
         // frame-by-frame instead.
         double publishPopMax = 0.0;
+        double publishPopMeanAbsLumaMax = 0.0;
         double republishDeltaMax = 0.0;
         bool churnPublished = true;
         for (std::uint32_t cycle = 0U; cycle < 2U; ++cycle) {
@@ -135513,6 +135765,8 @@ int RunSurfaceStabilityFlickerSmoke(
             // window counts: the fallback restore, the depth-faded overlay,
             // and the publish itself are each a visible transient if they
             // change pixels.
+            std::optional<CapturedRgba> popFrameBefore;
+            std::optional<CapturedRgba> popFrameAfter;
             while (std::chrono::steady_clock::now() < popDeadline &&
                    !window->ShouldClose()) {
                 const auto& hq = runtimeState->linkedHqPreview;
@@ -135521,11 +135775,19 @@ int RunSurfaceStabilityFlickerSmoke(
                     pumpFrame(durationSeconds * kFocusNormalized);
                 const auto current = capture();
                 if (beforePublish.has_value() && current.has_value()) {
-                    publishPopMax = std::max(
-                        publishPopMax,
-                        changedPixelFraction(
+                    const auto delta = changedPixelFraction(
+                        beforePublish.value(),
+                        current.value());
+                    publishPopMeanAbsLumaMax = std::max(
+                        publishPopMeanAbsLumaMax,
+                        meanAbsLumaDelta(
                             beforePublish.value(),
                             current.value()));
+                    if (delta > publishPopMax) {
+                        publishPopMax = delta;
+                        popFrameBefore = beforePublish;
+                        popFrameAfter = current;
+                    }
                 }
                 const bool publishedNow =
                     runtimeState->linkedHqPreview.publishedFingerprint !=
@@ -135537,10 +135799,33 @@ int RunSurfaceStabilityFlickerSmoke(
                 }
                 beforePublish = current;
             }
+            // The worst frame pair makes the transient inspectable: dumping
+            // it turns a changed-pixel number into two images to diff.
+            if (std::getenv("INVISIBLE_PLACES_FLICKER_SAVE_POP_FRAMES") !=
+                    nullptr &&
+                popFrameBefore.has_value() && popFrameAfter.has_value()) {
+                savePpm(
+                    popFrameBefore.value(),
+                    config.name + "-pop-before-cycle" +
+                        std::to_string(cycle));
+                savePpm(
+                    popFrameAfter.value(),
+                    config.name + "-pop-after-cycle" +
+                        std::to_string(cycle));
+            }
             churnPublished &= sawPublish;
             // Outlast the publish crossfade so the settled capture compares
-            // steady states rather than a mid-ramp frame.
-            for (std::uint32_t settle = 0U; settle < 12U; ++settle) {
+            // steady states rather than a mid-ramp frame: wait for the
+            // fade flag itself (the frame count alone undershoots a long
+            // ramp on fast configs), then a few extra frames.
+            const auto settleDeadline = std::chrono::steady_clock::now() +
+                std::chrono::seconds{20};
+            while (runtimeState->linkedHqPreview.publishCrossfadeActive &&
+                   std::chrono::steady_clock::now() < settleDeadline &&
+                   !window->ShouldClose()) {
+                (void)pumpFrame(durationSeconds * kFocusNormalized);
+            }
+            for (std::uint32_t settle = 0U; settle < 6U; ++settle) {
                 (void)pumpFrame(durationSeconds * kFocusNormalized);
             }
             const auto settled = capture();
@@ -135622,6 +135907,7 @@ int RunSurfaceStabilityFlickerSmoke(
             {"static_flicker_max", staticMax},
             {"static_flicker_mean", staticMean},
             {"publish_pop_max", publishPopMax},
+            {"publish_pop_mean_abs_luma_max", publishPopMeanAbsLumaMax},
             {"republish_delta_max", republishDeltaMax},
             {"scrub_median_delta", scrubMedianDelta},
             {"scrub_max_delta", scrubMaxDelta},
@@ -135630,7 +135916,8 @@ int RunSurfaceStabilityFlickerSmoke(
         });
         std::cout << "Flicker config " << config.name
                   << ": static max " << staticMax << ", publish pop "
-                  << publishPopMax << ", republish delta "
+                  << publishPopMax << " (mean|dLuma| "
+                  << publishPopMeanAbsLumaMax << "), republish delta "
                   << republishDeltaMax << ", scrub median/max "
                   << scrubMedianDelta << "/" << scrubMaxDelta
                   << ", dark " << darkFraction << std::endl;

@@ -555,6 +555,12 @@ enum class PointCloudAdaptiveDensityRole : std::uint32_t {
     Disabled = 0U,
     Fine = 1U,
     Coarse = 2U,
+    // The previous publish's fine patches while a publish crossfade runs.
+    // Each point hands off to the incoming Fine layer exactly once during
+    // the ramp via a shared position-keyed hash, so the pair never double
+    // draws and never opens a gap. Fully handed off (drawing nothing) at
+    // steady state.
+    FineOutgoing = 3U,
 };
 
 struct PointCloudAdaptiveDensityTransition {

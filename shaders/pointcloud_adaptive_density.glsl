@@ -4,6 +4,7 @@
 const uint kAdaptiveDensityDisabled = 0u;
 const uint kAdaptiveDensityFine = 1u;
 const uint kAdaptiveDensityCoarse = 2u;
+const uint kAdaptiveDensityFineOutgoing = 3u;
 
 uint AdaptiveDensityHash(uint value) {
     value ^= value >> 16u;
@@ -33,20 +34,30 @@ bool AdaptiveDensityKeepsPoint(
     const float startDepth = uniforms.adaptiveDensityParameters.x;
     const float endDepth = uniforms.adaptiveDensityParameters.z;
     if (!(startDepth > 0.0 && endDepth > startDepth)) {
-        return true;
+        // Without a valid transition the incoming layers draw in full, so a
+        // lingering outgoing layer must not double-draw the same points.
+        return role != kAdaptiveDensityFineOutgoing;
     }
     const float coarseWeight = smoothstep(startDepth, endDepth, viewDepth);
     const float fineWeight = 1.0 - coarseWeight;
-    // w is the publish crossfade's coarse-engage factor: during a refresh
-    // the complete coarse layer draws for coverage, and after the publish
-    // the redundant near-zone coarse points ramp out over a short window
-    // instead of vanishing in one frame. Fine points stay at full density
-    // throughout so coverage never dips.
+    // w is the publish crossfade's engage factor: during a refresh the
+    // complete coarse layer draws for coverage, and after the publish the
+    // redundant near-zone coarse points ramp out over a short window
+    // instead of vanishing in one frame. The same ramp hands the fine
+    // points over from the outgoing to the incoming patch layers point by
+    // point, so the near zone never swaps in a single frame either.
     const float coarseEngage = clamp(
         uniforms.adaptiveDensityParameters.w,
         0.0,
         1.0);
-    const float probability = role == kAdaptiveDensityFine
+    // The publish crossfade blends the outgoing and incoming fine banks by
+    // complementary per-layer opacity (applied CPU-side to the layer style),
+    // not by partitioning points: a per-point handoff scrambles per-pixel
+    // blend order under sorted transparency and measured strictly worse.
+    // Both banks therefore keep the same depth-band probability here.
+    const float probability =
+        (role == kAdaptiveDensityFine ||
+         role == kAdaptiveDensityFineOutgoing)
         ? fineWeight * fineWeight
         : (role == kAdaptiveDensityCoarse
                ? mix(1.0, coarseWeight, coarseEngage)

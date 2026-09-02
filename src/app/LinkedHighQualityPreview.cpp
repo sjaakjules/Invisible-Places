@@ -186,9 +186,24 @@ float ResolveAdaptiveHqPublishCoarseEngage(
     if (elapsedSincePublish <= std::chrono::nanoseconds::zero()) {
         return 0.0F;
     }
-    const auto duration =
+    // Test-only override so the flicker lab can A/B ramp lengths from one
+    // binary; unset (production) uses the compiled constant.
+    static const auto overrideDuration =
+        []() -> std::optional<std::chrono::nanoseconds> {
+        const char* value = std::getenv("INVISIBLE_PLACES_CROSSFADE_MS");
+        if (value == nullptr || value[0] == '\0') {
+            return std::nullopt;
+        }
+        const long parsed = std::strtol(value, nullptr, 10);
+        if (parsed <= 0L || parsed > 60'000L) {
+            return std::nullopt;
+        }
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::milliseconds{parsed});
+    }();
+    const auto duration = overrideDuration.value_or(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
-            kAdaptiveHqPublishCrossfadeDuration);
+            kAdaptiveHqPublishCrossfadeDuration));
     if (elapsedSincePublish >= duration) {
         return 1.0F;
     }
