@@ -261,9 +261,15 @@ Scene3/
       Site3-ROCK-5mm.ply
       Site3-SAND-5mm.ply
       Site3-VEG-5mm.ply
+    Analysis/
+      Site3-ROCK-1mm-to-5mm.u32
+      Site3-ROCK-5mm-parent-count.u32
+      Site3-ROCK-1mm-stability.u32
+      Site3-ROCK-5mm-stability.u32
+      ... equivalent SAND and VEG files
 ```
 
-`active-bundle.json` schema 1 records the bundle fingerprint and the SHA-256 of the exact manifest bytes. The schema-1 manifest identifies the deterministic algorithm and complete scene, then records each role's canonical source path, size, nanosecond modification time, point count, property-schema digest, and full SHA-256 together with the equivalent identity for its cached output. The bundle fingerprint hashes the complete algorithm object plus the ordered ROCK/SAND/VEG source and output identities. The active pointer is replaced only after all three outputs and the finalized manifest are durable; a partial or rejected build never changes the settled pointer.
+`active-bundle.json` schema 1 records the bundle fingerprint and the SHA-256 of the exact manifest bytes. The schema-1 manifest identifies the deterministic algorithm and complete scene, then records each role's canonical source path, size, nanosecond modification time, point count, property-schema digest, and full SHA-256 together with the equivalent identity for its cached output and analysis sidecars. The bundle fingerprint hashes the complete algorithm object plus the ordered ROCK/SAND/VEG source, output, and sidecar identities. The active pointer is replaced only after all three outputs and the finalized manifest are durable; a partial or rejected build never changes the settled pointer.
 
 At activation the application verifies the small pointer/manifest binding, supported algorithm, complete role set, safe local paths, current file sizes and modification times, canonical/output PLY headers and property-schema digests, and the full SHA-256 of all three local outputs. Canonical 1 mm sources take the fast immutable-reference path at startup: path identity, size, modification time, vertex count, and schema are checked without rehashing roughly 30 GB. A changed source or cached output rejects the whole overlay. No role is redirected until every role passes.
 
@@ -272,6 +278,14 @@ The catalog and project retain the logical shared `Site3-ROLE-5mm.ply` paths. Po
 Build the local bundle explicitly with `scripts/build_scene3_display_density_cache.py`. The builder opens the exact canonical 1 mm sources read-only, rejects a cache root that overlaps or aliases them, preflights temporary disk space, derives exact role budgets with deterministic density-proportional strata and local attribute prefiltering, independently verifies every output, then atomically activates the local bundle. Its default RGB mean deliberately matches the renderer's current byte-domain interpretation of the untouched 1 mm reference; linear-light filtering is an opt-in diagnostic recorded in the manifest.
 
 Local activation does not modify or promote any shared file. Replacing shared 5 mm assets is a separate, explicit operation after matched 5 mm/1 mm still and motion validation, with verified rollback copies and atomic role replacement. The canonical 1 mm sources are never promotion targets; changing them requires separate advance approval because they drive final output.
+
+## Stable Surface Selection And Role Depth
+
+The version-4 cache records the exact emitted 5 mm parent for every canonical 1 mm point, the number of 1 mm parents represented by each 5 mm point, and four compact opacity alternatives for both densities. Surface analysis uses 20 mm XY columns and separates height strata when their vertical gap exceeds 12 mm. `Density + Continuity` scores each scan surface from its original 1 mm parent population and local Recession-field coherence, with a lower-surface tie-break. `Prefer Lower Surface` and `Prefer Upper Surface` expose deterministic comparisons. `Soft Separation` keeps the selected surface opaque, gives a nearby competing surface a partial weight, and fades a competitor to zero as separation grows from 12 to 35 mm. ROCK's stable preset selects the upper stratum to remove rock-under-rock; SAND follows the density/continuity winner; VEG remains `Draw Both`. `Surface Selection Mix` interpolates every choice back toward the authored opacity. Missing, stale, or invalid sidecars fall back to weight one.
+
+These modes are saved with each Visual under **Transparency & Depth > Linked Surface Selection** and apply identically to preview and export. Beauty multiplies the authored opacity by the stored weight. Fast Basic keeps its opaque early-depth path and converts a fractional weight into a deterministic point subset, so it does not introduce frame-to-frame noise.
+
+The adjacent **Role Participation** control is independent of surface selection. `All Roles (Current)` preserves the historical shared soft-edge depth prepass. `ROCK Culls / SAND Receives / VEG Overlay` makes ROCK write and test the prepass, makes SAND test that ROCK depth without hiding other SAND samples, and leaves sparse VEG outside the prepass. `Custom Per Role` exposes `Off / Overlay`, `Test Only`, and `Write + Test` separately. Thus sidecar weights settle competing scans in object space, while the role depth policy handles view-dependent rock occlusion.
 
 ## Density-Compensated Rendering
 

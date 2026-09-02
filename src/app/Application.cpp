@@ -163,6 +163,18 @@ using PointCloudGeometryMode = invisible_places::renderer::pointcloud::PointClou
 using PointCloudNprPreset = invisible_places::renderer::pointcloud::PointCloudNprPreset;
 using PointCloudPreviewLodMode = invisible_places::renderer::pointcloud::PointCloudPreviewLodMode;
 using PointCloudRendererMode = invisible_places::renderer::pointcloud::PointCloudRendererMode;
+using PointCloudGpuSortMode = invisible_places::renderer::pointcloud::PointCloudGpuSortMode;
+using PointCloudDepthParticipation =
+    invisible_places::renderer::pointcloud::PointCloudDepthParticipation;
+using PointCloudDepthRolePolicy =
+    invisible_places::renderer::pointcloud::PointCloudDepthRolePolicy;
+using PointCloudSurfaceStabilityMode =
+    invisible_places::renderer::pointcloud::PointCloudSurfaceStabilityMode;
+using PointCloudSurfaceStabilityPolicy =
+    invisible_places::renderer::pointcloud::PointCloudSurfaceStabilityPolicy;
+using PointCloudEmissionResponse =
+    invisible_places::renderer::pointcloud::PointCloudEmissionResponse;
+using invisible_places::renderer::pointcloud::ResolvePointCloudLayerRendererMode;
 using PointCloudShorelineWaveAlgorithm =
     invisible_places::renderer::pointcloud::PointCloudShorelineWaveAlgorithm;
 using PointCloudDensityCompensation =
@@ -1978,6 +1990,11 @@ struct AnimationPanelState {
     AnimationPreparedPathCacheState preparedPathCache{};
     AnimationMotionStatsCacheState motionStatsCache{};
     AnimationPerceivedFlowCacheState perceivedFlowCache{};
+    // Runtime guard for the saved automatic-near result. It intentionally
+    // ignores the resolved value itself, so camera/lens edits invalidate a
+    // stale result without creating a fingerprint feedback loop.
+    std::string automaticNearPlaneTrackedPath;
+    std::uint64_t automaticNearPlaneInputFingerprint = 0U;
     AnimationViewportDragState drag{};
     AnimationLiveCameraEditState liveCameraEdit{};
     AnimationFramePreviewState framePreview{};
@@ -5292,6 +5309,20 @@ ResolveTimingColouriseStack(
             colouriseResolved.blendMode = static_cast<
                 invisible_places::renderer::pointcloud::
                     TimingColouriseBlendMode>(effect.blendMode);
+            colouriseResolved.secondaryBlendMode = static_cast<
+                invisible_places::renderer::pointcloud::
+                    TimingColouriseBlendMode>(effect.secondaryBlendMode);
+            colouriseResolved.blendCompositionMode = static_cast<
+                invisible_places::renderer::pointcloud::
+                    TimingColouriseBlendCompositionMode>(
+                        effect.blendCompositionMode);
+            colouriseResolved.blendMix = invisible_places::timing::
+                EvaluateTimingColouriseEffectParameter(
+                    effect,
+                    invisible_places::timing::
+                        TimingColouriseEffectParameter::BlendMix,
+                    normalizedPosition,
+                    cyclic);
             colouriseResolved.rgbaLut =
                 invisible_places::timing::
                     EvaluateTimingColourisePaletteLut(
@@ -6994,6 +7025,10 @@ std::uint64_t AnimationPathMotionFingerprint(const AnimationPath& path) {
     HashBool(&seed, path.depthOfFieldEnabled);
     HashFloat(&seed, path.apertureFStops);
     HashFloat(&seed, path.depthOfFieldMaxBlurPixels);
+    HashBool(&seed, path.automaticNearPlaneEnabled);
+    HashFloat(&seed, path.automaticNearPlanePaddingMeters);
+    HashFloat(&seed, path.automaticNearPlaneMinimumMeters);
+    HashFloat(&seed, path.automaticNearPlaneResolvedMeters);
     HashCombine(&seed, path.keys.size());
     for (const auto& key : path.keys) {
         HashString(&seed, key.id);
@@ -7032,6 +7067,20 @@ std::uint64_t AnimationPathMotionFingerprint(const AnimationPath& path) {
     return seed;
 }
 
+std::uint64_t AutomaticNearPlaneInputFingerprint(
+    const AnimationPath& path) {
+    auto fingerprintPath = path;
+    fingerprintPath.automaticNearPlaneResolvedMeters = 0.0F;
+    std::uint64_t seed = AnimationPathMotionFingerprint(fingerprintPath);
+    HashCombine(&seed, path.associatedLayerPaths.size());
+    for (const auto& associatedPath : path.associatedLayerPaths) {
+        HashString(
+            &seed,
+            associatedPath.lexically_normal().generic_string());
+    }
+    return seed;
+}
+
 const invisible_places::camera::PreparedAnimationPathEvaluationContext& CachedPreparedAnimationPath(
     AnimationPanelState* panel,
     const AnimationPath& path) {
@@ -7050,6 +7099,96 @@ const invisible_places::camera::PreparedAnimationPathEvaluationContext& CachedPr
         panel->preparedPathCache.valid = true;
     }
     return panel->preparedPathCache.context;
+}
+
+glm::mat4 PointDepthSortViewFromAverage(
+    const invisible_places::camera::AnimationPathViewAverage& average) {
+    glm::vec3 direction{
+        average.viewDirection[0U],
+        average.viewDirection[1U],
+        average.viewDirection[2U],
+    };
+    if (glm::dot(direction, direction) <= 1.0e-10F) {
+        direction = {0.0F, 0.0F, -1.0F};
+    } else {
+        direction = glm::normalize(direction);
+    }
+    const glm::vec3 position{
+        average.cameraPosition[0U],
+        average.cameraPosition[1U],
+        average.cameraPosition[2U],
+    };
+
+    // Only row Z is read by pointcloud_depth_sort.comp. Constructing that row
+    // directly avoids an arbitrary roll choice for an almost-vertical aerial
+    // view and makes lateral translation disappear from the depth identity.
+    glm::mat4 view{1.0F};
+    view[0U][2U] = -direction.x;
+    view[1U][2U] = -direction.y;
+    view[2U][2U] = -direction.z;
+    view[3U][2U] = glm::dot(direction, position);
+    return view;
+}
+
+void ResolveAnimationPointDepthSortViews(
+    invisible_places::renderer::core::SceneRenderState* renderState,
+    const invisible_places::camera::PreparedAnimationPathEvaluationContext&
+        path,
+    float timeSeconds) {
+    if (renderState == nullptr || !path.valid) {
+        return;
+    }
+
+    std::optional<invisible_places::camera::AnimationPathViewAverage>
+        fullPathAverage;
+    for (auto& layer : renderState->pointCloudLayers) {
+        layer.depthSortViewValid = false;
+        if (!layer.style.gpuBackToFrontSorting ||
+            layer.style.geometryMode != PointCloudGeometryMode::ScreenSprites ||
+            layer.style.gpuSortMode == PointCloudGpuSortMode::PerFrame ||
+            // Fixed Vertical derives its axis from the cloud's own bounds
+            // inside the renderer; no animation-path average is involved.
+            layer.style.gpuSortMode == PointCloudGpuSortMode::FixedVertical) {
+            continue;
+        }
+
+        invisible_places::camera::AnimationPathViewAverage average;
+        if (layer.style.gpuSortMode == PointCloudGpuSortMode::FullAnimation) {
+            if (!fullPathAverage.has_value()) {
+                fullPathAverage = invisible_places::camera::
+                    AveragePreparedAnimationPathView(
+                        path,
+                        0.0F,
+                        path.durationSeconds,
+                        129U);
+            }
+            average = fullPathAverage.value();
+        } else {
+            const float windowSeconds = std::clamp(
+                layer.style.gpuSortWindowSeconds,
+                0.05F,
+                3600.0F);
+            const float intervalStart = timeSeconds - windowSeconds * 0.5F;
+            const float intervalEnd = timeSeconds + windowSeconds * 0.5F;
+            const auto sampleCount = static_cast<std::uint32_t>(std::clamp(
+                static_cast<int>(std::ceil(windowSeconds * 30.0F)) + 1,
+                5,
+                129));
+            average = invisible_places::camera::
+                AveragePreparedAnimationPathView(
+                    path,
+                    intervalStart,
+                    intervalEnd,
+                    sampleCount);
+        }
+        if (!average.valid) {
+            continue;
+        }
+        layer.depthSortView = PointDepthSortViewFromAverage(average);
+        layer.depthSortNearPlane = average.nearPlane;
+        layer.depthSortFarPlane = average.farPlane;
+        layer.depthSortViewValid = true;
+    }
 }
 
 invisible_places::camera::AnimationPathMotionStats CachedAnimationPathMotionStats(
@@ -7232,6 +7371,42 @@ void HashPointStyle(std::uint64_t* seed, const PointCloudStyleState& style) {
     HashFloat(seed, style.waterFlowSpeedScale);
     HashBool(seed, style.waterTrailStyleGeometry);
     HashBool(seed, style.solidCenters);
+    HashBool(seed, style.gpuBackToFrontSorting);
+    HashCombine(seed, static_cast<std::uint32_t>(style.gpuSortMode));
+    HashFloat(seed, style.gpuSortWindowSeconds);
+    HashBool(seed, style.depthPrepassEnabled);
+    HashFloat(seed, style.depthPrepassAlphaThreshold);
+    HashFloat(seed, style.depthPrepassToleranceMeters);
+    HashCombine(seed, static_cast<std::uint32_t>(style.depthRolePolicy));
+    HashCombine(
+        seed, static_cast<std::uint32_t>(style.rockDepthParticipation));
+    HashCombine(
+        seed, static_cast<std::uint32_t>(style.sandDepthParticipation));
+    HashCombine(
+        seed,
+        static_cast<std::uint32_t>(
+            style.vegetationDepthParticipation));
+    HashCombine(
+        seed,
+        static_cast<std::uint32_t>(style.surfaceStabilityPolicy));
+    HashCombine(
+        seed,
+        static_cast<std::uint32_t>(style.uniformSurfaceStabilityMode));
+    HashCombine(
+        seed,
+        static_cast<std::uint32_t>(style.rockSurfaceStabilityMode));
+    HashCombine(
+        seed,
+        static_cast<std::uint32_t>(style.sandSurfaceStabilityMode));
+    HashCombine(
+        seed,
+        static_cast<std::uint32_t>(style.vegetationSurfaceStabilityMode));
+    HashFloat(seed, style.surfaceStabilityInfluence);
+    HashFloat(seed, style.depthWeightStrength);
+    HashCombine(seed, static_cast<std::uint32_t>(style.emissionResponse));
+    HashBool(seed, style.normalCullEnabled);
+    HashFloat(seed, style.normalCullStartDegrees);
+    HashFloat(seed, style.normalCullEndDegrees);
     HashBool(seed, style.flowAnimation);
     HashBool(seed, style.waterPathView);
     HashBool(seed, style.waterTrailOverlay);
@@ -7288,6 +7463,13 @@ void HashTimingColouriseStack(
         HashCombine(
             seed,
             static_cast<std::uint64_t>(effect.blendMode));
+        HashCombine(
+            seed,
+            static_cast<std::uint64_t>(effect.secondaryBlendMode));
+        HashCombine(
+            seed,
+            static_cast<std::uint64_t>(effect.blendCompositionMode));
+        HashFloat(seed, effect.blendMix);
         for (const auto& sample : effect.rgbaLut) {
             for (const float value : sample) {
                 HashFloat(seed, value);
@@ -7902,6 +8084,16 @@ void RemapLegacyWaterTrailBindings(PreviewLayerSession* session) {
     RemapLegacyWaterTrailBinding(&session->pointStyle.colormapPosition, session->scalarFields);
 }
 
+bool HasAuthoringVisibleScalarFields(
+    const std::vector<invisible_places::io::ScalarFieldStats>& fields) {
+    return std::any_of(
+        fields.begin(),
+        fields.end(),
+        [](const invisible_places::io::ScalarFieldStats& field) {
+            return field.authoringVisible;
+        });
+}
+
 void SanitizePointCloudStyle(PreviewLayerSession* session) {
     if (session == nullptr) {
         return;
@@ -7909,15 +8101,17 @@ void SanitizePointCloudStyle(PreviewLayerSession* session) {
 
     const bool sourceOffersScalarFields =
         !session->availableScalarFields.empty();
+    const bool hasResidentAuthoringFields =
+        HasAuthoringVisibleScalarFields(session->scalarFields);
     if (!session->hasSourceRgb &&
         session->pointStyle.colorMode == PointCloudColorMode::SourceRgb) {
         session->pointStyle.colorMode =
-            !session->scalarFields.empty() || sourceOffersScalarFields
+            hasResidentAuthoringFields || sourceOffersScalarFields
                 ? PointCloudColorMode::ScalarColormap
                 : PointCloudColorMode::SolidColor;
     }
 
-    if (session->scalarFields.empty() && !sourceOffersScalarFields &&
+    if (!hasResidentAuthoringFields && !sourceOffersScalarFields &&
         session->pointStyle.colorMode == PointCloudColorMode::ScalarColormap) {
         session->pointStyle.colorMode =
             session->hasSourceRgb ? PointCloudColorMode::SourceRgb : PointCloudColorMode::SolidColor;
@@ -7943,6 +8137,22 @@ void SanitizePointCloudStyle(PreviewLayerSession* session) {
     session->pointStyle.gaussianSharpness = std::max(0.001F, session->pointStyle.gaussianSharpness);
     session->pointStyle.featherPower = std::max(0.001F, session->pointStyle.featherPower);
     session->pointStyle.waterStreakAspect = std::clamp(session->pointStyle.waterStreakAspect, 1.0F, 32.0F);
+    session->pointStyle.depthPrepassAlphaThreshold =
+        std::clamp(session->pointStyle.depthPrepassAlphaThreshold, 0.0F, 1.0F);
+    session->pointStyle.depthPrepassToleranceMeters =
+        std::clamp(session->pointStyle.depthPrepassToleranceMeters, 0.0F, 10.0F);
+    session->pointStyle.gpuSortWindowSeconds =
+        std::clamp(session->pointStyle.gpuSortWindowSeconds, 0.05F, 3600.0F);
+    session->pointStyle.depthWeightStrength =
+        std::clamp(session->pointStyle.depthWeightStrength, 1.0F, 8.0F);
+    session->pointStyle.normalCullStartDegrees =
+        std::clamp(session->pointStyle.normalCullStartDegrees, 0.0F, 179.0F);
+    session->pointStyle.normalCullEndDegrees = std::clamp(
+        std::max(
+            session->pointStyle.normalCullEndDegrees,
+            session->pointStyle.normalCullStartDegrees + 1.0F),
+        1.0F,
+        180.0F);
     session->pointStyle.colorizeAmount = std::clamp(session->pointStyle.colorizeAmount, 0.0F, 1.0F);
     session->pointStyle.stylisationStrength =
         std::clamp(session->pointStyle.stylisationStrength, 0.0F, 1.0F);
@@ -8107,7 +8317,6 @@ std::optional<std::size_t> FindWaterFillSceneSandSessionIndex(
 bool IsInactiveLegacyWaterOverlaySession(
     const PreviewLayerSession& session);
 bool IsGeneratedWaterFlowOverlaySession(const PreviewLayerSession& session);
-bool VisibleGeneratedWaterTrailOverlayPresent(const PreviewRuntimeState& runtimeState);
 bool IsProtectedWaterPointVisualName(std::string_view name);
 std::optional<PointCloudStyleState> MakeProtectedWaterPointVisualStyle(
     const PreviewRuntimeState& runtimeState,
@@ -9693,7 +9902,7 @@ std::string BindingFieldLabel(
     const RenderParameterBinding& binding,
     const std::vector<invisible_places::io::ScalarFieldStats>& scalarFields) {
     const auto* fieldStats = ScalarFieldStatsBySlot(scalarFields, binding.fieldMap.fieldSlot);
-    if (fieldStats != nullptr) {
+    if (fieldStats != nullptr && fieldStats->authoringVisible) {
         return fieldStats->name;
     }
     if (!binding.fieldMap.fieldName.empty()) {
@@ -10148,10 +10357,12 @@ bool DrawScalarBindingBody(
         }
     }
 
+    const bool hasResidentAuthoringFields =
+        HasAuthoringVisibleScalarFields(scalarFields);
     const bool hasOnDemandFields =
         session != nullptr && !session->availableScalarFields.empty();
     if (binding->mode == ParameterSourceMode::Constant ||
-        (scalarFields.empty() && !hasOnDemandFields)) {
+        (!hasResidentAuthoringFields && !hasOnDemandFields)) {
         const float displayScale = std::max(1.0e-6F, config.displayScale);
         float constantValue = invisible_places::style::ScalarConstant(*binding) * displayScale;
         const std::optional<float> hardMin =
@@ -10171,7 +10382,7 @@ bool DrawScalarBindingBody(
             changed = true;
         }
         if (binding->mode == ParameterSourceMode::FieldMapped &&
-            scalarFields.empty()) {
+            !hasResidentAuthoringFields) {
             ImGui::TextDisabled("No scalar fields are available for this layer.");
         }
         if (!binding->active) {
@@ -10185,6 +10396,9 @@ bool DrawScalarBindingBody(
 
     if (ImGui::BeginCombo("Field", BindingFieldLabel(*binding, scalarFields).c_str())) {
         for (std::size_t fieldIndex = 0; fieldIndex < scalarFields.size(); ++fieldIndex) {
+            if (!scalarFields[fieldIndex].authoringVisible) {
+                continue;
+            }
             const bool selected = binding->fieldMap.fieldSlot == static_cast<std::int32_t>(fieldIndex);
             if (ImGui::Selectable(scalarFields[fieldIndex].name.c_str(), selected)) {
                 // Leaving a field stashes its manual bounds; arriving on a
@@ -11992,19 +12206,6 @@ bool IsGeneratedWaterFlowOverlaySession(const PreviewLayerSession& session) {
            IsGeneratedWaterFlowTrailOverlayStem(stem);
 }
 
-bool VisibleGeneratedWaterTrailOverlayPresent(const PreviewRuntimeState& runtimeState) {
-    return std::any_of(
-        runtimeState.sessions.begin(),
-        runtimeState.sessions.end(),
-        [](const PreviewLayerSession& session) {
-            return session.loaded &&
-                   session.visible &&
-                   session.kind == LayerKind::PointCloud &&
-                   session.pointStyle.waterTrailOverlay &&
-                   IsGeneratedWaterOverlaySession(session);
-        });
-}
-
 std::optional<std::size_t> FindSessionIndexBySourcePath(
     const PreviewRuntimeState& runtimeState,
     const std::filesystem::path& sourcePath);
@@ -12164,6 +12365,193 @@ std::vector<std::filesystem::path> VisibleAssociatedLidarLayerPaths(
     }
     NormalizeAssociatedLayerPaths(&paths);
     return paths;
+}
+
+struct AutomaticNearPlaneAnalysis {
+    bool success = false;
+    float closestVisibleDepthMeters = 0.0F;
+    float resolvedNearPlaneMeters = 0.0F;
+    std::size_t pathSampleCount = 0U;
+    std::size_t pointSampleCount = 0U;
+    std::string message;
+};
+
+AutomaticNearPlaneAnalysis AnalyseAutomaticNearPlane(
+    const PreviewRuntimeState& runtimeState,
+    const AnimationPath& path) {
+    AutomaticNearPlaneAnalysis result;
+    const auto prepared =
+        invisible_places::camera::PrepareAnimationPathEvaluation(path);
+    if (!prepared.valid) {
+        result.message = "Automatic near plane needs at least one camera key.";
+        return result;
+    }
+
+    auto associations = path.associatedLayerPaths;
+    CanonicalizeAssociatedLayerPathsForSceneGroups(
+        runtimeState,
+        &associations);
+    std::vector<const PreviewLayerSession*> sources;
+    float largestPointSpacingMeters = 0.0F;
+    const auto collectSources = [&](bool requireAssociation) {
+        for (const auto& session : runtimeState.sessions) {
+            if (session.kind != LayerKind::PointCloud ||
+                session.pivotSamples.empty() ||
+                IsGeneratedWaterOverlaySession(session)) {
+                continue;
+            }
+            const bool resident =
+                IsCpuReadyAnalysisPointCloudSource(session) ||
+                IsRenderablePointCloudSource(runtimeState, session);
+            if (!resident) {
+                continue;
+            }
+            if (requireAssociation &&
+                !AssociatedLayerPathsContain(
+                    associations,
+                    AssociationPathForSession(session))) {
+                continue;
+            }
+            sources.push_back(&session);
+            largestPointSpacingMeters = std::max(
+                largestPointSpacingMeters,
+                std::max(
+                    session.pointSpacingMeters,
+                    session.inferredPointSpacingMeters));
+        }
+    };
+    if (!associations.empty()) {
+        collectSources(true);
+    }
+    // Legacy paths can have no association, and an association can refer to a
+    // scene that is not currently resident. Falling back to visible resident
+    // LiDAR keeps the feature useful without silently loading new assets.
+    if (sources.empty()) {
+        collectSources(false);
+    }
+    if (sources.empty()) {
+        result.message =
+            "Automatic near plane needs a resident point-cloud scene.";
+        return result;
+    }
+
+    std::vector<float> sampleTimes;
+    constexpr std::size_t kUniformPathSamples = 128U;
+    const std::size_t uniformPathSampleCount =
+        prepared.singleKey ? 1U : kUniformPathSamples;
+    sampleTimes.reserve(uniformPathSampleCount + prepared.knots.size());
+    const float duration = std::max(0.0F, prepared.durationSeconds);
+    for (std::size_t index = 0U; index < uniformPathSampleCount; ++index) {
+        const float fraction = uniformPathSampleCount > 1U
+                                   ? static_cast<float>(index) /
+                                         static_cast<float>(
+                                             uniformPathSampleCount - 1U)
+                                   : 0.0F;
+        sampleTimes.push_back(duration * fraction);
+    }
+    sampleTimes.insert(
+        sampleTimes.end(),
+        prepared.knots.begin(),
+        prepared.knots.end());
+    std::sort(sampleTimes.begin(), sampleTimes.end());
+    sampleTimes.erase(
+        std::unique(
+            sampleTimes.begin(),
+            sampleTimes.end(),
+            [](float left, float right) {
+                return std::abs(left - right) <= 1.0e-6F;
+            }),
+        sampleTimes.end());
+
+    float closestVisibleDepth = std::numeric_limits<float>::infinity();
+    float smallestFarPlane = std::numeric_limits<float>::infinity();
+    std::size_t testedPoints = 0U;
+    constexpr float kFrustumMargin = 1.025F;
+    for (const float timeSeconds : sampleTimes) {
+        const auto evaluation =
+            invisible_places::camera::EvaluatePreparedAnimationPath(
+                prepared,
+                timeSeconds);
+        invisible_places::camera::OrbitCamera camera;
+        camera.ApplyState(evaluation.camera);
+        const auto matrices = camera.Matrices(prepared.aspectRatio);
+        smallestFarPlane = std::min(
+            smallestFarPlane,
+            evaluation.camera.farPlane);
+        for (const auto* source : sources) {
+            for (const auto& sample : source->pivotSamples) {
+                ++testedPoints;
+                const glm::vec4 worldPosition{
+                    sample.x,
+                    sample.y,
+                    sample.z,
+                    1.0F};
+                const glm::vec4 viewPosition =
+                    matrices.view * worldPosition;
+                const float viewDepth = -viewPosition.z;
+                if (!std::isfinite(viewDepth) || viewDepth <= 0.0F ||
+                    viewDepth >= smallestFarPlane) {
+                    continue;
+                }
+                const glm::vec4 clip =
+                    matrices.viewProjection * worldPosition;
+                if (!std::isfinite(clip.w) || clip.w <= 1.0e-6F) {
+                    continue;
+                }
+                const float inverseW = 1.0F / clip.w;
+                const float ndcX = clip.x * inverseW;
+                const float ndcY = clip.y * inverseW;
+                if (!std::isfinite(ndcX) || !std::isfinite(ndcY) ||
+                    std::abs(ndcX) > kFrustumMargin ||
+                    std::abs(ndcY) > kFrustumMargin) {
+                    continue;
+                }
+                closestVisibleDepth =
+                    std::min(closestVisibleDepth, viewDepth);
+            }
+        }
+    }
+    if (!std::isfinite(closestVisibleDepth)) {
+        result.message =
+            "No resident point samples enter the camera frustum over this path.";
+        return result;
+    }
+
+    const float authoredPadding = std::clamp(
+        std::isfinite(path.automaticNearPlanePaddingMeters)
+            ? path.automaticNearPlanePaddingMeters
+            : 0.02F,
+        0.0F,
+        1000.0F);
+    // Pivot samples are deliberately sparse. Two source spacings plus 2 mm
+    // is a conservative guard for a nearer omitted sample; it is fixed for
+    // the whole shot and therefore cannot introduce temporal pumping.
+    const float samplingGuard = std::max(
+        0.002F,
+        std::max(0.0F, largestPointSpacingMeters) * 2.0F);
+    const float minimumNear = std::clamp(
+        std::isfinite(path.automaticNearPlaneMinimumMeters)
+            ? path.automaticNearPlaneMinimumMeters
+            : 0.0005F,
+        1.0e-5F,
+        1000.0F);
+    const float farLimit = std::isfinite(smallestFarPlane)
+                               ? std::max(
+                                     minimumNear,
+                                     smallestFarPlane - 1.0e-4F)
+                               : 1000.0F;
+    result.closestVisibleDepthMeters = closestVisibleDepth;
+    result.resolvedNearPlaneMeters = std::clamp(
+        closestVisibleDepth - authoredPadding - samplingGuard,
+        minimumNear,
+        farLimit);
+    result.pathSampleCount = sampleTimes.size();
+    result.pointSampleCount = testedPoints;
+    result.success = true;
+    result.message =
+        "Analysed " + std::to_string(result.pathSampleCount) +
+        " path positions using resident scene samples.";
+    return result;
 }
 
 bool AssociatedLayerPathsIntersect(
@@ -14039,6 +14427,13 @@ void EvictScalarFieldsOverBudget(
                                         session)
                                   : invisible_places::app::UsedScalarFieldSet{};
         for (const auto& field : session.scalarFields) {
+            if (field.sourceIndex < 0) {
+                // Runtime support columns (surface stability) can never be
+                // evicted; counting them against the streaming budget would
+                // make the sweep evict and re-stream real fields forever
+                // once the budget sits below the un-evictable overhead.
+                continue;
+            }
             residentBytes += bytesPerField;
             std::uint64_t lastTick = 0U;
             if (const auto tickIt =
@@ -33860,8 +34255,7 @@ std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
     const auto* activeColouriseEffects =
         ActiveTimingColouriseEffects(runtimeState);
     const bool fastBasicRenderer =
-        FastBasicPointRendererActive(runtimeState.projectSettings) &&
-        !VisibleGeneratedWaterTrailOverlayPresent(runtimeState);
+        FastBasicPointRendererActive(runtimeState.projectSettings);
     std::uint64_t effectiveSeepageInvocations = 0U;
     for (std::size_t sessionIndex = 0; sessionIndex < runtimeState.sessions.size(); ++sessionIndex) {
         const auto& session = runtimeState.sessions[sessionIndex];
@@ -33968,13 +34362,20 @@ std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
         invisible_places::water::PrepareWaterSeepagePulseFields(
             &seepageGrid,
             0.0F);
+        const bool generatedWaterOverlay =
+            IsGeneratedWaterOverlaySession(session);
+        const bool fastBasicLayer =
+            ResolvePointCloudLayerRendererMode(
+                runtimeState.projectSettings.pointCloudRendererMode,
+                generatedWaterOverlay,
+                style) == PointCloudRendererMode::FastBasic;
         layers.push_back(
             {.cloud = session.offlinePointCloud,
-             .style = fastBasicRenderer
+             .style = fastBasicLayer
                           ? MakeEffectiveFastBasicStyle(
                                 style,
                                 session.hasSourceRgb,
-                                IsGeneratedWaterOverlaySession(session))
+                                generatedWaterOverlay)
                           : style,
              .timingColourise =
                  activeColouriseEffects != nullptr &&
@@ -33988,9 +34389,9 @@ std::vector<OfflinePointLayerSnapshot> BuildOfflinePointLayerSnapshots(
                            sessionIsWaterFill)
                      : invisible_places::renderer::pointcloud::
                            ResolvedTimingColouriseStack{},
-             .generatedWaterOverlay = IsGeneratedWaterOverlaySession(session),
+             .generatedWaterOverlay = generatedWaterOverlay,
              .hasSourceRgb = session.hasSourceRgb,
-             .fastBasic = fastBasicRenderer,
+             .fastBasic = fastBasicLayer,
              // A settled GPU Flow resource and its deterministic CPU export
              // snapshot may use different route sampling densities. Offline
              // rendering must never read beyond the snapshot's own arrays.
@@ -34127,6 +34528,20 @@ std::vector<invisible_places::output::OfflinePointLayer> BuildOfflinePointLayers
                 if (const auto groundSlot = FindGroundIdMotionScalarFieldSlot(snapshot.cloud->scalarFields);
                     groundSlot.has_value() && groundSlot.value() < snapshot.cloud->scalarFields.size()) {
                     layer.groundIdMotionFieldSlot = groundSlot.value();
+                }
+            }
+        }
+        if (!layer.generatedWaterOverlay) {
+            // Resolved once per layer: the per-point weight lookup must be a
+            // plain array index, and this exact-name predicate matches the
+            // live renderer's resolver.
+            const auto& fields = snapshot.cloud->scalarFields;
+            for (std::size_t field = 0U; field < fields.size(); ++field) {
+                if (fields[field].name ==
+                    invisible_places::io::
+                        kPointCloudSurfaceStabilityPackedFieldName) {
+                    layer.surfaceStabilityFieldSlot = field;
+                    break;
                 }
             }
         }
@@ -34956,9 +35371,6 @@ BuildAnimationExportPointCloudLayerSnapshot(
     PointCloudRendererMode rendererMode) {
     std::vector<invisible_places::renderer::core::SceneRenderState::PointCloudLayerState> layers;
     const auto activeWaterScenario = ResolveActiveWaterScenarioState(runtimeState);
-    const bool fastBasicRenderer =
-        rendererMode == PointCloudRendererMode::FastBasic &&
-        !VisibleGeneratedWaterTrailOverlayPresent(runtimeState);
     for (std::size_t sessionIndex = 0; sessionIndex < runtimeState.sessions.size(); ++sessionIndex) {
         const auto& session = runtimeState.sessions[sessionIndex];
         if (!IsGpuAnimationExportPointCloudSourceReady(
@@ -34990,19 +35402,25 @@ BuildAnimationExportPointCloudLayerSnapshot(
         // snapshot lives for the whole export job, and the level is applied
         // per frame in BuildPointCloudExrRenderState from the frozen
         // per-frame water state so it animates during export.
+        const bool generatedWaterOverlay =
+            IsGeneratedWaterOverlaySession(session);
+        const bool fastBasicLayer =
+            ResolvePointCloudLayerRendererMode(
+                rendererMode,
+                generatedWaterOverlay,
+                exportStyle) == PointCloudRendererMode::FastBasic;
         const auto effectiveStyle =
-            fastBasicRenderer
+            fastBasicLayer
                 ? MakeEffectiveFastBasicStyle(
                       exportStyle,
                       session.hasSourceRgb,
-                      IsGeneratedWaterOverlaySession(session))
+                      generatedWaterOverlay)
                 : exportStyle;
         layers.push_back(
             {.layerId = sessionIndex,
              .style = effectiveStyle,
              .scalarFields = session.scalarFields,
-             .generatedWaterOverlay =
-                 IsGeneratedWaterOverlaySession(session),
+             .generatedWaterOverlay = generatedWaterOverlay,
              .hasSourceRgb = session.hasSourceRgb,
              .hasNormals = session.hasNormals,
              .timingColouriseEligible =
@@ -35963,6 +36381,24 @@ invisible_places::renderer::core::SceneRenderState BuildPointCloudExrRenderState
             resolvedShorelines.end());
     } else {
         renderState.additionalShorelines.clear();
+    }
+
+    std::optional<
+        invisible_places::camera::PreparedAnimationPathEvaluationContext>
+        preparedSortPath;
+    const auto* sortPath = job.preparedAnimationPath.has_value()
+                               ? &job.preparedAnimationPath.value()
+                               : nullptr;
+    if (sortPath == nullptr && job.animationPath.has_value()) {
+        preparedSortPath = invisible_places::camera::
+            PrepareAnimationPathEvaluation(job.animationPath.value());
+        sortPath = &preparedSortPath.value();
+    }
+    if (sortPath != nullptr && sortPath->valid) {
+        ResolveAnimationPointDepthSortViews(
+            &renderState,
+            *sortPath,
+            flowTimeSeconds);
     }
 
     return renderState;
@@ -38599,9 +39035,7 @@ ResolveCurrentRenderSetupSnapshot(
         document.tempWaterPointVisualStyle =
             project.tempWaterPointVisualStyle;
         document.renderer.pointCloudRendererMode =
-            VisibleGeneratedWaterTrailOverlayPresent(*runtimeState)
-                ? PointCloudRendererMode::Beauty
-                : runtimeState->projectSettings.pointCloudRendererMode;
+            runtimeState->projectSettings.pointCloudRendererMode;
         document.renderer.backgroundColor =
             runtimeState->projectSettings.backgroundColor;
         document.renderer.eyeDomeLightingEnabled =
@@ -39501,10 +39935,8 @@ BuildSelectedBackgroundBatchRenderSetups(
     }
 
     const auto projectSnapshot = BuildProjectDocument(*runtimeState);
-    const auto rendererMode = VisibleGeneratedWaterTrailOverlayPresent(
-                                  *runtimeState)
-        ? PointCloudRendererMode::Beauty
-        : runtimeState->projectSettings.pointCloudRendererMode;
+    const auto rendererMode =
+        runtimeState->projectSettings.pointCloudRendererMode;
     BackgroundBatchRenderSetupPlan plan;
     plan.modeLabel = AnimationExportModeLabel(effectivePreset.mode);
     std::string loadError;
@@ -42926,9 +43358,7 @@ void StartSelectedQuickMp4Batch(
     }
 
     const auto batchRendererMode =
-        VisibleGeneratedWaterTrailOverlayPresent(*runtimeState)
-            ? PointCloudRendererMode::Beauty
-            : runtimeState->projectSettings.pointCloudRendererMode;
+        runtimeState->projectSettings.pointCloudRendererMode;
     const auto batchVisualOverride =
         std::optional<PointVisualExportOverride>{
             savedVisual->visualOverride};
@@ -43433,9 +43863,7 @@ void StartStillCameraExportJob(
     }
 
     const auto exportRendererMode =
-        VisibleGeneratedWaterTrailOverlayPresent(*runtimeState)
-            ? PointCloudRendererMode::Beauty
-            : runtimeState->projectSettings.pointCloudRendererMode;
+        runtimeState->projectSettings.pointCloudRendererMode;
     const auto savedVisual = ResolveSavedPointVisualExportSelection(runtimeState);
     if (!savedVisual.has_value()) {
         runtimeState->errorMessage =
@@ -54708,7 +55136,8 @@ bool DrawPointCloudColourSection(
         changed |= ImGui::ColorEdit4("Solid Color", style.solidColor.data());
     }
 
-    if (style.colorMode == PointCloudColorMode::ScalarColormap && !session->scalarFields.empty()) {
+    if (style.colorMode == PointCloudColorMode::ScalarColormap &&
+        HasAuthoringVisibleScalarFields(session->scalarFields)) {
         int colormapIndex = static_cast<int>(style.colormap);
         const char* colormaps[] = {
             "Viridis",
@@ -55790,6 +56219,313 @@ bool DrawPointCloudFalloffSection(PreviewLayerSession* session) {
     return changed;
 }
 
+bool DrawPointCloudTransparencyDepthSection(PreviewLayerSession* session) {
+    if (session == nullptr || !BeginPanelSection("Transparency & Depth")) {
+        return false;
+    }
+
+    auto& style = session->pointStyle;
+    bool changed = false;
+    changed |= ImGui::Checkbox(
+        "GPU Back-to-Front Sort",
+        &style.gpuBackToFrontSorting);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Opt-in GPU depth-bucket sorting with conventional alpha blending. "
+            "It is intended for genuinely translucent screen sprites and adds "
+            "a compute pass only while enabled.");
+    }
+    if (style.gpuBackToFrontSorting) {
+        int sortModeIndex = static_cast<int>(style.gpuSortMode);
+        const char* sortModes[] = {
+            "Per Frame",
+            "Full Animation (Stable)",
+            "Moving Average",
+            "Fixed Vertical (Top-Down)",
+        };
+        if (DrawRightAlignedCombo(
+                "Sort Direction",
+                &sortModeIndex,
+                sortModes,
+                IM_ARRAYSIZE(sortModes))) {
+            style.gpuSortMode = static_cast<PointCloudGpuSortMode>(
+                std::clamp(sortModeIndex, 0, 3));
+            changed = true;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Per Frame follows the exact camera. Full Animation averages "
+                "the complete camera path and reuses one ordering. Moving "
+                "Average smooths the direction around each frame. Animation "
+                "modes fall back to Per Frame when no path is active. Fixed "
+                "Vertical sorts bottom-up along world Z from the cloud's own "
+                "bounds — one cached ordering for any camera, ideal for "
+                "aerial/top-down passes, no animation path needed.");
+        }
+        if (style.gpuSortMode == PointCloudGpuSortMode::MovingAverage) {
+            changed |= DrawRangedFloatControl(
+                "Average Window (s)",
+                &style.gpuSortWindowSeconds,
+                {.visualMin = 0.05F,
+                 .visualMax = 10.0F,
+                 .format = "%.2f s",
+                 .hardMin = 0.05F,
+                 .hardMax = 3600.0F});
+        } else if (style.gpuSortMode ==
+                   PointCloudGpuSortMode::FullAnimation) {
+            ImGui::TextDisabled(
+                "Recommended for fixed-direction aerial pans; sorted once per source/budget.");
+        } else if (style.gpuSortMode ==
+                   PointCloudGpuSortMode::FixedVertical) {
+            ImGui::TextDisabled(
+                "Camera-independent world-Z ordering; sorted once per source/budget.");
+        }
+    }
+    if (style.geometryMode != PointCloudGeometryMode::ScreenSprites) {
+        ImGui::TextDisabled(
+            "GPU sorting applies to Screen Sprites; surfels keep weighted blending.");
+    }
+
+    changed |= ImGui::Checkbox(
+        "Soft-Edge Depth Prepass",
+        &style.depthPrepassEnabled);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Runs in both preview and export. Opaque point cores establish the "
+            "nearest surface; nearby soft edges may still blend, while deeper "
+            "surfaces are rejected. This is the soft/Gaussian equivalent of "
+            "Preview Performance Mode's hard depth culling.");
+    }
+    if (style.depthPrepassEnabled) {
+        int rolePolicyIndex = static_cast<int>(style.depthRolePolicy);
+        const char* rolePolicies[] = {
+            "All Roles (Current)",
+            "ROCK Culls / SAND Receives / VEG Overlay",
+            "Custom Per Role",
+        };
+        if (DrawRightAlignedCombo(
+                "Role Participation",
+                &rolePolicyIndex,
+                rolePolicies,
+                IM_ARRAYSIZE(rolePolicies))) {
+            style.depthRolePolicy = static_cast<PointCloudDepthRolePolicy>(
+                std::clamp(rolePolicyIndex, 0, 2));
+            changed = true;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "All Roles preserves the existing shared prepass. The ROCK "
+                "preset keeps ROCK self-occlusion, lets SAND test only the "
+                "ROCK surface, and draws VEG as a transparent overlay. "
+                "Custom exposes the same write/test choices per role.");
+        }
+        if (style.depthRolePolicy == PointCloudDepthRolePolicy::Custom) {
+            const auto drawParticipation = [&](const char* label,
+                                               PointCloudDepthParticipation* value) {
+                int index = static_cast<int>(*value);
+                const char* choices[] = {
+                    "Off / Overlay",
+                    "Test Only",
+                    "Write + Test",
+                };
+                if (!DrawRightAlignedCombo(
+                        label,
+                        &index,
+                        choices,
+                        IM_ARRAYSIZE(choices))) {
+                    return false;
+                }
+                *value = static_cast<PointCloudDepthParticipation>(
+                    std::clamp(index, 0, 2));
+                return true;
+            };
+            changed |= drawParticipation(
+                "ROCK Depth", &style.rockDepthParticipation);
+            changed |= drawParticipation(
+                "SAND Depth", &style.sandDepthParticipation);
+            changed |= drawParticipation(
+                "VEG Depth", &style.vegetationDepthParticipation);
+        }
+        changed |= DrawRangedFloatControl(
+            "Core Alpha Threshold",
+            &style.depthPrepassAlphaThreshold,
+            {.visualMin = 0.05F,
+             .visualMax = 1.0F,
+             .format = "%.2f",
+             .hardMin = 0.0F,
+             .hardMax = 1.0F});
+        changed |= DrawRangedFloatControl(
+            "Surface Tolerance (m)",
+            &style.depthPrepassToleranceMeters,
+            {.visualMin = 0.0F,
+             .visualMax = 0.25F,
+             .format = "%.4f",
+             .hardMin = 0.0F,
+             .hardMax = 10.0F});
+        ImGui::TextDisabled(
+            "Raise tolerance for larger spacing or grazing-angle surfaces.");
+    }
+
+    int stabilityPolicyIndex =
+        static_cast<int>(style.surfaceStabilityPolicy);
+    const char* stabilityPolicies[] = {
+        "One Mode / Off",
+        "Stable ROCK + SAND Roles",
+        "Custom Per Role",
+    };
+    if (DrawRightAlignedCombo(
+            "Linked Surface Selection",
+            &stabilityPolicyIndex,
+            stabilityPolicies,
+            IM_ARRAYSIZE(stabilityPolicies))) {
+        style.surfaceStabilityPolicy =
+            static_cast<PointCloudSurfaceStabilityPolicy>(
+                std::clamp(stabilityPolicyIndex, 0, 2));
+        changed = true;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Uses the versioned 1 mm to 5 mm analysis sidecar. Stable Roles "
+            "softly removes ROCK below ROCK, selects the denser continuous "
+            "SAND surface, and leaves VEG fully transparent-overlaid. Missing "
+            "or stale sidecars safely render at the authored opacity.");
+    }
+    const auto drawStabilityMode = [&](const char* label,
+                                       PointCloudSurfaceStabilityMode* value) {
+        int index = static_cast<int>(*value);
+        const char* choices[] = {
+            "Original / Off",
+            "Draw Both",
+            "Density + Continuity",
+            "Prefer Lower Surface",
+            "Prefer Upper Surface",
+            "Soft Separation",
+        };
+        if (!DrawRightAlignedCombo(
+                label,
+                &index,
+                choices,
+                IM_ARRAYSIZE(choices))) {
+            return false;
+        }
+        *value = static_cast<PointCloudSurfaceStabilityMode>(
+            std::clamp(index, 0, 5));
+        return true;
+    };
+    if (style.surfaceStabilityPolicy ==
+        PointCloudSurfaceStabilityPolicy::Uniform) {
+        changed |= drawStabilityMode(
+            "Surface Mode", &style.uniformSurfaceStabilityMode);
+    } else if (style.surfaceStabilityPolicy ==
+               PointCloudSurfaceStabilityPolicy::Custom) {
+        changed |= drawStabilityMode(
+            "ROCK Surface", &style.rockSurfaceStabilityMode);
+        changed |= drawStabilityMode(
+            "SAND Surface", &style.sandSurfaceStabilityMode);
+        changed |= drawStabilityMode(
+            "VEG Surface", &style.vegetationSurfaceStabilityMode);
+    } else {
+        ImGui::TextDisabled(
+            "ROCK: Soft Separation | SAND: Density + Continuity | VEG: Draw Both");
+    }
+    const bool stabilityEnabled =
+        style.surfaceStabilityPolicy !=
+            PointCloudSurfaceStabilityPolicy::Uniform ||
+        (style.uniformSurfaceStabilityMode !=
+             PointCloudSurfaceStabilityMode::Original &&
+         style.uniformSurfaceStabilityMode !=
+             PointCloudSurfaceStabilityMode::DrawAll);
+    if (!stabilityEnabled) {
+        ImGui::BeginDisabled();
+    }
+    changed |= DrawRangedFloatControl(
+        "Surface Selection Mix",
+        &style.surfaceStabilityInfluence,
+        {.visualMin = 0.0F,
+         .visualMax = 1.0F,
+         .format = "%.2f",
+         .hardMin = 0.0F,
+         .hardMax = 1.0F});
+    if (!stabilityEnabled) {
+        ImGui::EndDisabled();
+    }
+
+    changed |= DrawRangedFloatControl(
+        "Depth Weight Strength",
+        &style.depthWeightStrength,
+        {.visualMin = 1.0F,
+         .visualMax = 8.0F,
+         .format = "%.2f",
+         .hardMin = 1.0F,
+         .hardMax = 8.0F});
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Strengthens Beauty's near-fragment weighting. 1.0 is the existing "
+            "renderer exactly; higher values reduce colour bleeding from depth.");
+    }
+
+    int emissionResponseIndex = static_cast<int>(style.emissionResponse);
+    const char* emissionResponses[] = {
+        "Accumulated (Legacy)",
+        "Saturated (Front Surface)",
+    };
+    if (DrawRightAlignedCombo(
+            "Emission Response",
+            &emissionResponseIndex,
+            emissionResponses,
+            IM_ARRAYSIZE(emissionResponses))) {
+        style.emissionResponse = static_cast<PointCloudEmissionResponse>(
+            std::clamp(emissionResponseIndex, 0, 1));
+        changed = true;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Accumulated keeps the established behaviour: emission energy "
+            "sums across every overlapping point (and density compensation) "
+            "before one exponential response, so deep stacks glow brighter. "
+            "Saturated applies the exponential response per point and folds "
+            "it into the blended colour, bounding glow at the visible "
+            "surface. Both transparency paths honour the choice identically.");
+    }
+
+    changed |= ImGui::Checkbox(
+        "Back-Face Fade",
+        &style.normalCullEnabled);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Fades points whose stored normal faces away from the camera — "
+            "for example returns beneath an overhang viewed from above. "
+            "Angles measure the normal against the direction to the camera: "
+            "fully visible up to Fade Start, hidden beyond Hidden Beyond. "
+            "Screen Sprites only; runs in preview and export, and requires "
+            "normals (layers without them are unaffected).");
+    }
+    if (style.normalCullEnabled) {
+        changed |= DrawRangedFloatControl(
+            "Fade Start (deg)",
+            &style.normalCullStartDegrees,
+            {.visualMin = 30.0F,
+             .visualMax = 150.0F,
+             .format = "%.0f deg",
+             .hardMin = 0.0F,
+             .hardMax = 179.0F});
+        changed |= DrawRangedFloatControl(
+            "Hidden Beyond (deg)",
+            &style.normalCullEndDegrees,
+            {.visualMin = 45.0F,
+             .visualMax = 180.0F,
+             .format = "%.0f deg",
+             .hardMin = 1.0F,
+             .hardMax = 180.0F});
+        ImGui::TextDisabled(
+            "90 deg is edge-on; higher keeps more grazing points.");
+    }
+    ImGui::TextDisabled("All controls are saved with the named Visual.");
+
+    EndPanelSection();
+    return changed;
+}
+
 bool DrawVisualBindingSection(
     const char* sectionLabel,
     const char* id,
@@ -55915,6 +56651,7 @@ bool DrawPointCloudStyleSection(
     changed |= DrawPointCloudStylisationSection(session);
     changed |= DrawPointCloudSurfaceMotionSection(session);
     changed |= DrawPointCloudFalloffSection(session);
+    changed |= DrawPointCloudTransparencyDepthSection(session);
     changed |= DrawPointCloudColourSection(runtimeState, session, linkedBaseStyle);
     changed |= DrawVisualBindingSection(
         "Opacity",
@@ -72355,6 +73092,143 @@ void DrawAnimationSection(
         depthOfFieldChanged = true;
     }
 
+    const std::string automaticNearPlanePathIdentity =
+        panel.currentFilePath + "\n" + animationPath.name;
+    const std::uint64_t automaticNearPlaneInputFingerprint =
+        AutomaticNearPlaneInputFingerprint(animationPath);
+    if (panel.automaticNearPlaneTrackedPath !=
+            automaticNearPlanePathIdentity ||
+        panel.automaticNearPlaneInputFingerprint == 0U) {
+        // A freshly loaded saved animation owns its persisted result; take
+        // that exact state as the editing baseline.
+        panel.automaticNearPlaneTrackedPath =
+            automaticNearPlanePathIdentity;
+        panel.automaticNearPlaneInputFingerprint =
+            automaticNearPlaneInputFingerprint;
+    } else if (
+        panel.automaticNearPlaneInputFingerprint !=
+            automaticNearPlaneInputFingerprint &&
+        animationPath.automaticNearPlaneResolvedMeters > 0.0F) {
+        animationPath.automaticNearPlaneResolvedMeters = 0.0F;
+        panel.dirty = true;
+        runtimeState->statusMessage =
+            "Camera path or lens changed; automatic near plane needs reanalysis.";
+        if (animationPath.automaticNearPlaneEnabled && panel.liveApply) {
+            ApplyAnimationScrub(runtimeState);
+        }
+        panel.automaticNearPlaneInputFingerprint =
+            AutomaticNearPlaneInputFingerprint(animationPath);
+    } else {
+        panel.automaticNearPlaneInputFingerprint =
+            automaticNearPlaneInputFingerprint;
+    }
+
+    ImGui::SeparatorText("Clipping Precision");
+    bool automaticNearPlaneEnabled =
+        animationPath.automaticNearPlaneEnabled;
+    bool runAutomaticNearPlaneAnalysis = false;
+    if (ImGui::Checkbox(
+            "Automatic Near Plane",
+            &automaticNearPlaneEnabled)) {
+        animationPath.automaticNearPlaneEnabled =
+            automaticNearPlaneEnabled;
+        panel.dirty = true;
+        runAutomaticNearPlaneAnalysis = automaticNearPlaneEnabled;
+        if (!automaticNearPlaneEnabled && panel.liveApply) {
+            ApplyAnimationScrub(runtimeState);
+        }
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+        ImGui::SetTooltip(
+            "Finds the closest resident scene sample visible anywhere along "
+            "the complete animation, subtracts the safety padding, and uses "
+            "one constant near plane for every frame. This improves depth "
+            "precision without frame-to-frame clipping-plane pumping.");
+    }
+    if (!animationPath.automaticNearPlaneEnabled) {
+        ImGui::BeginDisabled();
+    }
+    float automaticNearPlanePadding =
+        animationPath.automaticNearPlanePaddingMeters;
+    if (ImGui::InputFloat(
+            "Near Safety Padding",
+            &automaticNearPlanePadding,
+            0.005F,
+            0.05F,
+            "%.4f m")) {
+        animationPath.automaticNearPlanePaddingMeters = std::clamp(
+            std::isfinite(automaticNearPlanePadding)
+                ? automaticNearPlanePadding
+                : 0.02F,
+            0.0F,
+            1000.0F);
+        animationPath.automaticNearPlaneResolvedMeters = 0.0F;
+        panel.dirty = true;
+    }
+    float automaticNearPlaneMinimum =
+        animationPath.automaticNearPlaneMinimumMeters;
+    if (ImGui::InputFloat(
+            "Minimum Near Plane",
+            &automaticNearPlaneMinimum,
+            0.0005F,
+            0.005F,
+            "%.5f m")) {
+        animationPath.automaticNearPlaneMinimumMeters = std::clamp(
+            std::isfinite(automaticNearPlaneMinimum)
+                ? automaticNearPlaneMinimum
+                : 0.0005F,
+            1.0e-5F,
+            1000.0F);
+        animationPath.automaticNearPlaneResolvedMeters = 0.0F;
+        panel.dirty = true;
+    }
+    if (ImGui::Button(
+            animationPath.automaticNearPlaneResolvedMeters > 0.0F
+                ? "Reanalyse Full Path"
+                : "Analyse Full Path")) {
+        runAutomaticNearPlaneAnalysis = true;
+    }
+    if (animationPath.automaticNearPlaneResolvedMeters > 0.0F) {
+        ImGui::SameLine();
+        ImGui::TextDisabled(
+            "constant %.5f m",
+            animationPath.automaticNearPlaneResolvedMeters);
+    } else {
+        ImGui::SameLine();
+        ImGui::TextDisabled("not analysed");
+    }
+    if (!animationPath.automaticNearPlaneEnabled) {
+        ImGui::EndDisabled();
+    }
+    if (runAutomaticNearPlaneAnalysis) {
+        const auto nearAnalysis = AnalyseAutomaticNearPlane(
+            *runtimeState,
+            animationPath);
+        if (nearAnalysis.success) {
+            animationPath.automaticNearPlaneResolvedMeters =
+                nearAnalysis.resolvedNearPlaneMeters;
+            panel.dirty = true;
+            runtimeState->statusMessage =
+                nearAnalysis.message + " Closest visible sample " +
+                FormatFixed(
+                    nearAnalysis.closestVisibleDepthMeters,
+                    5) +
+                " m; constant near plane " +
+                FormatFixed(
+                    nearAnalysis.resolvedNearPlaneMeters,
+                    5) +
+                " m.";
+            runtimeState->errorMessage.clear();
+            if (panel.liveApply) {
+                ApplyAnimationScrub(runtimeState);
+            }
+        } else {
+            runtimeState->errorMessage = nearAnalysis.message;
+        }
+    }
+    panel.automaticNearPlaneInputFingerprint =
+        AutomaticNearPlaneInputFingerprint(animationPath);
+
     const auto& preparedAnimationPath = CachedPreparedAnimationPath(&panel, animationPath);
     const auto evaluation = invisible_places::camera::EvaluatePreparedAnimationPath(
         preparedAnimationPath,
@@ -78911,7 +79785,9 @@ void DrawPointRendererPanel(
         }
     }
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Fast Basic renders opaque 1 px square points, with source RGB, solid colour, scalar colormaps, and colourise.");
+        ImGui::SetTooltip(
+            "Fast Basic keeps the main cloud on the opaque fast path while generated Flow trails retain their Beauty material.\n"
+            "Main-cloud geometry, falloff, opacity, emission, depth fade, and stylisation are simplified; source RGB, solid colour, scalar colormaps, and colourise remain.");
     }
 
     ImGui::SeparatorText("Adaptive HQ");
@@ -90839,10 +91715,17 @@ void DrawProjectPanel(
             if (session.availableScalarFields.empty()) {
                 continue;
             }
+            const auto authoringResident = static_cast<std::size_t>(
+                std::count_if(
+                    cloud.scalarFields.begin(),
+                    cloud.scalarFields.end(),
+                    [](const invisible_places::io::ScalarFieldStats& field) {
+                        return field.authoringVisible;
+                    }));
             ImGui::Text(
                 "%s: %zu / %zu fields resident",
                 session.displayName.c_str(),
-                cloud.scalarFields.size(),
+                authoringResident,
                 session.availableScalarFields.size());
         }
         ImGui::Text(
@@ -97829,11 +98712,11 @@ void DrawWaterRunClipsTimeline(
 }
 
 // One take-owned marker rail shared by the Timings editor, the embedded
-// Water feature timelines, and the Global Animation header. Every rail of
-// the active Timing Take shows the same markers regardless of run
-// membership or selection. A marker's body hover is deliberately
-// informational; the adjacent non-interactive '?' owns every manipulation
-// instruction.
+// Water feature timelines, the selected Visual Feature timeline, and the
+// Global Animation header. Every rail of the active Timing Take shows the
+// same markers regardless of run membership or selection. A marker's body
+// hover is deliberately informational; the adjacent non-interactive '?'
+// owns every manipulation instruction.
 void DrawTimingTakeMarkStrip(
     const char* id,
     PreviewRuntimeState* runtimeState,
@@ -97841,7 +98724,9 @@ void DrawTimingTakeMarkStrip(
     invisible_places::timing::TimingTakeSceneState* scene,
     float durationSeconds,
     bool cameraDomain = false,
-    std::optional<std::pair<ImVec2, float>> fixedPlacement = std::nullopt) {
+    std::optional<std::pair<ImVec2, float>> fixedPlacement = std::nullopt,
+    const AnimationTimelineCoordinateContext* coordinateOverride = nullptr,
+    bool helpGutterWithinRail = false) {
     if (runtimeState == nullptr || scene == nullptr || scenarioId.empty()) {
         return;
     }
@@ -97866,23 +98751,42 @@ void DrawTimingTakeMarkStrip(
         ? std::max(24.0F, fixedPlacement->second)
         : std::max(
               24.0F,
-              ImGui::GetContentRegionAvail().x - kHelpGutterWidth);
+              ImGui::GetContentRegionAvail().x -
+                  (helpGutterWithinRail ? 0.0F : kHelpGutterWidth));
     ImGui::InvisibleButton(
         "##TimingTakeMarks",
         ImVec2{railWidth, kRailHeight},
         ImGuiButtonFlags_MouseButtonLeft);
-    const bool railHovered = ImGui::IsItemHovered();
+    const bool surfaceHovered = ImGui::IsItemHovered();
     const ImVec2 railMin = ImGui::GetItemRectMin();
     const ImVec2 railMax = ImGui::GetItemRectMax();
-    ImGui::SameLine(0.0F, 0.0F);
-    ImGui::Dummy(ImVec2{kHelpGutterWidth, kRailHeight});
-    const ImVec2 helpMin{railMax.x, railMin.y};
-    const ImVec2 helpMax{railMax.x + kHelpGutterWidth, railMax.y};
+    if (!helpGutterWithinRail) {
+        ImGui::SameLine(0.0F, 0.0F);
+        ImGui::Dummy(ImVec2{kHelpGutterWidth, kRailHeight});
+    }
+    const ImVec2 helpMin{
+        helpGutterWithinRail
+            ? std::max(railMin.x, railMax.x - kHelpGutterWidth)
+            : railMax.x,
+        railMin.y};
+    const ImVec2 helpMax{
+        helpGutterWithinRail ? railMax.x
+                             : railMax.x + kHelpGutterWidth,
+        railMax.y};
+    // The selected Visual Feature graph uses the complete available width
+    // and keeps its own help affordance inside that surface. Its marker rail
+    // follows the same geometry; exclude the in-rail help gutter from marker
+    // hit testing while retaining exact marker/key X alignment.
+    const bool railHovered =
+        surfaceHovered &&
+        (!helpGutterWithinRail ||
+         !ImGui::IsMouseHoveringRect(helpMin, helpMax, /*clip=*/true));
     const auto globalSurface = cameraDomain
         ? ResolveGlobalAnimationTimelineSurface(runtimeState)
         : GlobalAnimationTimelineSurface{};
-    const auto timelineCoordinates =
-        ResolveAnimationTimelineCoordinateContext(*runtimeState);
+    const auto timelineCoordinates = coordinateOverride != nullptr
+        ? *coordinateOverride
+        : ResolveAnimationTimelineCoordinateContext(*runtimeState);
     const float width = std::max(1.0F, railMax.x - railMin.x);
     const auto xForPosition = [&](float position) {
         const float fraction = cameraDomain
@@ -101455,68 +102359,61 @@ bool PasteTimingColouriseKeysAtPlayhead(
                 TimingColourisePaletteKeyModel::StopParameters &&
             item.paletteStopIndex.value() <
                 effect->basePalette.stops.size()) {
-            const auto& stop = effect->basePalette.stops[
-                item.paletteStopIndex.value()];
-            if (item.paletteStopParameter.value() ==
-                invisible_places::timing::
-                    TimingColourisePaletteStopParameter::Colour) {
-                pasted = invisible_places::timing::
-                    AddOrUpdateTimingColourisePaletteStopColourKey(
-                        effect,
-                        stop.id,
-                        position,
-                        item.colourValue,
-                        item.interpolation);
-            } else if (
-                item.paletteStopParameter.value() ==
-                invisible_places::timing::
-                    TimingColourisePaletteStopParameter::Position) {
-                auto palette = invisible_places::timing::
-                    EvaluateTimingColourisePalette(
-                        *effect,
-                        position,
-                        CurrentAnimationTimingIsCyclic(*runtimeState));
-                const auto evaluatedStop = std::find_if(
-                    palette.stops.begin(),
-                    palette.stops.end(),
-                    [&](const auto& candidate) {
-                        return candidate.id == stop.id;
-                    });
-                if (evaluatedStop != palette.stops.end()) {
-                    evaluatedStop->position = std::clamp(
-                        item.value,
-                        0.0F,
-                        1.0F);
-                    pasted = invisible_places::timing::
-                        AddOrUpdateTimingColourisePaletteMarkerKeys(
-                            effect,
-                            position,
-                            std::move(palette));
-                    if (pasted) {
-                        // Preserve the copied curve style for the marker whose
-                        // value was pasted; the other grouped markers retain
-                        // their own established interpolation modes.
-                        pasted = invisible_places::timing::
-                            AddOrUpdateTimingColourisePaletteStopScalarKey(
-                                effect,
-                                stop.id,
-                                invisible_places::timing::
-                                    TimingColourisePaletteStopParameter::
-                                        Position,
-                                position,
-                                item.value,
-                                item.interpolation);
-                    }
+            const std::string stopId = effect->basePalette.stops[
+                item.paletteStopIndex.value()].id;
+            const auto parameter = item.paletteStopParameter.value();
+            auto palette = invisible_places::timing::
+                EvaluateTimingColourisePalette(
+                    *effect,
+                    position,
+                    CurrentAnimationTimingIsCyclic(*runtimeState));
+            const auto evaluatedStop = std::find_if(
+                palette.stops.begin(),
+                palette.stops.end(),
+                [&](const auto& candidate) {
+                    return candidate.id == stopId;
+                });
+            if (evaluatedStop != palette.stops.end()) {
+                if (parameter == invisible_places::timing::
+                                     TimingColourisePaletteStopParameter::
+                                         Colour) {
+                    evaluatedStop->colour = item.colourValue;
+                } else if (
+                    parameter == invisible_places::timing::
+                                     TimingColourisePaletteStopParameter::
+                                         Position) {
+                    evaluatedStop->position = item.value;
+                } else {
+                    evaluatedStop->colouriseAmount = item.value;
                 }
-            } else {
                 pasted = invisible_places::timing::
-                    AddOrUpdateTimingColourisePaletteStopScalarKey(
+                    AddOrUpdateTimingColourisePaletteMarkerKeys(
                         effect,
-                        stop.id,
-                        item.paletteStopParameter.value(),
                         position,
-                        item.value,
-                        item.interpolation);
+                        std::move(palette));
+                // The complete snapshot preserves all marker state. Restore
+                // the copied lane's interpolation style after it is created.
+                if (pasted &&
+                    parameter == invisible_places::timing::
+                                     TimingColourisePaletteStopParameter::
+                                         Colour) {
+                    pasted = invisible_places::timing::
+                        AddOrUpdateTimingColourisePaletteStopColourKey(
+                            effect,
+                            stopId,
+                            position,
+                            item.colourValue,
+                            item.interpolation);
+                } else if (pasted) {
+                    pasted = invisible_places::timing::
+                        AddOrUpdateTimingColourisePaletteStopScalarKey(
+                            effect,
+                            stopId,
+                            parameter,
+                            position,
+                            item.value,
+                            item.interpolation);
+                }
             }
         }
         if (!pasted) {
@@ -101553,6 +102450,33 @@ bool PasteTimingColouriseKeysAtPlayhead(
              : "; skipped " + std::to_string(skippedValues) +
                    " incompatible value(s).") ;
     return true;
+}
+
+AnimationTimelineCoordinateContext
+ResolveTimingColouriseTimelineCoordinateContext(
+    const PreviewRuntimeState& runtimeState,
+    const invisible_places::timing::TimingColouriseEffect& effect) {
+    auto coordinates =
+        ResolveAnimationTimelineCoordinateContext(runtimeState);
+    if (coordinates.linkedCyclic) {
+        return coordinates;
+    }
+    const auto activation = invisible_places::timing::
+        SanitizeTimingColouriseActivationRange(effect.activationRange);
+    const bool activeRangeView =
+        runtimeState.timingsPanel.colouriseTimelineView ==
+            TimingColouriseTimelineView::ActiveRange &&
+        activation.end - activation.start >
+            invisible_places::timing::kTimingColouriseKeyTolerance;
+    // Preserve the established unlinked Full/Active Range switch. Linked
+    // takes instead share the animation panel's signed cyclic lens.
+    coordinates.unlinkedRange = activeRangeView
+        ? invisible_places::timing::TimelineViewRange{
+              .start = activation.start,
+              .end = activation.end,
+          }
+        : invisible_places::timing::TimelineViewRange{};
+    return coordinates;
 }
 
 void DrawTimingKeyLaneGroup(
@@ -101643,25 +102567,10 @@ void DrawTimingKeyLaneGroup(
     const auto activation = invisible_places::timing::
         SanitizeTimingColouriseActivationRange(
             effect->activationRange);
-    auto timelineCoordinates =
-        ResolveAnimationTimelineCoordinateContext(*runtimeState);
-    const bool activeRangeView =
-        !timelineCoordinates.linkedCyclic &&
-        runtimeState->timingsPanel.colouriseTimelineView ==
-            TimingColouriseTimelineView::ActiveRange &&
-        activation.end - activation.start >
-            invisible_places::timing::
-                kTimingColouriseKeyTolerance;
-    if (!timelineCoordinates.linkedCyclic) {
-        // Preserve the established unlinked Full/Active Range switch. Linked
-        // takes instead share the animation panel's signed cyclic lens.
-        timelineCoordinates.unlinkedRange = activeRangeView
-            ? invisible_places::timing::TimelineViewRange{
-                  .start = activation.start,
-                  .end = activation.end,
-              }
-            : invisible_places::timing::TimelineViewRange{};
-    }
+    const auto timelineCoordinates =
+        ResolveTimingColouriseTimelineCoordinateContext(
+            *runtimeState,
+            *effect);
     const auto positionInView = [&](float position) {
         return timelineCoordinates.AuthoredIsInView(
             position,
@@ -101821,9 +102730,9 @@ void DrawTimingKeyLaneGroup(
             }
             if (lane.track == TimingColouriseKeyTrack::Palette &&
                 lane.stopParameter.has_value()) {
-                // Each stop property is an independent timeline node. Marker
-                // Position keys are created as a group, but only an explicit
-                // multi-selection retimes more than the chosen stop.
+                // Complete palette snapshots create every property node at the
+                // same time. A graph node can still be retimed independently;
+                // only an explicit multi-selection retimes the other nodes.
                 const auto found = std::find_if(
                     effect->paletteStopParameterKeys.begin(),
                     effect->paletteStopParameterKeys.end(),
@@ -102844,20 +103753,20 @@ void DrawTimingKeyLaneGroup(
                                key.parameter == parameter;
                     },
                     position);
-                if (parameter ==
-                    TimingColourisePaletteStopParameter::Colour) {
-                    const auto palette = invisible_places::timing::
-                        EvaluateTimingColourisePalette(
-                            *effect,
-                            position,
-                            cyclicTiming);
-                    const auto stop = std::find_if(
-                        palette.stops.begin(),
-                        palette.stops.end(),
-                        [&](const auto& candidate) {
-                            return candidate.id == lane.stopId;
-                        });
-                    if (stop != palette.stops.end()) {
+                auto palette = invisible_places::timing::
+                    EvaluateTimingColourisePalette(
+                        *effect,
+                        position,
+                        cyclicTiming);
+                const auto stop = std::find_if(
+                    palette.stops.begin(),
+                    palette.stops.end(),
+                    [&](const auto& candidate) {
+                        return candidate.id == lane.stopId;
+                    });
+                if (stop != palette.stops.end()) {
+                    if (parameter ==
+                        TimingColourisePaletteStopParameter::Colour) {
                         auto coordinates = invisible_places::timing::
                             TimingColouriseColourToSpace(
                                 stop->colour,
@@ -102866,42 +103775,43 @@ void DrawTimingKeyLaneGroup(
                             lane.paletteColourComponent.value() < 3U) {
                             coordinates[lane.paletteColourComponent.value()] =
                                 scalarValue;
-                            added = invisible_places::timing::
-                                AddOrUpdateTimingColourisePaletteStopColourKey(
-                                    effect,
-                                    lane.stopId,
-                                    position,
-                                    invisible_places::timing::
-                                        TimingColouriseColourFromSpace(
-                                            coordinates,
-                                            effect->
-                                                colourKeyInterpolationSpace),
-                                    interpolation);
+                            stop->colour = invisible_places::timing::
+                                TimingColouriseColourFromSpace(
+                                    coordinates,
+                                    effect->colourKeyInterpolationSpace);
                         }
+                    } else if (
+                        parameter ==
+                        TimingColourisePaletteStopParameter::Position) {
+                        stop->position = scalarValue;
+                    } else {
+                        stop->colouriseAmount = scalarValue;
                     }
-                } else if (
-                    parameter ==
-                    TimingColourisePaletteStopParameter::Position) {
-                    // A directly manipulated marker curve changes only that
-                    // marker. The lower rail expands aggregate/grouped times
-                    // back to every represented key for coordinated retiming.
                     added = invisible_places::timing::
-                        AddOrUpdateTimingColourisePaletteStopScalarKey(
+                        AddOrUpdateTimingColourisePaletteMarkerKeys(
                             effect,
-                            lane.stopId,
-                            parameter,
                             position,
-                            scalarValue,
-                            interpolation);
-                } else {
-                    added = invisible_places::timing::
-                        AddOrUpdateTimingColourisePaletteStopScalarKey(
-                            effect,
-                            lane.stopId,
-                            parameter,
-                            position,
-                            scalarValue,
-                            interpolation);
+                            palette);
+                    if (added &&
+                        parameter ==
+                            TimingColourisePaletteStopParameter::Colour) {
+                        added = invisible_places::timing::
+                            AddOrUpdateTimingColourisePaletteStopColourKey(
+                                effect,
+                                lane.stopId,
+                                position,
+                                stop->colour,
+                                interpolation);
+                    } else if (added) {
+                        added = invisible_places::timing::
+                            AddOrUpdateTimingColourisePaletteStopScalarKey(
+                                effect,
+                                lane.stopId,
+                                parameter,
+                                position,
+                                scalarValue,
+                                interpolation);
+                    }
                 }
             } else if (
                 lane.track == TimingColouriseKeyTrack::EmissiveFalloff &&
@@ -105197,6 +106107,8 @@ const char* TimingColouriseEffectParameterLabel(
             return "Falloff Skew Centre";
         case TimingColouriseEffectParameter::EmissiveSkewSpread:
             return "Falloff Skew Spread";
+        case TimingColouriseEffectParameter::BlendMix:
+            return "Blend Mix";
         // Legacy per-side lanes; live tracks never carry them.
         case TimingColouriseEffectParameter::PaletteSkewLower:
             return "Lower Skew";
@@ -105347,6 +106259,8 @@ ImU32 TimingColouriseEffectParameterDisplayColour(
             return IM_COL32(238, 174, 72, 255);
         case TimingColouriseEffectParameter::EmissiveLevel:
             return IM_COL32(244, 155, 78, 255);
+        case TimingColouriseEffectParameter::BlendMix:
+            return IM_COL32(102, 190, 235, 255);
         case TimingColouriseEffectParameter::PaletteSkewLower:
         case TimingColouriseEffectParameter::PaletteSkewUpper:
             return IM_COL32(174, 142, 230, 255);
@@ -105356,11 +106270,12 @@ ImU32 TimingColouriseEffectParameterDisplayColour(
 
 bool DrawTimingColouriseBlendModeCombo(
     PreviewRuntimeState* runtimeState,
-    invisible_places::timing::TimingColouriseEffect* effect) {
+    invisible_places::timing::TimingColouriseEffect* effect,
+    bool secondary = false) {
     if (runtimeState == nullptr || effect == nullptr) {
         return false;
     }
-    static constexpr std::array<const char*, 6>
+    static constexpr std::array<const char*, 7>
         kTimingColouriseBlendModeLabels = {
             "Normal",
             "Multiply",
@@ -105368,30 +106283,101 @@ bool DrawTimingColouriseBlendModeCombo(
             "Add",
             "Divide",
             "Vivid Light",
+            "Darken (Color Burn)",
         };
+    auto* blendMode = secondary
+        ? &effect->secondaryBlendMode
+        : &effect->blendMode;
     int blendModeIndex = std::clamp(
-        static_cast<int>(effect->blendMode),
+        static_cast<int>(*blendMode),
         0,
         static_cast<int>(kTimingColouriseBlendModeLabels.size()) - 1);
     ImGui::SetNextItemWidth(-FLT_MIN);
     if (!ImGui::Combo(
-            "##TimingColouriseBlendMode",
+            secondary
+                ? "##TimingColouriseSecondaryBlendMode"
+                : "##TimingColouriseBlendMode",
             &blendModeIndex,
             kTimingColouriseBlendModeLabels.data(),
             static_cast<int>(kTimingColouriseBlendModeLabels.size()))) {
         DrawTimingControlTooltip(
-            "How this feature's colour combines with earlier features or "
-            "the cloud colour. Colourise Amount remains the layer opacity.");
+            *blendMode == invisible_places::timing::
+                                     TimingColouriseBlendMode::ColorBurn
+                ? "Strongly darkens the colour beneath this feature. White "
+                  "is neutral; darker palette colours burn the cloud darker. "
+                  "Colourise Amount controls the strength."
+                : "How this feature's colour combines with earlier features "
+                  "or the cloud colour. Colourise Amount remains the layer "
+                  "opacity.");
         return false;
     }
-    effect->blendMode = static_cast<
+    *blendMode = static_cast<
         invisible_places::timing::TimingColouriseBlendMode>(
         blendModeIndex);
     runtimeState->previewRenderStateSignatureValid = false;
     DrawTimingControlTooltip(
-        "How this feature's colour combines with earlier features or the "
-        "cloud colour. Colourise Amount remains the layer opacity.");
+        *blendMode == invisible_places::timing::
+                                 TimingColouriseBlendMode::ColorBurn
+            ? "Strongly darkens the colour beneath this feature. White is "
+              "neutral; darker palette colours burn the cloud darker. "
+              "Colourise Amount controls the strength."
+            : "How this feature's colour combines with earlier features or "
+              "the cloud colour. Colourise Amount remains the layer opacity.");
     return true;
+}
+
+bool DrawTimingColouriseBlendCompositionCombo(
+    PreviewRuntimeState* runtimeState,
+    invisible_places::timing::TimingColouriseEffect* effect) {
+    using invisible_places::timing::TimingColouriseBlendCompositionMode;
+    if (runtimeState == nullptr || effect == nullptr) {
+        return false;
+    }
+    static constexpr std::array<const char*, 3> kLabels = {
+        "Primary only",
+        "Crossfade",
+        "Apply after",
+    };
+    const auto previousMode = effect->blendCompositionMode;
+    int modeIndex = std::clamp(
+        static_cast<int>(effect->blendCompositionMode),
+        0,
+        static_cast<int>(kLabels.size()) - 1);
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    const bool changed = ImGui::Combo(
+        "##TimingColouriseBlendComposition",
+        &modeIndex,
+        kLabels.data(),
+        static_cast<int>(kLabels.size()));
+    if (changed) {
+        effect->blendCompositionMode =
+            static_cast<TimingColouriseBlendCompositionMode>(modeIndex);
+        if (previousMode ==
+                TimingColouriseBlendCompositionMode::PrimaryOnly &&
+            effect->blendCompositionMode ==
+                TimingColouriseBlendCompositionMode::Crossfade &&
+            effect->blendMix == 1.0F &&
+            std::none_of(
+                effect->effectParameterKeys.begin(),
+                effect->effectParameterKeys.end(),
+                [](const auto& key) {
+                    return key.parameter == invisible_places::timing::
+                        TimingColouriseEffectParameter::BlendMix;
+                })) {
+            effect->blendMix = 0.5F;
+        }
+        runtimeState->previewRenderStateSignatureValid = false;
+    }
+    const char* tooltip =
+        effect->blendCompositionMode ==
+                TimingColouriseBlendCompositionMode::Crossfade
+            ? "Blend between the primary and secondary mode results. Blend Mix 0 uses only the primary result; 1 uses only the secondary result."
+            : effect->blendCompositionMode ==
+                      TimingColouriseBlendCompositionMode::ApplyAfter
+                  ? "Apply the primary mode first, then apply the secondary mode to that result. Blend Mix controls only the second step."
+                  : "Use the primary blend mode only. Secondary settings and their animation remain stored but dormant.";
+    DrawTimingControlTooltip(tooltip);
+    return changed;
 }
 
 bool DrawTimingColouriseEffectParameterTrackButtons(
@@ -105549,6 +106535,13 @@ bool DrawTimingColouriseEffectParameterEditor(
             parameterTooltip =
                 "Animate the value used by the selected Max or Scale mode. Drag the slider for live changes or double-click it for exact entry. This changes colour mixing, not point opacity.";
             break;
+        case TimingColouriseEffectParameter::BlendMix:
+            parameterTooltip =
+                effect->blendCompositionMode == invisible_places::timing::
+                        TimingColouriseBlendCompositionMode::ApplyAfter
+                    ? "Animate the strength of the secondary mode applied after the primary result. 0 disables the second step; 1 applies it at full feature strength."
+                    : "Animate the crossfade between blend modes. 0 is the primary result, 1 is the secondary result, and values between them mix the two.";
+            break;
         case TimingColouriseEffectParameter::EmissiveLevel:
             parameterTooltip =
                 "Apply a field-masked light level without changing point opacity. Drag across the -2.5 to +2.5 working range; double-click to type any finite value. Positive values add emission and negative values darken, with -1 fully dark at full mask.";
@@ -105678,6 +106671,9 @@ bool DrawTimingColouriseEffectParameterEditor(
             parameter == TimingColouriseEffectParameter::AmountOverride) {
             authoredValue = std::clamp(authoredValue, 0.0F, 1.0F);
         } else if (
+            parameter == TimingColouriseEffectParameter::BlendMix) {
+            authoredValue = std::clamp(authoredValue, 0.0F, 1.0F);
+        } else if (
             parameter ==
                 TimingColouriseEffectParameter::PaletteSkewCentre ||
             parameter ==
@@ -105705,6 +106701,9 @@ bool DrawTimingColouriseEffectParameterEditor(
                     break;
                 case TimingColouriseEffectParameter::AmountOverride:
                     effect->colouriseAmountOverride = authoredValue;
+                    break;
+                case TimingColouriseEffectParameter::BlendMix:
+                    effect->blendMix = authoredValue;
                     break;
                 case TimingColouriseEffectParameter::EmissiveLevel:
                     effect->emissiveLevel = authoredValue;
@@ -106438,6 +107437,21 @@ void AppendTimingColourisePaletteTimelineLanes(
         TimingColouriseEffectParameter::PalettePhase,
         "Colour Phase",
         IM_COL32(238, 174, 72, 255));
+    if (effect->blendCompositionMode !=
+            invisible_places::timing::
+                TimingColouriseBlendCompositionMode::PrimaryOnly ||
+        std::any_of(
+            effect->effectParameterKeys.begin(),
+            effect->effectParameterKeys.end(),
+            [](const auto& key) {
+                return key.parameter ==
+                    TimingColouriseEffectParameter::BlendMix;
+            })) {
+        appendEffectParameterLane(
+            TimingColouriseEffectParameter::BlendMix,
+            "Blend Mix",
+            IM_COL32(102, 190, 235, 255));
+    }
 
     if (effect->paletteKeyModel ==
         TimingColourisePaletteKeyModel::LegacySnapshots) {
@@ -107453,9 +108467,8 @@ void DrawTimingColourisePaletteEditor(
         }
         ImGui::EndDisabled();
         DrawTimingControlTooltip(
-            "Key all marker Positions with +, or key a stop's Colour or "
-            "Colourise Amount from its editor, to create animated palette "
-            "versions for this Visual Feature.");
+            "Use +, or edit any marker Position, Colour, or Colourise Amount, "
+            "to store a complete palette keyframe for this Visual Feature.");
       }
     };
 
@@ -107575,9 +108588,9 @@ void DrawTimingColourisePaletteEditor(
             "snapshot keys exist, move onto the exact key to flip it.";
     } else if (hasPaletteKeys) {
         flipPaletteTooltip =
-            "Reverse the palette left to right by keying every stop "
-            "Position here. Position keys use the normal timeline "
-            "interpolation and first/last-key hold behaviour.";
+            "Reverse the palette left to right and store a complete palette "
+            "keyframe here. Its marker Positions, Colours, and Colourise "
+            "Amounts use the normal timeline interpolation.";
     } else if (presetSource && effect->paletteEdited) {
         flipPaletteTooltip =
             "Reverse this effect's private _edited preset left to right. "
@@ -107700,24 +108713,11 @@ void DrawTimingColourisePaletteEditor(
                    ? nullptr
                    : &*found;
     };
-    const auto interpolationForAt =
-        [&](std::string_view stopId,
-            TimingColourisePaletteStopParameter parameter,
-            float keyPosition) {
-        return TimingScalarTrackInterpolationAt(
-            effect->paletteStopParameterKeys,
-            [&](const auto& key) {
-                return key.stopId == stopId &&
-                       key.parameter == parameter;
-            },
-            keyPosition);
-    };
-
     drawFlipPaletteButton();
 
-    // Marker Position keys are one authored group. Keep their controls next
-    // to the markers themselves and leave stop Colour / Amount keying in the
-    // stop editor and value graph, where those independent tracks belong.
+    // A palette keyframe is one authored group containing every marker and
+    // every marker property. Individual graph lanes remain available for
+    // choosing interpolation and fine adjustment after the snapshot exists.
     const auto previousMarkerKey = invisible_places::timing::
         PreviousTimingColourisePaletteMarkerKeyPosition(
             *effect,
@@ -107746,14 +108746,14 @@ void DrawTimingColourisePaletteEditor(
         StopAnimationPlayback(runtimeState);
         markerKeysMutated = true;
         runtimeState->statusMessage =
-            "Keyed every palette marker Position at animation position " +
+            "Keyed the complete palette at animation position " +
             FormatFixed(position, 4) + ".";
     }
     ImGui::EndDisabled();
     DrawTimingControlTooltip(
         canKeyMarkerGroup
-            ? "Key every colour marker's Position together at the current animation position. Stop Colour and Colourise Amount remain independent tracks."
-            : "This palette source is currently view-only, so its marker Positions cannot be keyed.");
+            ? "Store every marker's Position, Colour, and Colourise Amount together at the current animation position."
+            : "This palette source is currently view-only, so its palette cannot be keyed.");
 
     ImGui::SameLine(0.0F, 2.0F);
     ImGui::BeginDisabled(!previousMarkerKey.has_value());
@@ -107765,8 +108765,8 @@ void DrawTimingColourisePaletteEditor(
     ImGui::EndDisabled();
     DrawTimingControlTooltip(
         previousMarkerKey.has_value()
-            ? "Go to the previous grouped palette-marker Position key."
-            : "There is no earlier grouped marker Position key.");
+            ? "Go to the previous complete palette keyframe."
+            : "There is no earlier palette keyframe.");
 
     ImGui::SameLine(0.0F, 2.0F);
     ImGui::BeginDisabled(!nextMarkerKey.has_value());
@@ -107778,8 +108778,8 @@ void DrawTimingColourisePaletteEditor(
     ImGui::EndDisabled();
     DrawTimingControlTooltip(
         nextMarkerKey.has_value()
-            ? "Go to the next grouped palette-marker Position key."
-            : "There is no later grouped marker Position key.");
+            ? "Go to the next complete palette keyframe."
+            : "There is no later palette keyframe.");
 
     ImGui::SameLine(0.0F, 2.0F);
     ImGui::BeginDisabled(markerKeyCount == 0U);
@@ -107794,9 +108794,8 @@ void DrawTimingColourisePaletteEditor(
             runtimeState->statusMessage = legacyModel
                 ? "Removed the legacy palette snapshot at animation position " +
                       FormatFixed(position, 4) + "."
-                : "Removed the grouped palette-marker Position keys at animation position " +
-                      FormatFixed(position, 4) +
-                      "; Colour and Amount keys were preserved.";
+                : "Removed the complete palette keyframe at animation position " +
+                      FormatFixed(position, 4) + ".";
         }
     }
     ImGui::EndDisabled();
@@ -107804,8 +108803,8 @@ void DrawTimingColourisePaletteEditor(
         markerKeyCount > 0U
             ? legacyModel
                   ? "Remove this legacy whole-palette snapshot key."
-                  : "Remove every marker Position key at this animation position. Stop Colour and Colourise Amount keys are preserved."
-            : "There is no grouped marker Position key here to remove.");
+                  : "Remove every marker Position, Colour, and Colourise Amount key in this palette keyframe."
+            : "There is no palette keyframe here to remove.");
     ImGui::PopID();
 
     // Palette-version navigation and the non-keyed amount mode belong with
@@ -108004,14 +109003,6 @@ void DrawTimingColourisePaletteEditor(
             if (effect->paletteKeys.empty()) {
                 markPaletteBaseEdited();
             }
-        } else if (!legacyModel &&
-                   !hasPaletteKeys) {
-            effect->basePalette =
-                invisible_places::timing::
-                    SanitizeTimingColourisePalette(
-                        workingPalette);
-            workingPalette = effect->basePalette;
-            markPaletteBaseEdited();
         } else if (!legacyModel) {
             const auto editedPalette = workingPalette;
             std::optional<std::string> selectedStopId;
@@ -108034,74 +109025,12 @@ void DrawTimingColourisePaletteEditor(
             if (topologyChanged) {
                 markPaletteBaseEdited();
             }
-            bool markerPositionChanged = false;
-            for (const auto& stop :
-                 editedPalette.stops) {
-                const auto beforeIndex =
-                    stopIndexById(
-                        paletteBeforePreview,
-                        stop.id);
-                if (!beforeIndex.has_value()) {
-                    continue;
-                }
-                const auto& before = paletteBeforePreview
-                    .stops[beforeIndex.value()];
-                const bool positionChanged =
-                    std::abs(before.position - stop.position) >
-                    std::numeric_limits<float>::epsilon();
-                const bool amountChanged =
-                    std::abs(
-                        before.colouriseAmount -
-                        stop.colouriseAmount) >
-                    std::numeric_limits<float>::epsilon();
-                markerPositionChanged =
-                    markerPositionChanged || positionChanged;
-                if (!amountChanged) {
-                    continue;
-                }
-                const bool amountTrackArmed = std::any_of(
-                    effect->paletteStopParameterKeys.begin(),
-                    effect->paletteStopParameterKeys.end(),
-                    [&](const auto& key) {
-                        return key.stopId == stop.id &&
-                               key.parameter ==
-                                   TimingColourisePaletteStopParameter::
-                                       ColouriseAmount;
-                    });
-                if (amountTrackArmed) {
-                    (void)invisible_places::timing::
-                        AddOrUpdateTimingColourisePaletteStopScalarKey(
-                            effect,
-                            stop.id,
-                            TimingColourisePaletteStopParameter::
-                                ColouriseAmount,
-                            previewKeyPosition,
-                            stop.colouriseAmount,
-                            interpolationForAt(
-                                stop.id,
-                                TimingColourisePaletteStopParameter::
-                                    ColouriseAmount,
-                                previewKeyPosition));
-                    continue;
-                }
-                const auto baseIndex = stopIndexById(
-                    effect->basePalette,
-                    stop.id);
-                if (baseIndex.has_value()) {
-                    effect->basePalette
-                        .stops[baseIndex.value()]
-                        .colouriseAmount = stop.colouriseAmount;
-                    markPaletteBaseEdited();
-                }
-            }
-            if (markerPositionChanged) {
-                (void)invisible_places::timing::
+            if (invisible_places::timing::
                     AddOrUpdateTimingColourisePaletteMarkerKeys(
                         effect,
                         previewKeyPosition,
-                        editedPalette);
-            }
-            if (topologyChanged) {
+                        editedPalette)) {
+                hasPaletteKeys = true;
                 workingPalette = invisible_places::timing::
                     EvaluateTimingColourisePalette(
                         *effect,
@@ -108204,25 +109133,26 @@ void DrawTimingColourisePaletteEditor(
                             Colour,
                         pickerPosition) != nullptr;
                 if (ImGui::SmallButton("+##KeyColour")) {
-                    (void)invisible_places::timing::
-                        AddOrUpdateTimingColourisePaletteStopColourKey(
+                    auto keyedPalette = workingPalette;
+                    (void)ReplaceTimingColourisePaletteStop(
+                        &keyedPalette,
+                        selectedIndex,
+                        editedStop);
+                    if (invisible_places::timing::
+                        AddOrUpdateTimingColourisePaletteMarkerKeys(
                             effect,
-                            originalStop.id,
                             pickerPosition,
-                            editedStop.colour,
-                            interpolationForAt(
-                                originalStop.id,
-                                TimingColourisePaletteStopParameter::
-                                    Colour,
-                                pickerPosition));
+                            std::move(keyedPalette))) {
+                        hasPaletteKeys = true;
+                    }
                     runtimeState
                         ->previewRenderStateSignatureValid =
                         false;
                 }
                 DrawTimingControlTooltip(
                     colourExact
-                        ? "Update Colour Key: update only this stop's colour key at the captured animation position."
-                        : "Key Colour: key only this stop's colour at the captured animation position.");
+                        ? "Update this complete palette keyframe using the current marker colours, positions, and amounts."
+                        : "Create a complete palette keyframe here, including every marker colour, position, and amount.");
             }
 
             ImGui::TextDisabled("Position");
@@ -108242,9 +109172,9 @@ void DrawTimingColourisePaletteEditor(
                      .hardMax = 1.0F,
                      .width = positionControlWidth});
             DrawTimingControlTooltip(
-                hasPaletteKeys && !legacyModel
-                    ? "Drag to position this stop from 0 to 1. Double-click the slider to type an exact value. A keyed edit writes Position keys for every marker at this captured animation position; use the vertical + rail beside the palette to key the group without moving one."
-                    : "Drag to position this stop from 0 to 1. Double-click the slider to type an exact value. Use the vertical + rail beside the palette to key all marker Positions together.");
+                !legacyModel
+                    ? "Drag to position this stop from 0 to 1. The edit creates or updates a complete palette keyframe at the captured animation position. Double-click to type an exact value."
+                    : "Drag to position this stop from 0 to 1. Double-click the slider to type an exact value.");
             ImGui::TextDisabled("Amount");
             const float amountControlWidth = std::max(
                 110.0F,
@@ -108266,7 +109196,9 @@ void DrawTimingColourisePaletteEditor(
                      .hardMax = 1.0F,
                      .width = amountControlWidth});
             DrawTimingControlTooltip(
-                "Drag to set this stop's Colourise Amount from 0 to 1. Double-click the slider to type an exact value.");
+                !legacyModel
+                    ? "Drag to set this stop's Colourise Amount from 0 to 1. The edit creates or updates a complete palette keyframe at the captured animation position. Double-click to type an exact value."
+                    : "Drag to set this stop's Colourise Amount from 0 to 1. Double-click to type an exact value.");
             if (!legacyModel) {
                 ImGui::SameLine();
                 const bool amountExact =
@@ -108276,30 +109208,26 @@ void DrawTimingColourisePaletteEditor(
                             ColouriseAmount,
                         pickerPosition) != nullptr;
                 if (ImGui::SmallButton("+##KeyAmount")) {
-                    (void)invisible_places::timing::
-                        AddOrUpdateTimingColourisePaletteStopScalarKey(
+                    auto keyedPalette = workingPalette;
+                    (void)ReplaceTimingColourisePaletteStop(
+                        &keyedPalette,
+                        selectedIndex,
+                        editedStop);
+                    if (invisible_places::timing::
+                        AddOrUpdateTimingColourisePaletteMarkerKeys(
                             effect,
-                            originalStop.id,
-                            TimingColourisePaletteStopParameter::
-                                ColouriseAmount,
                             pickerPosition,
-                            std::clamp(
-                                editedStop.colouriseAmount,
-                                0.0F,
-                                1.0F),
-                            interpolationForAt(
-                                originalStop.id,
-                                TimingColourisePaletteStopParameter::
-                                    ColouriseAmount,
-                                pickerPosition));
+                            std::move(keyedPalette))) {
+                        hasPaletteKeys = true;
+                    }
                     runtimeState
                         ->previewRenderStateSignatureValid =
                         false;
                 }
                 DrawTimingControlTooltip(
                     amountExact
-                        ? "Update Amount Key: update only this stop's Colourise Amount key at the captured animation position."
-                        : "Key Amount: key only this stop's Colourise Amount at the captured animation position.");
+                        ? "Update this complete palette keyframe using the current marker colours, positions, and amounts."
+                        : "Create a complete palette keyframe here, including every marker colour, position, and amount.");
             }
             editedStop.position =
                 std::clamp(
@@ -108328,72 +109256,13 @@ void DrawTimingColourisePaletteEditor(
                     if (effect->paletteKeys.empty()) {
                         markPaletteBaseEdited();
                     }
-                } else if (
-                    !legacyModel &&
-                    !hasPaletteKeys) {
-                    effect->basePalette =
-                        invisible_places::timing::
-                            SanitizeTimingColourisePalette(
-                                workingPalette);
-                    workingPalette =
-                        effect->basePalette;
-                    markPaletteBaseEdited();
                 } else if (!legacyModel) {
-                    if (colourChanged) {
-                        (void)invisible_places::timing::
-                            AddOrUpdateTimingColourisePaletteStopColourKey(
-                                effect,
-                                originalStop.id,
-                                pickerPosition,
-                                editedStop.colour,
-                                interpolationForAt(
-                                    originalStop.id,
-                                    TimingColourisePaletteStopParameter::
-                                        Colour,
-                                    pickerPosition));
-                    }
-                    if (positionChanged) {
-                        (void)invisible_places::timing::
+                    if (invisible_places::timing::
                             AddOrUpdateTimingColourisePaletteMarkerKeys(
                                 effect,
                                 pickerPosition,
-                                workingPalette);
-                    }
-                    if (amountChanged) {
-                        const bool amountTrackArmed = std::any_of(
-                            effect->paletteStopParameterKeys.begin(),
-                            effect->paletteStopParameterKeys.end(),
-                            [&](const auto& key) {
-                                return key.stopId == originalStop.id &&
-                                       key.parameter ==
-                                           TimingColourisePaletteStopParameter::
-                                               ColouriseAmount;
-                            });
-                        if (amountTrackArmed) {
-                            (void)invisible_places::timing::
-                                AddOrUpdateTimingColourisePaletteStopScalarKey(
-                                    effect,
-                                    originalStop.id,
-                                    TimingColourisePaletteStopParameter::
-                                        ColouriseAmount,
-                                    pickerPosition,
-                                    editedStop.colouriseAmount,
-                                    interpolationForAt(
-                                        originalStop.id,
-                                        TimingColourisePaletteStopParameter::
-                                            ColouriseAmount,
-                                        pickerPosition));
-                        } else if (const auto baseIndex =
-                                       stopIndexById(
-                                           effect->basePalette,
-                                           originalStop.id);
-                                   baseIndex.has_value()) {
-                            effect->basePalette
-                                .stops[baseIndex.value()]
-                                .colouriseAmount =
-                                editedStop.colouriseAmount;
-                            markPaletteBaseEdited();
-                        }
+                                workingPalette)) {
+                        hasPaletteKeys = true;
                     }
                 }
                 runtimeState
@@ -108492,7 +109361,8 @@ void DrawTimingColourisePaletteEditor(
             selected.colouriseAmount);
         DrawTimingControlTooltip(
             "Double-click the selected marker to edit its exact colour, "
-            "position, amount, and independent keys.");
+            "position, and amount. Any edit stores the complete palette "
+            "keyframe; its property interpolation remains adjustable below.");
     }
 
     if (legacyModel) {
@@ -108608,8 +109478,10 @@ BuildActiveTimingColouriseFieldCatalog(
             fields[layer].scalarFieldNames.reserve(
                 session.scalarFields.size());
             for (const auto& field : session.scalarFields) {
-                fields[layer].scalarFieldNames.push_back(
-                    field.name);
+                if (field.authoringVisible) {
+                    fields[layer].scalarFieldNames.push_back(
+                        field.name);
+                }
             }
         }
     }
@@ -109498,6 +110370,9 @@ bool SetTimingColouriseEffectParameterAt(
         case TimingColouriseEffectParameter::AmountOverride:
             effect->colouriseAmountOverride =
                 std::clamp(value, 0.0F, 1.0F);
+            return true;
+        case TimingColouriseEffectParameter::BlendMix:
+            effect->blendMix = std::clamp(value, 0.0F, 1.0F);
             return true;
         case TimingColouriseEffectParameter::EmissiveLevel:
             effect->emissiveLevel = value;
@@ -111978,13 +112853,29 @@ void DrawTimingColouriseTopVisualControls(
                 /*labelOnRight=*/true,
                 38.0F);
             if (blendCell.visible) {
+                ImGui::TextDisabled("Primary");
                 (void)DrawTimingColouriseBlendModeCombo(
                     runtimeState,
                     effect);
+                ImGui::Spacing();
+                ImGui::TextDisabled("Combine");
+                (void)DrawTimingColouriseBlendCompositionCombo(
+                    runtimeState,
+                    effect);
+                if (effect->blendCompositionMode !=
+                    invisible_places::timing::
+                        TimingColouriseBlendCompositionMode::PrimaryOnly) {
+                    ImGui::Spacing();
+                    ImGui::TextDisabled("Secondary");
+                    (void)DrawTimingColouriseBlendModeCombo(
+                        runtimeState,
+                        effect,
+                        /*secondary=*/true);
+                }
                 SetTimingSelectorLabelColumn(blendCell);
                 DrawTimingCompactSelectorLabel(
                     "Blend",
-                    "How this feature's colour combines with earlier features or the cloud colour. Colourise Amount remains the layer opacity.");
+                    "Choose a primary mode, then optionally crossfade to or apply a second mode after it. Colourise Amount remains the feature mask strength.");
             }
             EndTimingSelectorCell(blendCell);
         }
@@ -112165,6 +113056,39 @@ void DrawTimingColouriseUnifiedTimeline(
         }
         lane.positions = std::span<const float>{lane.ownedPositions};
     }
+
+    // User-authored markers belong to the active Timing Take rather than to
+    // one effect. Repeat that shared rail beside the selected Visual
+    // Feature's own keys so named animation events remain visible while its
+    // curves are being authored. The coordinate override is important when
+    // this feature is zoomed to its active range: markers and keys must use
+    // the exact same horizontal mapping.
+    const auto scenarioId = ActiveWaterTimingScenarioId(*runtimeState);
+    auto* timingScene = invisible_places::timing::FindTimingTakeSceneState(
+        &runtimeState->water.timingTakeSceneStates,
+        scenarioId,
+        ActiveWaterTimingSceneGroupName(runtimeState->water));
+    if (timingScene != nullptr && !timingScene->marks.empty() &&
+        runtimeState->animationPanel.currentPath.has_value()) {
+        const float durationSeconds = std::max(
+            0.0F,
+            AuthoredAnimationTrackDurationSeconds(
+                *runtimeState->animationPanel.currentPath));
+        const auto timelineCoordinates =
+            ResolveTimingColouriseTimelineCoordinateContext(
+                *runtimeState,
+                *effect);
+        DrawTimingTakeMarkStrip(
+            "##VisualFeatureTimingTakeMarks",
+            runtimeState,
+            scenarioId,
+            timingScene,
+            durationSeconds,
+            /*cameraDomain=*/false,
+            /*fixedPlacement=*/std::nullopt,
+            &timelineCoordinates,
+            /*helpGutterWithinRail=*/true);
+    }
     if (lanes.empty()) {
         ImGui::TextDisabled(
             "Select at least one key group to show its curves.");
@@ -112288,7 +113212,7 @@ void DrawTimingColouriseCompactNumberEditors(
     }
     using invisible_places::timing::TimingColouriseEffectParameter;
     std::vector<TimingColouriseEffectParameter> parameters;
-    parameters.reserve(7U);
+    parameters.reserve(8U);
     if (effect->colouriseEnabled) {
         parameters.push_back(
             TimingColouriseEffectParameter::PaletteSkewCentre);
@@ -112298,6 +113222,12 @@ void DrawTimingColouriseCompactNumberEditors(
             TimingColouriseEffectParameter::AmountOverride);
         parameters.push_back(
             TimingColouriseEffectParameter::PalettePhase);
+        if (effect->blendCompositionMode !=
+            invisible_places::timing::
+                TimingColouriseBlendCompositionMode::PrimaryOnly) {
+            parameters.push_back(
+                TimingColouriseEffectParameter::BlendMix);
+        }
     }
     if (effect->emissiveEnabled) {
         parameters.push_back(
@@ -119863,10 +120793,6 @@ bool PreviewLiveVisualEffectsRequireSceneRedraw(
     if (PreviewWaterSeepageRequiresSceneRedraw(runtimeState)) {
         return true;
     }
-    const bool fastBasicRenderer =
-        FastBasicPointRendererActive(runtimeState.projectSettings) &&
-        !VisibleGeneratedWaterTrailOverlayPresent(runtimeState);
-
     // Project-owned Shoreline effects animate continuously whenever visible.
     // Resolve them exactly as BuildRenderState will so a keyed-zero list does
     // not latch redraws and legacy point-visual shoreline fields are ignored.
@@ -119897,8 +120823,13 @@ bool PreviewLiveVisualEffectsRequireSceneRedraw(
             ShorelineWaveEligibleSession(session)) {
             return true;
         }
+        const bool fastBasicLayer =
+            ResolvePointCloudLayerRendererMode(
+                runtimeState.projectSettings.pointCloudRendererMode,
+                IsGeneratedWaterOverlaySession(session),
+                renderStyle) == PointCloudRendererMode::FastBasic;
         if (!runtimeState.projectSettings.liveVisualEffects ||
-            fastBasicRenderer) {
+            fastBasicLayer) {
             continue;
         }
         // A trail-overlay session at zero flow activity renders nothing: the
@@ -119952,8 +120883,7 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
     }
     const auto matrices = renderCamera->Matrices(aspectRatio);
     const bool fastBasicRenderer =
-        FastBasicPointRendererActive(runtimeState.projectSettings) &&
-        !VisibleGeneratedWaterTrailOverlayPresent(runtimeState);
+        FastBasicPointRendererActive(runtimeState.projectSettings);
 
     renderState.view = matrices.view;
     renderState.projection = matrices.projection;
@@ -120117,13 +121047,20 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                         &renderStyle,
                         resolvedShorelines.front());
             }
+            const bool generatedWaterOverlay =
+                IsGeneratedWaterOverlaySession(session);
+            const bool fastBasicLayer =
+                ResolvePointCloudLayerRendererMode(
+                    renderState.pointCloudRendererMode,
+                    generatedWaterOverlay,
+                    renderStyle) == PointCloudRendererMode::FastBasic;
             renderState.pointCloudLayers.push_back(
                 {.layerId = sessionIndex,
-                 .style = fastBasicRenderer
+                 .style = fastBasicLayer
                               ? MakeEffectiveFastBasicStyle(
                                     renderStyle,
                                     session.hasSourceRgb,
-                                    IsGeneratedWaterOverlaySession(session))
+                                    generatedWaterOverlay)
                               : renderStyle,
                  .timingColourise =
                      activeColouriseEffects != nullptr &&
@@ -120138,8 +121075,7 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                          : invisible_places::renderer::pointcloud::
                            ResolvedTimingColouriseStack{},
                  .scalarFields = session.scalarFields,
-                 .generatedWaterOverlay =
-                     IsGeneratedWaterOverlaySession(session),
+                 .generatedWaterOverlay = generatedWaterOverlay,
                  .hasSourceRgb = session.hasSourceRgb,
                  .hasNormals = session.hasNormals,
                  .timingColouriseEligible =
@@ -120440,6 +121376,41 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
                      std::numeric_limits<std::uint32_t>::max())),
              .densityCompensation = {},
              .rainCollisionRole = WaterSurfaceRole::None});
+    }
+
+    // Animation-aware modes are meaningful only while the viewport follows
+    // the animation camera. A manually detached/orbited view deliberately
+    // falls back to the current-frame camera until it is reattached.
+    auto& animationPanel = runtimeState.animationPanel;
+    if (cameraOverride == nullptr &&
+        animationPanel.linkedViewCameraAttached) {
+        const auto* sortPath =
+            ResolvePresentedAnimationPathForWater(runtimeState);
+        if (sortPath != nullptr) {
+            float normalizedPosition =
+                std::clamp(animationPanel.scrubAmount, 0.0F, 1.0F);
+            if (const auto linkedPair =
+                    ResolveActiveAnimationLinkedPair(runtimeState);
+                linkedPair.has_value()) {
+                for (std::size_t member = 0U; member < 2U; ++member) {
+                    if (linkedPair->members[member] == sortPath &&
+                        animationPanel.linkedMemberLocalPlayheadsValid[member]) {
+                        normalizedPosition = std::clamp(
+                            animationPanel.linkedMemberLocalPlayheads[member],
+                            0.0F,
+                            1.0F);
+                        break;
+                    }
+                }
+            }
+            const auto& preparedSortPath = CachedPreparedAnimationPath(
+                &animationPanel,
+                *sortPath);
+            ResolveAnimationPointDepthSortViews(
+                &renderState,
+                preparedSortPath,
+                preparedSortPath.durationSeconds * normalizedPosition);
+        }
     }
 
     return renderState;
@@ -121543,6 +122514,341 @@ struct GuiSmokeReport {
     void Fail(std::string message) { failures.push_back(std::move(message)); }
     [[nodiscard]] bool Passed() const { return failures.empty(); }
 };
+
+int RunPointDepthOptionsSmoke(
+    platform::Window* window,
+    invisible_places::renderer::core::VulkanViewportShell* viewport) {
+    if (window == nullptr || viewport == nullptr) {
+        std::cerr << "Point depth-options smoke requires a live window and viewport.\n";
+        return 2;
+    }
+
+    constexpr std::size_t kLayerId =
+        std::numeric_limits<std::size_t>::max() - 23U;
+    invisible_places::io::LoadedPointCloud cloud;
+    cloud.layerName = "Point Depth Options Smoke";
+    cloud.hasSourceRgb = true;
+    cloud.hasNormals = true;
+    constexpr int kGridRadius = 12;
+    constexpr float kGridSpacing = 0.075F;
+    for (int y = -kGridRadius; y <= kGridRadius; ++y) {
+        for (int x = -kGridRadius; x <= kGridRadius; ++x) {
+            // Deliberately upload the near point first. The sort must reverse
+            // this input order before conventional alpha blending.
+            const std::array<invisible_places::io::Float3, 2U> positions{{
+                {static_cast<float>(x) * kGridSpacing,
+                 static_cast<float>(y) * kGridSpacing,
+                 0.0F},
+                {static_cast<float>(x) * kGridSpacing,
+                 static_cast<float>(y) * kGridSpacing,
+                 -0.45F},
+            }};
+            const std::array<std::uint32_t, 2U> colours{{
+                0xFF0000FFU,
+                0xFFFF0000U,
+            }};
+            // The camera looks down -Z from z=4: the near plane faces the
+            // camera and the far plane faces away, giving the back-face
+            // fade a full-strength positive and negative case.
+            const std::array<invisible_places::io::Float3, 2U> normals{{
+                {0.0F, 0.0F, 1.0F},
+                {0.0F, 0.0F, -1.0F},
+            }};
+            for (std::size_t depthIndex = 0U;
+                 depthIndex < positions.size();
+                 ++depthIndex) {
+                cloud.positions.push_back(positions[depthIndex]);
+                cloud.packedColors.push_back(colours[depthIndex]);
+                cloud.normals.push_back(normals[depthIndex]);
+                cloud.bounds.Expand(positions[depthIndex]);
+            }
+        }
+    }
+
+    std::vector<std::uint32_t> previewIndices;
+    previewIndices.reserve(cloud.positions.size() / 2U + 1U);
+    for (std::uint32_t index = 0U;
+         index < cloud.positions.size();
+         ++index) {
+        if (((index / 2U) % 2U) == 0U) {
+            previewIndices.push_back(index);
+        }
+    }
+
+    bool uploaded = false;
+    const bool captureWasEnabled =
+        viewport->LiveSceneReadbackCaptureEnabled();
+    const auto cleanup = [&]() {
+        try {
+            viewport->WaitIdle();
+            if (uploaded) {
+                viewport->RemovePointCloud(kLayerId);
+            }
+            if (!captureWasEnabled) {
+                viewport->SetLiveSceneReadbackCaptureEnabled(false);
+            }
+        } catch (...) {
+            // Preserve the original smoke failure; viewport destruction still
+            // owns a settled final cleanup.
+        }
+    };
+
+    try {
+        viewport->UploadPointCloud(kLayerId, cloud, previewIndices);
+        uploaded = true;
+        viewport->SetSceneCachingEnabled(false);
+        viewport->SetLiveSceneRenderingEnabled(true);
+        viewport->SetLiveSceneReadbackCaptureEnabled(true);
+
+        invisible_places::camera::CameraState cameraState;
+        cameraState.position = {0.0F, 0.0F, 4.0F};
+        cameraState.target = {0.0F, 0.0F, 0.0F};
+        cameraState.orbitCenter = cameraState.target;
+        cameraState.hasOrbitCenter = true;
+        cameraState.nearPlane = 0.05F;
+        cameraState.farPlane = 25.0F;
+        cameraState.focusDistance = 4.0F;
+        invisible_places::camera::OrbitCamera camera;
+        camera.ApplyState(cameraState);
+        const auto matrices =
+            camera.Matrices(CurrentAspectRatio(*viewport));
+
+        PointCloudStyleState style;
+        style.geometryMode = PointCloudGeometryMode::ScreenSprites;
+        style.falloffProfile = PointCloudFalloffProfile::Gaussian;
+        style.gaussianSharpness = 4.0F;
+        style.colorMode = PointCloudColorMode::SourceRgb;
+        style.solidCenters = false;
+        style.gpuBackToFrontSorting = true;
+        style.gpuSortMode = PointCloudGpuSortMode::FullAnimation;
+        style.depthWeightStrength = 4.0F;
+        invisible_places::style::SetScalarConstant(&style.pointSize, 18.0F);
+        invisible_places::style::SetScalarConstant(&style.opacity, 0.78F);
+        invisible_places::style::SetScalarConstant(
+            &style.emissiveStrength,
+            0.0F);
+        invisible_places::style::SetScalarConstant(&style.depthFade, 0.0F);
+
+        invisible_places::renderer::core::SceneRenderState renderState;
+        renderState.view = matrices.view;
+        renderState.projection = matrices.projection;
+        renderState.viewProjection = matrices.viewProjection;
+        renderState.cameraPosition = matrices.position;
+        renderState.backgroundColor = {0.012F, 0.015F, 0.020F, 1.0F};
+        renderState.nearPlane = cameraState.nearPlane;
+        renderState.farPlane = cameraState.farPlane;
+        renderState.focusDistance = cameraState.focusDistance;
+        renderState.pointCloudRendererMode = PointCloudRendererMode::Beauty;
+        renderState.pointCloudLayers.push_back({
+            .layerId = kLayerId,
+            .style = style,
+            .hasSourceRgb = true,
+            .drawPointCount = 0U,
+            .depthSortView = matrices.view,
+            .depthSortNearPlane = cameraState.nearPlane,
+            .depthSortFarPlane = cameraState.farPlane,
+            .depthSortViewValid = true,
+        });
+
+        const auto drawLiveFrames = [&](std::uint32_t frameCount) {
+            for (std::uint32_t frame = 0U; frame < frameCount; ++frame) {
+                window->PollEvents();
+                viewport->BeginUiFrame();
+                viewport->UpdateRenderState(renderState);
+                viewport->DrawFrame();
+            }
+        };
+        const auto validateLiveReadback = [&]() {
+            const auto readback = viewport->ReadLiveSceneFrame();
+            const auto pixelCount =
+                static_cast<std::size_t>(readback.width) * readback.height;
+            if (readback.width == 0U || readback.height == 0U ||
+                readback.colorRgba8.size() != pixelCount * 4U ||
+                readback.linearDepth.size() != pixelCount ||
+                std::none_of(
+                    readback.linearDepth.begin(),
+                    readback.linearDepth.end(),
+                    [](float depth) {
+                        return std::isfinite(depth) && depth > 0.0F;
+                    })) {
+                throw std::runtime_error{
+                    "GPU point depth-options live readback was empty."};
+            }
+        };
+        const auto renderAndValidateExport = [&]() {
+            invisible_places::renderer::core::PointCloudExrFrameRequest request{
+                .renderState = renderState,
+                .width = 192U,
+                .height = 128U,
+                // Force the complete source after allocating the sort output
+                // for a smaller preview budget.
+                .previewDensity = false,
+                .readbackMask = invisible_places::renderer::core::
+                    PointCloudExrReadbackMask::All,
+            };
+            const auto image = viewport->RenderPointCloudExrFrame(request);
+            const auto pixelCount =
+                static_cast<std::size_t>(request.width) * request.height;
+            const auto validDepthCount = static_cast<std::size_t>(
+                std::count_if(
+                    image.depth.begin(),
+                    image.depth.end(),
+                    [](float depth) {
+                        return std::isfinite(depth) && depth > 0.0F;
+                    }));
+            if (image.width != request.width || image.height != request.height ||
+                image.rgbaHalf.size() != pixelCount * 4U ||
+                image.normalHalf.size() != pixelCount * 3U ||
+                image.albedoHalf.size() != pixelCount * 3U ||
+                image.depth.size() != pixelCount ||
+                validDepthCount == 0U) {
+                throw std::runtime_error{
+                    "GPU point depth-options EXR readback was empty "
+                    "(layers=" +
+                    std::to_string(viewport->ExrLastRecordedLayerCount()) +
+                    ", points=" +
+                    std::to_string(viewport->ExrLastRecordedPointCount()) +
+                    ", depth_values=" +
+                    std::to_string(image.depth.size()) +
+                    ", valid_depth=" +
+                    std::to_string(validDepthCount) + ")."};
+            }
+        };
+
+        const auto sortDispatchesBefore =
+            viewport->Diagnostics().pointDepthSortDispatchCount;
+        const auto sortReusesBefore =
+            viewport->Diagnostics().pointDepthSortCacheReuseCount;
+        drawLiveFrames(3U);
+        const auto& stableSortDiagnostics = viewport->Diagnostics();
+        if (stableSortDiagnostics.pointDepthSortDispatchCount !=
+                sortDispatchesBefore + 1U ||
+            stableSortDiagnostics.pointDepthSortCacheReuseCount <
+                sortReusesBefore + 2U) {
+            throw std::runtime_error{
+                "Full-animation GPU point sorting did not preserve and "
+                "reuse one ordering across unchanged animation frames "
+                "(dispatches=" +
+                std::to_string(
+                    stableSortDiagnostics.pointDepthSortDispatchCount -
+                    sortDispatchesBefore) +
+                ", reuses=" +
+                std::to_string(
+                    stableSortDiagnostics.pointDepthSortCacheReuseCount -
+                    sortReusesBefore) +
+                ")."};
+        }
+        validateLiveReadback();
+        renderAndValidateExport();
+
+        // Rebuild both sampled-index descriptors after the sort allocation is
+        // live. This guards the point-budget edits used during interaction.
+        std::vector<std::uint32_t> smallerBudget;
+        for (std::uint32_t index = 0U;
+             index < cloud.positions.size();
+             index += 4U) {
+            smallerBudget.push_back(index);
+        }
+        viewport->UpdatePointBudget(
+            kLayerId,
+            smallerBudget,
+            /*indicesAlreadySortedUnique=*/true,
+            /*retainBufferCapacity=*/true);
+        drawLiveFrames(2U);
+
+        viewport->UpdatePointBudget(
+            kLayerId,
+            {},
+            /*indicesAlreadySortedUnique=*/true,
+            /*retainBufferCapacity=*/false);
+        std::vector<std::uint32_t> interactiveIndices;
+        for (std::uint32_t index = 1U;
+             index < cloud.positions.size();
+             index += 5U) {
+            interactiveIndices.push_back(index);
+        }
+        viewport->UpdateInteractivePointSampleBuffer(
+            kLayerId,
+            interactiveIndices,
+            /*includeSurfelIndices=*/false,
+            /*indicesAlreadySortedUnique=*/true);
+        renderState.pointCloudLayers.front().drawPointCount =
+            static_cast<std::uint32_t>(interactiveIndices.size());
+        drawLiveFrames(2U);
+        validateLiveReadback();
+
+        renderState.pointCloudLayers.front().drawPointCount = 0U;
+        renderState.pointCloudLayers.front().style.depthPrepassEnabled = true;
+        renderState.pointCloudLayers.front().style
+            .depthPrepassAlphaThreshold = 0.35F;
+        renderState.pointCloudLayers.front().style
+            .depthPrepassToleranceMeters = 0.03F;
+        drawLiveFrames(3U);
+        validateLiveReadback();
+        renderAndValidateExport();
+
+        // Fixed Vertical derives a camera-independent ordering from the
+        // cloud's own Z bounds: expect exactly one new sort for the mode
+        // switch and cache reuse afterwards. Non-zero emissive routes the
+        // sorted layer through the emission accumulation attachment and the
+        // sorted emission composite subpass in both live and EXR paths.
+        auto& verticalStyle = renderState.pointCloudLayers.front().style;
+        verticalStyle.depthPrepassEnabled = false;
+        verticalStyle.gpuSortMode = PointCloudGpuSortMode::FixedVertical;
+        invisible_places::style::SetScalarConstant(
+            &verticalStyle.emissiveStrength,
+            0.75F);
+        const auto verticalDispatchesBefore =
+            viewport->Diagnostics().pointDepthSortDispatchCount;
+        drawLiveFrames(3U);
+        const auto verticalDispatches =
+            viewport->Diagnostics().pointDepthSortDispatchCount -
+            verticalDispatchesBefore;
+        if (verticalDispatches != 1U) {
+            throw std::runtime_error{
+                "Fixed Vertical GPU point sorting did not reuse one "
+                "camera-independent ordering (dispatches=" +
+                std::to_string(verticalDispatches) + ")."};
+        }
+        validateLiveReadback();
+        renderAndValidateExport();
+
+        // Saturated emission, the back-face fade, and the soft-edge depth
+        // prepass must also hold together on the weighted (non-sorted)
+        // path — the sort-free authoring combination. No sort dispatches
+        // may occur while sorting is disabled.
+        auto& weightedStyle = renderState.pointCloudLayers.front().style;
+        weightedStyle.gpuBackToFrontSorting = false;
+        weightedStyle.depthPrepassEnabled = true;
+        weightedStyle.emissionResponse =
+            invisible_places::renderer::pointcloud::
+                PointCloudEmissionResponse::Saturated;
+        weightedStyle.normalCullEnabled = true;
+        weightedStyle.normalCullStartDegrees = 75.0F;
+        weightedStyle.normalCullEndDegrees = 105.0F;
+        const auto weightedDispatchesBefore =
+            viewport->Diagnostics().pointDepthSortDispatchCount;
+        drawLiveFrames(3U);
+        if (viewport->Diagnostics().pointDepthSortDispatchCount !=
+            weightedDispatchesBefore) {
+            throw std::runtime_error{
+                "Sort-free weighted rendering still dispatched the GPU "
+                "transparency sort."};
+        }
+        validateLiveReadback();
+        renderAndValidateExport();
+    } catch (const std::exception& error) {
+        cleanup();
+        std::cerr << "Point depth-options smoke failed: "
+                  << error.what() << '\n';
+        return 1;
+    }
+
+    cleanup();
+    std::cout
+        << "GPU point sorting and soft-edge depth prepass smoke passed.\n";
+    return 0;
+}
 
 bool WriteGuiSmokeReport(const GuiSmokeReport& report) {
     std::error_code error;
@@ -135375,9 +136681,9 @@ int RunWaterIntegrationSmoke(
                      session.pointCloudContentGeneration});
         }
 
-        // Isolate the authored SAND/ROCK/VEG bundle. Generated Flow and Mesh
-        // Flow overlays intentionally force Beauty, which would make a Fast
-        // Basic selection exercise the wrong renderer.
+        // Isolate the authored SAND/ROCK/VEG bundle so these checks can assert
+        // one minimal pass per authored layer. Generated Flow trails retain
+        // Beauty as mixed overlay layers and are covered separately.
         for (auto& session : runtimeState->sessions) {
             if (session.kind == LayerKind::PointCloud &&
                 !IsAuthoredTimingColouriseLayer(session)) {
@@ -135752,9 +137058,6 @@ int RunWaterIntegrationSmoke(
                     secondDiagnostics);
         }
 
-        runtimeState->projectSettings
-            .pointCloudRendererMode =
-            savedRendererMode;
         runtimeState->water.dynamicMeshFlowSettings
             .showTrails = savedMeshFlowShowTrails;
         for (std::size_t index = 0U;
@@ -135771,6 +137074,86 @@ int RunWaterIntegrationSmoke(
         runtimeState->animationPanel.scrubAmount =
             savedScrubAmount;
         ApplyAnimationScrub(runtimeState);
+
+        runtimeState->projectSettings
+            .pointCloudRendererMode =
+            PointCloudRendererMode::FastBasic;
+        const auto mixedWaterFrame =
+            ResolveWaterFrameState(runtimeState);
+        const auto mixedRenderState =
+            BuildRenderState(
+                *runtimeState,
+                *viewport,
+                120.0F,
+                &mixedWaterFrame);
+        const auto mixedFastLayerCount =
+            static_cast<std::size_t>(std::count_if(
+                mixedRenderState.pointCloudLayers.begin(),
+                mixedRenderState.pointCloudLayers.end(),
+                [&](const auto& layer) {
+                    return ResolvePointCloudLayerRendererMode(
+                               mixedRenderState.pointCloudRendererMode,
+                               layer.generatedWaterOverlay,
+                               layer.style) ==
+                           PointCloudRendererMode::FastBasic;
+                }));
+        const auto mixedBeautyTrailCount =
+            static_cast<std::size_t>(std::count_if(
+                mixedRenderState.pointCloudLayers.begin(),
+                mixedRenderState.pointCloudLayers.end(),
+                [&](const auto& layer) {
+                    return layer.generatedWaterOverlay &&
+                           layer.style.waterTrailOverlay &&
+                           ResolvePointCloudLayerRendererMode(
+                               mixedRenderState.pointCloudRendererMode,
+                               layer.generatedWaterOverlay,
+                               layer.style) ==
+                               PointCloudRendererMode::Beauty;
+                }));
+        PumpWaterIntegrationSmokeFrame(
+            window,
+            runtimeState,
+            viewport,
+            120.0F,
+            true);
+        const auto mixedDiagnostics =
+            viewport->Diagnostics();
+        if (mixedRenderState.pointCloudRendererMode ==
+                PointCloudRendererMode::FastBasic &&
+            mixedFastLayerCount > 0U &&
+            mixedBeautyTrailCount > 0U &&
+            mixedDiagnostics.pointFastBasicDrawCalls >=
+                mixedFastLayerCount &&
+            mixedDiagnostics.pointAccumulationLayerCount >=
+                mixedBeautyTrailCount &&
+            mixedDiagnostics.pointRenderModes ==
+                "fast-basic-square + beauty-overlay") {
+            report.Pass(
+                "Fast Basic remained authoritative for the authored clouds while visible generated Flow trails rendered as Beauty overlay layers in the same live frame.");
+        } else {
+            std::ostringstream detail;
+            detail
+                << "Mixed Fast Basic/Beauty Flow routing failed"
+                << " (scene_mode="
+                << static_cast<std::uint32_t>(
+                       mixedRenderState.pointCloudRendererMode)
+                << ",fast_layers="
+                << mixedFastLayerCount
+                << ",beauty_trails="
+                << mixedBeautyTrailCount
+                << ",fast_draws="
+                << mixedDiagnostics.pointFastBasicDrawCalls
+                << ",beauty_accumulation_layers="
+                << mixedDiagnostics.pointAccumulationLayerCount
+                << ",diagnostic_mode="
+                << mixedDiagnostics.pointRenderModes
+                << ").";
+            report.Fail(detail.str());
+        }
+
+        runtimeState->projectSettings
+            .pointCloudRendererMode =
+            savedRendererMode;
         PumpWaterIntegrationSmokeFrame(
             window,
             runtimeState,
@@ -137099,6 +138482,13 @@ int Application::Run(ApplicationRunOptions options) const {
         if (!viewport.has_value()) {
             std::cerr << "GUI smoke mode requires a live Vulkan viewport.\n";
             return 2;
+        }
+        if (options.guiSmoke->scenario == "point-depth-options") {
+            const auto smokeExitCode =
+                RunPointDepthOptionsSmoke(&window, &viewport.value());
+            StopBackgroundWorkForShutdown(&runtimeState);
+            viewport->WaitIdle();
+            return smokeExitCode;
         }
         if (options.guiSmoke->scenario ==
                 "temporal-camera-overlay" ||
