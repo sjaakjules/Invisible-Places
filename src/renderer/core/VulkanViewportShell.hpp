@@ -524,14 +524,36 @@ class VulkanViewportShell {
     void UpdateRenderState(const SceneRenderState& state);
     [[nodiscard]] bool RainImpactEffectsRequireRedraw(
         float currentTimeSeconds) const;
+    // A worker thread may pre-stage the GPU payload of an upcoming upload:
+    // buffer creation and the multi-hundred-megabyte host-visible copies
+    // are device-level Vulkan work that is safe off the render thread, so
+    // the render-thread upload then only allocates descriptor sets and
+    // registers the layer. Destruction of an unadopted payload is safe on
+    // any thread, but the shell must outlive every staged payload (join
+    // staging workers before teardown).
+    struct StagedPointCloudUpload;
+    [[nodiscard]] std::shared_ptr<StagedPointCloudUpload>
+    StagePointCloudUpload(
+        const invisible_places::io::LoadedPointCloud& cloud,
+        const std::vector<std::uint32_t>& sampledIndices);
     void UploadPointCloud(
         std::size_t layerId,
         const invisible_places::io::LoadedPointCloud& cloud,
-        const std::vector<std::uint32_t>& sampledIndices);
+        const std::vector<std::uint32_t>& sampledIndices,
+        std::shared_ptr<StagedPointCloudUpload> stagedUpload = nullptr);
     // A density transaction can bracket several remove/upload/attachment
     // operations so executable point command buffers are settled and reset
     // exactly once. Calls may be nested; only the outer pair owns the settle.
-    void BeginPointCloudMutationBatch();
+    // Detaches a point-cloud layer from the draw list immediately and
+    // destroys its GPU resources only after every frame that could still
+    // reference them has completed its slot-fence wait, so retiring a
+    // multi-gigabyte layer never drains the device. Layers carrying a
+    // dynamic mesh-flow simulation fall back to the synchronous removal.
+    void RemovePointCloudDeferred(std::size_t layerId);
+    // requiresQuiescentGpu=false opens a creation-only batch: no device
+    // drain at open; the first destructive mutation inside (a replace,
+    // removal, budget or mask change) settles the device exactly once.
+    void BeginPointCloudMutationBatch(bool requiresQuiescentGpu = true);
     void EndPointCloudMutationBatch();
     void SetSmokeFailNextPointCloudUploadAfterPartialAllocation(bool enabled = true);
     void SetSmokeFailNextWaterFlowUploadAfterPartialAllocation(bool enabled = true);
@@ -1373,6 +1395,18 @@ class VulkanViewportShell {
         std::uint32_t height);
 
     [[nodiscard]] BufferAllocation CreateHostVisibleBuffer(VkDeviceSize size, VkBufferUsageFlags usage) const;
+    // The buffer-creation and copy portion of a point-cloud upload, shared
+    // by the render-thread path and worker-thread staging. onRenderThread
+    // gates the resident-peak telemetry and the injected-failure test hook,
+    // which touch shell state; with it false the method performs only
+    // device-level Vulkan calls and is safe on a staging thread.
+    [[nodiscard]] ActivePointCloudResources BuildPointCloudUploadResources(
+        const invisible_places::io::LoadedPointCloud& cloud,
+        const std::vector<std::uint32_t>& sampledIndices,
+        bool onRenderThread);
+    // Destroys the plain buffer allocations of a staged (descriptor-less)
+    // payload; device-level only, safe on any thread.
+    void DestroyStagedPointCloudBuffers(ActivePointCloudResources* resources);
     [[nodiscard]] BufferAllocation CreateDeviceLocalBuffer(
         VkDeviceSize size,
         VkBufferUsageFlags usage) const;
@@ -1564,8 +1598,16 @@ class VulkanViewportShell {
         glm::mat4{1.0F},
         glm::mat4{1.0F}};
     bool temporalCameraOverlayCurrentViewProjectionsValid_ = false;
+    struct DeferredPointCloudDestroy {
+        std::uint64_t detachFrame = 0U;
+        ActivePointCloudResources resources;
+    };
+    std::vector<DeferredPointCloudDestroy> deferredPointCloudDestroys_;
+    std::uint64_t pointCloudFrameCounter_ = 0U;
+    void FlushDeferredPointCloudDestroys(bool force);
     std::uint32_t pointCloudMutationBatchDepth_ = 0U;
     std::uint32_t pointCloudMutationBatchWaitCount_ = 0U;
+    bool pointCloudMutationBatchQuiesced_ = false;
     std::uint32_t lastPointCloudMutationBatchWaitCount_ = 0U;
     std::uint64_t pointCloudResidentPeakBytes_ = 0U;
     std::uint64_t pointCloudMutationBatchPeakBytes_ = 0U;

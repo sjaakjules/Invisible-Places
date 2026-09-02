@@ -1746,6 +1746,7 @@ VulkanViewportShell::~VulkanViewportShell() {
     }
 
     ResetPointCloudReferencingCommandBuffers();
+    FlushDeferredPointCloudDestroys(true);
     for (auto& resources : pointCloudResources_) {
         RetirePointCloudRenderDescriptors(&resources);
     }
@@ -2051,6 +2052,8 @@ void VulkanViewportShell::DrawFrame() {
     Check(
         vkWaitForFences(device_, 1, &frame.fence, VK_TRUE, UINT64_MAX),
         "vkWaitForFences(frame slot)");
+    ++pointCloudFrameCounter_;
+    FlushDeferredPointCloudDestroys(false);
     const auto fenceWaitEnd = collectDiagnostics
                                   ? std::chrono::steady_clock::now()
                                   : std::chrono::steady_clock::time_point{};
@@ -2861,13 +2864,23 @@ void VulkanViewportShell::UpdateRenderState(const SceneRenderState& state) {
     diagnostics_.summary = summary.str();
 }
 
-void VulkanViewportShell::BeginPointCloudMutationBatch() {
+void VulkanViewportShell::BeginPointCloudMutationBatch(
+    bool requiresQuiescentGpu) {
     if (pointCloudMutationBatchDepth_ == 0U) {
         pointCloudMutationBatchWaitCount_ = 0U;
         pointCloudMutationBatchPeakBytes_ = PointCloudResidentBytes();
-        WaitIdle();
-        ResetPointCloudReferencingCommandBuffers();
-        ++pointCloudMutationBatchWaitCount_;
+        pointCloudMutationBatchQuiesced_ = false;
+        if (requiresQuiescentGpu) {
+            WaitIdle();
+            ResetPointCloudReferencingCommandBuffers();
+            pointCloudMutationBatchQuiesced_ = true;
+            ++pointCloudMutationBatchWaitCount_;
+        }
+    } else if (requiresQuiescentGpu &&
+               !pointCloudMutationBatchQuiesced_) {
+        // A nested batch that needs the settled device upgrades the outer
+        // creation-only batch exactly once.
+        SettlePointCloudMutation();
     }
     ++pointCloudMutationBatchDepth_;
 }
@@ -2989,24 +3002,31 @@ void VulkanViewportShell::TrackPointCloudResidentPeak(std::uint64_t unpublishedB
 
 void VulkanViewportShell::SettlePointCloudMutation() {
     if (pointCloudMutationBatchDepth_ > 0U) {
+        if (pointCloudMutationBatchQuiesced_) {
+            return;
+        }
+        // A batch opened without requiring a quiescent device settles
+        // lazily: the first mutation that destroys or replaces live
+        // resources pays the one drain, while pure creations before it
+        // (new-layer uploads are host-visible buffer fills) overlap
+        // whatever the GPU still has in flight.
+        WaitIdle();
+        ResetPointCloudReferencingCommandBuffers();
+        pointCloudMutationBatchQuiesced_ = true;
+        ++pointCloudMutationBatchWaitCount_;
         return;
     }
     WaitIdle();
     ResetPointCloudReferencingCommandBuffers();
 }
 
-void VulkanViewportShell::UploadPointCloud(std::size_t layerId, const invisible_places::io::LoadedPointCloud& cloud,
-                                           const std::vector<std::uint32_t>& sampledIndices) {
-    if (cloud.PointCount() == 0) {
-        throw std::runtime_error{"Cannot upload an empty point cloud."};
-    }
-    if (cloud.PointCount() > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::runtime_error{"Point cloud exceeds the current 32-bit draw-count limit."};
-    }
-
+VulkanViewportShell::ActivePointCloudResources
+VulkanViewportShell::BuildPointCloudUploadResources(
+    const invisible_places::io::LoadedPointCloud& cloud,
+    const std::vector<std::uint32_t>& sampledIndices,
+    bool onRenderThread) {
     ActivePointCloudResources resources;
-    resources.layerId = layerId;
-    resources.pointCount = static_cast<std::uint32_t>(cloud.PointCount());
+        resources.pointCount = static_cast<std::uint32_t>(cloud.PointCount());
     resources.activePointCount = resources.pointCount;
     resources.scalarFieldCount = static_cast<std::uint32_t>(cloud.ScalarFieldCount());
     resources.hasSourceRgb = cloud.hasSourceRgb;
@@ -3020,7 +3040,9 @@ void VulkanViewportShell::UploadPointCloud(std::size_t layerId, const invisible_
             static_cast<VkDeviceSize>(cloud.positions.size() * sizeof(invisible_places::io::Float3)),
             VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
         UploadBufferData(resources.positionBuffer, cloud.positions.data(), resources.positionBuffer.size);
-        TrackPointCloudResidentPeak(PointCloudResourceResidentBytes(resources));
+        if (onRenderThread) {
+            TrackPointCloudResidentPeak(PointCloudResourceResidentBytes(resources));
+        }
 
         resources.positionStorageBuffer = CreateHostVisibleBuffer(
             static_cast<VkDeviceSize>(cloud.positions.size() * sizeof(glm::vec4)), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -3032,8 +3054,11 @@ void VulkanViewportShell::UploadPointCloud(std::size_t layerId, const invisible_
             const auto& position = cloud.positions[pointIndex];
             storagePositions[pointIndex] = glm::vec4{position.x, position.y, position.z, 1.0F};
         }
-        TrackPointCloudResidentPeak(PointCloudResourceResidentBytes(resources));
-        if (smokeFailNextPointCloudUploadAfterPartialAllocation_) {
+        if (onRenderThread) {
+            TrackPointCloudResidentPeak(PointCloudResourceResidentBytes(resources));
+        }
+        if (onRenderThread &&
+            smokeFailNextPointCloudUploadAfterPartialAllocation_) {
             smokeFailNextPointCloudUploadAfterPartialAllocation_ = false;
             throw std::runtime_error{"Injected point-cloud upload failure after partial allocation."};
         }
@@ -3042,7 +3067,9 @@ void VulkanViewportShell::UploadPointCloud(std::size_t layerId, const invisible_
             CreateHostVisibleBuffer(static_cast<VkDeviceSize>(cloud.packedColors.size() * sizeof(std::uint32_t)),
                                     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         UploadBufferData(resources.colorBuffer, cloud.packedColors.data(), resources.colorBuffer.size);
-        TrackPointCloudResidentPeak(PointCloudResourceResidentBytes(resources));
+        if (onRenderThread) {
+            TrackPointCloudResidentPeak(PointCloudResourceResidentBytes(resources));
+        }
 
         if (resources.hasNormals) {
             resources.normalBuffer =
@@ -3062,7 +3089,9 @@ void VulkanViewportShell::UploadPointCloud(std::size_t layerId, const invisible_
                 CreateHostVisibleBuffer(sizeof(fallbackNormal), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
             UploadBufferData(resources.normalBuffer, &fallbackNormal, sizeof(fallbackNormal));
         }
-        TrackPointCloudResidentPeak(PointCloudResourceResidentBytes(resources));
+        if (onRenderThread) {
+            TrackPointCloudResidentPeak(PointCloudResourceResidentBytes(resources));
+        }
 
         if (!cloud.scalarFieldValues.empty()) {
             resources.scalarFieldBuffer =
@@ -3075,7 +3104,9 @@ void VulkanViewportShell::UploadPointCloud(std::size_t layerId, const invisible_
             resources.scalarFieldBuffer = CreateHostVisibleBuffer(sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
             UploadBufferData(resources.scalarFieldBuffer, &fallbackScalar, sizeof(float));
         }
-        TrackPointCloudResidentPeak(PointCloudResourceResidentBytes(resources));
+        if (onRenderThread) {
+            TrackPointCloudResidentPeak(PointCloudResourceResidentBytes(resources));
+        }
         const WaterSeepageNodeTopologyGpu emptySeepageNode{};
         resources.seepageNodeBuffer =
             CreateHostVisibleBuffer(sizeof(emptySeepageNode), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -3125,9 +3156,110 @@ void VulkanViewportShell::UploadPointCloud(std::size_t layerId, const invisible_
                 UploadBufferData(resources.sampledSurfelIndexBuffer, surfelIndices.data(),
                                  resources.sampledSurfelIndexBuffer.size);
             }
+            if (onRenderThread) {
             TrackPointCloudResidentPeak(PointCloudResourceResidentBytes(resources));
         }
+        }
 
+        return resources;
+    } catch (...) {
+        DestroyStagedPointCloudBuffers(&resources);
+        throw;
+    }
+}
+
+void VulkanViewportShell::DestroyStagedPointCloudBuffers(
+    ActivePointCloudResources* resources) {
+    if (resources == nullptr) {
+        return;
+    }
+    DestroyBuffer(&resources->positionBuffer);
+    DestroyBuffer(&resources->positionStorageBuffer);
+    DestroyBuffer(&resources->colorBuffer);
+    DestroyBuffer(&resources->normalBuffer);
+    DestroyBuffer(&resources->scalarFieldBuffer);
+    DestroyBuffer(&resources->seepageNodeBuffer);
+    for (auto& paramsBuffer : resources->seepageParamsBuffers) {
+        DestroyBuffer(&paramsBuffer);
+    }
+    DestroyBuffer(&resources->seepageExrParamsBuffer);
+    DestroyBuffer(&resources->seepageHashCellBuffer);
+    DestroyBuffer(&resources->seepageNodeReferenceBuffer);
+    for (auto& styleBuffer : resources->styleBuffers) {
+        DestroyBuffer(&styleBuffer);
+    }
+    DestroyBuffer(&resources->exrStyleBuffer);
+    DestroyBuffer(&resources->sampledIndexBuffer);
+    DestroyBuffer(&resources->sampledSurfelIndexBuffer);
+}
+
+struct VulkanViewportShell::StagedPointCloudUpload {
+    ActivePointCloudResources resources;
+    std::uint64_t pointCount = 0U;
+    std::uint32_t scalarFieldCount = 0U;
+    bool hasNormals = false;
+};
+
+std::shared_ptr<VulkanViewportShell::StagedPointCloudUpload>
+VulkanViewportShell::StagePointCloudUpload(
+    const invisible_places::io::LoadedPointCloud& cloud,
+    const std::vector<std::uint32_t>& sampledIndices) {
+    if (cloud.PointCount() == 0) {
+        throw std::runtime_error{"Cannot stage an empty point cloud."};
+    }
+    if (cloud.PointCount() > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::runtime_error{"Point cloud exceeds the current 32-bit draw-count limit."};
+    }
+    auto staged = std::shared_ptr<StagedPointCloudUpload>(
+        new StagedPointCloudUpload{},
+        [this](StagedPointCloudUpload* payload) {
+            if (payload != nullptr) {
+                DestroyStagedPointCloudBuffers(&payload->resources);
+                delete payload;
+            }
+        });
+    staged->resources =
+        BuildPointCloudUploadResources(cloud, sampledIndices, false);
+    staged->pointCount = cloud.PointCount();
+    staged->scalarFieldCount =
+        static_cast<std::uint32_t>(cloud.ScalarFieldCount());
+    staged->hasNormals =
+        cloud.hasNormals && cloud.normals.size() == cloud.positions.size();
+    return staged;
+}
+
+void VulkanViewportShell::UploadPointCloud(std::size_t layerId, const invisible_places::io::LoadedPointCloud& cloud,
+                                           const std::vector<std::uint32_t>& sampledIndices,
+                                           std::shared_ptr<StagedPointCloudUpload> stagedUpload) {
+    if (cloud.PointCount() == 0) {
+        throw std::runtime_error{"Cannot upload an empty point cloud."};
+    }
+    if (cloud.PointCount() > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::runtime_error{"Point cloud exceeds the current 32-bit draw-count limit."};
+    }
+
+    // Adopt a worker-staged payload when it matches the cloud exactly;
+    // otherwise build the buffers inline as before.
+    const bool adoptable = stagedUpload != nullptr &&
+        stagedUpload->pointCount == cloud.PointCount() &&
+        stagedUpload->scalarFieldCount ==
+            static_cast<std::uint32_t>(cloud.ScalarFieldCount()) &&
+        stagedUpload->hasNormals ==
+            (cloud.hasNormals &&
+             cloud.normals.size() == cloud.positions.size()) &&
+        sampledIndices.empty();
+    ActivePointCloudResources resources;
+    if (adoptable) {
+        resources = std::move(stagedUpload->resources);
+        stagedUpload->resources = ActivePointCloudResources{};
+        TrackPointCloudResidentPeak(
+            PointCloudResourceResidentBytes(resources));
+    } else {
+        resources =
+            BuildPointCloudUploadResources(cloud, sampledIndices, true);
+    }
+    resources.layerId = layerId;
+    try {
         resources.pointDescriptorPool = CreatePointDescriptorPool(
             0U,
             exrExportResources_.depthImage.view != VK_NULL_HANDLE);
@@ -3143,7 +3275,12 @@ void VulkanViewportShell::UploadPointCloud(std::size_t layerId, const invisible_
     }
 
     try {
-        SettlePointCloudMutation();
+        // A fresh layer id is a pure creation: nothing in flight can
+        // reference buffers that did not exist, so only a replace needs the
+        // device settled before the old resources are destroyed below.
+        if (FindPointCloudResources(layerId) != nullptr) {
+            SettlePointCloudMutation();
+        }
     } catch (...) {
         DestroyPointCloudResources(&resources);
         throw;
@@ -5826,6 +5963,46 @@ void VulkanViewportShell::ClearPointHighlights(std::size_t layerId) {
     ++sceneRevision_;
 }
 
+void VulkanViewportShell::RemovePointCloudDeferred(std::size_t layerId) {
+    auto resourcesIt = std::find_if(
+        pointCloudResources_.begin(),
+        pointCloudResources_.end(),
+        [layerId](const ActivePointCloudResources& resources) {
+            return resources.layerId == layerId;
+        });
+    if (resourcesIt == pointCloudResources_.end()) {
+        return;
+    }
+    if (resourcesIt->dynamicMeshFlowAllocationRevision != 0U) {
+        RemovePointCloud(layerId);
+        return;
+    }
+    deferredPointCloudDestroys_.push_back({
+        .detachFrame = pointCloudFrameCounter_,
+        .resources = std::move(*resourcesIt),
+    });
+    pointCloudResources_.erase(resourcesIt);
+    ++sceneRevision_;
+}
+
+void VulkanViewportShell::FlushDeferredPointCloudDestroys(bool force) {
+    for (std::size_t entry = 0U;
+         entry < deferredPointCloudDestroys_.size();) {
+        auto& deferred = deferredPointCloudDestroys_[entry];
+        const bool aged =
+            pointCloudFrameCounter_ - deferred.detachFrame >
+            static_cast<std::uint64_t>(kFramesInFlight);
+        if (!force && !aged) {
+            ++entry;
+            continue;
+        }
+        DestroyPointCloudResources(&deferred.resources);
+        deferredPointCloudDestroys_.erase(
+            deferredPointCloudDestroys_.begin() +
+            static_cast<std::ptrdiff_t>(entry));
+    }
+}
+
 void VulkanViewportShell::RemovePointCloud(std::size_t layerId) {
     auto resourcesIt = std::find_if(
         pointCloudResources_.begin(),
@@ -5845,6 +6022,7 @@ void VulkanViewportShell::RemovePointCloud(std::size_t layerId) {
 
 void VulkanViewportShell::ClearPointClouds() {
     SettlePointCloudMutation();
+    FlushDeferredPointCloudDestroys(true);
     // Base layers may bind a Mesh Flow contact generation owned by another
     // point resource. Retire every render descriptor before destroying any
     // resource so teardown cannot leave a cross-resource buffer reference.
