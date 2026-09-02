@@ -348,6 +348,18 @@ if(BUILD_TESTING AND INVISIBLE_PLACES_ENABLE_TESTS)
                     LABELS "pointcloud;python;display_density_cache"
                     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
             )
+            add_test(
+                NAME point-visual-profile-merge-tests
+                COMMAND
+                    "${INVISIBLE_PLACES_PATCH_PYTHON_EXECUTABLE}" -m unittest
+                    tests/test_merge_point_visual_profiles.py -v
+            )
+            set_tests_properties(
+                point-visual-profile-merge-tests
+                PROPERTIES
+                    LABELS "pointcloud;python"
+                    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+            )
         endif()
     endif()
 
