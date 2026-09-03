@@ -8,14 +8,20 @@ encoder defaults and the recommended settings.
 ## Current recommendation (2026-09-04)
 
 The export panel now offers three MP4 quality tiers: **Normal**, **HQ**
-and **Detail**. They change encoder settings only - the render itself is
-identical - and they are content guidance, not bound to any particular
-animation. Use **HQ** with VideoToolbox for smooth or solid content such
-as the Base pass. For sparse fine-point content such as Thin, keep using
-**HQ** with VideoToolbox off (x265) when file size matters, or use
-**Detail** with VideoToolbox when a hardware-only encode is preferred and
-a much larger file is acceptable (constant quality 75 plus a 15-frame
-GOP, so speckle survives the hardware encoder).
+and **Max**. They change encoder settings only - the render itself is
+identical - and every tier encodes at least as fast as the GPU captures,
+so the choice does not change export time. Use **HQ** with VideoToolbox
+for smooth or solid content such as the Base pass. For sparse fine-point
+content such as Thin, use **HQ** with VideoToolbox off (x265) when file
+size matters, or **Max** with VideoToolbox for the same quality from the
+hardware encoder with a much larger file (constant quality 75 plus a
+15-frame GOP, so speckle survives the encoder's rate control).
+
+The panel now also shows the measured SSIM of the selected tier against
+the ProRes 4444 / lossless gold standard (colour and alpha, at the
+smooth and fine-point content anchors from the tables below), plus a
+time and file-size estimate projected from this machine's most similar
+completed export (stored in Saved/.invisible_places/export_history.json).
 
 The latest 120-frame, full-pipeline comparison used the real 4x
 supersampled export and lossless PNG ground truth:
@@ -29,7 +35,7 @@ supersampled export and lossless PNG ground truth:
 | **Base, MP4 HQ VideoToolbox** | **0.988** | **0.996** | **16 GB** |
 | Base, ProRes 422 HQ | 0.984 | 0.998 | 64 GB |
 
-For the new hardware Detail setting, a controlled 48-frame re-encode of
+For the hardware Max tier, a controlled 48-frame re-encode of
 the same Thin PNG ground truth selected VideoToolbox constant-quality 75
 and a 15-frame GOP. It measured 0.9719 colour and 0.9984 matte SSIM, versus
 0.972/0.997 for MP4 HQ CPU. The trade-off is approximately 85 GB for the

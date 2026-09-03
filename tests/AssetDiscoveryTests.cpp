@@ -14,6 +14,7 @@
 #include "io/TransformMatrix.hpp"
 #include "output/ExrWriter.hpp"
 #include "output/ExportGpuBanding.hpp"
+#include "output/ExportEstimates.hpp"
 #include "output/EyeDomeLighting.hpp"
 #include "output/HoudiniCameraExport.hpp"
 #include "output/OfflinePointRenderer.hpp"
@@ -12357,6 +12358,194 @@ TEST_CASE("GPU export banding protects world surfels and removes unnecessary spl
         std::numeric_limits<double>::quiet_NaN());
     CHECK(state.completedSamples == completedSamples);
     CHECK(state.bandCount == 1U);
+}
+
+TEST_CASE("Export history persists, trims, and survives bad files", "[output][export][estimates]") {
+    namespace out = invisible_places::output;
+    const auto historyPath = std::filesystem::temp_directory_path() /
+                             "invisible_places_export_history_test.json";
+    std::filesystem::remove(historyPath);
+
+    CHECK(out::LoadExportHistory(historyPath).empty());
+
+    out::ExportHistoryRecord record;
+    record.animationName = "Surface_05_Surface";
+    record.visualName = "Surface_05_Thin_v2";
+    record.mode = out::AnimationExportMode::FastPreviewMp4;
+    record.quality = out::AnimationExportQuality::Hq;
+    record.useVideoToolbox = false;
+    record.externalAlphaMatte = true;
+    record.supersampleScale = 4U;
+    record.outputWidth = 3840U;
+    record.outputHeight = 2160U;
+    record.frameCount = 120U;
+    record.wallSeconds = 90.0;
+    record.captureSecondsPerFrame = 0.5;
+    record.outputBytes = 350000000ULL;
+    record.completedAtIso = "2026-09-04";
+    REQUIRE(out::AppendExportHistoryRecord(historyPath, record).empty());
+
+    auto second = record;
+    second.visualName = "Surface_05_Base_v2";
+    REQUIRE(out::AppendExportHistoryRecord(historyPath, second).empty());
+
+    const auto loaded = out::LoadExportHistory(historyPath);
+    REQUIRE(loaded.size() == 2U);
+    CHECK(loaded[0].visualName == "Surface_05_Thin_v2");
+    CHECK(loaded[1].visualName == "Surface_05_Base_v2");
+    CHECK(loaded[0].mode == out::AnimationExportMode::FastPreviewMp4);
+    CHECK(loaded[0].quality == out::AnimationExportQuality::Hq);
+    CHECK(loaded[0].frameCount == 120U);
+    CHECK(loaded[0].outputBytes == 350000000ULL);
+    CHECK(loaded[0].captureSecondsPerFrame == Catch::Approx(0.5));
+
+    auto third = record;
+    third.visualName = "Newest";
+    REQUIRE(out::AppendExportHistoryRecord(historyPath, third, 2U).empty());
+    const auto trimmed = out::LoadExportHistory(historyPath);
+    REQUIRE(trimmed.size() == 2U);
+    CHECK(trimmed[0].visualName == "Surface_05_Base_v2");
+    CHECK(trimmed[1].visualName == "Newest");
+
+    {
+        std::ofstream corrupt{historyPath, std::ios::trunc};
+        corrupt << "not json";
+    }
+    CHECK(out::LoadExportHistory(historyPath).empty());
+    REQUIRE(out::AppendExportHistoryRecord(historyPath, record).empty());
+    CHECK(out::LoadExportHistory(historyPath).size() == 1U);
+
+    std::filesystem::remove(historyPath);
+}
+
+TEST_CASE("Export history matching requires encoder identity and prefers content", "[output][export][estimates]") {
+    namespace out = invisible_places::output;
+    out::ExportHistoryRecord thin;
+    thin.animationName = "Surface_05_Surface";
+    thin.visualName = "Surface_05_Thin_v2";
+    thin.mode = out::AnimationExportMode::FastPreviewMp4;
+    thin.quality = out::AnimationExportQuality::Hq;
+    thin.useVideoToolbox = false;
+    thin.externalAlphaMatte = true;
+    thin.supersampleScale = 4U;
+    thin.outputWidth = 3840U;
+    thin.outputHeight = 2160U;
+    thin.frameCount = 120U;
+    thin.wallSeconds = 90.0;
+    thin.captureSecondsPerFrame = 0.5;
+    thin.outputBytes = 350000000ULL;
+
+    auto base = thin;
+    base.visualName = "Surface_05_Base_v2";
+    auto videoToolbox = thin;
+    videoToolbox.useVideoToolbox = true;
+    const std::vector<out::ExportHistoryRecord> records{thin, base, videoToolbox};
+
+    out::ExportEstimateSelection selection;
+    selection.mode = out::AnimationExportMode::FastPreviewMp4;
+    selection.quality = out::AnimationExportQuality::Hq;
+    selection.useVideoToolbox = false;
+    selection.externalAlphaMatte = true;
+    selection.supersampleScale = 4U;
+    selection.outputWidth = 3840U;
+    selection.outputHeight = 2160U;
+    selection.animationName = "Surface_05_Surface";
+    selection.visualName = "surface_05_base_v2";
+
+    const auto* match = out::FindBestExportHistoryMatch(records, selection);
+    REQUIRE(match != nullptr);
+    CHECK(match->visualName == "Surface_05_Base_v2");
+
+    selection.useVideoToolbox = true;
+    const auto* videoToolboxMatch =
+        out::FindBestExportHistoryMatch(records, selection);
+    REQUIRE(videoToolboxMatch != nullptr);
+    CHECK(videoToolboxMatch->useVideoToolbox);
+
+    selection.quality = out::AnimationExportQuality::Xq;
+    CHECK(out::FindBestExportHistoryMatch(records, selection) == nullptr);
+}
+
+TEST_CASE("Export estimates scale by frame count and pixels with fixed overhead", "[output][export][estimates]") {
+    namespace out = invisible_places::output;
+    out::ExportHistoryRecord record;
+    record.mode = out::AnimationExportMode::FastPreviewMp4;
+    record.quality = out::AnimationExportQuality::Hq;
+    record.supersampleScale = 4U;
+    record.outputWidth = 3840U;
+    record.outputHeight = 2160U;
+    record.frameCount = 100U;
+    record.wallSeconds = 80.0;  // 50 s capture + 30 s setup
+    record.captureSecondsPerFrame = 0.5;
+    record.outputBytes = 100000000ULL;
+
+    out::ExportEstimateSelection selection;
+    selection.supersampleScale = 4U;
+    selection.outputWidth = 3840U;
+    selection.outputHeight = 2160U;
+
+    const auto same = out::EstimateExportTimeAndSize(record, selection, 1000U);
+    CHECK_FALSE(same.pixelScaled);
+    CHECK(same.secondsPerFrame == Catch::Approx(0.5));
+    CHECK(same.totalSeconds == Catch::Approx(0.5 * 1000.0 + 30.0));
+    CHECK(same.totalBytes == 1000000000ULL);
+
+    selection.supersampleScale = 2U;  // quarter of the pixels
+    const auto scaled = out::EstimateExportTimeAndSize(record, selection, 1000U);
+    CHECK(scaled.pixelScaled);
+    CHECK(scaled.secondsPerFrame == Catch::Approx(0.125));
+}
+
+TEST_CASE("Export quality estimates expose measured anchors only", "[output][export][estimates]") {
+    namespace out = invisible_places::output;
+    const auto hqVideoToolbox = out::LookupExportQualityEstimate(
+        out::AnimationExportMode::FastPreviewMp4,
+        out::AnimationExportQuality::Hq,
+        true);
+    REQUIRE(hqVideoToolbox.has_value());
+    CHECK(hqVideoToolbox->colourSmoothPercent.value() == Catch::Approx(98.8F));
+    CHECK(hqVideoToolbox->colourFinePercent.value() == Catch::Approx(92.3F));
+    CHECK(hqVideoToolbox->alphaFinePercent.value() == Catch::Approx(90.4F));
+
+    const auto hqCpu = out::LookupExportQualityEstimate(
+        out::AnimationExportMode::FastPreviewMp4,
+        out::AnimationExportQuality::Hq,
+        false);
+    REQUIRE(hqCpu.has_value());
+    CHECK_FALSE(hqCpu->colourSmoothPercent.has_value());
+    CHECK(hqCpu->colourFinePercent.value() == Catch::Approx(97.2F));
+
+    CHECK_FALSE(out::LookupExportQualityEstimate(
+                    out::AnimationExportMode::FastPreviewMp4,
+                    out::AnimationExportQuality::Normal,
+                    true)
+                    .has_value());
+    CHECK_FALSE(out::LookupExportQualityEstimate(
+                    out::AnimationExportMode::ProRes422Mov,
+                    out::AnimationExportQuality::Normal,
+                    false)
+                    .has_value());
+
+    const auto proRes422Hq = out::LookupExportQualityEstimate(
+        out::AnimationExportMode::ProRes422HqVideoToolboxMov,
+        out::AnimationExportQuality::Hq,
+        true);
+    REQUIRE(proRes422Hq.has_value());
+    CHECK(proRes422Hq->colourFinePercent.value() == Catch::Approx(95.2F));
+
+    const auto proRes4444 = out::LookupExportQualityEstimate(
+        out::AnimationExportMode::ProRes4444Mov,
+        out::AnimationExportQuality::Normal,
+        false);
+    REQUIRE(proRes4444.has_value());
+    CHECK(proRes4444->colourFinePercent.value() == Catch::Approx(99.96F));
+
+    const auto pngStack = out::LookupExportQualityEstimate(
+        out::AnimationExportMode::PngStack,
+        out::AnimationExportQuality::Normal,
+        false);
+    REQUIRE(pngStack.has_value());
+    CHECK(pngStack->lossless);
 }
 
 TEST_CASE("Built-in export presets use compact codec settings with legacy aliases", "[output][video]") {

@@ -26,6 +26,7 @@
 #include "io/PlyHeader.hpp"
 #include "output/ExrWriter.hpp"
 #include "output/ExportGpuBanding.hpp"
+#include "output/ExportEstimates.hpp"
 #include "output/HoudiniCameraExport.hpp"
 #include "output/OfflinePointRenderer.hpp"
 #include "output/PngWriter.hpp"
@@ -4291,6 +4292,10 @@ struct LinkedAnimationExportDialogState {
 
 struct PreviewRuntimeState {
     std::filesystem::path dataRoot;
+    // Per-machine export history backing the panel's time/size estimate.
+    // Never part of the project document, so it cannot dirty an artist save.
+    std::vector<invisible_places::output::ExportHistoryRecord> exportHistory;
+    bool exportHistoryLoaded = false;
     std::vector<PreviewLayerSession> sessions;
     std::uint64_t nextPointCloudContentGeneration = 1U;
     std::vector<ScenePointCloudRuntime> pointCloudScenes;
@@ -37788,7 +37793,7 @@ const char* AnimationExportQualityLabel(
     }
     if (mode == invisible_places::output::AnimationExportMode::FastPreviewMp4) {
         if (quality == invisible_places::output::AnimationExportQuality::Xq) {
-            return "Detail";
+            return "Max";
         }
         return quality == invisible_places::output::AnimationExportQuality::Hq
                    ? "HQ"
@@ -44167,6 +44172,48 @@ private:
     bool armed_ = false;
 };
 
+std::filesystem::path ExportHistoryFilePath() {
+    return invisible_places::app::workspace::LocalSavedDirectory(
+               Application::DefaultDataDirectory()) /
+           ".invisible_places" / "export_history.json";
+}
+
+void EnsureExportHistoryLoaded(PreviewRuntimeState* runtimeState) {
+    if (runtimeState == nullptr || runtimeState->exportHistoryLoaded) {
+        return;
+    }
+    runtimeState->exportHistory =
+        invisible_places::output::LoadExportHistory(ExportHistoryFilePath());
+    runtimeState->exportHistoryLoaded = true;
+}
+
+// Median of the warm frames: the cold first frames carry pipeline warm-up
+// and sort allocation, which would inflate every later estimate.
+double MedianWarmCaptureSecondsPerFrame(std::vector<float> frameSeconds) {
+    if (frameSeconds.empty()) {
+        return 0.0;
+    }
+    if (frameSeconds.size() > 8U) {
+        frameSeconds.erase(frameSeconds.begin(), frameSeconds.begin() + 4);
+    }
+    const auto middle = frameSeconds.size() / 2U;
+    std::nth_element(
+        frameSeconds.begin(),
+        frameSeconds.begin() + static_cast<std::ptrdiff_t>(middle),
+        frameSeconds.end());
+    return static_cast<double>(frameSeconds[middle]);
+}
+
+std::string StripAnimationFileSuffix(std::string name) {
+    constexpr std::string_view kSuffix = ".ipanim";
+    if (name.size() > kSuffix.size() &&
+        name.compare(name.size() - kSuffix.size(), kSuffix.size(), kSuffix) ==
+            0) {
+        name.resize(name.size() - kSuffix.size());
+    }
+    return name;
+}
+
 void StartAnimationExportJob(
     PreviewRuntimeState* runtimeState,
     invisible_places::renderer::core::VulkanViewportShell* viewport,
@@ -44690,6 +44737,75 @@ void FinishOfflineRenderJob(
         &job,
         renderSetupStatus,
         finalErrorMessage);
+    if (renderSetupStatus == RenderSetupStatus::Completed &&
+        !job.stillCameraJob && job.exportLog.capturedFrames > 0U) {
+        invisible_places::output::ExportHistoryRecord record;
+        record.animationName = StripAnimationFileSuffix(
+            job.animationFilePath.stem().string());
+        record.visualName = job.exportVisualName;
+        record.mode = job.mode;
+        record.quality = job.quality;
+        record.useVideoToolbox = job.useVideoToolbox;
+        record.externalAlphaMatte = job.externalAlphaMatte;
+        record.supersampleScale = std::max(1U, job.mp4SupersampleScale);
+        record.outputWidth = job.settings.width;
+        record.outputHeight = job.settings.height;
+        record.frameCount = job.exportLog.capturedFrames;
+        record.wallSeconds = std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() -
+                                 job.startedAt)
+                                 .count();
+        record.captureSecondsPerFrame =
+            MedianWarmCaptureSecondsPerFrame(job.frameRenderSeconds);
+        const auto addOutputBytes = [&record](
+                                        const std::filesystem::path& path) {
+            std::error_code sizeError;
+            const auto bytes = std::filesystem::file_size(path, sizeError);
+            if (!sizeError) {
+                record.outputBytes += bytes;
+            }
+        };
+        if (!job.videoOutputPath.empty()) {
+            addOutputBytes(job.videoOutputPath);
+        }
+        if (!job.alphaMatteVideoPath.empty()) {
+            addOutputBytes(job.alphaMatteVideoPath);
+        }
+        if (record.outputBytes == 0U && !job.pngStackDirectory.empty() &&
+            !job.pngStackFrameStem.empty()) {
+            std::error_code iterateError;
+            for (const auto& entry : std::filesystem::directory_iterator{
+                     job.pngStackDirectory,
+                     iterateError}) {
+                if (entry.is_regular_file(iterateError) &&
+                    entry.path().filename().string().rfind(
+                        job.pngStackFrameStem,
+                        0U) == 0U) {
+                    addOutputBytes(entry.path());
+                }
+            }
+        }
+        const auto completedAt =
+            std::chrono::system_clock::to_time_t(
+                std::chrono::system_clock::now());
+        std::tm completedAtParts{};
+        localtime_r(&completedAt, &completedAtParts);
+        char completedAtText[16] = {};
+        std::strftime(
+            completedAtText,
+            sizeof(completedAtText),
+            "%Y-%m-%d",
+            &completedAtParts);
+        record.completedAtIso = completedAtText;
+        EnsureExportHistoryLoaded(runtimeState);
+        const auto historyError =
+            invisible_places::output::AppendExportHistoryRecord(
+                ExportHistoryFilePath(),
+                record);
+        if (historyError.empty()) {
+            runtimeState->exportHistory.push_back(std::move(record));
+        }
+    }
     if (!job.renderSetupWarning.empty()) {
         if (!finalStatusMessage.empty()) {
             finalStatusMessage += " ";
@@ -47030,7 +47146,7 @@ void DrawAnimationExportSection(
         const char* qualityLabels[] = {
             "Normal",
             proRes4444 ? "XQ" : "HQ",
-            "Detail",
+            "Max",
         };
         const int qualityLabelCount = mp4 ? 3 : 2;
         if (!testMp4 &&
@@ -47049,13 +47165,16 @@ void DrawAnimationExportSection(
         }
         if (!testMp4 && ImGui::IsItemHovered()) {
             ImGui::SetTooltip(
-                mp4 ? "Encoder settings only - the render itself is identical in every tier.\n"
+                mp4 ? "Encoder settings only - the render itself is identical in every\n"
+                      "tier, and encoding keeps pace with GPU capture, so the quality\n"
+                      "choice does not change export time. Pick on quality vs file size.\n"
                       "Normal: preview-grade bitrate.\n"
-                      "HQ: delivery grade. VideoToolbox on = fast fixed high bitrate, ideal for\n"
-                      "smooth or solid content. Off = x265 constant quality, the best pick for\n"
+                      "HQ: delivery grade. VideoToolbox on = hardware, fixed high bitrate,\n"
+                      "ideal for smooth or solid content. Off = x265, the best pick for\n"
                       "sparse fine-point content at sensible file sizes.\n"
-                      "Detail: constant-quality VideoToolbox with a short GOP so sparse fine\n"
-                      "points survive the hardware encoder; files grow several times larger.\n"
+                      "Max: the highest tier. VideoToolbox on = hardware constant quality\n"
+                      "with a short GOP so sparse fine points survive; files grow several\n"
+                      "times larger. Off = extra-low x265 CRF (rarely needed over HQ).\n"
                       "Choose by how the content looks, not by which animation it is."
                     : "Encoder settings only - the render itself is identical in every tier.");
         }
@@ -47112,8 +47231,8 @@ void DrawAnimationExportSection(
             quality == invisible_places::output::AnimationExportQuality::Xq) {
             ImGui::TextDisabled(
                 useVideoToolbox
-                    ? "Detail holds constant quality on sparse fine points; expect a much larger VideoToolbox file."
-                    : "Detail uses extra-low x265 CRF; HQ with VideoToolbox off already handles fine points.");
+                    ? "Max holds constant quality on sparse fine points; expect a much larger VideoToolbox file."
+                    : "Max uses extra-low x265 CRF; HQ with VideoToolbox off already handles fine points.");
         }
     }
 
@@ -47135,6 +47254,183 @@ void DrawAnimationExportSection(
             AnimationExportModeLabel(panel.exportMode));
     } else {
         ImGui::TextDisabled("HQ EXR: preview-density AOV export; optimized for visual parity, not full-source density.");
+    }
+
+    // Measured quality against the ProRes 4444 / lossless gold standard, and
+    // a time/size projection from this machine's own comparable past renders.
+    {
+        const auto estimatePreset = ViewedExportPreset(*runtimeState);
+        const auto estimateQuality = NormalizeExportQualityForMode(
+            panel.exportMode,
+            estimatePreset.quality);
+        const bool estimateVideoToolbox = AnimationExportUsesVideoToolbox(
+            panel.exportMode,
+            estimatePreset.useVideoToolbox);
+        const auto formatPercent = [](float value) {
+            char text[16];
+            std::snprintf(
+                text,
+                sizeof(text),
+                value >= 99.9F ? "%.2f%%" : "%.1f%%",
+                static_cast<double>(value));
+            return std::string{text};
+        };
+        const auto qualityEstimate =
+            invisible_places::output::LookupExportQualityEstimate(
+                panel.exportMode,
+                estimateQuality,
+                estimateVideoToolbox);
+        const bool alphaDelivered =
+            estimatePreset.externalAlphaMatte ||
+            AnimationExportWritesPngStack(panel.exportMode) ||
+            panel.exportMode ==
+                invisible_places::output::AnimationExportMode::ProRes4444Mov ||
+            panel.exportMode ==
+                invisible_places::output::AnimationExportMode::HqPreviewDensityExr;
+        if (qualityEstimate.has_value()) {
+            if (qualityEstimate->lossless) {
+                ImGui::TextDisabled(
+                    "Quality: lossless - no encoding loss versus the render.");
+            } else {
+                std::string line = "Quality vs 4444 gold: colour ";
+                if (qualityEstimate->colourSmoothPercent.has_value() &&
+                    qualityEstimate->colourFinePercent.has_value()) {
+                    line += formatPercent(
+                                qualityEstimate->colourSmoothPercent.value()) +
+                            " smooth / " +
+                            formatPercent(
+                                qualityEstimate->colourFinePercent.value()) +
+                            " fine";
+                } else if (qualityEstimate->colourFinePercent.has_value()) {
+                    line += formatPercent(
+                                qualityEstimate->colourFinePercent.value()) +
+                            "+ (fine-point anchor)";
+                }
+                if (alphaDelivered) {
+                    line += " - alpha ";
+                    if (qualityEstimate->alphaSmoothPercent.has_value() &&
+                        qualityEstimate->alphaFinePercent.has_value()) {
+                        line +=
+                            formatPercent(
+                                qualityEstimate->alphaSmoothPercent.value()) +
+                            " / " +
+                            formatPercent(
+                                qualityEstimate->alphaFinePercent.value());
+                    } else if (qualityEstimate->alphaFinePercent.has_value()) {
+                        line += formatPercent(
+                                    qualityEstimate->alphaFinePercent.value()) +
+                                "+";
+                    }
+                }
+                ImGui::TextDisabled("%s", line.c_str());
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip(
+                        "SSIM measured on Surface_05 against lossless / ProRes 4444\n"
+                        "ground truth. \"Smooth\" is the dense Base content anchor;\n"
+                        "\"fine\" is near-pixel Thin speckle, the hardest content for\n"
+                        "any encoder. A render lands between its content anchors.");
+                }
+            }
+        } else if (panel.exportMode !=
+                   invisible_places::output::AnimationExportMode::TestMp4) {
+            ImGui::TextDisabled(
+                "Quality vs 4444 gold: unmeasured for this tier.");
+        }
+
+        EnsureExportHistoryLoaded(runtimeState);
+        invisible_places::output::ExportEstimateSelection estimateSelection;
+        estimateSelection.mode = panel.exportMode;
+        estimateSelection.quality = estimateQuality;
+        estimateSelection.useVideoToolbox = estimateVideoToolbox;
+        estimateSelection.externalAlphaMatte = estimatePreset.externalAlphaMatte;
+        estimateSelection.supersampleScale =
+            AnimationExportUsesSupersampledRgbaFrames(panel.exportMode)
+                ? std::max(1U, estimatePreset.settings.supersampleScale)
+                : 1U;
+        estimateSelection.outputWidth = estimatePreset.settings.width;
+        estimateSelection.outputHeight = estimatePreset.settings.height;
+        if (!panel.currentFilePath.empty()) {
+            estimateSelection.animationName = StripAnimationFileSuffix(
+                std::filesystem::path{panel.currentFilePath}.stem().string());
+        }
+        if (const auto visualSelection =
+                ResolveCurrentPointVisualExportSelection(runtimeState);
+            visualSelection.has_value()) {
+            estimateSelection.visualName = visualSelection->visualName;
+        }
+        const auto* historyMatch =
+            invisible_places::output::FindBestExportHistoryMatch(
+                runtimeState->exportHistory,
+                estimateSelection);
+        if (historyMatch != nullptr) {
+            const auto selectionFrameCount =
+                panel.currentPath.has_value()
+                    ? invisible_places::output::AnimationRenderSequenceFrameCount(
+                          panel.currentPath.value(),
+                          estimatePreset.settings)
+                    : std::size_t{0U};
+            const auto estimate =
+                invisible_places::output::EstimateExportTimeAndSize(
+                    *historyMatch,
+                    estimateSelection,
+                    selectionFrameCount);
+            const auto formatDuration = [](double seconds) {
+                char text[32];
+                const auto totalMinutes =
+                    static_cast<long long>(seconds / 60.0 + 0.5);
+                if (totalMinutes >= 60) {
+                    std::snprintf(
+                        text,
+                        sizeof(text),
+                        "%lld h %02lld m",
+                        totalMinutes / 60,
+                        totalMinutes % 60);
+                } else {
+                    std::snprintf(text, sizeof(text), "%lld m", totalMinutes);
+                }
+                return std::string{text};
+            };
+            std::string line = "Estimate";
+            if (selectionFrameCount > 0U) {
+                line += ": ~" + formatDuration(estimate.totalSeconds);
+            }
+            {
+                char rate[32];
+                std::snprintf(
+                    rate,
+                    sizeof(rate),
+                    " @ %.2f s/frame",
+                    estimate.secondsPerFrame);
+                line += rate;
+            }
+            if (estimate.totalBytes > 0U && selectionFrameCount > 0U) {
+                char size[32];
+                const auto gigabytes =
+                    static_cast<double>(estimate.totalBytes) / 1.0e9;
+                std::snprintf(
+                    size,
+                    sizeof(size),
+                    gigabytes >= 10.0 ? ", ~%.0f GB" : ", ~%.1f GB",
+                    gigabytes);
+                line += size;
+            }
+            line += " (from " +
+                    (historyMatch->visualName.empty()
+                         ? historyMatch->animationName
+                         : historyMatch->visualName) +
+                    ", " + historyMatch->completedAtIso + ")";
+            if (estimate.pixelScaled) {
+                line += " scaled for pixel count";
+            }
+            line += ".";
+            ImGui::TextDisabled("%s", line.c_str());
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Projected from this machine's most similar completed export\n"
+                    "with identical encoder settings; content match (visual, then\n"
+                    "animation) decides which past render is quoted.");
+            }
+        }
     }
 
     bool settingsChanged = false;
