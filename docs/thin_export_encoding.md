@@ -7,11 +7,15 @@ encoder defaults and the recommended settings.
 
 ## Current recommendation (2026-09-04)
 
-The export panel now offers three MP4 quality choices. Use **HQ (Base)**
-with VideoToolbox for the smooth Base pass. For Thin, keep using **HQ
-(Base)** with VideoToolbox off when file size matters, or use the new
-**Detail (Thin)** setting with VideoToolbox when a hardware-only encode is
-preferred and a much larger file is acceptable.
+The export panel now offers three MP4 quality tiers: **Normal**, **HQ**
+and **Detail**. They change encoder settings only - the render itself is
+identical - and they are content guidance, not bound to any particular
+animation. Use **HQ** with VideoToolbox for smooth or solid content such
+as the Base pass. For sparse fine-point content such as Thin, keep using
+**HQ** with VideoToolbox off (x265) when file size matters, or use
+**Detail** with VideoToolbox when a hardware-only encode is preferred and
+a much larger file is acceptable (constant quality 75 plus a 15-frame
+GOP, so speckle survives the hardware encoder).
 
 The latest 120-frame, full-pipeline comparison used the real 4x
 supersampled export and lossless PNG ground truth:

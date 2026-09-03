@@ -45066,7 +45066,8 @@ void ProcessOfflineRenderJobStep(
                 // The old 512-row policy replayed every point up to 17 times
                 // at 4x 4K. Screen sprites use one full-frame submission;
                 // world surfels alone get a protective split because each
-                // point expands to six vertices. Warm timings may add at most
+                // point expands to a four-vertex strip. Warm timings may add at
+                // most
                 // one further split or remove an unnecessary one.
                 const bool largeGpuFrame =
                     static_cast<std::uint64_t>(request.width) *
@@ -47028,8 +47029,8 @@ void DrawAnimationExportSection(
                       : 1;
         const char* qualityLabels[] = {
             "Normal",
-            proRes4444 ? "XQ" : (mp4 ? "HQ (Base)" : "HQ"),
-            "Detail (Thin)",
+            proRes4444 ? "XQ" : "HQ",
+            "Detail",
         };
         const int qualityLabelCount = mp4 ? 3 : 2;
         if (!testMp4 &&
@@ -47045,6 +47046,18 @@ void DrawAnimationExportSection(
             preset.quality = NormalizeExportQualityForMode(panel.exportMode, preset.quality);
             SanitizeExportPreset(&preset);
             quality = preset.quality;
+        }
+        if (!testMp4 && ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                mp4 ? "Encoder settings only - the render itself is identical in every tier.\n"
+                      "Normal: preview-grade bitrate.\n"
+                      "HQ: delivery grade. VideoToolbox on = fast fixed high bitrate, ideal for\n"
+                      "smooth or solid content. Off = x265 constant quality, the best pick for\n"
+                      "sparse fine-point content at sensible file sizes.\n"
+                      "Detail: constant-quality VideoToolbox with a short GOP so sparse fine\n"
+                      "points survive the hardware encoder; files grow several times larger.\n"
+                      "Choose by how the content looks, not by which animation it is."
+                    : "Encoder settings only - the render itself is identical in every tier.");
         }
 
         bool useVideoToolbox =
@@ -47099,8 +47112,8 @@ void DrawAnimationExportSection(
             quality == invisible_places::output::AnimationExportQuality::Xq) {
             ImGui::TextDisabled(
                 useVideoToolbox
-                    ? "Detail preserves sparse Thin points; expect a much larger VideoToolbox file."
-                    : "Detail uses extra-low x265 CRF; HQ CPU is normally sufficient for Thin.");
+                    ? "Detail holds constant quality on sparse fine points; expect a much larger VideoToolbox file."
+                    : "Detail uses extra-low x265 CRF; HQ with VideoToolbox off already handles fine points.");
         }
     }
 
