@@ -135619,6 +135619,20 @@ int RunExportSegmentLabSmoke(
                 .useVideoToolbox = true,
             };
         }
+        if (mode == "prores4444-vt") {
+            return ExportBenchmarkVariant{
+                .mode = AnimationExportMode::ProRes4444VideoToolboxMov,
+                .quality = AnimationExportQuality::Normal,
+                .useVideoToolbox = true,
+            };
+        }
+        if (mode == "prores422hq-vt") {
+            return ExportBenchmarkVariant{
+                .mode = AnimationExportMode::ProRes422HqVideoToolboxMov,
+                .quality = AnimationExportQuality::Hq,
+                .useVideoToolbox = true,
+            };
+        }
         if (mode == "mp4hq-cpu") {
             return ExportBenchmarkVariant{
                 .mode = AnimationExportMode::FastPreviewMp4,
@@ -135701,6 +135715,16 @@ int RunExportSegmentLabSmoke(
             spec.label);
         preset.settings.startFrame = spec.startFrame;
         preset.settings.endFrame = spec.endFrame;
+        if (const char* supersampleOverride = std::getenv(
+                "INVISIBLE_PLACES_EXPORT_SEGMENT_SUPERSAMPLE");
+            supersampleOverride != nullptr &&
+            supersampleOverride[0] != '\0') {
+            preset.settings.supersampleScale = std::clamp<std::uint32_t>(
+                static_cast<std::uint32_t>(
+                    std::strtoul(supersampleOverride, nullptr, 10)),
+                1U,
+                4U);
+        }
         if (spec.temporalSamples > 1U) {
             preset.settings.temporalSupersampling = true;
             preset.settings.temporalSampleCount = spec.temporalSamples;
