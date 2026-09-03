@@ -19,7 +19,11 @@ namespace invisible_places::renderer::pointcloud {
 
 namespace {
 
-constexpr std::uint32_t kSurfelVerticesPerPoint = 6U;
+constexpr std::uint32_t kSurfelVerticesPerPoint = 4U;
+// Sampled surfel draws are indexed triangle strips: four encoded corners
+// (pointIndex * 4 + corner) followed by one primitive-restart index.
+constexpr std::uint32_t kSurfelEncodedIndicesPerPoint = 5U;
+constexpr std::uint32_t kSurfelPrimitiveRestartIndex = 0xFFFFFFFFU;
 constexpr float kMaterialEpsilon = 1.0e-5F;
 
 std::string NormalizePointCloudSceneRole(std::string_view sceneRole) {
@@ -1920,10 +1924,14 @@ std::vector<std::uint32_t> GenerateFrustumUnionPointIndices(
 std::vector<std::uint32_t> GenerateSurfelEncodedSampleIndices(
     const std::vector<std::uint32_t>& sampledPointIndices) {
     std::vector<std::uint32_t> indices;
-    indices.reserve(sampledPointIndices.size() * kSurfelVerticesPerPoint);
+    indices.reserve(
+        sampledPointIndices.size() * kSurfelEncodedIndicesPerPoint);
 
     for (const auto pointIndex : sampledPointIndices) {
-        if (pointIndex > (std::numeric_limits<std::uint32_t>::max() / kSurfelVerticesPerPoint)) {
+        // The restart index must stay distinct from any encoded corner.
+        if (pointIndex >
+            (kSurfelPrimitiveRestartIndex - kSurfelVerticesPerPoint) /
+                kSurfelVerticesPerPoint) {
             return {};
         }
 
@@ -1931,6 +1939,7 @@ std::vector<std::uint32_t> GenerateSurfelEncodedSampleIndices(
         for (std::uint32_t cornerIndex = 0; cornerIndex < kSurfelVerticesPerPoint; ++cornerIndex) {
             indices.push_back(encodedBase + cornerIndex);
         }
+        indices.push_back(kSurfelPrimitiveRestartIndex);
     }
 
     return indices;

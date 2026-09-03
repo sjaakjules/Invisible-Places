@@ -17,7 +17,8 @@ struct ExportGpuBandingState {
     bool primed = false;
 };
 
-// World surfels expand every point to six vertices and can create long first
+// World surfels expand every point to a four-vertex strip and can create
+// long first
 // submissions. They start with one protective split; screen sprites start on
 // the fastest single-submit path.
 void PrimeExportGpuBanding(

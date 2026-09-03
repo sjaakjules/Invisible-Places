@@ -141,7 +141,7 @@ layout(set = 0, binding = 6, std430) readonly buffer SurfelNormals {
 
 const uint kFieldMapFlagClamp = 1u;
 const uint kFieldMapFlagInvert = 2u;
-const uint kSurfelVerticesPerPoint = 6u;
+const uint kSurfelVerticesPerPoint = 4u;
 const uint kWaterPhaseFieldSlot = 3u;
 const uint kWaterSpeedFieldSlot = 4u;
 const uint kWaterWidthFieldSlot = 5u;
@@ -186,13 +186,14 @@ const uint kWaterTrailEndFadeFullDistanceFieldSlot = 34u;
 const uint kWaterTrailEndFadeRandomBeginDistanceFieldSlot = 35u;
 const float kWaterParticleSpeedScale = 0.12;
 
-const vec2 kSurfelCorners[6] = vec2[](
+// Triangle-strip corner order: (0,1,2) and (2,1,3) cover the quad, one
+// third fewer vertex invocations than the previous six-vertex list. Culling
+// is disabled on every surfel pipeline, so strip winding is irrelevant.
+const vec2 kSurfelCorners[4] = vec2[](
     vec2(-1.0, -1.0),
     vec2(1.0, -1.0),
-    vec2(1.0, 1.0),
-    vec2(-1.0, -1.0),
-    vec2(1.0, 1.0),
-    vec2(-1.0, 1.0));
+    vec2(-1.0, 1.0),
+    vec2(1.0, 1.0));
 
 float LoadScalarFieldValue(uint fieldSlot, uint pointIndex) {
     if (fieldSlot == 0xFFFFFFFFu ||
@@ -1118,11 +1119,18 @@ float ScreenPixelWorldSpan(float viewDepth, float pixels) {
 void main() {
 #ifdef SORTED_SURFEL
     const uint pointIndex = inSortedPointIndex;
-    const uint cornerIndex = uint(gl_VertexIndex);
+    const uint cornerIndex = uint(gl_VertexIndex) & 3u;
 #else
-    const uint encodedVertexIndex = uint(gl_VertexIndex);
-    const uint pointIndex = encodedVertexIndex / kSurfelVerticesPerPoint;
-    const uint cornerIndex = encodedVertexIndex - (pointIndex * kSurfelVerticesPerPoint);
+    // One decode covers both draw forms without a flag. Instanced
+    // full-source draws submit four vertices per instance, so
+    // gl_VertexIndex >> 2 is zero and the instance is the point. Sampled
+    // budget draws are indexed with encoded pointIndex * 4 + corner (and
+    // primitive restarts), so the instance is zero and the shift recovers
+    // the point. The overlap case (instance 0, vertex < 4) decodes to
+    // point 0 corner 0-3 under both readings.
+    const uint pointIndex =
+        uint(gl_InstanceIndex) + (uint(gl_VertexIndex) >> 2u);
+    const uint cornerIndex = uint(gl_VertexIndex) & 3u;
 #endif
     const vec2 corner = kSurfelCorners[int(cornerIndex)];
 
@@ -1157,6 +1165,53 @@ void main() {
         outPointIndex = pointIndex;
         return;
     }
+    // Resolve once for both the beauty AOV and the optional facing fade.
+    // This intentionally follows the screen-sprite path: generated water
+    // particles/trails do not inherit a source-surface normal and therefore
+    // remain visible rather than being culled by an unrelated normal.
+    const vec3 aovNormal = ResolveAovNormal(pointIndex);
+    // Facing fade, evaluated BEFORE the ripple/rain/flow composites and the
+    // basis so a fully faded point skips that per-vertex work entirely. The
+    // point centre (never the expanded corner) keeps one stable decision
+    // per surfel across every pipeline variant.
+    float facingFade = 1.0;
+    if (styleData.emissionNormalControl.y > 0.5 &&
+        dot(aovNormal, aovNormal) > 1.0e-8) {
+        vec3 facingReference = uniforms.cameraPosition.xyz - center;
+        if (styleData.surfaceStabilityControl.z == 1u) {
+            facingReference = vec3(
+                uniforms.view[0][2],
+                uniforms.view[1][2],
+                uniforms.view[2][2]);
+        } else if (styleData.surfaceStabilityControl.z == 2u) {
+            facingReference = vec3(0.0, 0.0, 1.0);
+        }
+        const float referenceLengthSquared =
+            dot(facingReference, facingReference);
+        if (RippleFiniteVec3(aovNormal) &&
+            RippleFiniteVec3(facingReference) &&
+            referenceLengthSquared > 1.0e-12) {
+            const float facingCosine = clamp(dot(
+                normalize(aovNormal),
+                facingReference * inversesqrt(referenceLengthSquared)),
+                -1.0,
+                1.0);
+            if (RippleFiniteFloat(facingCosine)) {
+                facingFade = smoothstep(
+                    styleData.emissionNormalControl.w,
+                    styleData.emissionNormalControl.z,
+                    facingCosine);
+            }
+        }
+    }
+    if (facingFade <= 1.0e-4) {
+        gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+        outOpacity = 0.0;
+        outDepthFade = 0.0;
+        outViewDepth = centerDepth;
+        outPointIndex = pointIndex;
+        return;
+    }
     vec3 tangent;
     vec3 bitangent;
     float surfaceAngleMask;
@@ -1167,11 +1222,6 @@ void main() {
         tangent,
         bitangent,
         surfaceAngleMask);
-    // Resolve once for both the beauty AOV and the optional facing fade.
-    // This intentionally follows the screen-sprite path: generated water
-    // particles/trails do not inherit a source-surface normal and therefore
-    // remain visible rather than being culled by an unrelated normal.
-    const vec3 aovNormal = ResolveAovNormal(pointIndex);
     vec3 rippleNormal =
         styleData.pointMeta.z != 0u && pointIndex < styleData.pointMeta.x
             ? surfelNormals.normals[pointIndex].xyz
@@ -1282,42 +1332,9 @@ void main() {
              meshFlowContact.opacityAdd) * flowEffectVisibility,
         0.0,
         4.0) * ResolvePointCloudSurfaceStabilityWeight(pointIndex);
-    // Match screen sprites for every surfel pipeline variant, including the
-    // depth prepass and sorted paths. Using the point centre (not an expanded
-    // quad corner) gives all six vertices one stable facing decision.
-    if (styleData.emissionNormalControl.y > 0.5 &&
-        dot(aovNormal, aovNormal) > 1.0e-8) {
-        vec3 facingReference = uniforms.cameraPosition.xyz - center;
-        if (styleData.surfaceStabilityControl.z == 1u) {
-            facingReference = vec3(
-                uniforms.view[0][2],
-                uniforms.view[1][2],
-                uniforms.view[2][2]);
-        } else if (styleData.surfaceStabilityControl.z == 2u) {
-            facingReference = vec3(0.0, 0.0, 1.0);
-        }
-        const float referenceLengthSquared =
-            dot(facingReference, facingReference);
-        if (RippleFiniteVec3(aovNormal) &&
-            RippleFiniteVec3(facingReference) &&
-            referenceLengthSquared > 1.0e-12) {
-            const float facingCosine = clamp(dot(
-                normalize(aovNormal),
-                facingReference * inversesqrt(referenceLengthSquared)),
-                -1.0,
-                1.0);
-            if (RippleFiniteFloat(facingCosine)) {
-                const float facingFade = smoothstep(
-                    styleData.emissionNormalControl.w,
-                    styleData.emissionNormalControl.z,
-                    facingCosine);
-                if (facingFade <= 1.0e-4) {
-                    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
-                }
-                outOpacity *= facingFade;
-            }
-        }
-    }
+    // The facing fade itself was resolved before the effect composites so a
+    // fully faded point exits early; partial fades only scale opacity here.
+    outOpacity *= facingFade;
 #ifndef DEPTH_PREPASS
     outEmissive =
         animatedFlow.y +

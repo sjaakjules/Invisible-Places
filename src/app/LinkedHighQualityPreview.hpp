@@ -34,12 +34,13 @@ constexpr float kAdaptiveHqRefreshBorderFraction = 0.10F;
 // 6 GiB working set, while the limit still prevents an unbounded session.
 constexpr std::uint64_t kAdaptiveHqRetainedFringeByteBudgetPerRole =
     6ULL * 1024ULL * 1024ULL * 1024ULL;
-// A retained coarse guard consumes one uint32 point index plus six uint32
-// surfel indices on the GPU. These limits keep timeline reuse broad on the
-// user's unified-memory Mac while bounding the fallback layer independently
-// of the decoded 1 mm block cache.
+// A retained coarse guard consumes one uint32 point index plus five uint32
+// surfel strip indices (four encoded corners and a primitive restart) on
+// the GPU. These limits keep timeline reuse broad on the user's
+// unified-memory Mac while bounding the fallback layer independently of
+// the decoded 1 mm block cache.
 constexpr std::uint64_t kAdaptiveHqFiveMillimeterGuardGpuBytesPerPoint =
-    7ULL * sizeof(std::uint32_t);
+    6ULL * sizeof(std::uint32_t);
 constexpr std::uint64_t kAdaptiveHqFiveMillimeterGuardByteBudgetPerRole =
     768ULL * 1024ULL * 1024ULL;
 // Camera navigation changes direction unpredictably, so retain only the

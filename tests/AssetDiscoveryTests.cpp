@@ -1889,16 +1889,18 @@ TEST_CASE("Point budget sampling is deterministic and avoids first-N ordering", 
     CHECK(!full.UsesSampledIndices());
 }
 
-TEST_CASE("Surfel sampled indices encode six vertices per source point", "[budget][sampling][surfel]") {
+TEST_CASE("Surfel sampled indices encode a four-corner strip plus restart per source point", "[budget][sampling][surfel]") {
     const std::vector<std::uint32_t> sampledPoints{2U, 7U};
     const auto encoded =
         invisible_places::renderer::pointcloud::GenerateSurfelEncodedSampleIndices(sampledPoints);
 
-    REQUIRE(encoded.size() == 12);
-    CHECK(encoded[0] == 12U);
-    CHECK(encoded[5] == 17U);
-    CHECK(encoded[6] == 42U);
-    CHECK(encoded[11] == 47U);
+    REQUIRE(encoded.size() == 10);
+    CHECK(encoded[0] == 8U);
+    CHECK(encoded[3] == 11U);
+    CHECK(encoded[4] == 0xFFFFFFFFU);
+    CHECK(encoded[5] == 28U);
+    CHECK(encoded[8] == 31U);
+    CHECK(encoded[9] == 0xFFFFFFFFU);
 }
 
 TEST_CASE("Spatial point budget sampling preserves coverage across ordered clusters", "[budget][sampling]") {

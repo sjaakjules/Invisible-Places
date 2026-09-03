@@ -60,15 +60,14 @@ layout(set = 0, binding = 6, std430) readonly buffer SurfelNormals {
     vec4 normals[];
 } surfelNormals;
 
-const uint kSurfelVerticesPerPoint = 6u;
+const uint kSurfelVerticesPerPoint = 4u;
 
-const vec2 kSurfelCorners[6] = vec2[](
+// Triangle-strip corner order; see pointcloud_surfel.vert.
+const vec2 kSurfelCorners[4] = vec2[](
     vec2(-1.0, -1.0),
     vec2(1.0, -1.0),
-    vec2(1.0, 1.0),
-    vec2(-1.0, -1.0),
-    vec2(1.0, 1.0),
-    vec2(-1.0, 1.0));
+    vec2(-1.0, 1.0),
+    vec2(1.0, 1.0));
 
 vec4 UnpackRgba8(uint packedColor) {
     return vec4(
@@ -150,8 +149,11 @@ float ScreenPixelWorldSpan(float viewDepth, float pixels) {
 
 void main() {
     const uint encodedVertexIndex = uint(gl_VertexIndex);
-    const uint pointIndex = encodedVertexIndex / kSurfelVerticesPerPoint;
-    const uint cornerIndex = encodedVertexIndex - (pointIndex * kSurfelVerticesPerPoint);
+    // See pointcloud_surfel.vert: instanced full-source draws carry the
+    // point in gl_InstanceIndex; indexed sampled draws encode point*4+corner.
+    const uint pointIndex =
+        uint(gl_InstanceIndex) + (encodedVertexIndex >> 2u);
+    const uint cornerIndex = encodedVertexIndex & 3u;
     const vec2 corner = kSurfelCorners[int(cornerIndex)];
 
     const vec3 center = surfelPositions.positions[pointIndex].xyz;

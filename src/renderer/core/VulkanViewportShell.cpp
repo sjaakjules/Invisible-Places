@@ -1368,9 +1368,16 @@ std::optional<std::uint32_t> FindSurfaceStabilityScalarFieldSlot(
     return std::nullopt;
 }
 
-constexpr std::uint32_t kSurfelVerticesPerPoint = 6U;
+// World surfels draw as instanced four-vertex triangle strips (one third
+// fewer vertex invocations than the previous six-vertex list). Sampled
+// budget draws stay indexed: four encoded corners (pointIndex * 4 + corner)
+// then one primitive-restart index per point.
+constexpr std::uint32_t kSurfelVerticesPerPoint = 4U;
+constexpr std::uint32_t kSurfelEncodedIndicesPerPoint = 5U;
+constexpr std::uint32_t kSurfelPrimitiveRestartIndex = 0xFFFFFFFFU;
 constexpr std::uint32_t kMaxSurfelEncodedPointCount =
-    std::numeric_limits<std::uint32_t>::max() / kSurfelVerticesPerPoint;
+    (kSurfelPrimitiveRestartIndex - kSurfelVerticesPerPoint) /
+    kSurfelVerticesPerPoint;
 
 std::vector<std::uint32_t> SanitizePointIndices(
     const std::vector<std::uint32_t>& indices,
@@ -5790,14 +5797,14 @@ void VulkanViewportShell::UpdatePointBudget(
 
     if (sanitized->back() <= kMaxSurfelEncodedPointCount) {
         const auto surfelIndexCount =
-            sanitized->size() * kSurfelVerticesPerPoint;
+            sanitized->size() * kSurfelEncodedIndicesPerPoint;
         const auto surfelIndexBytes = static_cast<VkDeviceSize>(
             surfelIndexCount * sizeof(std::uint32_t));
         ensureCapacity(
             &resources->sampledSurfelIndexBuffer,
             surfelIndexBytes,
             static_cast<VkDeviceSize>(validPointCount) *
-                kSurfelVerticesPerPoint * sizeof(std::uint32_t));
+                kSurfelEncodedIndicesPerPoint * sizeof(std::uint32_t));
         auto* destination = static_cast<std::uint32_t*>(
             resources->sampledSurfelIndexBuffer.mapped);
         if (destination == nullptr) {
@@ -5811,6 +5818,7 @@ void VulkanViewportShell::UpdatePointBudget(
                  ++corner) {
                 *destination++ = encodedBase + corner;
             }
+            *destination++ = kSurfelPrimitiveRestartIndex;
         }
     } else {
         DestroyBuffer(&resources->sampledSurfelIndexBuffer);
@@ -9263,7 +9271,10 @@ void VulkanViewportShell::CreatePointPipelines() {
 
     VkPipelineInputAssemblyStateCreateInfo surfelInputAssembly{
         VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-    surfelInputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    surfelInputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+    // Restart applies only to the indexed sampled draws; instanced strip
+    // draws restart implicitly at each instance.
+    surfelInputAssembly.primitiveRestartEnable = VK_TRUE;
 
     VkPipelineViewportStateCreateInfo viewportState{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
     viewportState.viewportCount = 1;
@@ -10715,7 +10726,10 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
 
     VkPipelineInputAssemblyStateCreateInfo surfelInputAssembly{
         VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-    surfelInputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    surfelInputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+    // Restart applies only to the indexed sampled draws; instanced strip
+    // draws restart implicitly at each instance.
+    surfelInputAssembly.primitiveRestartEnable = VK_TRUE;
 
     VkPipelineViewportStateCreateInfo viewportState{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
     viewportState.viewportCount = 1;
@@ -16744,8 +16758,8 @@ bool VulkanViewportShell::RecordPointCloudLayerDraw(
     if (plan.worldSurfels) {
         if (drawSortedPointOrder) {
             // Supply one sorted source point per instance. The specialised
-            // vertex shader expands each instance into the six vertices of
-            // its surfel, avoiding a six-times-larger sorted index buffer.
+            // vertex shader expands each instance into its surfel's
+            // four-vertex strip, avoiding an expanded sorted index buffer.
             const VkBuffer sortedPointBuffer =
                 resources->depthSortedIndexBuffer.buffer;
             constexpr VkDeviceSize sortedPointOffset = 0U;
@@ -16763,23 +16777,32 @@ bool VulkanViewportShell::RecordPointCloudLayerDraw(
                 0U);
             return true;
         }
-        const std::uint32_t surfelVertexCount = plan.drawPointCount * kSurfelVerticesPerPoint;
         if (plan.sampledBudgetReady) {
+            const std::uint32_t surfelIndexCount =
+                plan.drawPointCount * kSurfelEncodedIndicesPerPoint;
             vkCmdBindIndexBuffer(
                 commandBuffer,
                 resources->sampledSurfelIndexBuffer.buffer,
                 0,
                 VK_INDEX_TYPE_UINT32);
-            vkCmdDrawIndexed(commandBuffer, surfelVertexCount, 1, 0, 0, 0);
+            vkCmdDrawIndexed(commandBuffer, surfelIndexCount, 1, 0, 0, 0);
         } else if (plan.interactiveSampleReady) {
+            const std::uint32_t surfelIndexCount =
+                plan.drawPointCount * kSurfelEncodedIndicesPerPoint;
             vkCmdBindIndexBuffer(
                 commandBuffer,
                 resources->interactiveSurfelIndexBuffer.buffer,
                 0,
                 VK_INDEX_TYPE_UINT32);
-            vkCmdDrawIndexed(commandBuffer, surfelVertexCount, 1, 0, 0, 0);
+            vkCmdDrawIndexed(commandBuffer, surfelIndexCount, 1, 0, 0, 0);
         } else {
-            vkCmdDraw(commandBuffer, surfelVertexCount, 1, 0, 0);
+            // Instanced full-source draw: the point is gl_InstanceIndex.
+            vkCmdDraw(
+                commandBuffer,
+                kSurfelVerticesPerPoint,
+                plan.drawPointCount,
+                0,
+                0);
         }
         return true;
     }
@@ -16944,13 +16967,14 @@ bool VulkanViewportShell::RecordPointCloudHighlightDraw(
     }
 
     if (worldSurfels) {
-        const std::uint32_t surfelVertexCount = highlightLayer.drawPointCount * kSurfelVerticesPerPoint;
+        const std::uint32_t surfelIndexCount =
+            highlightLayer.drawPointCount * kSurfelEncodedIndicesPerPoint;
         vkCmdBindIndexBuffer(
             commandBuffer,
             highlight.surfelIndexBuffer.buffer,
             0,
             VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(commandBuffer, surfelVertexCount, 1, 0, 0, 0);
+        vkCmdDrawIndexed(commandBuffer, surfelIndexCount, 1, 0, 0, 0);
         return true;
     }
 
