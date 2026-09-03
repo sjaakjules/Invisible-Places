@@ -17,11 +17,18 @@ layout(location = 12) in vec4 inWaterColourTransform;
 layout(location = 13) flat in vec4 inTimingColouriseTransform;
 layout(location = 14) flat in vec4 inTimingColouriseScale;
 
+#ifdef POINTCLOUD_SORTED_ALPHA
+layout(location = 0) out vec4 outSortedColor;
+layout(location = 1) out vec4 outSortedNormal;
+layout(location = 2) out vec4 outSortedAlbedo;
+layout(location = 3) out vec4 outSortedEmission;
+#else
 layout(location = 0) out vec4 outAccumulation;
 layout(location = 1) out float outRevealage;
 layout(location = 2) out vec4 outEmission;
 layout(location = 3) out vec4 outNormalAccumulation;
 layout(location = 4) out vec4 outAlbedoAccumulation;
+#endif
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 viewProjection;
@@ -228,6 +235,7 @@ float ResolveDepthFadeAlpha(float depthFade) {
     return mix(1.0, 1.0 - depthNorm, clamp(depthFade, 0.0, 1.0));
 }
 
+#ifndef POINTCLOUD_SORTED_ALPHA
 void WriteAovs(vec3 albedo, vec3 normal, float aovWeight) {
     outNormalAccumulation = vec4(0.0);
     outAlbedoAccumulation = vec4(albedo * aovWeight, aovWeight);
@@ -235,6 +243,7 @@ void WriteAovs(vec3 albedo, vec3 normal, float aovWeight) {
         outNormalAccumulation = vec4(normalize(normal) * aovWeight, aovWeight);
     }
 }
+#endif
 
 void main() {
     const float coverage = PointCloudDiscCoverage(inDiscCoord, styleData.renderParams2.x);
@@ -267,6 +276,37 @@ void main() {
         radius,
         inPointIndex,
         inSurfaceAngleMask);
+#ifdef POINTCLOUD_SORTED_ALPHA
+    outSortedEmission = vec4(0.0);
+    vec3 sortedColor = baseColor;
+    float resolvedEmissive = max(0.0, inEmissive);
+    const float timingEmissionAdd = ResolveTimingColouriseEmissionAdd();
+    if (timingEmissionAdd > 0.0) {
+        resolvedEmissive += timingEmissionAdd;
+    }
+    const float emissionGain =
+        resolvedEmissive * max(0.0, styleData.renderParams0.x);
+    if (emissionGain > 1e-5) {
+        if (PointCloudSaturatedEmissionEnabled()) {
+            sortedColor = PointCloudSaturatedEmissionColor(
+                baseColor,
+                compensatedRawAlpha,
+                alpha,
+                emissionGain);
+        } else {
+            outSortedEmission = vec4(
+                baseColor * compensatedRawAlpha * emissionGain,
+                compensatedRawAlpha * emissionGain);
+        }
+    }
+    outSortedColor = vec4(sortedColor, alpha);
+    outSortedNormal = vec4(
+        dot(inAovNormal, inAovNormal) > 1.0e-8
+            ? normalize(inAovNormal)
+            : vec3(0.0),
+        alpha);
+    outSortedAlbedo = vec4(baseColor, alpha);
+#else
     outAccumulation = vec4(0.0);
     outRevealage = 0.0;
     outEmission = vec4(0.0);
@@ -300,4 +340,5 @@ void main() {
     // AOVs stay at the unlit base colour; the saturated fold is a beauty
     // response, not albedo.
     WriteAovs(baseColor, inAovNormal, aovWeight);
+#endif
 }

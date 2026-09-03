@@ -79,6 +79,9 @@ RenderSetupDocument MakeRenderSetup() {
     document.exportPreset.settings.temporalSampleCount = 8U;
     document.livePointVisual.solidColor = {0.2F, 0.3F, 0.4F, 0.9F};
     document.livePointVisual.pointSize.constantValue[0] = 3.25F;
+    document.livePointVisual.normalCullReference =
+        invisible_places::renderer::pointcloud::
+            PointCloudNormalCullReference::FixedVertical;
 
     WaterKeyedSettingTrack rainTrack;
     rainTrack.settingId = "amount";
@@ -379,6 +382,10 @@ TEST_CASE(
     CHECK(loaded->exportPreset.settings.width == 2560U);
     CHECK(loaded->exportPreset.settings.temporalSampleCount == 8U);
     CHECK(loaded->livePointVisual.solidColor[2] == Approx(0.4F));
+    CHECK(
+        loaded->livePointVisual.normalCullReference ==
+        invisible_places::renderer::pointcloud::
+            PointCloudNormalCullReference::FixedVertical);
     REQUIRE(loaded->timingState.waterFeatureTimingRuns.size() == 1U);
     CHECK(loaded->timingState.waterFeatureTimingRuns.front()
               .features.front()

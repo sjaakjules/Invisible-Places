@@ -65,6 +65,7 @@
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <GLFW/glfw3.h>
+#include <Imath/half.h>
 
 #include <algorithm>
 #include <array>
@@ -2478,6 +2479,13 @@ struct ExportMemorySample {
 struct ExportLogState {
     std::filesystem::path path;
     std::vector<ExportStartupPhase> startupPhases;
+    // Depth-sort activity across the export, from the viewport's cumulative
+    // counters. FullAnimation should sort each static source once; a large
+    // dispatch count reveals live/export buffer alternation re-sorting.
+    std::uint64_t sortDispatchBaseline = 0U;
+    std::uint64_t sortCacheReuseBaseline = 0U;
+    std::uint64_t sortDispatchCount = 0U;
+    std::uint64_t sortCacheReuseCount = 0U;
     std::chrono::system_clock::time_point startedWallTime{};
     std::chrono::steady_clock::time_point startedAt{};
     ProcessMemorySnapshot startMemory{};
@@ -7223,7 +7231,6 @@ void ResolveAnimationPointDepthSortViews(
     for (auto& layer : renderState->pointCloudLayers) {
         layer.depthSortViewValid = false;
         if (!layer.style.gpuBackToFrontSorting ||
-            layer.style.geometryMode != PointCloudGeometryMode::ScreenSprites ||
             layer.style.gpuSortMode == PointCloudGpuSortMode::PerFrame ||
             // Fixed Vertical derives its axis from the cloud's own bounds
             // inside the renderer; no animation-path average is involved.
@@ -8218,7 +8225,9 @@ void SanitizePointCloudStyle(PreviewLayerSession* session) {
     session->pointStyle.featherPower = std::max(0.001F, session->pointStyle.featherPower);
     session->pointStyle.waterStreakAspect = std::clamp(session->pointStyle.waterStreakAspect, 1.0F, 32.0F);
     session->pointStyle.depthPrepassAlphaThreshold =
-        std::clamp(session->pointStyle.depthPrepassAlphaThreshold, 0.0F, 1.0F);
+        invisible_places::renderer::pointcloud::
+            SanitizePointCloudDepthPrepassAlphaThreshold(
+                session->pointStyle.depthPrepassAlphaThreshold);
     session->pointStyle.depthPrepassToleranceMeters =
         std::clamp(session->pointStyle.depthPrepassToleranceMeters, 0.0F, 10.0F);
     session->pointStyle.gpuSortWindowSeconds =
@@ -38261,6 +38270,10 @@ ExportLogState MakeExportLogState(
     log.startedAt = std::chrono::steady_clock::now();
     log.path = BuildUniqueExportLogPath(outputDirectory, mode, log.startedWallTime);
     log.startMemory = ReadCurrentProcessMemorySnapshot();
+    log.sortDispatchBaseline =
+        viewport.Diagnostics().pointDepthSortDispatchCount;
+    log.sortCacheReuseBaseline =
+        viewport.Diagnostics().pointDepthSortCacheReuseCount;
     log.peakMemory = log.startMemory;
     log.peakProcessMemoryBytes = ProcessMemoryPressureBytes(log.startMemory);
     log.startThermalState = invisible_places::platform::CurrentSystemThermalState();
@@ -38419,6 +38432,25 @@ void RecordExportDurationBucket(
         *maxDuration = duration;
     }
     ++(*count);
+}
+
+void UpdateExportSortCounters(
+    OfflineRenderJobState* job,
+    const invisible_places::renderer::core::VulkanViewportShell& viewport) {
+    if (job == nullptr) {
+        return;
+    }
+    const auto& diagnostics = viewport.Diagnostics();
+    job->exportLog.sortDispatchCount =
+        diagnostics.pointDepthSortDispatchCount -
+        std::min(
+            diagnostics.pointDepthSortDispatchCount,
+            job->exportLog.sortDispatchBaseline);
+    job->exportLog.sortCacheReuseCount =
+        diagnostics.pointDepthSortCacheReuseCount -
+        std::min(
+            diagnostics.pointDepthSortCacheReuseCount,
+            job->exportLog.sortCacheReuseBaseline);
 }
 
 void RecordExportGpuSampleDuration(
@@ -40842,6 +40874,10 @@ std::string WriteExportLog(
     log << "GPU sample total: " << FormatDurationForLog(job.exportLog.gpuSampleTotal) << '\n';
     log << "GPU sample average: " << FormatDurationForLog(averageGpuSampleDuration) << '\n';
     log << "GPU sample max: " << FormatDurationForLog(job.exportLog.gpuSampleMax) << '\n';
+    log << "Point depth sort dispatches: "
+        << job.exportLog.sortDispatchCount << '\n';
+    log << "Point depth sort cache reuses: "
+        << job.exportLog.sortCacheReuseCount << '\n';
     log << "Readback count: " << job.exportLog.readbackCount << '\n';
     log << "Readback total: " << FormatDurationForLog(job.exportLog.readbackTotal) << '\n';
     log << "Readback average: " << FormatDurationForLog(averageReadbackDuration) << '\n';
@@ -41350,8 +41386,26 @@ void RunAnimationExportWriter(
     AnimationExportOutputOptions outputOptions,
     std::uint32_t totalFrames,
     std::shared_ptr<AnimationExportWriterState> writerState) {
+    // Heavy supersampled exports are GPU-capture bound with large recorded
+    // headroom (zero writer waits at 2x 4K), so their conversion/encoding
+    // burst runs at utility priority to keep the UI and the rest of the
+    // system responsive; small fast exports keep the old priority because
+    // conversion can be their bottleneck. Quality is identical either way.
+    const std::uint64_t supersampledPixels =
+        static_cast<std::uint64_t>(settings.width) * settings.height *
+        static_cast<std::uint64_t>(
+            std::max<std::uint32_t>(1U, settings.supersampleScale)) *
+        static_cast<std::uint64_t>(
+            std::max<std::uint32_t>(1U, settings.supersampleScale));
+    const bool responsiveExport =
+        supersampledPixels >=
+        static_cast<std::uint64_t>(3840U) * 2160U * 4U;
+    invisible_places::output::SetVideoConversionBackgroundPriority(
+        responsiveExport);
 #if defined(__APPLE__)
-    (void)::pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+    (void)::pthread_set_qos_class_self_np(
+        responsiveExport ? QOS_CLASS_UTILITY : QOS_CLASS_USER_INITIATED,
+        0);
 #endif
     FILE* videoPipe = nullptr;
     FILE* alphaMattePipe = nullptr;
@@ -41546,6 +41600,14 @@ void RunAnimationExportWriter(
                     settings.framesPerSecond,
                     outputOptions.previewVideoPath);
             }
+#if defined(__APPLE__)
+            if (responsiveExport) {
+                // Demote the whole encoder process (x265 worker pools
+                // included) so its burst shares cores politely; encoding
+                // still runs far faster than GPU capture at these sizes.
+                command = "/usr/sbin/taskpolicy -c utility " + command;
+            }
+#endif
             videoPipe = ::popen(command.c_str(), "w");
             if (videoPipe == nullptr) {
                 if (outputOptions.previewMp4Optional && !writesFastPng) {
@@ -41561,7 +41623,7 @@ void RunAnimationExportWriter(
                 }
             }
             if (writesAlphaMattePair && !writesCombinedColorAlphaMatte && videoPipe != nullptr) {
-                const auto matteCommand = BuildFfmpegAlphaMatteCommandForMode(
+                auto matteCommand = BuildFfmpegAlphaMatteCommandForMode(
                     mode,
                     outputOptions.quality,
                     outputOptions.useVideoToolbox,
@@ -41580,6 +41642,12 @@ void RunAnimationExportWriter(
                             : closeError);
                     return;
                 }
+#if defined(__APPLE__)
+                if (responsiveExport) {
+                    matteCommand =
+                        "/usr/sbin/taskpolicy -c utility " + matteCommand;
+                }
+#endif
                 alphaMattePipe = ::popen(matteCommand.c_str(), "w");
                 if (alphaMattePipe == nullptr) {
                     const auto closeError = closePreviewPipe();
@@ -44924,6 +44992,7 @@ void ProcessOfflineRenderJobStep(
                 sampleState.lastGpuSampleDuration = readyAt - sampleState.gpuSampleSubmittedAt;
                 sampleState.lastReadbackDuration = readbackEnd - readyAt;
                 RecordExportGpuSampleDuration(&job, sampleState.lastGpuSampleDuration);
+                UpdateExportSortCounters(&job, *viewport);
                 RecordExportReadbackDuration(&job, sampleState.lastReadbackDuration);
 
                 // Export EDL now finishes in the GPU command buffer before
@@ -44971,6 +45040,26 @@ void ProcessOfflineRenderJobStep(
                     targetHeight,
                     sampleTimeSeconds,
                     ExportReadbackMaskForPass(job, previewPass));
+                // Make the stored tile size real for GPU submission: large
+                // supersampled frames render as row bands, each its own
+                // queue submit, so the interactive UI is no longer parked
+                // behind one multi-second command buffer on the shared
+                // graphics queue. Small frames keep the single submission.
+                if (static_cast<std::uint64_t>(request.width) *
+                        request.height >=
+                    static_cast<std::uint64_t>(3840U) * 2160U * 2U) {
+                    request.gpuBandRows =
+                        std::max(512U, job.settings.tileSize);
+                }
+                // Test override: forces a band height, or 0 for the single
+                // historical submission, so banded and unbanded frames can
+                // be byte-compared from one binary.
+                if (const char* bandOverride =
+                        std::getenv("INVISIBLE_PLACES_EXPORT_GPU_BAND_ROWS");
+                    bandOverride != nullptr && bandOverride[0] != ' ') {
+                    request.gpuBandRows = static_cast<std::uint32_t>(
+                        std::strtoul(bandOverride, nullptr, 10));
+                }
                 if (!viewport->BeginPointCloudExrFrame(request)) {
                     runtimeState->statusMessage = "Waiting for GPU export resources...";
                     return;
@@ -56327,20 +56416,23 @@ bool DrawPointCloudTransparencyDepthSection(PreviewLayerSession* session) {
         &style.gpuBackToFrontSorting);
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip(
-            "Opt-in GPU depth-bucket sorting with conventional alpha blending. "
-            "It is intended for genuinely translucent screen sprites and adds "
-            "a compute pass only while enabled.");
+            "Draws translucent sprites and world surfels from far to near "
+            "using GPU depth buckets and conventional alpha blending. Each source is "
+            "sorted internally. Separate canonical resources use the stable "
+            "SAND, ROCK, VEG composite order so SAND cannot paint over a ROCK "
+            "ledge merely because it was submitted later. The shared "
+            "Soft-Edge Depth Prepass adds geometric cross-source occlusion.");
     }
     if (style.gpuBackToFrontSorting) {
         int sortModeIndex = static_cast<int>(style.gpuSortMode);
         const char* sortModes[] = {
-            "Per Frame",
-            "Full Animation (Stable)",
-            "Moving Average",
+            "Current Camera (View-Correct)",
+            "Full Animation Average (Stable)",
+            "Moving Average (Smoothed)",
             "Fixed Vertical (Top-Down)",
         };
         if (DrawRightAlignedCombo(
-                "Sort Direction",
+                "Sort Reference",
                 &sortModeIndex,
                 sortModes,
                 IM_ARRAYSIZE(sortModes))) {
@@ -56350,13 +56442,17 @@ bool DrawPointCloudTransparencyDepthSection(PreviewLayerSession* session) {
         }
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(
-                "Per Frame follows the exact camera. Full Animation averages "
-                "the complete camera path and reuses one ordering. Moving "
-                "Average smooths the direction around each frame. Animation "
-                "modes fall back to Per Frame when no path is active. Fixed "
-                "Vertical sorts bottom-up along world Z from the cloud's own "
-                "bounds — one cached ordering for any camera, ideal for "
-                "aerial/top-down passes, no animation path needed.");
+                "Every mode still draws far-to-near; this chooses the axis "
+                "used to measure depth. Current Camera is geometrically "
+                "correct for the displayed/exported view. Full Animation "
+                "reuses one average path axis for temporal stability, but can "
+                "misorder ledges when the view direction changes. Moving "
+                "Average smooths that axis around each frame. Animation modes "
+                "fall back to Current Camera when no path is active or the "
+                "live camera has been manually detached. Fixed Vertical uses "
+                "world Z and is intended only for top-down views. Current "
+                "Camera and Moving Average may reshuffle residual equal-depth "
+                "bucket ties when they dispatch again.");
         }
         if (style.gpuSortMode == PointCloudGpuSortMode::MovingAverage) {
             changed |= DrawRangedFloatControl(
@@ -56370,18 +56466,13 @@ bool DrawPointCloudTransparencyDepthSection(PreviewLayerSession* session) {
         } else if (style.gpuSortMode ==
                    PointCloudGpuSortMode::FullAnimation) {
             ImGui::TextDisabled(
-                "Recommended for fixed-direction aerial pans; sorted once per source/budget.");
+                "One cached average axis: stable for fixed-direction pans; may be wrong after a large turn.");
         } else if (style.gpuSortMode ==
                    PointCloudGpuSortMode::FixedVertical) {
             ImGui::TextDisabled(
                 "Camera-independent world-Z ordering; sorted once per source/budget.");
         }
     }
-    if (style.geometryMode != PointCloudGeometryMode::ScreenSprites) {
-        ImGui::TextDisabled(
-            "GPU sorting applies to Screen Sprites; surfels keep weighted blending.");
-    }
-
     changed |= ImGui::Checkbox(
         "Soft-Edge Depth Prepass",
         &style.depthPrepassEnabled);
@@ -56392,11 +56483,15 @@ bool DrawPointCloudTransparencyDepthSection(PreviewLayerSession* session) {
             "surfaces are rejected. This is the soft/Gaussian equivalent of "
             "Preview Performance Mode's hard depth culling.");
     }
+    if (style.gpuBackToFrontSorting && !style.depthPrepassEnabled) {
+        ImGui::TextDisabled(
+            "Per-source sort uses SAND -> ROCK -> VEG fallback; enable the prepass for geometric occlusion.");
+    }
     if (style.depthPrepassEnabled) {
         int rolePolicyIndex = static_cast<int>(style.depthRolePolicy);
         const char* rolePolicies[] = {
-            "All Roles (Current)",
-            "ROCK Culls / SAND Receives / VEG Overlay",
+            "All Roles Compete for Depth",
+            "ROCK Occludes SAND / VEG Overlay (Recommended)",
             "Custom Per Role",
         };
         if (DrawRightAlignedCombo(
@@ -56410,10 +56505,15 @@ bool DrawPointCloudTransparencyDepthSection(PreviewLayerSession* session) {
         }
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(
-                "All Roles preserves the existing shared prepass. The ROCK "
-                "preset keeps ROCK self-occlusion, lets SAND test only the "
-                "ROCK surface, and draws VEG as a transparent overlay. "
+                "All Roles lets ROCK, SAND, and VEG compete to own the nearest "
+                "depth core. The recommended ROCK policy keeps ROCK "
+                "self-occlusion, lets SAND test the ROCK surface without "
+                "replacing it, and draws VEG as a transparent overlay. "
                 "Custom exposes the same write/test choices per role.");
+        }
+        if (style.depthRolePolicy == PointCloudDepthRolePolicy::Uniform) {
+            ImGui::TextDisabled(
+                "At ROCK/SAND boundaries, use the recommended policy so SAND cannot replace ROCK depth.");
         }
         if (style.depthRolePolicy == PointCloudDepthRolePolicy::Custom) {
             const auto drawParticipation = [&](const char* label,
@@ -56450,6 +56550,16 @@ bool DrawPointCloudTransparencyDepthSection(PreviewLayerSession* session) {
              .format = "%.2f",
              .hardMin = 0.0F,
              .hardMax = 1.0F});
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "0.50 is the stable starting point. Lower values allow soft "
+                "Gaussian and antialiasing fringes to own hard depth, which "
+                "can reveal/hide a rear surface as coverage moves between "
+                "pixels. Higher values are more conservative but may leave "
+                "small gaps in the occluding surface. The threshold uses "
+                "geometric alpha before per-layer display-density correction, "
+                "so live and full-density export choose the same cores.");
+        }
         changed |= DrawRangedFloatControl(
             "Surface Tolerance (m)",
             &style.depthPrepassToleranceMeters,
@@ -56459,7 +56569,7 @@ bool DrawPointCloudTransparencyDepthSection(PreviewLayerSession* session) {
              .hardMin = 0.0F,
              .hardMax = 10.0F});
         ImGui::TextDisabled(
-            "Raise tolerance for larger spacing or grazing-angle surfaces.");
+            "View-depth band: grazing views may need 0.10-0.25 m; top-down views often need 0.005-0.030 m.");
     }
 
     int stabilityPolicyIndex =
@@ -56591,10 +56701,13 @@ bool DrawPointCloudTransparencyDepthSection(PreviewLayerSession* session) {
         ImGui::SetTooltip(
             "Fades points whose stored normal faces away from the camera — "
             "for example returns beneath an overhang viewed from above. "
-            "Angles measure the normal against the direction to the camera: "
+            "Angles measure the normal against the selected Fade Reference: "
             "fully visible up to Fade Start, hidden beyond Hidden Beyond. "
-            "Screen Sprites only; runs in preview and export, and requires "
-            "normals (layers without them are unaffected).");
+            "The same fade is applied while writing the soft depth prepass, "
+            "so a fully faded point no longer occludes another role. It runs "
+            "for screen sprites and both world-space point modes in preview "
+            "and export, and requires normals (layers without them are "
+            "unaffected).");
     }
     if (style.normalCullEnabled) {
         int normalCullReferenceIndex =
@@ -56641,7 +56754,7 @@ bool DrawPointCloudTransparencyDepthSection(PreviewLayerSession* session) {
         ImGui::TextDisabled(
             style.normalCullReference ==
                     PointCloudNormalCullReference::FixedVertical
-                ? "Fixed +Z: pair with Fixed Vertical sorting for stable top-down output."
+                ? "Fixed +Z is top-down only: side-facing ROCK also stops owning prepass depth."
                 : "90 deg is edge-on; higher keeps more grazing points.");
     }
     ImGui::TextDisabled("All controls are saved with the named Visual.");
@@ -121805,10 +121918,22 @@ invisible_places::renderer::core::SceneRenderState BuildRenderState(
             const auto& preparedSortPath = CachedPreparedAnimationPath(
                 &animationPanel,
                 *sortPath);
-            ResolveAnimationPointDepthSortViews(
-                &renderState,
-                preparedSortPath,
-                preparedSortPath.durationSeconds * normalizedPosition);
+            // The attachment flag can remain set for a normal (non-paired)
+            // animation after manual viewport navigation. Do not let its
+            // cached average depth axis leak into that detached view: from
+            // the opposite side of a ledge it would make the far surface sort
+            // as though it were near. Export supplies a cameraOverride and
+            // resolves the authored path independently.
+            if (invisible_places::camera::
+                    PreparedAnimationCameraMatchesFrame(
+                        cameraState,
+                        preparedSortPath,
+                        normalizedPosition)) {
+                ResolveAnimationPointDepthSortViews(
+                    &renderState,
+                    preparedSortPath,
+                    preparedSortPath.durationSeconds * normalizedPosition);
+            }
         }
     }
 
@@ -122924,6 +123049,10 @@ int RunPointDepthOptionsSmoke(
 
     constexpr std::size_t kLayerId =
         std::numeric_limits<std::size_t>::max() - 23U;
+    constexpr std::size_t kRockLayerId =
+        std::numeric_limits<std::size_t>::max() - 24U;
+    constexpr std::size_t kSandLayerId =
+        std::numeric_limits<std::size_t>::max() - 25U;
     invisible_places::io::LoadedPointCloud cloud;
     cloud.layerName = "Point Depth Options Smoke";
     cloud.hasSourceRgb = true;
@@ -122964,6 +123093,28 @@ int RunPointDepthOptionsSmoke(
         }
     }
 
+    invisible_places::io::LoadedPointCloud rockCloud;
+    rockCloud.layerName = "Point Depth Options ROCK";
+    rockCloud.hasSourceRgb = true;
+    rockCloud.hasNormals = true;
+    invisible_places::io::LoadedPointCloud sandCloud;
+    sandCloud.layerName = "Point Depth Options SAND";
+    sandCloud.hasSourceRgb = true;
+    sandCloud.hasNormals = true;
+    for (std::size_t pointIndex = 0U;
+         pointIndex + 1U < cloud.positions.size();
+         pointIndex += 2U) {
+        rockCloud.positions.push_back(cloud.positions[pointIndex]);
+        rockCloud.packedColors.push_back(cloud.packedColors[pointIndex]);
+        rockCloud.normals.push_back(cloud.normals[pointIndex]);
+        rockCloud.bounds.Expand(cloud.positions[pointIndex]);
+
+        sandCloud.positions.push_back(cloud.positions[pointIndex + 1U]);
+        sandCloud.packedColors.push_back(cloud.packedColors[pointIndex + 1U]);
+        sandCloud.normals.push_back(cloud.normals[pointIndex + 1U]);
+        sandCloud.bounds.Expand(cloud.positions[pointIndex + 1U]);
+    }
+
     std::vector<std::uint32_t> previewIndices;
     previewIndices.reserve(cloud.positions.size() / 2U + 1U);
     for (std::uint32_t index = 0U;
@@ -122975,6 +123126,8 @@ int RunPointDepthOptionsSmoke(
     }
 
     bool uploaded = false;
+    bool rockUploaded = false;
+    bool sandUploaded = false;
     const bool captureWasEnabled =
         viewport->LiveSceneReadbackCaptureEnabled();
     const auto cleanup = [&]() {
@@ -122982,6 +123135,12 @@ int RunPointDepthOptionsSmoke(
             viewport->WaitIdle();
             if (uploaded) {
                 viewport->RemovePointCloud(kLayerId);
+            }
+            if (rockUploaded) {
+                viewport->RemovePointCloud(kRockLayerId);
+            }
+            if (sandUploaded) {
+                viewport->RemovePointCloud(kSandLayerId);
             }
             if (!captureWasEnabled) {
                 viewport->SetLiveSceneReadbackCaptureEnabled(false);
@@ -122995,6 +123154,10 @@ int RunPointDepthOptionsSmoke(
     try {
         viewport->UploadPointCloud(kLayerId, cloud, previewIndices);
         uploaded = true;
+        viewport->UploadPointCloud(kRockLayerId, rockCloud, {});
+        rockUploaded = true;
+        viewport->UploadPointCloud(kSandLayerId, sandCloud, {});
+        sandUploaded = true;
         viewport->SetSceneCachingEnabled(false);
         viewport->SetLiveSceneRenderingEnabled(true);
         viewport->SetLiveSceneReadbackCaptureEnabled(true);
@@ -123074,7 +123237,36 @@ int RunPointDepthOptionsSmoke(
                     "GPU point depth-options live readback was empty."};
             }
         };
-        const auto renderAndValidateExport = [&]() {
+        const auto validateSortedNearSurfaceDominates = [&]() {
+            const auto readback = viewport->ReadLiveSceneFrame();
+            if (readback.width == 0U || readback.height == 0U ||
+                readback.colorRgba8.size() !=
+                    static_cast<std::size_t>(readback.width) *
+                        readback.height * 4U) {
+                throw std::runtime_error{
+                    "GPU point depth-options colour readback was empty."};
+            }
+
+            // The synthetic planes project to the same screen positions.
+            // Near is red and far is blue, while the upload deliberately
+            // supplies near first. Correct source-over transparency therefore
+            // requires the GPU sort to draw blue first and red last.
+            const std::uint32_t centreX = readback.width / 2U;
+            const std::uint32_t centreY = readback.height / 2U;
+            const std::size_t pixel =
+                static_cast<std::size_t>(centreY) * readback.width + centreX;
+            const std::size_t rgbaOffset = pixel * 4U;
+            const auto red = readback.colorRgba8[rgbaOffset];
+            const auto blue = readback.colorRgba8[rgbaOffset + 2U];
+            if (red <= blue) {
+                throw std::runtime_error{
+                    "GPU back-to-front sort composited the far blue surface "
+                    "over the near red surface (centre red=" +
+                    std::to_string(red) + ", blue=" +
+                    std::to_string(blue) + ")."};
+            }
+        };
+        const auto renderAndValidateExport = [&](bool validateNearSurface) {
             invisible_places::renderer::core::PointCloudExrFrameRequest request{
                 .renderState = renderState,
                 .width = 192U,
@@ -123112,6 +123304,26 @@ int RunPointDepthOptionsSmoke(
                     ", valid_depth=" +
                     std::to_string(validDepthCount) + ")."};
             }
+            if (validateNearSurface) {
+                const std::size_t centrePixel =
+                    static_cast<std::size_t>(request.height / 2U) *
+                        request.width +
+                    request.width / 2U;
+                const std::size_t rgbaOffset = centrePixel * 4U;
+                const float red = static_cast<float>(Imath::half{
+                    Imath::half::FromBits,
+                    image.rgbaHalf[rgbaOffset]});
+                const float blue = static_cast<float>(Imath::half{
+                    Imath::half::FromBits,
+                    image.rgbaHalf[rgbaOffset + 2U]});
+                if (red <= blue) {
+                    throw std::runtime_error{
+                        "GPU export composited the far blue layer over the "
+                        "near red layer (centre red=" +
+                        std::to_string(red) + ", blue=" +
+                        std::to_string(blue) + ")."};
+                }
+            }
         };
 
         const auto sortDispatchesBefore =
@@ -123138,7 +123350,8 @@ int RunPointDepthOptionsSmoke(
                 ")."};
         }
         validateLiveReadback();
-        renderAndValidateExport();
+        validateSortedNearSurfaceDominates();
+        renderAndValidateExport(false);
 
         // Rebuild both sampled-index descriptors after the sort allocation is
         // live. This guards the point-budget edits used during interaction.
@@ -123179,12 +123392,14 @@ int RunPointDepthOptionsSmoke(
         renderState.pointCloudLayers.front().drawPointCount = 0U;
         renderState.pointCloudLayers.front().style.depthPrepassEnabled = true;
         renderState.pointCloudLayers.front().style
-            .depthPrepassAlphaThreshold = 0.35F;
+            .depthPrepassAlphaThreshold =
+                renderer::pointcloud::
+                    kDefaultPointCloudDepthPrepassAlphaThreshold;
         renderState.pointCloudLayers.front().style
             .depthPrepassToleranceMeters = 0.03F;
         drawLiveFrames(3U);
         validateLiveReadback();
-        renderAndValidateExport();
+        renderAndValidateExport(false);
 
         // Fixed Vertical derives a camera-independent ordering from the
         // cloud's own Z bounds: expect exactly one new sort for the mode
@@ -123210,7 +123425,167 @@ int RunPointDepthOptionsSmoke(
                 std::to_string(verticalDispatches) + ")."};
         }
         validateLiveReadback();
-        renderAndValidateExport();
+        renderAndValidateExport(false);
+
+        // Canonical scene roles are separate GPU resources. A per-source sort
+        // cannot interleave their points, and the ordinary session order is
+        // ROCK then SAND. With no prepass, the deterministic semantic fallback
+        // must therefore composite SAND first and ROCK last in both live and
+        // export command buffers.
+        const auto combinedLayer = renderState.pointCloudLayers.front();
+        auto layeredStyle = combinedLayer.style;
+        layeredStyle.gpuBackToFrontSorting = true;
+        layeredStyle.gpuSortMode = PointCloudGpuSortMode::FullAnimation;
+        layeredStyle.depthPrepassEnabled = false;
+        layeredStyle.depthRolePolicy =
+            invisible_places::renderer::pointcloud::
+                PointCloudDepthRolePolicy::Uniform;
+        layeredStyle.effectiveDepthParticipation =
+            invisible_places::renderer::pointcloud::
+                PointCloudDepthParticipation::WriteAndTest;
+        layeredStyle.depthPrepassAlphaThreshold =
+            renderer::pointcloud::
+                kDefaultPointCloudDepthPrepassAlphaThreshold;
+        layeredStyle.depthPrepassToleranceMeters = 0.50F;
+        layeredStyle.normalCullEnabled = false;
+        invisible_places::style::SetScalarConstant(
+            &layeredStyle.emissiveStrength,
+            0.0F);
+        const auto makeLayer = [&](std::size_t layerId,
+                                   invisible_places::water::WaterSurfaceRole
+                                       role) {
+            return invisible_places::renderer::core::SceneRenderState::
+                PointCloudLayerState{
+                    .layerId = layerId,
+                    .style = layeredStyle,
+                    .hasSourceRgb = true,
+                    .hasNormals = true,
+                    .drawPointCount = 0U,
+                    .depthSortView = matrices.view,
+                    .depthSortNearPlane = cameraState.nearPlane,
+                    .depthSortFarPlane = cameraState.farPlane,
+                    .depthSortViewValid = true,
+                    .rainCollisionRole = role,
+                };
+        };
+        renderState.pointCloudLayers = {
+            makeLayer(
+                kRockLayerId,
+                invisible_places::water::WaterSurfaceRole::Rock),
+            makeLayer(
+                kSandLayerId,
+                invisible_places::water::WaterSurfaceRole::Sand),
+        };
+        drawLiveFrames(3U);
+        validateLiveReadback();
+        validateSortedNearSurfaceDominates();
+        renderAndValidateExport(true);
+
+        // Repeat with the shared prepass and a deliberately broad accepted
+        // band. Both layers survive the geometric test, so the same semantic
+        // fallback must still keep the ROCK ledge above SAND.
+        layeredStyle.depthPrepassEnabled = true;
+        layeredStyle.depthPrepassToleranceMeters = 0.50F;
+        renderState.pointCloudLayers = {
+            makeLayer(
+                kRockLayerId,
+                invisible_places::water::WaterSurfaceRole::Rock),
+            makeLayer(
+                kSandLayerId,
+                invisible_places::water::WaterSurfaceRole::Sand),
+        };
+        drawLiveFrames(3U);
+        validateLiveReadback();
+        validateSortedNearSurfaceDominates();
+        renderAndValidateExport(true);
+
+        // Reverse both the submitted layer order and the semantic roles.
+        // The near red plane is now SAND, while the far blue plane is ROCK,
+        // whose semantic composite priority would otherwise draw it last.
+        // A narrow shared prepass must still reject that genuinely deeper
+        // ROCK layer. This proves that the role tiebreak only applies inside
+        // the tolerance band and cannot override real cross-layer depth.
+        layeredStyle.depthPrepassToleranceMeters = 0.02F;
+        renderState.pointCloudLayers = {
+            makeLayer(
+                kSandLayerId,
+                invisible_places::water::WaterSurfaceRole::Rock),
+            makeLayer(
+                kRockLayerId,
+                invisible_places::water::WaterSurfaceRole::Sand),
+        };
+        renderState.pointCloudLayers[0].densityCompensation = {
+            .footprintScale = 1.0F,
+            .coverageCorrection = 0.68F,
+        };
+        renderState.pointCloudLayers[1].densityCompensation = {
+            .footprintScale = 1.0F,
+            .coverageCorrection = 0.246F,
+        };
+        drawLiveFrames(3U);
+        validateLiveReadback();
+        validateSortedNearSurfaceDominates();
+        renderAndValidateExport(true);
+
+        // Exercise the same sorted-index buffer through the instanced surfel
+        // path. This guards both the live pipelines and the separate export
+        // pipeline set: near red surfels must still be submitted after far
+        // blue surfels without allocating six expanded indices per point.
+        auto surfelCombinedLayer = combinedLayer;
+        surfelCombinedLayer.style.geometryMode =
+            PointCloudGeometryMode::WorldSurfels;
+        surfelCombinedLayer.style.gpuBackToFrontSorting = true;
+        surfelCombinedLayer.style.gpuSortMode =
+            PointCloudGpuSortMode::FullAnimation;
+        surfelCombinedLayer.style.depthPrepassEnabled = false;
+        invisible_places::style::SetScalarConstant(
+            &surfelCombinedLayer.style.surfelDiameter,
+            0.16F);
+        renderState.pointCloudLayers = {surfelCombinedLayer};
+        drawLiveFrames(3U);
+        validateLiveReadback();
+        validateSortedNearSurfaceDominates();
+        renderAndValidateExport(true);
+
+        // Sprite and surfel layers share the same sorted-layer sequence. They
+        // are not grouped by geometry mode: the semantic SAND -> ROCK fallback
+        // can therefore keep the near surfel ROCK surface above the far sprite
+        // SAND surface in both preview and export.
+        layeredStyle.depthPrepassEnabled = false;
+        renderState.pointCloudLayers = {
+            makeLayer(
+                kRockLayerId,
+                invisible_places::water::WaterSurfaceRole::Rock),
+            makeLayer(
+                kSandLayerId,
+                invisible_places::water::WaterSurfaceRole::Sand),
+        };
+        renderState.pointCloudLayers[0].style.geometryMode =
+            PointCloudGeometryMode::WorldSurfels;
+        invisible_places::style::SetScalarConstant(
+            &renderState.pointCloudLayers[0].style.surfelDiameter,
+            0.16F);
+        renderState.pointCloudLayers[1].style.geometryMode =
+            PointCloudGeometryMode::ScreenSprites;
+        drawLiveFrames(3U);
+        validateLiveReadback();
+        validateSortedNearSurfaceDominates();
+        renderAndValidateExport(true);
+
+        // The shared soft-edge prepass must likewise accept surfel geometry.
+        // A broad tolerance keeps both surfaces in the blend band, exercising
+        // the sorted surfel hybrid pipeline rather than masking it by culling.
+        renderState.pointCloudLayers[0].style.depthPrepassEnabled = true;
+        renderState.pointCloudLayers[0].style.depthPrepassToleranceMeters =
+            0.50F;
+        renderState.pointCloudLayers[1].style.depthPrepassEnabled = true;
+        renderState.pointCloudLayers[1].style.depthPrepassToleranceMeters =
+            0.50F;
+        drawLiveFrames(3U);
+        validateLiveReadback();
+        validateSortedNearSurfaceDominates();
+        renderAndValidateExport(true);
+        renderState.pointCloudLayers = {combinedLayer};
 
         // Saturated emission, the back-face fade, and the soft-edge depth
         // prepass must also hold together on the weighted (non-sorted)
@@ -123227,15 +123602,36 @@ int RunPointDepthOptionsSmoke(
         weightedStyle.normalCullEndDegrees = 105.0F;
         const auto weightedDispatchesBefore =
             viewport->Diagnostics().pointDepthSortDispatchCount;
-        drawLiveFrames(3U);
+        constexpr std::array<PointCloudNormalCullReference, 3U>
+            kNormalCullReferences{
+                PointCloudNormalCullReference::ToCamera,
+                PointCloudNormalCullReference::CameraAxis,
+                PointCloudNormalCullReference::FixedVertical,
+            };
+        constexpr std::array<PointCloudGeometryMode, 2U> kGeometryModes{
+            PointCloudGeometryMode::ScreenSprites,
+            PointCloudGeometryMode::WorldSurfels,
+        };
+        for (const auto geometryMode : kGeometryModes) {
+            weightedStyle.geometryMode = geometryMode;
+            if (geometryMode == PointCloudGeometryMode::WorldSurfels) {
+                invisible_places::style::SetScalarConstant(
+                    &weightedStyle.surfelDiameter,
+                    0.16F);
+            }
+            for (const auto reference : kNormalCullReferences) {
+                weightedStyle.normalCullReference = reference;
+                drawLiveFrames(2U);
+                validateLiveReadback();
+                renderAndValidateExport(false);
+            }
+        }
         if (viewport->Diagnostics().pointDepthSortDispatchCount !=
             weightedDispatchesBefore) {
             throw std::runtime_error{
                 "Sort-free weighted rendering still dispatched the GPU "
                 "transparency sort."};
         }
-        validateLiveReadback();
-        renderAndValidateExport();
     } catch (const std::exception& error) {
         cleanup();
         std::cerr << "Point depth-options smoke failed: "
@@ -123245,7 +123641,7 @@ int RunPointDepthOptionsSmoke(
 
     cleanup();
     std::cout
-        << "GPU point sorting and soft-edge depth prepass smoke passed.\n";
+        << "GPU sprite/surfel sorting and soft-edge depth prepass smoke passed.\n";
     return 0;
 }
 
@@ -134924,9 +135320,14 @@ int RunAdaptiveHqSurfacePerformanceSmoke(
 // ground-truth PNG stacks, ProRes references, and MP4 replicas of the
 // delivery preset. Driven by INVISIBLE_PLACES_EXPORT_SEGMENT_SPECS, a
 // semicolon-separated list of label,visual,mode,start,end entries where
-// mode is png / prores4444xq / prores4444 / mp4hq / mp4hq-cpu. The
-// animation comes from INVISIBLE_PLACES_EXPORT_SEGMENT_ANIMATION (default
-// Surface_05a). Point the smoke at a duplicated project copy.
+// mode is png / prores422hq / prores422 / prores4444xq / prores4444 /
+// mp4hq / mp4hq-cpu. The animation comes from
+// INVISIBLE_PLACES_EXPORT_SEGMENT_ANIMATION (default Surface_05a). An optional
+// INVISIBLE_PLACES_EXPORT_SEGMENT_NORMAL_CULL_REFERENCE override accepts
+// to_camera / camera_axis / fixed_vertical. Optional depth-threshold,
+// tolerance, prepass, cull, and sort overrides support controlled flicker
+// ablations without editing the source project.
+// Point the smoke at a duplicated project copy.
 int RunExportSegmentLabSmoke(
     const GuiSmokeOptions& options,
     platform::Window* window,
@@ -135036,6 +135437,117 @@ int RunExportSegmentLabSmoke(
                  : runtimeState->errorMessage));
         return finish();
     }
+    std::optional<PointCloudNormalCullReference> normalCullReferenceOverride;
+    if (const char* reference = std::getenv(
+            "INVISIBLE_PLACES_EXPORT_SEGMENT_NORMAL_CULL_REFERENCE");
+        reference != nullptr && reference[0] != '\0') {
+        const std::string_view value{reference};
+        if (value == "to_camera") {
+            normalCullReferenceOverride =
+                PointCloudNormalCullReference::ToCamera;
+        } else if (value == "camera_axis") {
+            normalCullReferenceOverride =
+                PointCloudNormalCullReference::CameraAxis;
+        } else if (value == "fixed_vertical") {
+            normalCullReferenceOverride =
+                PointCloudNormalCullReference::FixedVertical;
+        } else {
+            failures.emplace_back(
+                "Unknown normal-cull reference override: " +
+                std::string{value});
+            return finish();
+        }
+        report["normal_cull_reference_override"] = value;
+    }
+    const auto parseFloatOverride = [&](const char* environmentName,
+                                        float minimum,
+                                        float maximum,
+                                        std::optional<float>* output) {
+        const char* text = std::getenv(environmentName);
+        if (text == nullptr || text[0] == '\0') {
+            return true;
+        }
+        char* end = nullptr;
+        const float value = std::strtof(text, &end);
+        if (end == text || end == nullptr || end[0] != '\0' ||
+            !std::isfinite(value) || value < minimum || value > maximum) {
+            failures.emplace_back(
+                std::string{"Invalid "} + environmentName + ": " + text);
+            return false;
+        }
+        *output = value;
+        report[environmentName] = value;
+        return true;
+    };
+    const auto parseBoolOverride = [&](const char* environmentName,
+                                       std::optional<bool>* output) {
+        const char* text = std::getenv(environmentName);
+        if (text == nullptr || text[0] == '\0') {
+            return true;
+        }
+        const std::string_view value{text};
+        if (value == "1" || value == "true" || value == "on") {
+            *output = true;
+        } else if (value == "0" || value == "false" || value == "off") {
+            *output = false;
+        } else {
+            failures.emplace_back(
+                std::string{"Invalid "} + environmentName + ": " + text);
+            return false;
+        }
+        report[environmentName] = output->value();
+        return true;
+    };
+    std::optional<float> depthAlphaThresholdOverride;
+    std::optional<float> depthToleranceOverride;
+    std::optional<bool> depthPrepassOverride;
+    std::optional<bool> normalCullEnabledOverride;
+    if (!parseFloatOverride(
+            "INVISIBLE_PLACES_EXPORT_SEGMENT_DEPTH_ALPHA_THRESHOLD",
+            0.0F,
+            1.0F,
+            &depthAlphaThresholdOverride) ||
+        !parseFloatOverride(
+            "INVISIBLE_PLACES_EXPORT_SEGMENT_DEPTH_TOLERANCE_METERS",
+            0.0F,
+            10.0F,
+            &depthToleranceOverride) ||
+        !parseBoolOverride(
+            "INVISIBLE_PLACES_EXPORT_SEGMENT_DEPTH_PREPASS_ENABLED",
+            &depthPrepassOverride) ||
+        !parseBoolOverride(
+            "INVISIBLE_PLACES_EXPORT_SEGMENT_NORMAL_CULL_ENABLED",
+            &normalCullEnabledOverride)) {
+        return finish();
+    }
+    struct SortOverride {
+        bool enabled = true;
+        PointCloudGpuSortMode mode = PointCloudGpuSortMode::FullAnimation;
+    };
+    std::optional<SortOverride> sortOverride;
+    if (const char* sort = std::getenv(
+            "INVISIBLE_PLACES_EXPORT_SEGMENT_GPU_SORT_MODE");
+        sort != nullptr && sort[0] != '\0') {
+        const std::string_view value{sort};
+        SortOverride parsed;
+        if (value == "off") {
+            parsed.enabled = false;
+        } else if (value == "per_frame") {
+            parsed.mode = PointCloudGpuSortMode::PerFrame;
+        } else if (value == "full_animation") {
+            parsed.mode = PointCloudGpuSortMode::FullAnimation;
+        } else if (value == "moving_average") {
+            parsed.mode = PointCloudGpuSortMode::MovingAverage;
+        } else if (value == "fixed_vertical") {
+            parsed.mode = PointCloudGpuSortMode::FixedVertical;
+        } else {
+            failures.emplace_back(
+                "Unknown GPU-sort override: " + std::string{value});
+            return finish();
+        }
+        sortOverride = parsed;
+        report["gpu_sort_mode_override"] = value;
+    }
     const char* animationEnv =
         std::getenv("INVISIBLE_PLACES_EXPORT_SEGMENT_ANIMATION");
     const std::string animationName =
@@ -135069,6 +135581,20 @@ int RunExportSegmentLabSmoke(
             return ExportBenchmarkVariant{
                 .mode = AnimationExportMode::PngStack,
                 .quality = AnimationExportQuality::Hq,
+                .useVideoToolbox = false,
+            };
+        }
+        if (mode == "prores422hq") {
+            return ExportBenchmarkVariant{
+                .mode = AnimationExportMode::ProRes422HqMov,
+                .quality = AnimationExportQuality::Hq,
+                .useVideoToolbox = false,
+            };
+        }
+        if (mode == "prores422") {
+            return ExportBenchmarkVariant{
+                .mode = AnimationExportMode::ProRes422Mov,
+                .quality = AnimationExportQuality::Normal,
                 .useVideoToolbox = false,
             };
         }
@@ -135124,6 +135650,47 @@ int RunExportSegmentLabSmoke(
         if (!warning.empty()) {
             std::cout << "Visual '" << spec.visual << "' warning: "
                       << warning << std::endl;
+        }
+        const bool hasStyleOverride =
+            normalCullReferenceOverride.has_value() ||
+            depthAlphaThresholdOverride.has_value() ||
+            depthToleranceOverride.has_value() ||
+            depthPrepassOverride.has_value() ||
+            normalCullEnabledOverride.has_value() ||
+            sortOverride.has_value();
+        if (hasStyleOverride) {
+            for (auto& session : runtimeState->sessions) {
+                if (session.kind == LayerKind::PointCloud &&
+                    IsSceneGroupedPointCloud(session)) {
+                    auto& style = session.pointStyle;
+                    if (normalCullReferenceOverride.has_value()) {
+                        style.normalCullReference =
+                            normalCullReferenceOverride.value();
+                    }
+                    if (depthAlphaThresholdOverride.has_value()) {
+                        style.depthPrepassAlphaThreshold =
+                            depthAlphaThresholdOverride.value();
+                    }
+                    if (depthToleranceOverride.has_value()) {
+                        style.depthPrepassToleranceMeters =
+                            depthToleranceOverride.value();
+                    }
+                    if (depthPrepassOverride.has_value()) {
+                        style.depthPrepassEnabled =
+                            depthPrepassOverride.value();
+                    }
+                    if (normalCullEnabledOverride.has_value()) {
+                        style.normalCullEnabled =
+                            normalCullEnabledOverride.value();
+                    }
+                    if (sortOverride.has_value()) {
+                        style.gpuBackToFrontSorting =
+                            sortOverride->enabled;
+                        style.gpuSortMode = sortOverride->mode;
+                    }
+                }
+            }
+            runtimeState->previewRenderStateSignatureValid = false;
         }
         const auto segmentDirectory = outputDirectory / spec.label;
         std::error_code createError;

@@ -2910,7 +2910,10 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
         PointCloudGpuSortMode::FixedVertical;
     pointStyle.gpuSortWindowSeconds = 2.75F;
     pointStyle.depthPrepassEnabled = true;
-    pointStyle.depthPrepassAlphaThreshold = 0.62F;
+    // The previous default must remain explicit after the safer 0.50 default
+    // is introduced, otherwise saving an older Visual would silently change
+    // its authored depth-core classification.
+    pointStyle.depthPrepassAlphaThreshold = 0.35F;
     pointStyle.depthPrepassToleranceMeters = 0.075F;
     pointStyle.depthWeightStrength = 5.25F;
     pointStyle.depthRolePolicy = invisible_places::renderer::pointcloud::
@@ -2935,6 +2938,8 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     pointStyle.normalCullEnabled = true;
     pointStyle.normalCullStartDegrees = 68.0F;
     pointStyle.normalCullEndDegrees = 122.0F;
+    pointStyle.normalCullReference = invisible_places::renderer::pointcloud::
+        PointCloudNormalCullReference::FixedVertical;
     pointStyle.flowAnimation = true;
     pointStyle.waterTrailOverlay = true;
     invisible_places::style::ConfigureFieldMapFromStats(
@@ -3018,6 +3023,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
         CHECK(savedJson.find("\"fixed_vertical\"") != std::string::npos);
         CHECK(savedJson.find("\"saturated\"") != std::string::npos);
         CHECK(savedJson.find("\"normal_cull_enabled\"") != std::string::npos);
+        CHECK(savedJson.find("\"normal_cull_reference\"") != std::string::npos);
         CHECK(savedJson.find("\"depth_prepass_enabled\"") != std::string::npos);
         CHECK(savedJson.find("\"depth_prepass_alpha_threshold\"") != std::string::npos);
         CHECK(savedJson.find("\"depth_prepass_tolerance_meters\"") != std::string::npos);
@@ -3498,7 +3504,7 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
             PointCloudGpuSortMode::FixedVertical);
     CHECK(loadedVisual.style.gpuSortWindowSeconds == Catch::Approx(2.75F));
     CHECK(loadedVisual.style.depthPrepassEnabled);
-    CHECK(loadedVisual.style.depthPrepassAlphaThreshold == Catch::Approx(0.62F));
+    CHECK(loadedVisual.style.depthPrepassAlphaThreshold == Catch::Approx(0.35F));
     CHECK(loadedVisual.style.depthPrepassToleranceMeters == Catch::Approx(0.075F));
     CHECK(loadedVisual.style.depthWeightStrength == Catch::Approx(5.25F));
     CHECK(
@@ -3541,6 +3547,10 @@ TEST_CASE("Project document round-trips binding-backed point-cloud styles", "[se
     CHECK(loadedVisual.style.normalCullEnabled);
     CHECK(loadedVisual.style.normalCullStartDegrees == Catch::Approx(68.0F));
     CHECK(loadedVisual.style.normalCullEndDegrees == Catch::Approx(122.0F));
+    CHECK(
+        loadedVisual.style.normalCullReference ==
+        invisible_places::renderer::pointcloud::
+            PointCloudNormalCullReference::FixedVertical);
     CHECK(loadedVisual.style.flowAnimation);
     CHECK(loadedVisual.style.waterTrailOverlay);
     CHECK(loadedVisual.style.pointSize.fieldMap.fieldSlot == 2);
@@ -9203,6 +9213,61 @@ TEST_CASE("Point alpha contribution policy is shared by preview and export selec
     CHECK_FALSE(invisible_places::renderer::pointcloud::PointCloudAlphaContributesDepth(0.0F));
     CHECK_FALSE(invisible_places::renderer::pointcloud::PointCloudAlphaContributesDepth(-0.01F));
     CHECK(invisible_places::renderer::pointcloud::PointCloudAlphaContributesDepth(0.01F));
+}
+
+TEST_CASE(
+    "Half-alpha soft-depth core excludes temporally unstable translucent fringes",
+    "[point-style][depth-prepass][stability]") {
+    using invisible_places::renderer::pointcloud::
+        kDefaultPointCloudDepthPrepassAlphaThreshold;
+    using invisible_places::renderer::pointcloud::
+        PointCloudAlphaWritesSoftDepth;
+    using invisible_places::renderer::pointcloud::
+        SanitizePointCloudDepthPrepassAlphaThreshold;
+
+    CHECK(kDefaultPointCloudDepthPrepassAlphaThreshold ==
+          Catch::Approx(0.50F));
+    CHECK(PointCloudAlphaWritesSoftDepth(0.50F, 0.50F));
+    CHECK_FALSE(PointCloudAlphaWritesSoftDepth(0.499F, 0.50F));
+    CHECK_FALSE(PointCloudAlphaWritesSoftDepth(
+        std::numeric_limits<float>::quiet_NaN(),
+        0.50F));
+    CHECK(SanitizePointCloudDepthPrepassAlphaThreshold(
+              std::numeric_limits<float>::quiet_NaN()) ==
+          Catch::Approx(0.50F));
+    CHECK(SanitizePointCloudDepthPrepassAlphaThreshold(-1.0F) ==
+          Catch::Approx(0.0F));
+    CHECK(SanitizePointCloudDepthPrepassAlphaThreshold(2.0F) ==
+          Catch::Approx(1.0F));
+
+    // Representative Gaussian/AA fringe coverage straddles the former 0.35
+    // threshold as a point moves by subpixels, but never reaches a true
+    // half-alpha core. The conservative threshold prevents that fringe from
+    // alternately becoming the hard owner of a shared depth pixel.
+    constexpr std::array<float, 5U> kMovingFringeAlpha{
+        0.34F,
+        0.42F,
+        0.33F,
+        0.47F,
+        0.32F,
+    };
+    const auto ownershipTransitions = [&](float threshold) {
+        std::size_t transitions = 0U;
+        bool previous = PointCloudAlphaWritesSoftDepth(
+            kMovingFringeAlpha.front(), threshold);
+        for (std::size_t index = 1U;
+             index < kMovingFringeAlpha.size();
+             ++index) {
+            const bool current = PointCloudAlphaWritesSoftDepth(
+                kMovingFringeAlpha[index], threshold);
+            transitions += current != previous ? 1U : 0U;
+            previous = current;
+        }
+        return transitions;
+    };
+    CHECK(ownershipTransitions(0.35F) == 4U);
+    CHECK(ownershipTransitions(
+              kDefaultPointCloudDepthPrepassAlphaThreshold) == 0U);
 }
 
 TEST_CASE("Point material variant resolver selects simple and unified paths", "[point-style]") {
@@ -14883,7 +14948,10 @@ TEST_CASE("Point-cloud defaults choose the fastest preview path", "[pointcloud][
             PointCloudGpuSortMode::PerFrame);
     CHECK(style.gpuSortWindowSeconds == Catch::Approx(1.0F));
     CHECK_FALSE(style.depthPrepassEnabled);
-    CHECK(style.depthPrepassAlphaThreshold == Catch::Approx(0.35F));
+    CHECK(style.depthPrepassAlphaThreshold ==
+          Catch::Approx(
+              invisible_places::renderer::pointcloud::
+                  kDefaultPointCloudDepthPrepassAlphaThreshold));
     CHECK(style.depthPrepassToleranceMeters == Catch::Approx(0.02F));
     CHECK(style.depthWeightStrength == Catch::Approx(1.0F));
     CHECK(
@@ -14893,6 +14961,10 @@ TEST_CASE("Point-cloud defaults choose the fastest preview path", "[pointcloud][
     CHECK_FALSE(style.normalCullEnabled);
     CHECK(style.normalCullStartDegrees == Catch::Approx(75.0F));
     CHECK(style.normalCullEndDegrees == Catch::Approx(105.0F));
+    CHECK(
+        style.normalCullReference ==
+        invisible_places::renderer::pointcloud::
+            PointCloudNormalCullReference::ToCamera);
     CHECK(ResolvePointCloudMaterialVariant(style) == PointCloudMaterialVariant::OpaqueHardDisc);
 
     auto movingStyle = style;
@@ -15056,6 +15128,8 @@ TEST_CASE("Fast Basic point-cloud style override keeps cheap colour controls", "
     style.emissionResponse = invisible_places::renderer::pointcloud::
         PointCloudEmissionResponse::Saturated;
     style.normalCullEnabled = true;
+    style.normalCullReference = invisible_places::renderer::pointcloud::
+        PointCloudNormalCullReference::CameraAxis;
     style.surfaceStabilityPolicy = invisible_places::renderer::pointcloud::
         PointCloudSurfaceStabilityPolicy::StableRoles;
     style.effectiveSurfaceStabilityMode = invisible_places::renderer::pointcloud::
@@ -15089,6 +15163,10 @@ TEST_CASE("Fast Basic point-cloud style override keeps cheap colour controls", "
         invisible_places::renderer::pointcloud::
             PointCloudEmissionResponse::Accumulated);
     CHECK_FALSE(fast.normalCullEnabled);
+    CHECK(
+        fast.normalCullReference ==
+        invisible_places::renderer::pointcloud::
+            PointCloudNormalCullReference::CameraAxis);
     CHECK(
         fast.surfaceStabilityPolicy ==
         invisible_places::renderer::pointcloud::

@@ -100,7 +100,9 @@ void main() {
     if (alpha <= 1e-5 ||
         styleData.renderControl.x == 0u ||
         styleData.renderControl.x == 3u ||
-        (styleData.renderControl.x == 1u && alpha < clamp(styleData.renderParams3.x, 0.0, 1.0)) ||
+        // Density compensation is an optical parity correction and can differ
+        // by semantic layer. Keep geometric depth ownership independent of it.
+        (styleData.renderControl.x == 1u && rawAlpha < clamp(styleData.renderParams3.x, 0.0, 1.0)) ||
         (styleData.renderControl.x == 2u && !PointCloudDepthCoveragePasses(inDiscCoord, styleData.renderParams2.x))) {
         discard;
     }

@@ -12,7 +12,9 @@
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <glm/geometric.hpp>
 #include <glm/mat4x4.hpp>
+#include <glm/vec3.hpp>
 
 namespace {
 
@@ -1190,6 +1192,190 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "Normal-cull references remove pan-dependent fades without quadrant asymmetry",
+    "[pointcloud][normal-cull][stability]") {
+    using invisible_places::renderer::pointcloud::
+        PointCloudNormalCullReference;
+    using invisible_places::renderer::pointcloud::PointCloudStyleState;
+    using invisible_places::renderer::pointcloud::
+        ResolvePointCloudNormalCullFade;
+
+    PointCloudStyleState style;
+    style.normalCullEnabled = true;
+    style.normalCullStartDegrees = 75.0F;
+    style.normalCullEndDegrees = 105.0F;
+
+    const glm::vec3 normal = glm::normalize(glm::vec3{0.8F, 0.0F, 0.6F});
+    const glm::vec3 point{0.0F, 0.0F, 0.0F};
+    const glm::vec3 viewAxisToCamera{0.0F, 0.0F, 1.0F};
+    const glm::vec3 cameraAbove{0.0F, 0.0F, 5.0F};
+    const glm::vec3 cameraAcross{-5.0F, 0.0F, 5.0F};
+
+    style.normalCullReference = PointCloudNormalCullReference::ToCamera;
+    const float perspectiveAbove = ResolvePointCloudNormalCullFade(
+        style, normal, point, cameraAbove, viewAxisToCamera);
+    const float perspectiveAcross = ResolvePointCloudNormalCullFade(
+        style, normal, point, cameraAcross, viewAxisToCamera);
+    CHECK(perspectiveAbove > 0.99F);
+    CHECK(perspectiveAcross < perspectiveAbove - 0.25F);
+
+    style.normalCullReference = PointCloudNormalCullReference::CameraAxis;
+    const float axisAbove = ResolvePointCloudNormalCullFade(
+        style, normal, point, cameraAbove, viewAxisToCamera);
+    const float axisAcross = ResolvePointCloudNormalCullFade(
+        style, normal, point, cameraAcross, viewAxisToCamera);
+    CHECK(axisAbove == Catch::Approx(axisAcross).margin(1.0e-6F));
+
+    style.normalCullReference = PointCloudNormalCullReference::FixedVertical;
+    const float verticalAbove = ResolvePointCloudNormalCullFade(
+        style,
+        normal,
+        point,
+        cameraAbove,
+        glm::vec3{1.0F, 0.0F, 0.0F});
+    const float verticalAcross = ResolvePointCloudNormalCullFade(
+        style,
+        normal,
+        point,
+        cameraAcross,
+        glm::vec3{-1.0F, 0.0F, 0.0F});
+    CHECK(verticalAbove == Catch::Approx(verticalAcross).margin(1.0e-6F));
+
+    // Mirroring both the stored normal and camera across a quadrant cannot
+    // change a dot-product facing decision; this guards against accidentally
+    // reintroducing atan/signed-angle logic here or in its shader mirror.
+    style.normalCullReference = PointCloudNormalCullReference::ToCamera;
+    const float positiveQuadrant = ResolvePointCloudNormalCullFade(
+        style,
+        glm::vec3{1.0F, 0.0F, 0.0F},
+        point,
+        glm::vec3{0.2F, 0.0F, 1.0F},
+        viewAxisToCamera);
+    const float negativeQuadrant = ResolvePointCloudNormalCullFade(
+        style,
+        glm::vec3{-1.0F, 0.0F, 0.0F},
+        point,
+        glm::vec3{-0.2F, 0.0F, 1.0F},
+        viewAxisToCamera);
+    CHECK(positiveQuadrant ==
+          Catch::Approx(negativeQuadrant).margin(1.0e-6F));
+
+    const float invalid = std::numeric_limits<float>::quiet_NaN();
+    CHECK(ResolvePointCloudNormalCullFade(
+              style,
+              glm::vec3{invalid, 0.0F, 1.0F},
+              point,
+              cameraAbove,
+              viewAxisToCamera) == Catch::Approx(1.0F));
+
+    style.normalCullReference =
+        static_cast<PointCloudNormalCullReference>(99U);
+    CHECK(ResolvePointCloudNormalCullFade(
+              style,
+              normal,
+              point,
+              cameraAcross,
+              viewAxisToCamera) == Catch::Approx(perspectiveAcross));
+
+    style.normalCullReference = PointCloudNormalCullReference::FixedVertical;
+    style.normalCullStartDegrees = invalid;
+    style.normalCullEndDegrees = invalid;
+    CHECK(std::isfinite(ResolvePointCloudNormalCullFade(
+        style,
+        normal,
+        point,
+        cameraAbove,
+        viewAxisToCamera)));
+}
+
+TEST_CASE(
+    "Back-face fade removes depth ownership for sprites and world surfels",
+    "[output][offline][pointcloud][normal-cull][surfel]") {
+    using invisible_places::renderer::pointcloud::
+        PointCloudColorMode;
+    using invisible_places::renderer::pointcloud::
+        PointCloudFalloffProfile;
+    using invisible_places::renderer::pointcloud::
+        PointCloudGeometryMode;
+    using invisible_places::renderer::pointcloud::
+        PointCloudNormalCullReference;
+    using invisible_places::renderer::pointcloud::
+        PointCloudStyleState;
+
+    const auto render = [](PointCloudGeometryMode geometryMode,
+                           float normalZ) {
+        invisible_places::io::LoadedPointCloud cloud;
+        cloud.positions = {{0.0F, 0.0F, 0.0F}};
+        cloud.packedColors = {0xFFFFFFFFU};
+        cloud.normals = {{0.0F, 0.0F, normalZ}};
+        cloud.hasSourceRgb = true;
+        cloud.hasNormals = true;
+
+        PointCloudStyleState style;
+        style.geometryMode = geometryMode;
+        style.colorMode = PointCloudColorMode::SourceRgb;
+        style.falloffProfile = PointCloudFalloffProfile::HardDisc;
+        style.normalCullEnabled = true;
+        style.normalCullReference =
+            PointCloudNormalCullReference::FixedVertical;
+        style.normalCullStartDegrees = 75.0F;
+        style.normalCullEndDegrees = 105.0F;
+        style.depthPrepassEnabled = true;
+        style.depthPrepassAlphaThreshold = 0.50F;
+        invisible_places::style::SetScalarConstant(
+            &style.pointSize,
+            9.0F);
+        invisible_places::style::SetScalarConstant(
+            &style.surfelDiameter,
+            0.50F);
+        invisible_places::style::SetScalarConstant(
+            &style.opacity,
+            1.0F);
+
+        const invisible_places::output::OfflinePointLayer layer{
+            .cloud = &cloud,
+            .style = style,
+            .hasSourceRgb = true,
+            .localToWorld = glm::mat4{1.0F},
+        };
+        invisible_places::camera::CameraState cameraState;
+        cameraState.position = {0.0F, 0.0F, 5.0F};
+        cameraState.target = {0.0F, 0.0F, 0.0F};
+        cameraState.nearPlane = 0.1F;
+        cameraState.farPlane = 20.0F;
+
+        invisible_places::output::ExrImage image;
+        invisible_places::output::InitializeExrImage(
+            &image,
+            17U,
+            17U);
+        invisible_places::output::RenderPointCloudTile(
+            {layer},
+            cameraState,
+            invisible_places::output::OfflineRenderTile{
+                0U,
+                0U,
+                17U,
+                17U},
+            &image);
+        return image;
+    };
+
+    constexpr std::size_t kCenter = 8U * 17U + 8U;
+    for (const auto geometryMode : {
+             PointCloudGeometryMode::ScreenSprites,
+             PointCloudGeometryMode::WorldSurfels,
+         }) {
+        const auto front = render(geometryMode, 1.0F);
+        const auto back = render(geometryMode, -1.0F);
+        REQUIRE(front.alpha[kCenter] > 0.0F);
+        CHECK(back.alpha[kCenter] ==
+              Catch::Approx(0.0F).margin(1.0e-6F));
+        CHECK_FALSE(std::isfinite(back.depth[kCenter]));
+    }
+}
+
+TEST_CASE(
     "Soft-edge depth prepass rejects deep points but preserves its tolerance band",
     "[output][offline][pointcloud][depth-prepass]") {
     auto render = [](bool depthPrepassEnabled,
@@ -1260,4 +1446,114 @@ TEST_CASE(
     const float strongerFrontToBack =
         strongerWeight.beautyR[kCenter] / strongerWeight.beautyB[kCenter];
     CHECK(strongerFrontToBack > originalFrontToBack * 1.5F);
+}
+
+TEST_CASE(
+    "Role-separated layers share soft depth independent of submission order",
+    "[output][offline][pointcloud][depth-prepass][scene]") {
+    using namespace invisible_places::renderer::pointcloud;
+
+    invisible_places::io::LoadedPointCloud rockCloud;
+    rockCloud.positions = {{0.0F, 0.0F, 0.0F}};
+    rockCloud.packedColors = {0xFF0000FFU};
+    rockCloud.hasSourceRgb = true;
+
+    invisible_places::io::LoadedPointCloud sandCloud;
+    sandCloud.positions = {{0.0F, 0.0F, -0.45F}};
+    sandCloud.packedColors = {0xFFFF0000U};
+    sandCloud.hasSourceRgb = true;
+
+    invisible_places::io::LoadedPointCloud vegetationCloud;
+    vegetationCloud.positions = {{0.0F, 0.0F, -0.90F}};
+    vegetationCloud.packedColors = {0xFF00FF00U};
+    vegetationCloud.hasSourceRgb = true;
+
+    PointCloudStyleState style;
+    style.colorMode = PointCloudColorMode::SourceRgb;
+    style.falloffProfile = PointCloudFalloffProfile::Gaussian;
+    style.gaussianSharpness = 4.0F;
+    style.depthPrepassEnabled = true;
+    style.depthPrepassAlphaThreshold =
+        kDefaultPointCloudDepthPrepassAlphaThreshold;
+    style.depthPrepassToleranceMeters = 0.02F;
+    style.depthRolePolicy = PointCloudDepthRolePolicy::RockOccluder;
+    invisible_places::style::SetScalarConstant(&style.pointSize, 9.0F);
+    invisible_places::style::SetScalarConstant(&style.opacity, 0.8F);
+
+    const auto makeLayer = [](const invisible_places::io::LoadedPointCloud* cloud,
+                              PointCloudStyleState layerStyle,
+                              float coverageCorrection) {
+        return invisible_places::output::OfflinePointLayer{
+            .cloud = cloud,
+            .style = std::move(layerStyle),
+            .hasSourceRgb = true,
+            .localToWorld = glm::mat4{1.0F},
+            .densityCompensation = {
+                .footprintScale = 1.0F,
+                .coverageCorrection = coverageCorrection,
+            },
+        };
+    };
+    const auto rock = makeLayer(
+        &rockCloud,
+        MakePointCloudStyleForSceneRole(style, "ROCK"),
+        0.246F);
+    const auto sand = makeLayer(
+        &sandCloud,
+        MakePointCloudStyleForSceneRole(style, "SAND"),
+        0.68F);
+    const auto vegetation = makeLayer(
+        &vegetationCloud,
+        MakePointCloudStyleForSceneRole(style, "VEG"),
+        0.246F);
+
+    const auto render = [](std::vector<invisible_places::output::OfflinePointLayer> layers) {
+        invisible_places::camera::CameraState cameraState;
+        cameraState.position = {0.0F, 0.0F, 5.0F};
+        cameraState.target = {0.0F, 0.0F, 0.0F};
+        cameraState.nearPlane = 0.1F;
+        cameraState.farPlane = 20.0F;
+        invisible_places::output::ExrImage image;
+        invisible_places::output::InitializeExrImage(&image, 17U, 17U);
+        invisible_places::output::RenderPointCloudTile(
+            layers,
+            cameraState,
+            invisible_places::output::OfflineRenderTile{0U, 0U, 17U, 17U},
+            &image);
+        return image;
+    };
+
+    constexpr std::size_t kCenter = 8U * 17U + 8U;
+    const auto rockOnly = render({rock});
+    const auto rockThenSand = render({rock, sand});
+    const auto sandThenRock = render({sand, rock});
+    REQUIRE(rockThenSand.beautyR[kCenter] > 0.0F);
+    CHECK(rockThenSand.beautyB[kCenter] ==
+          Catch::Approx(0.0F).margin(1.0e-6F));
+    CHECK(sandThenRock.beautyR[kCenter] ==
+          Catch::Approx(rockThenSand.beautyR[kCenter]).margin(1.0e-6F));
+    CHECK(sandThenRock.beautyB[kCenter] ==
+          Catch::Approx(0.0F).margin(1.0e-6F));
+    CHECK(rockThenSand.alpha[kCenter] ==
+          Catch::Approx(rockOnly.alpha[kCenter]).margin(1.0e-6F));
+    CHECK(sandThenRock.alpha[kCenter] ==
+          Catch::Approx(rockOnly.alpha[kCenter]).margin(1.0e-6F));
+
+    // The recommended role policy deliberately leaves sparse vegetation as
+    // an overlay. Uniform participation instead makes the same rear point
+    // compete for, and test against, the shared nearest surface.
+    const auto vegetationOverlay = render({rock, vegetation});
+    CHECK(vegetationOverlay.beautyG[kCenter] > 0.0F);
+    style.depthRolePolicy = PointCloudDepthRolePolicy::Uniform;
+    const auto uniformRock = makeLayer(
+        &rockCloud,
+        MakePointCloudStyleForSceneRole(style, "ROCK"),
+        0.246F);
+    const auto uniformVegetation = makeLayer(
+        &vegetationCloud,
+        MakePointCloudStyleForSceneRole(style, "VEG"),
+        0.68F);
+    const auto vegetationCulled = render({uniformVegetation, uniformRock});
+    CHECK(vegetationCulled.beautyG[kCenter] ==
+          Catch::Approx(0.0F).margin(1.0e-6F));
 }

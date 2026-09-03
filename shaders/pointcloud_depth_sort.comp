@@ -4,13 +4,13 @@
 // many buckets avoids the serial cost and temporary storage of an exact radix
 // sort while preserving the important far-to-near ordering between surfaces.
 //
-// The scatter phase allocates within-bucket slots with atomics, so two points
-// in the same bucket land in scheduler order — a different permutation every
-// dispatch, which reads as flicker wherever overlapping points share a
-// bucket. Two measures keep that raciness invisible: depth occupies enough
-// key bits that only near-coplanar points can tie, and a per-point hash
-// occupies the lowest key bits so even coplanar overlapping neighbours keep
-// one fixed relative order across re-sorts and camera angles.
+// The scatter phase allocates within-bucket slots with atomics, so points in
+// one complete key can land in scheduler order. The identity hash spreads
+// coherent near-coplanar neighbours across adjacent keys, but it cannot make
+// keys unique for 10M+ point layers. FullAnimation and FixedVertical avoid
+// temporal churn by caching one dispatched result; PerFrame and MovingAverage
+// remain approximate modes and may reorder the residual ties when they
+// deliberately dispatch again.
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0, std430) readonly buffer PointPositions {
@@ -79,9 +79,8 @@ uint SortBucket(uint pointIndex) {
     const uint depthBucket = min(
         uint(normalizedDepth * float(depthBucketCount - 1u)),
         depthBucketCount - 1u);
-    // Knuth multiplicative hash: decorrelates the tiebreak from upload order
-    // so overlapping neighbours almost never share a full key, whichever
-    // source-index pattern produced them.
+    // Knuth multiplicative hash: decorrelates the small tiebreak from upload
+    // order and reduces coherent same-key runs. It is not a uniqueness key.
     const uint indexHash =
         (pointIndex * 2654435761u) >> (32u - kIndexHashBucketBits);
     return (depthBucket << kIndexHashBucketBits) | indexHash;

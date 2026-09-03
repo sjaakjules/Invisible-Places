@@ -329,6 +329,8 @@ enum class PointCloudExrFrameStatus {
     Running,
     Ready,
 };
+// Running covers both an executing band and the gap where the next band was
+// just submitted; callers only ever act on Ready.
 
 struct PointCloudExrFrameRequest {
     SceneRenderState renderState{};
@@ -336,6 +338,13 @@ struct PointCloudExrFrameRequest {
     std::uint32_t height = 0;
     bool previewDensity = true;
     PointCloudExrReadbackMask readbackMask = PointCloudExrReadbackMask::All;
+    // When non-zero, the offscreen frame is rendered as a sequence of
+    // horizontal bands of about this many rows, each its own queue
+    // submission. Between bands the interactive UI's own submissions can
+    // run, so one enormous supersampled frame no longer parks the shared
+    // graphics queue for its full duration. Zero renders the historical
+    // single submission.
+    std::uint32_t gpuBandRows = 0;
 };
 
 struct PointHighlightStyle {
@@ -1027,6 +1036,10 @@ class VulkanViewportShell {
         VkPipeline pointSortedDepthAovPipeline = VK_NULL_HANDLE;
         VkPipeline pointSortedAlphaPipeline = VK_NULL_HANDLE;
         VkPipeline pointSortedAlphaHybridPipeline = VK_NULL_HANDLE;
+        VkRenderPass renderPassLoad = VK_NULL_HANDLE;
+        VkPipeline surfelSortedDepthAovPipeline = VK_NULL_HANDLE;
+        VkPipeline surfelSortedAlphaPipeline = VK_NULL_HANDLE;
+        VkPipeline surfelSortedAlphaHybridPipeline = VK_NULL_HANDLE;
         VkPipeline pointSortedEmissionCompositePipeline = VK_NULL_HANDLE;
         VkPipeline surfelDepthPipeline = VK_NULL_HANDLE;
         VkPipeline surfelAccumulationPipeline = VK_NULL_HANDLE;
@@ -1216,7 +1229,10 @@ class VulkanViewportShell {
         std::uint32_t height,
         bool enableEyeDomeLighting,
         PointCloudExrReadbackMask readbackMask);
-    void CreateExrExportRenderPass(ExrExportResources* resources);
+    void CreateExrExportRenderPass(
+        ExrExportResources* resources,
+        bool loadPersistentAttachments,
+        VkRenderPass* renderPass);
     void CreateExrExportPipelines(ExrExportResources* resources);
     void CreateExrExportEyeDomeLightingResources(ExrExportResources* resources);
     void CreateFramebuffers();
@@ -1343,7 +1359,11 @@ class VulkanViewportShell {
         VkCommandBuffer commandBuffer,
         std::uint32_t imageIndex,
         bool sceneRendered);
-    void RecordExrExportCommandBuffer(const PointCloudExrFrameRequest& request);
+    void RecordExrExportCommandBuffer(
+        const PointCloudExrFrameRequest& request,
+        const VkRect2D* bandScissor = nullptr,
+        bool loadPersistentAttachments = false,
+        bool recordReadbackCopies = true);
     [[nodiscard]] invisible_places::output::HalfRgbaExrImage
     ReadCompletedExrExportFrame(PointCloudExrReadbackMask readbackMask, std::uint32_t width, std::uint32_t height);
     [[nodiscard]] bool SceneImageNeedsRender(std::uint32_t imageIndex) const;
@@ -1377,7 +1397,8 @@ class VulkanViewportShell {
         std::size_t frameIndex,
         std::uint32_t imageIndex,
         bool exrStyle,
-        std::uint32_t* recordedDrawPointCount = nullptr);
+        std::uint32_t* recordedDrawPointCount = nullptr,
+        bool drawSortedPointOrder = false);
     [[nodiscard]] bool RecordPointCloudHighlightDraw(
         VkCommandBuffer commandBuffer,
         const SceneRenderState::PointCloudLayerState& layer,
@@ -1469,6 +1490,9 @@ class VulkanViewportShell {
     VkPipeline pointSortedDepthAovPipeline_ = VK_NULL_HANDLE;
     VkPipeline pointSortedAlphaPipeline_ = VK_NULL_HANDLE;
     VkPipeline pointSortedAlphaHybridPipeline_ = VK_NULL_HANDLE;
+    VkPipeline surfelSortedDepthAovPipeline_ = VK_NULL_HANDLE;
+    VkPipeline surfelSortedAlphaPipeline_ = VK_NULL_HANDLE;
+    VkPipeline surfelSortedAlphaHybridPipeline_ = VK_NULL_HANDLE;
     VkPipeline pointSortedEmissionCompositePipeline_ = VK_NULL_HANDLE;
     VkPipeline pointDepthSortPipeline_ = VK_NULL_HANDLE;
     VkPipeline dynamicMeshFlowComputePipeline_ = VK_NULL_HANDLE;
@@ -1562,6 +1586,12 @@ class VulkanViewportShell {
     std::uint32_t lastSubmittedImageIndex_ = 0U;
     bool lastSubmittedSceneImageValid_ = false;
     bool exrExportFrameInFlight_ = false;
+    // Remaining band rectangles of the in-flight offscreen frame, submitted
+    // one at a time from PollPointCloudExrFrame as each fence signals. The
+    // tweaked render state is retained so later bands re-record identically.
+    std::vector<VkRect2D> exrExportPendingBands_;
+    SceneRenderState exrExportBandRenderState_{};
+    PointCloudExrFrameRequest exrExportBandRequest_{};
     std::uint32_t exrLastRecordedLayerCount_ = 0U;
     std::uint64_t exrLastRecordedPointCount_ = 0U;
     std::uint32_t exrExportInFlightWidth_ = 0;

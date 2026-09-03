@@ -10,6 +10,7 @@
 
 #include <glm/geometric.hpp>
 #include <glm/mat4x4.hpp>
+#include <glm/trigonometric.hpp>
 #include <glm/matrix.hpp>
 #include <glm/vec3.hpp>
 #include <glm/vec4.hpp>
@@ -595,6 +596,21 @@ bool PointCloudAlphaContributesDepth(float alpha) {
     return alpha > kMaterialEpsilon;
 }
 
+float SanitizePointCloudDepthPrepassAlphaThreshold(float threshold) {
+    return std::clamp(
+        std::isfinite(threshold)
+            ? threshold
+            : kDefaultPointCloudDepthPrepassAlphaThreshold,
+        0.0F,
+        1.0F);
+}
+
+bool PointCloudAlphaWritesSoftDepth(float alpha, float threshold) {
+    return std::isfinite(alpha) &&
+           PointCloudAlphaContributesDepth(alpha) &&
+           alpha >= SanitizePointCloudDepthPrepassAlphaThreshold(threshold);
+}
+
 bool PointCloudStyleHasActiveStylisation(const PointCloudStyleState& style) {
     return style.stylisationMode != PointCloudStylisationMode::Off &&
            style.stylisationStrength > kMaterialEpsilon;
@@ -776,6 +792,81 @@ bool PointCloudDepthPrepassTests(const PointCloudStyleState& style) {
                PointCloudDepthParticipation::Disabled;
 }
 
+float ResolvePointCloudNormalCullFade(
+    const PointCloudStyleState& style,
+    const glm::vec3& worldNormal,
+    const glm::vec3& worldPosition,
+    const glm::vec3& cameraPosition,
+    const glm::vec3& cameraAxisToCamera) {
+    const auto finiteVector = [](const glm::vec3& value) {
+        return std::isfinite(value.x) && std::isfinite(value.y) &&
+               std::isfinite(value.z);
+    };
+    if (!style.normalCullEnabled ||
+        !finiteVector(worldNormal) ||
+        glm::dot(worldNormal, worldNormal) <= 1.0e-8F) {
+        return 1.0F;
+    }
+
+    glm::vec3 referenceDirection{0.0F, 0.0F, 1.0F};
+    switch (style.normalCullReference) {
+        case PointCloudNormalCullReference::ToCamera:
+            referenceDirection = cameraPosition - worldPosition;
+            break;
+        case PointCloudNormalCullReference::CameraAxis:
+            referenceDirection = cameraAxisToCamera;
+            break;
+        case PointCloudNormalCullReference::FixedVertical:
+            break;
+        default:
+            referenceDirection = cameraPosition - worldPosition;
+            break;
+    }
+    if (!finiteVector(referenceDirection)) {
+        return 1.0F;
+    }
+    const float referenceLengthSquared =
+        glm::dot(referenceDirection, referenceDirection);
+    if (referenceLengthSquared <= 1.0e-12F) {
+        return 1.0F;
+    }
+
+    const float startDegrees = std::clamp(
+        std::isfinite(style.normalCullStartDegrees)
+            ? style.normalCullStartDegrees
+            : 75.0F,
+        0.0F,
+        179.0F);
+    const float requestedEndDegrees =
+        std::isfinite(style.normalCullEndDegrees)
+            ? style.normalCullEndDegrees
+            : 105.0F;
+    const float endDegrees = std::clamp(
+        std::max(requestedEndDegrees, startDegrees + 1.0F),
+        1.0F,
+        180.0F);
+    const float facingCosine = std::clamp(
+        glm::dot(
+            glm::normalize(worldNormal),
+            referenceDirection / std::sqrt(referenceLengthSquared)),
+        -1.0F,
+        1.0F);
+    if (!std::isfinite(facingCosine)) {
+        return 1.0F;
+    }
+    const float hiddenCosine = std::cos(glm::radians(endDegrees));
+    const float visibleCosine = std::cos(glm::radians(startDegrees));
+    const float width = visibleCosine - hiddenCosine;
+    if (!std::isfinite(width) || width <= 1.0e-6F) {
+        return facingCosine < hiddenCosine ? 0.0F : 1.0F;
+    }
+    const float t = std::clamp(
+        (facingCosine - hiddenCosine) / width,
+        0.0F,
+        1.0F);
+    return t * t * (3.0F - (2.0F * t));
+}
+
 float ResolvePointCloudSurfaceStabilityWeight(
     PointCloudSurfaceStabilityMode mode,
     std::uint32_t packedWeights,
@@ -943,6 +1034,7 @@ PointCloudStyleState MakeFastBasicPointCloudStyle(
     style.normalCullEnabled = false;
     style.normalCullStartDegrees = sourceStyle.normalCullStartDegrees;
     style.normalCullEndDegrees = sourceStyle.normalCullEndDegrees;
+    style.normalCullReference = sourceStyle.normalCullReference;
     // The linked overlap analysis is a geometry selection, not a Beauty
     // material effect. Preserve it so Fast Basic can apply the same stable
     // choice as fixed opaque point coverage in its vertex path.

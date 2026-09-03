@@ -48,6 +48,7 @@ using invisible_places::renderer::pointcloud::PointCloudSurfaceStabilityPolicy;
 using invisible_places::renderer::pointcloud::PointCloudFalloffProfile;
 using invisible_places::renderer::pointcloud::PointCloudGeometryMode;
 using invisible_places::renderer::pointcloud::PointCloudGpuSortMode;
+using invisible_places::renderer::pointcloud::PointCloudNormalCullReference;
 using invisible_places::renderer::pointcloud::PointCloudEmissionResponse;
 using invisible_places::renderer::pointcloud::PointCloudFoamFrontsShorelineSettings;
 using invisible_places::renderer::pointcloud::PointCloudHeightFoamShorelineSettings;
@@ -60,6 +61,10 @@ using invisible_places::renderer::pointcloud::PointCloudStylisationMode;
 using invisible_places::renderer::pointcloud::PointCloudShorelineWaveAlgorithm;
 using invisible_places::renderer::pointcloud::PointCloudShorelineWaveProfile;
 using invisible_places::renderer::pointcloud::PointCloudShorelineWaveSettings;
+using invisible_places::renderer::pointcloud::
+    kDefaultPointCloudDepthPrepassAlphaThreshold;
+using invisible_places::renderer::pointcloud::
+    SanitizePointCloudDepthPrepassAlphaThreshold;
 
 struct LegacyAnimationLoopSmoothingKeyAdjustment {
     std::string keyId;
@@ -577,6 +582,34 @@ PointCloudGpuSortMode ParsePointCloudGpuSortMode(const json& value) {
         return PointCloudGpuSortMode::FixedVertical;
     }
     return PointCloudGpuSortMode::PerFrame;
+}
+
+const char* PointCloudNormalCullReferenceName(
+    PointCloudNormalCullReference reference) {
+    switch (reference) {
+        case PointCloudNormalCullReference::ToCamera:
+            return "to_camera";
+        case PointCloudNormalCullReference::CameraAxis:
+            return "camera_axis";
+        case PointCloudNormalCullReference::FixedVertical:
+            return "fixed_vertical";
+    }
+    return "to_camera";
+}
+
+PointCloudNormalCullReference ParsePointCloudNormalCullReference(
+    const json& value) {
+    if (!value.is_string()) {
+        return PointCloudNormalCullReference::ToCamera;
+    }
+    const auto name = value.get<std::string>();
+    if (name == "camera_axis" || name == "view_axis") {
+        return PointCloudNormalCullReference::CameraAxis;
+    }
+    if (name == "fixed_vertical" || name == "world_up") {
+        return PointCloudNormalCullReference::FixedVertical;
+    }
+    return PointCloudNormalCullReference::ToCamera;
 }
 
 const char* PointCloudDepthRolePolicyName(PointCloudDepthRolePolicy policy) {
@@ -1470,9 +1503,13 @@ json SerializePointCloudStyle(const PointCloudStyleState& style) {
     if (style.depthPrepassEnabled) {
         styleJson["depth_prepass_enabled"] = true;
     }
-    if (style.depthPrepassAlphaThreshold != 0.35F) {
+    const float depthPrepassAlphaThreshold =
+        SanitizePointCloudDepthPrepassAlphaThreshold(
+            style.depthPrepassAlphaThreshold);
+    if (depthPrepassAlphaThreshold !=
+        kDefaultPointCloudDepthPrepassAlphaThreshold) {
         styleJson["depth_prepass_alpha_threshold"] =
-            style.depthPrepassAlphaThreshold;
+            depthPrepassAlphaThreshold;
     }
     if (style.depthPrepassToleranceMeters != 0.02F) {
         styleJson["depth_prepass_tolerance_meters"] =
@@ -1538,6 +1575,11 @@ json SerializePointCloudStyle(const PointCloudStyleState& style) {
     }
     if (style.normalCullEndDegrees != 105.0F) {
         styleJson["normal_cull_end_degrees"] = style.normalCullEndDegrees;
+    }
+    if (style.normalCullReference !=
+        PointCloudNormalCullReference::ToCamera) {
+        styleJson["normal_cull_reference"] =
+            PointCloudNormalCullReferenceName(style.normalCullReference);
     }
     return styleJson;
 }
@@ -2218,12 +2260,11 @@ PointCloudStyleState ParsePointCloudStyle(const json& styleJson) {
         3600.0F);
     style.depthPrepassEnabled =
         styleJson.value("depth_prepass_enabled", style.depthPrepassEnabled);
-    style.depthPrepassAlphaThreshold = std::clamp(
-        styleJson.value(
-            "depth_prepass_alpha_threshold",
-            style.depthPrepassAlphaThreshold),
-        0.0F,
-        1.0F);
+    style.depthPrepassAlphaThreshold =
+        SanitizePointCloudDepthPrepassAlphaThreshold(
+            styleJson.value(
+                "depth_prepass_alpha_threshold",
+                style.depthPrepassAlphaThreshold));
     style.depthPrepassToleranceMeters = std::clamp(
         styleJson.value(
             "depth_prepass_tolerance_meters",
@@ -2288,6 +2329,10 @@ PointCloudStyleState ParsePointCloudStyle(const json& styleJson) {
     }
     style.normalCullEnabled =
         styleJson.value("normal_cull_enabled", style.normalCullEnabled);
+    if (styleJson.contains("normal_cull_reference")) {
+        style.normalCullReference = ParsePointCloudNormalCullReference(
+            styleJson.at("normal_cull_reference"));
+    }
     style.normalCullStartDegrees = std::clamp(
         styleJson.value(
             "normal_cull_start_degrees",

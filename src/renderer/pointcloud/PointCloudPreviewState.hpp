@@ -4,6 +4,7 @@
 #include "style/RenderParameterBinding.hpp"
 
 #include <glm/mat4x4.hpp>
+#include <glm/vec3.hpp>
 
 #include <algorithm>
 #include <array>
@@ -25,6 +26,10 @@ inline constexpr float kInactiveOpacityDefault = 1.0F;
 inline constexpr float kInactiveEmissionDefault = 0.0F;
 inline constexpr float kInactiveDepthFadeDefault = 0.0F;
 inline constexpr float kInactiveColormapPositionDefault = 0.5F;
+// A half-alpha core keeps Gaussian/AA fringes out of the hard depth surface.
+// Lower thresholds let marginal coverage become an occluder and can make a
+// rear surface alternate between accepted/rejected as points cross pixels.
+inline constexpr float kDefaultPointCloudDepthPrepassAlphaThreshold = 0.50F;
 inline constexpr std::size_t kTimingColouriseMaxEffects = 8U;
 inline constexpr std::size_t kTimingColouriseLutSamples = 64U;
 // Keep these renderer payload limits in lockstep with the authored timing
@@ -366,6 +371,17 @@ enum class PointCloudGpuSortMode : std::uint32_t {
     FixedVertical = 3U,
 };
 
+// Chooses the direction used by the optional stored-normal back-face fade.
+// ToCamera preserves the perspective-correct historical behaviour. CameraAxis
+// removes screen-position dependence during a parallel pan, while FixedVertical
+// is completely camera-independent and pairs with FixedVertical point sorting
+// for top-down animation passes.
+enum class PointCloudNormalCullReference : std::uint32_t {
+    ToCamera = 0U,
+    CameraAxis = 1U,
+    FixedVertical = 2U,
+};
+
 // Saved policy for deciding which semantic scene roles contribute to and
 // consume the soft-edge depth surface. Uniform preserves the historical
 // behaviour. RockOccluder keeps ROCK self-occlusion, lets SAND receive that
@@ -645,8 +661,7 @@ struct PointCloudStyleState {
     bool solidCenters = true;
     // Advanced transparency controls are deliberately opt-in so existing
     // named visuals retain their established weighted-blended appearance and
-    // render cost. GPU sorting currently applies to screen-sprite geometry;
-    // surfel geometry keeps weighted blended transparency.
+    // render cost. GPU sorting applies to both sprite and surfel geometry.
     bool gpuBackToFrontSorting = false;
     PointCloudGpuSortMode gpuSortMode = PointCloudGpuSortMode::PerFrame;
     // Symmetric animation-time window used by MovingAverage. Seconds keep the
@@ -657,7 +672,8 @@ struct PointCloudStyleState {
     // soft/Gaussian neighbours blendable while rejecting genuinely deeper
     // surfaces (for example the ground below an overhang).
     bool depthPrepassEnabled = false;
-    float depthPrepassAlphaThreshold = 0.35F;
+    float depthPrepassAlphaThreshold =
+        kDefaultPointCloudDepthPrepassAlphaThreshold;
     float depthPrepassToleranceMeters = 0.02F;
     PointCloudDepthRolePolicy depthRolePolicy =
         PointCloudDepthRolePolicy::Uniform;
@@ -697,12 +713,14 @@ struct PointCloudStyleState {
         PointCloudEmissionResponse::Accumulated;
     // Fades points whose stored normal faces away from the camera — for
     // example back-facing survey returns seen through an overhang from
-    // above. Fully visible up to the start angle (normal vs the direction to
-    // the camera), hidden beyond the end angle, smooth between. Points
-    // without normals are never culled.
+    // above. Fully visible up to the start angle against the selected
+    // reference direction, hidden beyond the end angle, smooth between.
+    // Points without normals are never culled.
     bool normalCullEnabled = false;
     float normalCullStartDegrees = 75.0F;
     float normalCullEndDegrees = 105.0F;
+    PointCloudNormalCullReference normalCullReference =
+        PointCloudNormalCullReference::ToCamera;
     bool flowAnimation = false;
     bool waterPathView = false;
     bool waterTrailOverlay = false;
@@ -773,6 +791,16 @@ struct PointCloudSessionState {
 
 std::uint64_t ClampPointBudget(std::uint64_t totalPoints, std::uint64_t requestedPoints);
 [[nodiscard]] bool PointCloudAlphaContributesDepth(float alpha);
+[[nodiscard]] float SanitizePointCloudDepthPrepassAlphaThreshold(
+    float threshold);
+// Mirrors the soft-depth fragment-pass decision using geometric/core alpha
+// before optical display-density correction. This keeps depth ownership
+// invariant across preview/export density and scene role. Non-finite alpha
+// never owns depth; a non-finite threshold falls back to the stable half-alpha
+// core.
+[[nodiscard]] bool PointCloudAlphaWritesSoftDepth(
+    float alpha,
+    float threshold);
 [[nodiscard]] bool PointCloudStyleHasActiveRoughnessMotion(const PointCloudStyleState& style);
 [[nodiscard]] bool TimingColouriseStackHasActiveEffects(
     const ResolvedTimingColouriseStack& stack);
@@ -784,6 +812,15 @@ std::uint64_t ClampPointBudget(std::uint64_t totalPoints, std::uint64_t requeste
     const PointCloudStyleState& style);
 [[nodiscard]] bool PointCloudDepthPrepassTests(
     const PointCloudStyleState& style);
+// CPU mirror of the GPU normal-fade direction and angular guard. Invalid or
+// degenerate inputs leave the point visible instead of introducing NaNs into
+// opacity/depth ownership.
+[[nodiscard]] float ResolvePointCloudNormalCullFade(
+    const PointCloudStyleState& style,
+    const glm::vec3& worldNormal,
+    const glm::vec3& worldPosition,
+    const glm::vec3& cameraPosition,
+    const glm::vec3& cameraAxisToCamera);
 [[nodiscard]] float ResolvePointCloudSurfaceStabilityWeight(
     PointCloudSurfaceStabilityMode mode,
     std::uint32_t packedWeights,

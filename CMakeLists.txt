@@ -138,6 +138,28 @@ add_custom_command(
 )
 list(APPEND INVISIBLE_PLACES_SHADER_OUTPUTS "${SHADER_OUTPUT}")
 
+set(SHADER_OUTPUT "${INVISIBLE_PLACES_SHADER_OUTPUT_DIR}/pointcloud_surfel_sorted.vert.spv")
+add_custom_command(
+    OUTPUT "${SHADER_OUTPUT}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${INVISIBLE_PLACES_SHADER_OUTPUT_DIR}"
+    COMMAND "${GLSLANG_VALIDATOR_EXECUTABLE}" -V --target-env vulkan1.2 -DSORTED_SURFEL=1 -I"${CMAKE_CURRENT_SOURCE_DIR}/shaders" -o "${SHADER_OUTPUT}" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_surfel.vert"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_surfel.vert" ${INVISIBLE_PLACES_SHADER_INCLUDES}
+    COMMENT "Compiling shader shaders/pointcloud_surfel.vert (sorted)"
+    VERBATIM
+)
+list(APPEND INVISIBLE_PLACES_SHADER_OUTPUTS "${SHADER_OUTPUT}")
+
+set(SHADER_OUTPUT "${INVISIBLE_PLACES_SHADER_OUTPUT_DIR}/pointcloud_surfel_sorted_depth_prepass.vert.spv")
+add_custom_command(
+    OUTPUT "${SHADER_OUTPUT}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${INVISIBLE_PLACES_SHADER_OUTPUT_DIR}"
+    COMMAND "${GLSLANG_VALIDATOR_EXECUTABLE}" -V --target-env vulkan1.2 -DSORTED_SURFEL=1 -DDEPTH_PREPASS=1 -I"${CMAKE_CURRENT_SOURCE_DIR}/shaders" -o "${SHADER_OUTPUT}" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_surfel.vert"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_surfel.vert" ${INVISIBLE_PLACES_SHADER_INCLUDES}
+    COMMENT "Compiling shader shaders/pointcloud_surfel.vert (sorted depth prepass)"
+    VERBATIM
+)
+list(APPEND INVISIBLE_PLACES_SHADER_OUTPUTS "${SHADER_OUTPUT}")
+
 set(SHADER_OUTPUT "${INVISIBLE_PLACES_SHADER_OUTPUT_DIR}/pointcloud_sorted_alpha.frag.spv")
 add_custom_command(
     OUTPUT "${SHADER_OUTPUT}"
@@ -156,6 +178,28 @@ add_custom_command(
     COMMAND "${GLSLANG_VALIDATOR_EXECUTABLE}" -V --target-env vulkan1.2 -DPOINTCLOUD_SORTED_ALPHA=1 -I"${CMAKE_CURRENT_SOURCE_DIR}/shaders" -o "${SHADER_OUTPUT}" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_exr_accumulation.frag"
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_exr_accumulation.frag" ${INVISIBLE_PLACES_SHADER_INCLUDES}
     COMMENT "Compiling shader shaders/pointcloud_exr_accumulation.frag (sorted alpha)"
+    VERBATIM
+)
+list(APPEND INVISIBLE_PLACES_SHADER_OUTPUTS "${SHADER_OUTPUT}")
+
+set(SHADER_OUTPUT "${INVISIBLE_PLACES_SHADER_OUTPUT_DIR}/pointcloud_surfel_sorted_alpha.frag.spv")
+add_custom_command(
+    OUTPUT "${SHADER_OUTPUT}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${INVISIBLE_PLACES_SHADER_OUTPUT_DIR}"
+    COMMAND "${GLSLANG_VALIDATOR_EXECUTABLE}" -V --target-env vulkan1.2 -DPOINTCLOUD_SORTED_ALPHA=1 -I"${CMAKE_CURRENT_SOURCE_DIR}/shaders" -o "${SHADER_OUTPUT}" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_surfel_accumulation.frag"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_surfel_accumulation.frag" ${INVISIBLE_PLACES_SHADER_INCLUDES}
+    COMMENT "Compiling shader shaders/pointcloud_surfel_accumulation.frag (sorted alpha)"
+    VERBATIM
+)
+list(APPEND INVISIBLE_PLACES_SHADER_OUTPUTS "${SHADER_OUTPUT}")
+
+set(SHADER_OUTPUT "${INVISIBLE_PLACES_SHADER_OUTPUT_DIR}/pointcloud_surfel_exr_sorted_alpha.frag.spv")
+add_custom_command(
+    OUTPUT "${SHADER_OUTPUT}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${INVISIBLE_PLACES_SHADER_OUTPUT_DIR}"
+    COMMAND "${GLSLANG_VALIDATOR_EXECUTABLE}" -V --target-env vulkan1.2 -DPOINTCLOUD_SORTED_ALPHA=1 -I"${CMAKE_CURRENT_SOURCE_DIR}/shaders" -o "${SHADER_OUTPUT}" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_surfel_exr_accumulation.frag"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/pointcloud_surfel_exr_accumulation.frag" ${INVISIBLE_PLACES_SHADER_INCLUDES}
+    COMMENT "Compiling shader shaders/pointcloud_surfel_exr_accumulation.frag (sorted alpha)"
     VERBATIM
 )
 list(APPEND INVISIBLE_PLACES_SHADER_OUTPUTS "${SHADER_OUTPUT}")

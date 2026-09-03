@@ -58,6 +58,88 @@ constexpr float kPointCloudAntialiasFeatherPixels = 1.0F;
            renderer::pointcloud::PointCloudRendererMode::FastBasic;
 }
 
+[[nodiscard]] bool IsSortedAlphaPointLayer(
+    renderer::pointcloud::PointCloudRendererMode requestedMode,
+    const SceneRenderState::PointCloudLayerState& layer) {
+    return !PointCloudLayerUsesFastBasicRenderer(requestedMode, layer) &&
+           layer.style.gpuBackToFrontSorting;
+}
+
+[[nodiscard]] bool IsSemanticSurveyPointLayer(
+    const SceneRenderState::PointCloudLayerState& layer) {
+    if (layer.generatedWaterOverlay) {
+        return false;
+    }
+    return layer.rainCollisionRole ==
+               invisible_places::water::WaterSurfaceRole::Rock ||
+           layer.rainCollisionRole ==
+               invisible_places::water::WaterSurfaceRole::Sand ||
+           layer.rainCollisionRole ==
+               invisible_places::water::WaterSurfaceRole::Vegetation;
+}
+
+[[nodiscard]] int SemanticSurveyCompositePriority(
+    const SceneRenderState::PointCloudLayerState& layer) {
+    // Each resource is sorted internally, but separate resources cannot be
+    // interleaved by the per-source compute pass. Use the semantic surface
+    // relationship as the deterministic fallback: SAND is the receiving
+    // ground, ROCK owns the ledge/surface boundary, and sparse VEG remains an
+    // overlay. With the shared prepass this is only a tiebreak inside its
+    // accepted depth band; without it this avoids the ordinary session order
+    // (ROCK, then SAND) painting the complete SAND layer over ROCK.
+    switch (layer.rainCollisionRole) {
+        case invisible_places::water::WaterSurfaceRole::Sand:
+            return 0;
+        case invisible_places::water::WaterSurfaceRole::Rock:
+            return 1;
+        case invisible_places::water::WaterSurfaceRole::Vegetation:
+            return 2;
+        case invisible_places::water::WaterSurfaceRole::None:
+        case invisible_places::water::WaterSurfaceRole::Ground:
+            break;
+    }
+    return 1;
+}
+
+[[nodiscard]] std::vector<const SceneRenderState::PointCloudLayerState*>
+SortedAlphaPointLayerDrawOrder(const SceneRenderState& renderState) {
+    std::vector<const SceneRenderState::PointCloudLayerState*> ordered;
+    ordered.reserve(renderState.pointCloudLayers.size());
+    // Keep sprite and surfel layers in one sequence. Geometry selects the
+    // draw pipeline later; it must never create a second ordering group.
+    for (const auto& layer : renderState.pointCloudLayers) {
+        if (IsSortedAlphaPointLayer(
+                renderState.pointCloudRendererMode,
+                layer)) {
+            ordered.push_back(&layer);
+        }
+    }
+
+    // Reorder only contiguous runs of canonical survey roles. Standalone
+    // clouds and generated overlays retain their authored/session position.
+    std::size_t runBegin = 0U;
+    while (runBegin < ordered.size()) {
+        if (!IsSemanticSurveyPointLayer(*ordered[runBegin])) {
+            ++runBegin;
+            continue;
+        }
+        std::size_t runEnd = runBegin + 1U;
+        while (runEnd < ordered.size() &&
+               IsSemanticSurveyPointLayer(*ordered[runEnd])) {
+            ++runEnd;
+        }
+        std::stable_sort(
+            ordered.begin() + static_cast<std::ptrdiff_t>(runBegin),
+            ordered.begin() + static_cast<std::ptrdiff_t>(runEnd),
+            [](const auto* left, const auto* right) {
+                return SemanticSurveyCompositePriority(*left) <
+                       SemanticSurveyCompositePriority(*right);
+            });
+        runBegin = runEnd;
+    }
+    return ordered;
+}
+
 struct QueueFamilySelection {
     std::optional<std::uint32_t> graphicsFamily;
     std::optional<std::uint32_t> presentFamily;
@@ -216,13 +298,18 @@ struct alignas(16) PointCloudStyleGpu {
     // Appended so every established std140 offset remains stable. x: core
     // alpha threshold, y: view-space tolerance metres, z: depth-weight
     // strength, w: GPU back-to-front sorting enabled.
-    glm::vec4 depthCompositingParams{0.35F, 0.02F, 1.0F, 0.0F};
+    glm::vec4 depthCompositingParams{
+        renderer::pointcloud::kDefaultPointCloudDepthPrepassAlphaThreshold,
+        0.02F,
+        1.0F,
+        0.0F};
     // x: emission response (0 accumulated, 1 saturated per-fragment fold),
     // y: back-face fade enabled, z/w: cosine of the fade start/end angles
-    // between the point normal and the direction to the camera.
+    // between the point normal and its selected reference direction.
     glm::vec4 emissionNormalControl{0.0F, 0.0F, 1.0F, -1.0F};
     // x: PointCloudSurfaceStabilityMode, y: packed RGBA8 scalar slot (or
-    // UINT_MAX when the validated sidecar is unavailable). z/w: spare.
+    // UINT_MAX when the validated sidecar is unavailable), z:
+    // PointCloudNormalCullReference, w: spare.
     glm::uvec4 surfaceStabilityControl{
         0U,
         std::numeric_limits<std::uint32_t>::max(),
@@ -255,11 +342,12 @@ struct alignas(16) PointDepthSortPushConstants {
     glm::vec4 depth{0.05F, 1000.0F, 0.0F, 0.0F};
 };
 
-// 2^17 logarithmic depth buckets keep same-key ties to near-coplanar points
-// (sub-millimetre at survey working distances), and the low 3 bits carry a
-// per-point hash so even those ties resolve to one fixed order instead of
-// the scatter phase's scheduler order. The hash width must match
-// kIndexHashBucketBits in pointcloud_depth_sort.comp.
+// 2^17 logarithmic depth buckets confine same-depth-key ties to near-coplanar
+// points (sub-millimetre at survey working distances), and the low 3 bits
+// spread coherent source neighbours before the atomic scatter. Those bits do
+// not make 10M+ point keys unique; temporal stability comes from caching the
+// dispatched result in FullAnimation/FixedVertical modes. The hash width must
+// match kIndexHashBucketBits in pointcloud_depth_sort.comp.
 constexpr std::uint32_t kPointDepthSortBucketCount = 1'048'576U;
 constexpr std::uint32_t kPointDepthSortWorkgroupSize = 256U;
 // Vulkan guarantees at least 65,535 compute groups in both X and Y. Use the
@@ -1814,6 +1902,18 @@ VulkanViewportShell::~VulkanViewportShell() {
         vkDestroyPipeline(
             device_,
             pointSortedAlphaHybridPipeline_,
+            nullptr);
+    }
+    if (surfelSortedDepthAovPipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device_, surfelSortedDepthAovPipeline_, nullptr);
+    }
+    if (surfelSortedAlphaPipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device_, surfelSortedAlphaPipeline_, nullptr);
+    }
+    if (surfelSortedAlphaHybridPipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(
+            device_,
+            surfelSortedAlphaHybridPipeline_,
             nullptr);
     }
     if (pointSortedEmissionCompositePipeline_ != VK_NULL_HANDLE) {
@@ -7266,7 +7366,42 @@ bool VulkanViewportShell::BeginPointCloudExrFrame(const PointCloudExrFrameReques
             vkResetCommandBuffer(exrExportResources_.commandBuffer, 0),
             "vkResetCommandBuffer(exr)");
         UploadFrameUniformsToBuffer(exrExportResources_.uniformBuffer, request.width, request.height);
-        RecordExrExportCommandBuffer(request);
+        exrExportPendingBands_.clear();
+        // Eye-dome lighting samples depth across neighbouring pixels, so a
+        // band boundary would read rows the frame has not rendered yet;
+        // banding is skipped for EDL frames.
+        const std::uint32_t bandRows =
+            needsEyeDomeLightingResources ? 0U : request.gpuBandRows;
+        if (bandRows > 0U && request.height > bandRows) {
+            for (std::uint32_t row = 0U; row < request.height;
+                 row += bandRows) {
+                exrExportPendingBands_.push_back(VkRect2D{
+                    {0, static_cast<std::int32_t>(row)},
+                    {request.width,
+                     std::min(bandRows, request.height - row)},
+                });
+            }
+        }
+        if (exrExportPendingBands_.empty()) {
+            RecordExrExportCommandBuffer(request);
+        } else {
+            // Band 0 uses the clearing pass with a full-frame render area
+            // (one background clear for the whole frame) but draws only its
+            // own rows; the remaining bands are resubmitted from the poll
+            // as each fence signals, letting UI submissions interleave.
+            const VkRect2D firstBand = exrExportPendingBands_.front();
+            exrExportPendingBands_.erase(exrExportPendingBands_.begin());
+            // Later bands re-record with the exact tweaked layer state this
+            // frame rendered with, and the full request (its render state
+            // still supplies the clear colour and EDL controls).
+            exrExportBandRenderState_ = renderState_;
+            exrExportBandRequest_ = request;
+            RecordExrExportCommandBuffer(
+                request,
+                &firstBand,
+                false,
+                exrExportPendingBands_.empty());
+        }
 
         VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         submitInfo.commandBufferCount = 1;
@@ -7290,6 +7425,43 @@ PointCloudExrFrameStatus VulkanViewportShell::PollPointCloudExrFrame() {
     }
     const VkResult status = vkGetFenceStatus(device_, exrExportResources_.fence);
     if (status == VK_SUCCESS) {
+        if (!exrExportPendingBands_.empty()) {
+            // The previous band finished; submit the next one. Each band is
+            // its own submission, so interactive frames slot in between.
+            const VkRect2D band = exrExportPendingBands_.front();
+            exrExportPendingBands_.erase(exrExportPendingBands_.begin());
+            Check(
+                vkResetFences(device_, 1, &exrExportResources_.fence),
+                "vkResetFences(exr band)");
+            Check(
+                vkResetCommandBuffer(exrExportResources_.commandBuffer, 0),
+                "vkResetCommandBuffer(exr band)");
+            const auto previousRenderState = renderState_;
+            renderState_ = exrExportBandRenderState_;
+            try {
+                RecordExrExportCommandBuffer(
+                    exrExportBandRequest_,
+                    &band,
+                    true,
+                    exrExportPendingBands_.empty());
+            } catch (...) {
+                renderState_ = previousRenderState;
+                exrExportPendingBands_.clear();
+                throw;
+            }
+            renderState_ = previousRenderState;
+            VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            submitInfo.commandBufferCount = 1;
+            submitInfo.pCommandBuffers = &exrExportResources_.commandBuffer;
+            Check(
+                vkQueueSubmit(
+                    graphicsQueue_,
+                    1,
+                    &submitInfo,
+                    exrExportResources_.fence),
+                "vkQueueSubmit(exr band)");
+            return PointCloudExrFrameStatus::Running;
+        }
         return PointCloudExrFrameStatus::Ready;
     }
     if (status == VK_NOT_READY) {
@@ -8938,10 +9110,16 @@ void VulkanViewportShell::CreatePointPipelines() {
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel.vert.spv").string());
     const auto surfelPrepassVertexShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_depth_prepass.vert.spv").string());
+    const auto surfelSortedVertexShaderCode =
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_sorted.vert.spv").string());
+    const auto surfelSortedPrepassVertexShaderCode =
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_sorted_depth_prepass.vert.spv").string());
     const auto surfelDepthFragmentShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_export_depth.frag.spv").string());
     const auto surfelAccumulationFragmentShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_accumulation.frag.spv").string());
+    const auto surfelSortedAlphaFragmentShaderCode =
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_sorted_alpha.frag.spv").string());
     const auto surfelConstantSimpleVertexShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_constant_simple.vert.spv").string());
     const auto surfelConstantSimpleFragmentShaderCode =
@@ -8972,10 +9150,16 @@ void VulkanViewportShell::CreatePointPipelines() {
         CreateShaderModule(device_, surfelVertexShaderCode, "vkCreateShaderModule(surfel vertex)");
     const auto surfelPrepassVertexModule =
         CreateShaderModule(device_, surfelPrepassVertexShaderCode, "vkCreateShaderModule(surfel prepass vertex)");
+    const auto surfelSortedVertexModule =
+        CreateShaderModule(device_, surfelSortedVertexShaderCode, "vkCreateShaderModule(sorted surfel vertex)");
+    const auto surfelSortedPrepassVertexModule =
+        CreateShaderModule(device_, surfelSortedPrepassVertexShaderCode, "vkCreateShaderModule(sorted surfel prepass vertex)");
     const auto surfelDepthFragmentModule =
         CreateShaderModule(device_, surfelDepthFragmentShaderCode, "vkCreateShaderModule(surfel depth fragment)");
     const auto surfelAccumulationFragmentModule =
         CreateShaderModule(device_, surfelAccumulationFragmentShaderCode, "vkCreateShaderModule(surfel accumulation fragment)");
+    const auto surfelSortedAlphaFragmentModule =
+        CreateShaderModule(device_, surfelSortedAlphaFragmentShaderCode, "vkCreateShaderModule(surfel sorted alpha fragment)");
     const auto surfelConstantSimpleVertexModule =
         CreateShaderModule(device_, surfelConstantSimpleVertexShaderCode, "vkCreateShaderModule(surfel simple vertex)");
     const auto surfelConstantSimpleFragmentModule =
@@ -9008,6 +9192,16 @@ void VulkanViewportShell::CreatePointPipelines() {
     surfelPrepassVertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
     surfelPrepassVertexStage.module = surfelPrepassVertexModule;
     surfelPrepassVertexStage.pName = "main";
+
+    VkPipelineShaderStageCreateInfo surfelSortedVertexStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    surfelSortedVertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    surfelSortedVertexStage.module = surfelSortedVertexModule;
+    surfelSortedVertexStage.pName = "main";
+
+    VkPipelineShaderStageCreateInfo surfelSortedPrepassVertexStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    surfelSortedPrepassVertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    surfelSortedPrepassVertexStage.module = surfelSortedPrepassVertexModule;
+    surfelSortedPrepassVertexStage.pName = "main";
 
     VkPipelineShaderStageCreateInfo constantSimpleVertexStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
     constantSimpleVertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -9048,6 +9242,24 @@ void VulkanViewportShell::CreatePointPipelines() {
 
     VkPipelineVertexInputStateCreateInfo surfelVertexInputInfo{
         VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+
+    const VkVertexInputBindingDescription sortedSurfelBindingDescription{
+        0U,
+        sizeof(std::uint32_t),
+        VK_VERTEX_INPUT_RATE_INSTANCE};
+    const VkVertexInputAttributeDescription sortedSurfelAttributeDescription{
+        0U,
+        0U,
+        VK_FORMAT_R32_UINT,
+        0U};
+    VkPipelineVertexInputStateCreateInfo sortedSurfelVertexInputInfo{
+        VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    sortedSurfelVertexInputInfo.vertexBindingDescriptionCount = 1U;
+    sortedSurfelVertexInputInfo.pVertexBindingDescriptions =
+        &sortedSurfelBindingDescription;
+    sortedSurfelVertexInputInfo.vertexAttributeDescriptionCount = 1U;
+    sortedSurfelVertexInputInfo.pVertexAttributeDescriptions =
+        &sortedSurfelAttributeDescription;
 
     VkPipelineInputAssemblyStateCreateInfo surfelInputAssembly{
         VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
@@ -9291,6 +9503,48 @@ void VulkanViewportShell::CreatePointPipelines() {
         &surfelDepthPrepassPipeline_);
 
     createPointPipeline(
+        surfelSortedPrepassVertexStage,
+        sortedSurfelVertexInputInfo,
+        surfelInputAssembly,
+        surfelDepthFragmentModule,
+        0,
+        std::vector<VkPipelineColorBlendAttachmentState>{linearDepthBlend},
+        true,
+        false,
+        VK_COMPARE_OP_LESS_OR_EQUAL,
+        "vkCreateGraphicsPipelines(surfel sorted depth AOV)",
+        &surfelSortedDepthAovPipeline_);
+
+    createPointPipeline(
+        surfelSortedVertexStage,
+        sortedSurfelVertexInputInfo,
+        surfelInputAssembly,
+        surfelSortedAlphaFragmentModule,
+        4,
+        std::vector<VkPipelineColorBlendAttachmentState>{
+            MakeAlphaBlendAttachment(),
+            MakeAdditiveBlendAttachment()},
+        true,
+        false,
+        VK_COMPARE_OP_LESS_OR_EQUAL,
+        "vkCreateGraphicsPipelines(surfel sorted alpha)",
+        &surfelSortedAlphaPipeline_);
+    createPointPipeline(
+        surfelSortedVertexStage,
+        sortedSurfelVertexInputInfo,
+        surfelInputAssembly,
+        surfelSortedAlphaFragmentModule,
+        4,
+        std::vector<VkPipelineColorBlendAttachmentState>{
+            MakeAlphaBlendAttachment(),
+            MakeAdditiveBlendAttachment()},
+        false,
+        false,
+        VK_COMPARE_OP_ALWAYS,
+        "vkCreateGraphicsPipelines(surfel sorted alpha hybrid depth)",
+        &surfelSortedAlphaHybridPipeline_);
+
+    createPointPipeline(
         surfelVertexStage,
         surfelVertexInputInfo,
         surfelInputAssembly,
@@ -9354,8 +9608,11 @@ void VulkanViewportShell::CreatePointPipelines() {
     vkDestroyShaderModule(device_, surfelOpaqueHardDiscFragmentModule, nullptr);
     vkDestroyShaderModule(device_, surfelConstantSimpleFragmentModule, nullptr);
     vkDestroyShaderModule(device_, surfelConstantSimpleVertexModule, nullptr);
+    vkDestroyShaderModule(device_, surfelSortedAlphaFragmentModule, nullptr);
     vkDestroyShaderModule(device_, surfelAccumulationFragmentModule, nullptr);
     vkDestroyShaderModule(device_, surfelDepthFragmentModule, nullptr);
+    vkDestroyShaderModule(device_, surfelSortedPrepassVertexModule, nullptr);
+    vkDestroyShaderModule(device_, surfelSortedVertexModule, nullptr);
     vkDestroyShaderModule(device_, surfelPrepassVertexModule, nullptr);
     vkDestroyShaderModule(device_, surfelVertexModule, nullptr);
     vkDestroyShaderModule(device_, constantSimpleFragmentModule, nullptr);
@@ -9676,7 +9933,8 @@ void VulkanViewportShell::CreateExrExportResources(
 
     std::vector<PendingPointDescriptorGeneration> stagedPointGenerations;
     try {
-        CreateExrExportRenderPass(&resources);
+        CreateExrExportRenderPass(&resources, false, &resources.renderPass);
+        CreateExrExportRenderPass(&resources, true, &resources.renderPassLoad);
         CreateExrExportPipelines(&resources);
 
         const VkImageUsageFlags colorPostProcessUsage =
@@ -9933,8 +10191,11 @@ void VulkanViewportShell::CreateExrExportEyeDomeLightingResources(
         nullptr);
 }
 
-void VulkanViewportShell::CreateExrExportRenderPass(ExrExportResources* resources) {
-    if (resources == nullptr) {
+void VulkanViewportShell::CreateExrExportRenderPass(
+    ExrExportResources* resources,
+    bool loadPersistentAttachments,
+    VkRenderPass* renderPass) {
+    if (resources == nullptr || renderPass == nullptr) {
         return;
     }
 
@@ -10004,6 +10265,19 @@ void VulkanViewportShell::CreateExrExportRenderPass(ExrExportResources* resource
     linearDepthAttachment.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
 
     VkAttachmentDescription aovOutputAttachment = colorAttachment;
+    if (loadPersistentAttachments) {
+        // Later bands of one frame must preserve what earlier bands stored.
+        // Persistent (STORE) attachments load their previous contents from
+        // the layout the first band left them in; per-band scratch
+        // attachments stay CLEAR because their lifetime is one band's pass
+        // and the render area is confined to that band.
+        for (VkAttachmentDescription* persistent :
+             {&colorAttachment, &linearDepthAttachment,
+              &aovOutputAttachment}) {
+            persistent->loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+            persistent->initialLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        }
+    }
 
     VkAttachmentReference linearDepthColorRef{5, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
     VkAttachmentReference finalColorRef{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
@@ -10247,7 +10521,7 @@ void VulkanViewportShell::CreateExrExportRenderPass(ExrExportResources* resource
     renderPassInfo.pSubpasses = subpasses.data();
     renderPassInfo.dependencyCount = static_cast<std::uint32_t>(dependencies.size());
     renderPassInfo.pDependencies = dependencies.data();
-    Check(vkCreateRenderPass(device_, &renderPassInfo, nullptr, &resources->renderPass), "vkCreateRenderPass(exr)");
+    Check(vkCreateRenderPass(device_, &renderPassInfo, nullptr, renderPass), "vkCreateRenderPass(exr)");
 }
 
 void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources) {
@@ -10284,6 +10558,12 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_depth_prepass.vert.spv").string());
     const auto surfelAccumulationFragmentShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_exr_accumulation.frag.spv").string());
+    const auto surfelSortedVertexShaderCode =
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_sorted.vert.spv").string());
+    const auto surfelSortedPrepassVertexShaderCode =
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_sorted_depth_prepass.vert.spv").string());
+    const auto surfelSortedAlphaFragmentShaderCode =
+        ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_exr_sorted_alpha.frag.spv").string());
     const auto surfelConstantSimpleVertexShaderCode =
         ReadBinaryFile((std::filesystem::path{INVISIBLE_PLACES_SHADER_OUTPUT_DIR} / "pointcloud_surfel_constant_simple.vert.spv").string());
     const auto surfelConstantSimpleFragmentShaderCode =
@@ -10326,6 +10606,12 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
         CreateShaderModule(device_, surfelPrepassVertexShaderCode, "vkCreateShaderModule(exr surfel prepass vertex)");
     const auto surfelAccumulationFragmentModule =
         CreateShaderModule(device_, surfelAccumulationFragmentShaderCode, "vkCreateShaderModule(exr surfel accumulation fragment)");
+    const auto surfelSortedVertexModule =
+        CreateShaderModule(device_, surfelSortedVertexShaderCode, "vkCreateShaderModule(exr sorted surfel vertex)");
+    const auto surfelSortedPrepassVertexModule =
+        CreateShaderModule(device_, surfelSortedPrepassVertexShaderCode, "vkCreateShaderModule(exr sorted surfel prepass vertex)");
+    const auto surfelSortedAlphaFragmentModule =
+        CreateShaderModule(device_, surfelSortedAlphaFragmentShaderCode, "vkCreateShaderModule(exr surfel sorted alpha fragment)");
     const auto surfelConstantSimpleVertexModule =
         CreateShaderModule(device_, surfelConstantSimpleVertexShaderCode, "vkCreateShaderModule(exr surfel simple vertex)");
     const auto surfelConstantSimpleFragmentModule =
@@ -10359,6 +10645,16 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
     surfelPrepassVertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
     surfelPrepassVertexStage.module = surfelPrepassVertexModule;
     surfelPrepassVertexStage.pName = "main";
+
+    VkPipelineShaderStageCreateInfo surfelSortedVertexStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    surfelSortedVertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    surfelSortedVertexStage.module = surfelSortedVertexModule;
+    surfelSortedVertexStage.pName = "main";
+
+    VkPipelineShaderStageCreateInfo surfelSortedPrepassVertexStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    surfelSortedPrepassVertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    surfelSortedPrepassVertexStage.module = surfelSortedPrepassVertexModule;
+    surfelSortedPrepassVertexStage.pName = "main";
 
     VkPipelineShaderStageCreateInfo constantSimpleVertexStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
     constantSimpleVertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -10398,6 +10694,24 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
 
     VkPipelineVertexInputStateCreateInfo surfelVertexInputInfo{
         VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+
+    const VkVertexInputBindingDescription sortedSurfelBindingDescription{
+        0U,
+        sizeof(std::uint32_t),
+        VK_VERTEX_INPUT_RATE_INSTANCE};
+    const VkVertexInputAttributeDescription sortedSurfelAttributeDescription{
+        0U,
+        0U,
+        VK_FORMAT_R32_UINT,
+        0U};
+    VkPipelineVertexInputStateCreateInfo sortedSurfelVertexInputInfo{
+        VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    sortedSurfelVertexInputInfo.vertexBindingDescriptionCount = 1U;
+    sortedSurfelVertexInputInfo.pVertexBindingDescriptions =
+        &sortedSurfelBindingDescription;
+    sortedSurfelVertexInputInfo.vertexAttributeDescriptionCount = 1U;
+    sortedSurfelVertexInputInfo.pVertexAttributeDescriptions =
+        &sortedSurfelAttributeDescription;
 
     VkPipelineInputAssemblyStateCreateInfo surfelInputAssembly{
         VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
@@ -10617,6 +10931,51 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
         "vkCreateGraphicsPipelines(exr surfel depth)",
         &resources->surfelDepthPipeline);
     createPointPipeline(
+        surfelSortedPrepassVertexStage,
+        sortedSurfelVertexInputInfo,
+        surfelInputAssembly,
+        surfelDepthFragmentModule,
+        0,
+        std::vector<VkPipelineColorBlendAttachmentState>{linearDepthBlend},
+        true,
+        false,
+        VK_COMPARE_OP_LESS_OR_EQUAL,
+        "vkCreateGraphicsPipelines(exr surfel sorted depth AOV)",
+        &resources->surfelSortedDepthAovPipeline);
+
+    createPointPipeline(
+        surfelSortedVertexStage,
+        sortedSurfelVertexInputInfo,
+        surfelInputAssembly,
+        surfelSortedAlphaFragmentModule,
+        4,
+        std::vector<VkPipelineColorBlendAttachmentState>{
+            MakeAlphaBlendAttachment(),
+            MakeAlphaBlendAttachment(),
+            MakeAlphaBlendAttachment(),
+            MakeAdditiveBlendAttachment()},
+        true,
+        false,
+        VK_COMPARE_OP_LESS_OR_EQUAL,
+        "vkCreateGraphicsPipelines(exr surfel sorted alpha)",
+        &resources->surfelSortedAlphaPipeline);
+    createPointPipeline(
+        surfelSortedVertexStage,
+        sortedSurfelVertexInputInfo,
+        surfelInputAssembly,
+        surfelSortedAlphaFragmentModule,
+        4,
+        std::vector<VkPipelineColorBlendAttachmentState>{
+            MakeAlphaBlendAttachment(),
+            MakeAlphaBlendAttachment(),
+            MakeAlphaBlendAttachment(),
+            MakeAdditiveBlendAttachment()},
+        false,
+        false,
+        VK_COMPARE_OP_ALWAYS,
+        "vkCreateGraphicsPipelines(exr surfel sorted alpha hybrid depth)",
+        &resources->surfelSortedAlphaHybridPipeline);
+    createPointPipeline(
         surfelVertexStage,
         surfelVertexInputInfo,
         surfelInputAssembly,
@@ -10711,7 +11070,10 @@ void VulkanViewportShell::CreateExrExportPipelines(ExrExportResources* resources
     vkDestroyShaderModule(device_, surfelConstantSimpleFragmentModule, nullptr);
     vkDestroyShaderModule(device_, surfelConstantSimpleVertexModule, nullptr);
     vkDestroyShaderModule(device_, surfelDepthFragmentModule, nullptr);
+    vkDestroyShaderModule(device_, surfelSortedAlphaFragmentModule, nullptr);
     vkDestroyShaderModule(device_, surfelAccumulationFragmentModule, nullptr);
+    vkDestroyShaderModule(device_, surfelSortedPrepassVertexModule, nullptr);
+    vkDestroyShaderModule(device_, surfelSortedVertexModule, nullptr);
     vkDestroyShaderModule(device_, surfelPrepassVertexModule, nullptr);
     vkDestroyShaderModule(device_, surfelVertexModule, nullptr);
     vkDestroyShaderModule(device_, fastBasicDepthFragmentModule, nullptr);
@@ -14823,6 +15185,24 @@ void VulkanViewportShell::DestroyExrExportResources(ExrExportResources* resource
             resources->pointSortedAlphaHybridPipeline,
             nullptr);
     }
+    if (resources->surfelSortedDepthAovPipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(
+            device_,
+            resources->surfelSortedDepthAovPipeline,
+            nullptr);
+    }
+    if (resources->surfelSortedAlphaPipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(
+            device_,
+            resources->surfelSortedAlphaPipeline,
+            nullptr);
+    }
+    if (resources->surfelSortedAlphaHybridPipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(
+            device_,
+            resources->surfelSortedAlphaHybridPipeline,
+            nullptr);
+    }
     if (resources->pointSortedEmissionCompositePipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(
             device_,
@@ -14846,6 +15226,10 @@ void VulkanViewportShell::DestroyExrExportResources(ExrExportResources* resource
     }
     if (resources->renderPass != VK_NULL_HANDLE) {
         vkDestroyRenderPass(device_, resources->renderPass, nullptr);
+    }
+    if (resources->renderPassLoad != VK_NULL_HANDLE) {
+        vkDestroyRenderPass(device_, resources->renderPassLoad, nullptr);
+        resources->renderPassLoad = VK_NULL_HANDLE;
     }
 
     DestroyImage(&resources->colorImage);
@@ -15131,7 +15515,8 @@ void VulkanViewportShell::EnsurePointDepthSortResources(
     resources->depthSortedIndexBuffer = CreateDeviceLocalBuffer(
         requiredIndexBytes,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-            VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+            VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
     resources->depthSortScratchBuffer = CreateDeviceLocalBuffer(
         requiredScratchBytes,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
@@ -15148,9 +15533,9 @@ bool VulkanViewportShell::RecordPointDepthSort(
     if (commandBuffer == VK_NULL_HANDLE ||
         pointDepthSortPipeline_ == VK_NULL_HANDLE ||
         pointDepthSortPipelineLayout_ == VK_NULL_HANDLE ||
-        layer.style.geometryMode !=
-            renderer::pointcloud::PointCloudGeometryMode::ScreenSprites ||
-        !layer.style.gpuBackToFrontSorting ||
+        !IsSortedAlphaPointLayer(
+            renderState_.pointCloudRendererMode,
+            layer) ||
         !ResolvePointCloudDrawPlan(
             layer,
             forceFullSource,
@@ -15253,7 +15638,8 @@ bool VulkanViewportShell::RecordPointDepthSort(
     beginBarriers[0].offset = 0U;
     beginBarriers[0].size = VK_WHOLE_SIZE;
     beginBarriers[1] = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
-    beginBarriers[1].srcAccessMask = VK_ACCESS_INDEX_READ_BIT;
+    beginBarriers[1].srcAccessMask =
+        VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
     beginBarriers[1].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     beginBarriers[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     beginBarriers[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -15353,7 +15739,8 @@ bool VulkanViewportShell::RecordPointDepthSort(
     VkBufferMemoryBarrier drawBarrier{
         VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
     drawBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    drawBarrier.dstAccessMask = VK_ACCESS_INDEX_READ_BIT;
+    drawBarrier.dstAccessMask =
+        VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
     drawBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     drawBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     drawBarrier.buffer = resources->depthSortedIndexBuffer.buffer;
@@ -15684,9 +16071,10 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
     const bool softDepthTests =
         renderer::pointcloud::PointCloudDepthPrepassTests(layer.style);
     const bool sortedDepthAovContribution =
-        exrStyle && layer.style.gpuBackToFrontSorting &&
-        layer.style.geometryMode ==
-            renderer::pointcloud::PointCloudGeometryMode::ScreenSprites &&
+        exrStyle &&
+        IsSortedAlphaPointLayer(
+            renderState_.pointCloudRendererMode,
+            layer) &&
         !layer.style.depthPrepassEnabled;
     const bool forceDepthContribution =
         renderState_.eyeDomeLightingEnabled || liveSceneReadbackCaptureEnabled_ ||
@@ -15734,7 +16122,8 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         renderer::pointcloud::PointCloudStyleUsesWorldSizedScreenSprites(layer.style) ? 1.0F : 0.0F,
     };
     styleGpu.renderParams3 = glm::vec4{
-        std::clamp(layer.style.depthPrepassAlphaThreshold, 0.0F, 1.0F),
+        renderer::pointcloud::SanitizePointCloudDepthPrepassAlphaThreshold(
+            layer.style.depthPrepassAlphaThreshold),
         pointSizeRangeMin_,
         pointSizeRangeMax_,
         std::max(0.0F, renderState_.flowTimeSeconds),
@@ -15764,17 +16153,27 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
         std::clamp(layer.style.granulationAngleStrength, 0.0F, 1.0F),
     };
     styleGpu.depthCompositingParams = glm::vec4{
-        std::clamp(layer.style.depthPrepassAlphaThreshold, 0.0F, 1.0F),
+        renderer::pointcloud::SanitizePointCloudDepthPrepassAlphaThreshold(
+            layer.style.depthPrepassAlphaThreshold),
         std::clamp(layer.style.depthPrepassToleranceMeters, 0.0F, 10.0F),
         std::clamp(layer.style.depthWeightStrength, 1.0F, 8.0F),
         layer.style.gpuBackToFrontSorting ? 1.0F : 0.0F,
     };
     constexpr float kDegreesToRadians = 0.01745329252F;
     const float normalCullStartDegrees =
-        std::clamp(layer.style.normalCullStartDegrees, 0.0F, 179.0F);
+        std::clamp(
+            std::isfinite(layer.style.normalCullStartDegrees)
+                ? layer.style.normalCullStartDegrees
+                : 75.0F,
+            0.0F,
+            179.0F);
+    const float requestedNormalCullEndDegrees =
+        std::isfinite(layer.style.normalCullEndDegrees)
+            ? layer.style.normalCullEndDegrees
+            : 105.0F;
     const float normalCullEndDegrees = std::clamp(
         std::max(
-            layer.style.normalCullEndDegrees,
+            requestedNormalCullEndDegrees,
             normalCullStartDegrees + 1.0F),
         1.0F,
         180.0F);
@@ -15791,6 +16190,14 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
     };
     const auto surfaceStabilitySlot =
         FindSurfaceStabilityScalarFieldSlot(layer.scalarFields);
+    auto normalCullReference =
+        static_cast<std::uint32_t>(layer.style.normalCullReference);
+    if (normalCullReference > static_cast<std::uint32_t>(
+            renderer::pointcloud::PointCloudNormalCullReference::
+                FixedVertical)) {
+        normalCullReference = static_cast<std::uint32_t>(
+            renderer::pointcloud::PointCloudNormalCullReference::ToCamera);
+    }
     styleGpu.surfaceStabilityControl = glm::uvec4{
         static_cast<std::uint32_t>(
             layer.style.effectiveSurfaceStabilityMode),
@@ -15798,7 +16205,7 @@ bool VulkanViewportShell::UploadPointCloudLayerStyle(
                 surfaceStabilitySlot.value() < resources->scalarFieldCount
             ? surfaceStabilitySlot.value()
             : std::numeric_limits<std::uint32_t>::max(),
-        0U,
+        normalCullReference,
         0U,
     };
     styleGpu.surfaceStabilityParams = glm::vec4{
@@ -16268,7 +16675,8 @@ bool VulkanViewportShell::RecordPointCloudLayerDraw(
     std::size_t frameIndex,
     std::uint32_t imageIndex,
     bool exrStyle,
-    std::uint32_t* recordedDrawPointCount) {
+    std::uint32_t* recordedDrawPointCount,
+    bool drawSortedPointOrder) {
     if (recordedDrawPointCount != nullptr) {
         *recordedDrawPointCount = 0;
     }
@@ -16277,6 +16685,13 @@ bool VulkanViewportShell::RecordPointCloudLayerDraw(
         return false;
     }
     auto* resources = plan.resources;
+    const bool sortedPointOrderReady =
+        layer.style.gpuBackToFrontSorting &&
+        resources->depthSortedIndexBuffer.buffer != VK_NULL_HANDLE &&
+        resources->depthSortCacheValid;
+    if (drawSortedPointOrder && !sortedPointOrderReady) {
+        return false;
+    }
     if (plan.worldSurfels) {
         if (surfelPipeline == VK_NULL_HANDLE) {
             return false;
@@ -16327,6 +16742,27 @@ bool VulkanViewportShell::RecordPointCloudLayerDraw(
     }
 
     if (plan.worldSurfels) {
+        if (drawSortedPointOrder) {
+            // Supply one sorted source point per instance. The specialised
+            // vertex shader expands each instance into the six vertices of
+            // its surfel, avoiding a six-times-larger sorted index buffer.
+            const VkBuffer sortedPointBuffer =
+                resources->depthSortedIndexBuffer.buffer;
+            constexpr VkDeviceSize sortedPointOffset = 0U;
+            vkCmdBindVertexBuffers(
+                commandBuffer,
+                0U,
+                1U,
+                &sortedPointBuffer,
+                &sortedPointOffset);
+            vkCmdDraw(
+                commandBuffer,
+                kSurfelVerticesPerPoint,
+                plan.drawPointCount,
+                0U,
+                0U);
+            return true;
+        }
         const std::uint32_t surfelVertexCount = plan.drawPointCount * kSurfelVerticesPerPoint;
         if (plan.sampledBudgetReady) {
             vkCmdBindIndexBuffer(
@@ -16360,13 +16796,10 @@ bool VulkanViewportShell::RecordPointCloudLayerDraw(
         vertexBuffers.data(),
         offsets.data());
 
-    if (layer.style.gpuBackToFrontSorting &&
-        resources->depthSortedIndexBuffer.buffer != VK_NULL_HANDLE &&
-        resources->depthSortCacheValid) {
-        // depthSortCacheValid proves a sort dispatch for the current cache
-        // key was recorded (or validly reused); without it the sorted index
-        // buffer may hold undefined or differently-sized contents, and the
-        // unsorted fallbacks below stay correct.
+    if (drawSortedPointOrder) {
+        // sortedPointOrderReady proves a sort dispatch for the current cache
+        // key was recorded (or validly reused), so the buffer cannot contain
+        // undefined or differently-sized contents.
         vkCmdBindIndexBuffer(
             commandBuffer,
             resources->depthSortedIndexBuffer.buffer,
@@ -16537,7 +16970,11 @@ bool VulkanViewportShell::RecordPointCloudHighlightDraw(
     return true;
 }
 
-void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameRequest& request) {
+void VulkanViewportShell::RecordExrExportCommandBuffer(
+    const PointCloudExrFrameRequest& request,
+    const VkRect2D* bandScissor,
+    bool loadPersistentAttachments,
+    bool recordReadbackCopies) {
     auto& resources = exrExportResources_;
     if (resources.commandBuffer == VK_NULL_HANDLE ||
         resources.renderPass == VK_NULL_HANDLE ||
@@ -16551,10 +16988,7 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
                    layer);
     };
     for (const auto& layer : renderState_.pointCloudLayers) {
-        if (layer.style.gpuBackToFrontSorting &&
-            layer.style.geometryMode ==
-                renderer::pointcloud::PointCloudGeometryMode::ScreenSprites &&
-            !PointCloudLayerUsesFastBasicRenderer(
+        if (IsSortedAlphaPointLayer(
                 renderState_.pointCloudRendererMode,
                 layer)) {
             PointCloudDrawPlan plan;
@@ -16635,10 +17069,19 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
     }
 
     VkRenderPassBeginInfo renderPassInfo{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-    renderPassInfo.renderPass = resources.renderPass;
+    // A banded continuation loads the persistent attachments and confines
+    // both the render area and the scissor to its band, so earlier bands'
+    // stored rows survive while the band's scratch attachments are cleared
+    // fresh. The first (or only) pass keeps the historical full-frame clear.
+    renderPassInfo.renderPass = loadPersistentAttachments
+        ? resources.renderPassLoad
+        : resources.renderPass;
     renderPassInfo.framebuffer = resources.framebuffer;
     renderPassInfo.renderArea.offset = {0, 0};
     renderPassInfo.renderArea.extent = {request.width, request.height};
+    if (loadPersistentAttachments && bandScissor != nullptr) {
+        renderPassInfo.renderArea = *bandScissor;
+    }
     renderPassInfo.clearValueCount = static_cast<std::uint32_t>(clearValues.size());
     renderPassInfo.pClearValues = clearValues.data();
 
@@ -16652,7 +17095,9 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
         0.0F,
         1.0F,
     };
-    const VkRect2D scissor{{0, 0}, {request.width, request.height}};
+    const VkRect2D scissor = bandScissor != nullptr
+        ? *bandScissor
+        : VkRect2D{{0, 0}, {request.width, request.height}};
     vkCmdSetViewport(resources.commandBuffer, 0, 1, &viewport);
     vkCmdSetScissor(resources.commandBuffer, 0, 1, &scissor);
 
@@ -16677,16 +17122,27 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
         const bool opaqueHardDisc =
             materialVariant == renderer::pointcloud::PointCloudMaterialVariant::OpaqueHardDisc;
         const bool sortedWithoutPrepass =
-            layer.style.gpuBackToFrontSorting &&
-            layer.style.geometryMode ==
-                renderer::pointcloud::PointCloudGeometryMode::ScreenSprites &&
+            IsSortedAlphaPointLayer(
+                renderState_.pointCloudRendererMode,
+                layer) &&
             !layer.style.depthPrepassEnabled;
         const bool softDepthWrites =
             renderer::pointcloud::PointCloudDepthPrepassWrites(layer.style);
+        // The sorted-without-prepass draw feeds only the linear-depth AOV
+        // (its pipelines never write hardware depth), so when the request
+        // reads back no depth plane and eye-dome lighting is off it is a
+        // pure extra full-cloud pass: for a 4x supersampled 62M-point world
+        // surfel frame that is ~373M wasted vertex invocations. Colour and
+        // the alpha matte are provably unchanged by skipping it.
+        const bool sortedDepthAovConsumed =
+            renderState_.eyeDomeLightingEnabled ||
+            HasPointCloudExrReadback(
+                request.readbackMask,
+                PointCloudExrReadbackMask::Depth);
         if (opaqueHardDisc || softDepthWrites ||
             (!layer.style.depthPrepassEnabled &&
              renderState_.eyeDomeLightingEnabled) ||
-            sortedWithoutPrepass) {
+            (sortedWithoutPrepass && sortedDepthAovConsumed)) {
             static_cast<void>(RecordPointCloudLayerDraw(
                 resources.commandBuffer,
                 layer,
@@ -16694,11 +17150,15 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
                 sortedWithoutPrepass
                     ? resources.pointSortedDepthAovPipeline
                     : resources.pointDepthPipeline,
-                resources.surfelDepthPipeline,
+                sortedWithoutPrepass
+                    ? resources.surfelSortedDepthAovPipeline
+                    : resources.surfelDepthPipeline,
                 false,
                 0U,
                 0U,
-                true));
+                true,
+                nullptr,
+                sortedWithoutPrepass));
         }
     }
 
@@ -16712,9 +17172,9 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
                 layer)) {
             continue;
         }
-        if (layer.style.gpuBackToFrontSorting &&
-            layer.style.geometryMode ==
-                renderer::pointcloud::PointCloudGeometryMode::ScreenSprites) {
+        if (IsSortedAlphaPointLayer(
+                renderState_.pointCloudRendererMode,
+                layer)) {
             continue;
         }
         VkPipeline spritePipeline = resources.pointAccumulationPipeline;
@@ -16798,13 +17258,9 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
         renderState_.pointCloudLayers.begin(),
         renderState_.pointCloudLayers.end(),
         [&](const auto& layer) {
-            return !PointCloudLayerUsesFastBasicRenderer(
-                       renderState_.pointCloudRendererMode,
-                       layer) &&
-                   layer.style.gpuBackToFrontSorting &&
-                   layer.style.geometryMode ==
-                       renderer::pointcloud::PointCloudGeometryMode::
-                           ScreenSprites;
+            return IsSortedAlphaPointLayer(
+                renderState_.pointCloudRendererMode,
+                layer);
         });
     if (hasSortedPointLayers) {
         // The emission attachment still holds subpass 1's weighted values,
@@ -16825,31 +17281,32 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
             1U,
             &emissionClearRect);
     }
-    for (const auto& layer : renderState_.pointCloudLayers) {
-        if (PointCloudLayerUsesFastBasicRenderer(
-                renderState_.pointCloudRendererMode,
-                layer) ||
-            !layer.style.gpuBackToFrontSorting ||
-            layer.style.geometryMode !=
-                renderer::pointcloud::PointCloudGeometryMode::ScreenSprites) {
-            continue;
-        }
+    for (const auto* layerPointer :
+         SortedAlphaPointLayerDrawOrder(renderState_)) {
+        const auto& layer = *layerPointer;
         std::uint32_t recordedDrawPointCount = 0U;
-        const VkPipeline sortedPipeline =
-            renderer::pointcloud::PointCloudDepthPrepassTests(layer.style)
+        const bool hybridDepth =
+            renderer::pointcloud::PointCloudDepthPrepassTests(layer.style);
+        const VkPipeline sortedSpritePipeline =
+            hybridDepth
                 ? resources.pointSortedAlphaHybridPipeline
                 : resources.pointSortedAlphaPipeline;
+        const VkPipeline sortedSurfelPipeline =
+            hybridDepth
+                ? resources.surfelSortedAlphaHybridPipeline
+                : resources.surfelSortedAlphaPipeline;
         if (RecordPointCloudLayerDraw(
                 resources.commandBuffer,
                 layer,
                 forceFullSourceForLayer(layer),
-                sortedPipeline,
-                VK_NULL_HANDLE,
+                sortedSpritePipeline,
+                sortedSurfelPipeline,
                 false,
                 0U,
                 0U,
                 true,
-                &recordedDrawPointCount)) {
+                &recordedDrawPointCount,
+                true)) {
             ++exrLastRecordedLayerCount_;
             exrLastRecordedPointCount_ += recordedDrawPointCount;
         }
@@ -17015,7 +17472,8 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
     colorCopyRegion.imageSubresource.baseArrayLayer = 0;
     colorCopyRegion.imageSubresource.layerCount = 1;
     colorCopyRegion.imageExtent = {request.width, request.height, 1};
-    if (HasPointCloudExrReadback(request.readbackMask, PointCloudExrReadbackMask::Color)) {
+    if (recordReadbackCopies &&
+        HasPointCloudExrReadback(request.readbackMask, PointCloudExrReadbackMask::Color)) {
         vkCmdCopyImageToBuffer(
             resources.commandBuffer,
             resources.colorImage.image,
@@ -17031,7 +17489,8 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
     depthCopyRegion.imageSubresource.baseArrayLayer = 0;
     depthCopyRegion.imageSubresource.layerCount = 1;
     depthCopyRegion.imageExtent = {request.width, request.height, 1};
-    if (HasPointCloudExrReadback(request.readbackMask, PointCloudExrReadbackMask::Depth)) {
+    if (recordReadbackCopies &&
+        HasPointCloudExrReadback(request.readbackMask, PointCloudExrReadbackMask::Depth)) {
         vkCmdCopyImageToBuffer(
             resources.commandBuffer,
             resources.linearDepthImage.image,
@@ -17047,7 +17506,8 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
     normalCopyRegion.imageSubresource.baseArrayLayer = 0;
     normalCopyRegion.imageSubresource.layerCount = 1;
     normalCopyRegion.imageExtent = {request.width, request.height, 1};
-    if (HasPointCloudExrReadback(request.readbackMask, PointCloudExrReadbackMask::Normal)) {
+    if (recordReadbackCopies &&
+        HasPointCloudExrReadback(request.readbackMask, PointCloudExrReadbackMask::Normal)) {
         vkCmdCopyImageToBuffer(
             resources.commandBuffer,
             resources.normalImage.image,
@@ -17063,7 +17523,8 @@ void VulkanViewportShell::RecordExrExportCommandBuffer(const PointCloudExrFrameR
     albedoCopyRegion.imageSubresource.baseArrayLayer = 0;
     albedoCopyRegion.imageSubresource.layerCount = 1;
     albedoCopyRegion.imageExtent = {request.width, request.height, 1};
-    if (HasPointCloudExrReadback(request.readbackMask, PointCloudExrReadbackMask::Albedo)) {
+    if (recordReadbackCopies &&
+        HasPointCloudExrReadback(request.readbackMask, PointCloudExrReadbackMask::Albedo)) {
         vkCmdCopyImageToBuffer(
             resources.commandBuffer,
             resources.albedoImage.image,
@@ -17271,10 +17732,7 @@ void VulkanViewportShell::RecordCommandBuffer(
     std::uint64_t pointPassSubmittedCount = diagnostics_.pointPassSubmittedCount;
 
     for (const auto& layer : renderState_.pointCloudLayers) {
-        if (layer.style.gpuBackToFrontSorting &&
-            layer.style.geometryMode ==
-                renderer::pointcloud::PointCloudGeometryMode::ScreenSprites &&
-            !PointCloudLayerUsesFastBasicRenderer(
+        if (IsSortedAlphaPointLayer(
                 renderState_.pointCloudRendererMode,
                 layer)) {
             PointCloudDrawPlan plan;
@@ -17459,9 +17917,9 @@ void VulkanViewportShell::RecordCommandBuffer(
             const bool opaqueHardDisc =
                 materialVariant == renderer::pointcloud::PointCloudMaterialVariant::OpaqueHardDisc;
             const bool sortedWithoutPrepass =
-                layer.style.gpuBackToFrontSorting &&
-                layer.style.geometryMode ==
-                    renderer::pointcloud::PointCloudGeometryMode::ScreenSprites &&
+                IsSortedAlphaPointLayer(
+                    renderState_.pointCloudRendererMode,
+                    layer) &&
                 !layer.style.depthPrepassEnabled;
             const bool softDepthWrites =
                 renderer::pointcloud::PointCloudDepthPrepassWrites(
@@ -17485,12 +17943,15 @@ void VulkanViewportShell::RecordCommandBuffer(
                     sortedWithoutPrepass
                         ? pointSortedDepthAovPipeline_
                         : pointDepthPrepassPipeline_,
-                    surfelDepthPrepassPipeline_,
+                    sortedWithoutPrepass
+                        ? surfelSortedDepthAovPipeline_
+                        : surfelDepthPrepassPipeline_,
                     false,
                     frameIndex,
                     imageIndex,
                     false,
-                    &recordedDrawPointCount)) {
+                    &recordedDrawPointCount,
+                    sortedWithoutPrepass)) {
                     markGpuPhaseActive(kGpuPhaseDepthActive);
                     if (collectDiagnostics) {
                         ++pointDrawCalls;
@@ -17519,9 +17980,9 @@ void VulkanViewportShell::RecordCommandBuffer(
                     layer)) {
                 continue;
             }
-            if (layer.style.gpuBackToFrontSorting &&
-                layer.style.geometryMode ==
-                    renderer::pointcloud::PointCloudGeometryMode::ScreenSprites) {
+            if (IsSortedAlphaPointLayer(
+                    renderState_.pointCloudRendererMode,
+                    layer)) {
                 continue;
             }
             const auto materialVariant =
@@ -17872,13 +18333,9 @@ void VulkanViewportShell::RecordCommandBuffer(
             renderState_.pointCloudLayers.begin(),
             renderState_.pointCloudLayers.end(),
             [&](const auto& layer) {
-                return !PointCloudLayerUsesFastBasicRenderer(
-                           renderState_.pointCloudRendererMode,
-                           layer) &&
-                       layer.style.gpuBackToFrontSorting &&
-                       layer.style.geometryMode ==
-                           renderer::pointcloud::PointCloudGeometryMode::
-                               ScreenSprites;
+                return IsSortedAlphaPointLayer(
+                    renderState_.pointCloudRendererMode,
+                    layer);
             });
     if (hasSortedPointLayers) {
         // The emission attachment still holds subpass 1's weighted values,
@@ -17900,31 +18357,32 @@ void VulkanViewportShell::RecordCommandBuffer(
             &emissionClearRect);
     }
     if (hasSortedPointLayers) {
-        for (const auto& layer : renderState_.pointCloudLayers) {
-            if (PointCloudLayerUsesFastBasicRenderer(
-                    renderState_.pointCloudRendererMode,
-                    layer) ||
-                !layer.style.gpuBackToFrontSorting ||
-                layer.style.geometryMode !=
-                    renderer::pointcloud::PointCloudGeometryMode::ScreenSprites) {
-                continue;
-            }
+        for (const auto* layerPointer :
+             SortedAlphaPointLayerDrawOrder(renderState_)) {
+            const auto& layer = *layerPointer;
             std::uint32_t recordedDrawPointCount = 0U;
-            const VkPipeline sortedPipeline =
-                renderer::pointcloud::PointCloudDepthPrepassTests(layer.style)
+            const bool hybridDepth =
+                renderer::pointcloud::PointCloudDepthPrepassTests(layer.style);
+            const VkPipeline sortedSpritePipeline =
+                hybridDepth
                     ? pointSortedAlphaHybridPipeline_
                     : pointSortedAlphaPipeline_;
+            const VkPipeline sortedSurfelPipeline =
+                hybridDepth
+                    ? surfelSortedAlphaHybridPipeline_
+                    : surfelSortedAlphaPipeline_;
             if (RecordPointCloudLayerDraw(
                     commandBuffer,
                     layer,
                     false,
-                    sortedPipeline,
-                    VK_NULL_HANDLE,
+                    sortedSpritePipeline,
+                    sortedSurfelPipeline,
                     false,
                     frameIndex,
                     imageIndex,
                     false,
-                    &recordedDrawPointCount)) {
+                    &recordedDrawPointCount,
+                    true)) {
                 markGpuPhaseActive(kGpuPhaseOpaqueActive);
                 if (collectDiagnostics) {
                     ++pointDrawCalls;

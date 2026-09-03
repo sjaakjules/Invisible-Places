@@ -16,9 +16,14 @@ layout(location = 12) in vec4 inWaterColourTransform;
 layout(location = 13) flat in vec4 inTimingColouriseTransform;
 layout(location = 14) flat in vec4 inTimingColouriseScale;
 
+#ifdef POINTCLOUD_SORTED_ALPHA
+layout(location = 0) out vec4 outSortedColor;
+layout(location = 1) out vec4 outSortedEmission;
+#else
 layout(location = 0) out vec4 outAccumulation;
 layout(location = 1) out float outRevealage;
 layout(location = 2) out vec4 outEmission;
+#endif
 
 layout(set = 0, binding = 0) uniform FrameUniforms {
     mat4 viewProjection;
@@ -256,6 +261,31 @@ void main() {
         radius,
         inPointIndex,
         inSurfaceAngleMask);
+#ifdef POINTCLOUD_SORTED_ALPHA
+    outSortedEmission = vec4(0.0);
+    vec3 sortedColor = baseColor;
+    float resolvedEmissive = max(0.0, inEmissive);
+    const float timingEmissionAdd = ResolveTimingColouriseEmissionAdd();
+    if (timingEmissionAdd > 0.0) {
+        resolvedEmissive += timingEmissionAdd;
+    }
+    const float emissionGain =
+        resolvedEmissive * max(0.0, styleData.renderParams0.x);
+    if (emissionGain > 1e-5) {
+        if (PointCloudSaturatedEmissionEnabled()) {
+            sortedColor = PointCloudSaturatedEmissionColor(
+                baseColor,
+                compensatedRawAlpha,
+                alpha,
+                emissionGain);
+        } else {
+            outSortedEmission = vec4(
+                baseColor * compensatedRawAlpha * emissionGain,
+                compensatedRawAlpha * emissionGain);
+        }
+    }
+    outSortedColor = vec4(sortedColor, alpha);
+#else
     outAccumulation = vec4(0.0);
     outRevealage = 0.0;
     outEmission = vec4(0.0);
@@ -283,4 +313,5 @@ void main() {
     const float weight = PointCloudWeightedAlphaWeight(weightedAlpha);
     outAccumulation = vec4(accumulationColor * weightedAlpha * weight, weightedAlpha * weight);
     outRevealage = weightedAlpha;
+#endif
 }

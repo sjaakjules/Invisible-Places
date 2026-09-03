@@ -1222,29 +1222,47 @@ void main() {
         ? clamp(resolvedOpacity, 0.0, 4.0)
         : safeBaseOpacity) * kernelEnergyScale *
         ResolvePointCloudSurfaceStabilityWeight(pointIndex);
-    // Optional back-face fade: points whose stored normal faces away from
-    // the camera fade out over the authored angular band — for example
-    // returns beneath an overhang seen from above. Zero-length normals
-    // (missing normals, trail/particle points) are never culled, and the
-    // depth-prepass variant applies the same fade so culled points stop
-    // occluding as well as stop drawing.
+    // Optional back-face fade. surfaceStabilityControl.z selects the
+    // historical point-to-camera direction (0), the camera's common view
+    // axis (1), or fixed world +Z (2). The latter two remove position-driven
+    // direction changes during pans; +Z also pairs with Fixed Vertical
+    // sorting to keep the decision independent of the animation camera.
+    // Invalid/missing normals remain visible instead of poisoning opacity or
+    // depth ownership with NaNs. The depth-prepass variant applies the same
+    // fade so culled points stop occluding as well as stop drawing.
     if (styleData.emissionNormalControl.y > 0.5 &&
         dot(aovNormal, aovNormal) > 1.0e-8) {
-        const vec3 toCamera = uniforms.cameraPosition.xyz - worldPosition.xyz;
-        const float toCameraLengthSquared = dot(toCamera, toCamera);
-        if (toCameraLengthSquared > 1.0e-12) {
-            const float facingCosine = dot(
+        vec3 facingReference =
+            uniforms.cameraPosition.xyz - worldPosition.xyz;
+        if (styleData.surfaceStabilityControl.z == 1u) {
+            facingReference = vec3(
+                uniforms.view[0][2],
+                uniforms.view[1][2],
+                uniforms.view[2][2]);
+        } else if (styleData.surfaceStabilityControl.z == 2u) {
+            facingReference = vec3(0.0, 0.0, 1.0);
+        }
+        const float referenceLengthSquared =
+            dot(facingReference, facingReference);
+        if (RippleFiniteVec3(aovNormal) &&
+            RippleFiniteVec3(facingReference) &&
+            referenceLengthSquared > 1.0e-12) {
+            const float facingCosine = clamp(dot(
                 normalize(aovNormal),
-                toCamera * inversesqrt(toCameraLengthSquared));
-            const float facingFade = smoothstep(
-                styleData.emissionNormalControl.w,
-                styleData.emissionNormalControl.z,
-                facingCosine);
-            if (facingFade <= 1.0e-4) {
-                gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
-                gl_PointSize = 0.0;
+                facingReference * inversesqrt(referenceLengthSquared)),
+                -1.0,
+                1.0);
+            if (RippleFiniteFloat(facingCosine)) {
+                const float facingFade = smoothstep(
+                    styleData.emissionNormalControl.w,
+                    styleData.emissionNormalControl.z,
+                    facingCosine);
+                if (facingFade <= 1.0e-4) {
+                    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+                    gl_PointSize = 0.0;
+                }
+                outOpacity *= facingFade;
             }
-            outOpacity *= facingFade;
         }
     }
 #ifndef DEPTH_PREPASS

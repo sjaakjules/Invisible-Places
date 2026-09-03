@@ -125,6 +125,8 @@ They support:
 - point budgets,
 - chunking or paging,
 - culling,
+- half-alpha soft-depth cores that exclude unstable translucent fringes,
+- perspective, pan-stable camera-axis, or fixed-world-axis normal fading,
 - screen-space and world-space sizing,
 - AOV export,
 - optional subtle procedural motion evaluated from rest position.

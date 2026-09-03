@@ -624,6 +624,18 @@ Opacity shall support constant and field-driven control.
 #### FR-STYLE-5
 The renderer should support multiple visual modes including solid dots, discs, X-ray, additive accents, and depth-cued looks.
 
+Stored-normal back-face fading shall offer the historical point-to-camera
+reference, one common camera-axis reference for pan-stable perspective output,
+and a camera-independent world-vertical reference for top-down animation. The
+vertical reference shall be saveable with a Visual and pair with fixed-vertical
+point sorting without changing legacy Visuals that omit it.
+
+The opt-in soft-edge depth prepass shall default its hard-owner threshold to
+half alpha so Gaussian and antialiasing fringes remain blendable without
+becoming unstable occluders. Explicit thresholds in older Visuals shall remain
+round-trippable, and non-finite runtime values shall conservatively fall back
+to the half-alpha default.
+
 #### FR-STYLE-6
 Styles shall be saveable and reusable as presets.
 

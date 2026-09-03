@@ -1,6 +1,13 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 
+#ifdef SORTED_SURFEL
+// One sorted source point is supplied per instance. The six triangle-list
+// vertices still come from gl_VertexIndex, avoiding a six-times-larger
+// expanded sort buffer for full-resolution clouds.
+layout(location = 0) in uint inSortedPointIndex;
+#endif
+
 #ifndef DEPTH_PREPASS
 layout(location = 0) out vec4 outSourceColor;
 layout(location = 1) out float outColormapValue;
@@ -1109,9 +1116,14 @@ float ScreenPixelWorldSpan(float viewDepth, float pixels) {
 }
 
 void main() {
+#ifdef SORTED_SURFEL
+    const uint pointIndex = inSortedPointIndex;
+    const uint cornerIndex = uint(gl_VertexIndex);
+#else
     const uint encodedVertexIndex = uint(gl_VertexIndex);
     const uint pointIndex = encodedVertexIndex / kSurfelVerticesPerPoint;
     const uint cornerIndex = encodedVertexIndex - (pointIndex * kSurfelVerticesPerPoint);
+#endif
     const vec2 corner = kSurfelCorners[int(cornerIndex)];
 
     // Trail role, travel phase, and visibility feed the flow position, the
@@ -1155,6 +1167,11 @@ void main() {
         tangent,
         bitangent,
         surfaceAngleMask);
+    // Resolve once for both the beauty AOV and the optional facing fade.
+    // This intentionally follows the screen-sprite path: generated water
+    // particles/trails do not inherit a source-surface normal and therefore
+    // remain visible rather than being culled by an unrelated normal.
+    const vec3 aovNormal = ResolveAovNormal(pointIndex);
     vec3 rippleNormal =
         styleData.pointMeta.z != 0u && pointIndex < styleData.pointMeta.x
             ? surfelNormals.normals[pointIndex].xyz
@@ -1265,6 +1282,42 @@ void main() {
              meshFlowContact.opacityAdd) * flowEffectVisibility,
         0.0,
         4.0) * ResolvePointCloudSurfaceStabilityWeight(pointIndex);
+    // Match screen sprites for every surfel pipeline variant, including the
+    // depth prepass and sorted paths. Using the point centre (not an expanded
+    // quad corner) gives all six vertices one stable facing decision.
+    if (styleData.emissionNormalControl.y > 0.5 &&
+        dot(aovNormal, aovNormal) > 1.0e-8) {
+        vec3 facingReference = uniforms.cameraPosition.xyz - center;
+        if (styleData.surfaceStabilityControl.z == 1u) {
+            facingReference = vec3(
+                uniforms.view[0][2],
+                uniforms.view[1][2],
+                uniforms.view[2][2]);
+        } else if (styleData.surfaceStabilityControl.z == 2u) {
+            facingReference = vec3(0.0, 0.0, 1.0);
+        }
+        const float referenceLengthSquared =
+            dot(facingReference, facingReference);
+        if (RippleFiniteVec3(aovNormal) &&
+            RippleFiniteVec3(facingReference) &&
+            referenceLengthSquared > 1.0e-12) {
+            const float facingCosine = clamp(dot(
+                normalize(aovNormal),
+                facingReference * inversesqrt(referenceLengthSquared)),
+                -1.0,
+                1.0);
+            if (RippleFiniteFloat(facingCosine)) {
+                const float facingFade = smoothstep(
+                    styleData.emissionNormalControl.w,
+                    styleData.emissionNormalControl.z,
+                    facingCosine);
+                if (facingFade <= 1.0e-4) {
+                    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+                }
+                outOpacity *= facingFade;
+            }
+        }
+    }
 #ifndef DEPTH_PREPASS
     outEmissive =
         animatedFlow.y +
@@ -1278,6 +1331,6 @@ void main() {
     outPointIndex = pointIndex;
 #ifndef DEPTH_PREPASS
     outSurfaceAngleMask = surfaceAngleMask;
-    outAovNormal = ResolveAovNormal(pointIndex);
+    outAovNormal = aovNormal;
 #endif
 }

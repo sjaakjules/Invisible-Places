@@ -85,6 +85,9 @@ bool PointCloudDepthPrepassRejectsFragment() {
     if (abs(denominator) <= 1.0e-7) {
         return false;
     }
+    // This rearrangement directly reconstructs positive -viewZ for the
+    // right-handed OrbitCamera projection (the numerator is the negated
+    // conventional view-Z solution), matching inViewDepth from the vertex.
     const float nearestCoreDepth =
         (hardwareDepth * uniforms.projection[3][3] -
          uniforms.projection[3][2]) /

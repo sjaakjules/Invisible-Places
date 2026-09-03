@@ -2089,14 +2089,12 @@ bool BuildOfflinePointSample(
     if (waterParticles) {
         sample->opacity *= WaterParticleFade(cloud, pointIndex, stylisationTimeSeconds);
     }
-    // Back-face fade, matching the GPU vertex path: points whose stored
-    // normal faces away from the camera fade over the authored angular band.
-    // Screen sprites only (the surfel vertex path has no fade), and points
-    // without normals are never culled.
+    // Back-face fade, matching the GPU vertex path. The selectable reference
+    // lets top-down animations avoid camera-position-dependent depth-owner
+    // changes while retaining the historical per-point perspective option.
+    // Screen sprites and world surfels use the same point-centre decision;
+    // points without normals are never culled.
     if (layer.style.normalCullEnabled &&
-        layer.style.geometryMode ==
-            invisible_places::renderer::pointcloud::PointCloudGeometryMode::
-                ScreenSprites &&
         cloud.hasNormals &&
         pointIndex < cloud.normals.size()) {
         const auto localNormal = ToGlm(cloud.normals[pointIndex]);
@@ -2104,27 +2102,18 @@ bool BuildOfflinePointSample(
             const glm::vec3 worldNormal = glm::normalize(
                 glm::transpose(glm::inverse(glm::mat3{layer.localToWorld})) *
                 localNormal);
-            const glm::vec3 toCamera = matrices.position - sample->worldCenter;
-            const float toCameraLengthSquared = glm::dot(toCamera, toCamera);
-            if (toCameraLengthSquared > 1.0e-12F) {
-                const float facingCosine = glm::dot(
+            const glm::vec3 cameraAxisToCamera{
+                matrices.view[0U][2U],
+                matrices.view[1U][2U],
+                matrices.view[2U][2U],
+            };
+            sample->opacity *= invisible_places::renderer::pointcloud::
+                ResolvePointCloudNormalCullFade(
+                    layer.style,
                     worldNormal,
-                    toCamera / std::sqrt(toCameraLengthSquared));
-                const float startDegrees = std::clamp(
-                    layer.style.normalCullStartDegrees,
-                    0.0F,
-                    179.0F);
-                const float endDegrees = std::clamp(
-                    std::max(
-                        layer.style.normalCullEndDegrees,
-                        startDegrees + 1.0F),
-                    1.0F,
-                    180.0F);
-                sample->opacity *= SmoothStep(
-                    std::cos(glm::radians(endDegrees)),
-                    std::cos(glm::radians(startDegrees)),
-                    facingCosine);
-            }
+                    sample->worldCenter,
+                    matrices.position,
+                    cameraAxisToCamera);
         }
     }
     sample->depthFade = Clamp01(
@@ -3080,10 +3069,10 @@ void RenderPointCloudTile(
                         if (invisible_places::renderer::pointcloud::
                                 PointCloudDepthPrepassWrites(layer.style) &&
                             localIndex < prepassDepth.size() &&
-                            alpha >= std::clamp(
-                                         layer.style.depthPrepassAlphaThreshold,
-                                         0.0F,
-                                         1.0F) &&
+                            invisible_places::renderer::pointcloud::
+                                PointCloudAlphaWritesSoftDepth(
+                                    rawAlpha,
+                                    layer.style.depthPrepassAlphaThreshold) &&
                             coveredViewDepth < prepassDepth[localIndex]) {
                             prepassDepth[localIndex] = coveredViewDepth;
                         }
