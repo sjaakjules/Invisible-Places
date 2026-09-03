@@ -1655,6 +1655,56 @@ bool VideoConversionBackgroundPriority() {
         std::memory_order_relaxed);
 }
 
+namespace {
+
+void AppendVideoToolboxHevcRateControl(
+    std::ostringstream* command,
+    AnimationExportQuality quality,
+    bool alphaMatte) {
+    if (command == nullptr) {
+        return;
+    }
+    const bool highQuality =
+        quality == AnimationExportQuality::Hq ||
+        quality == AnimationExportQuality::Xq;
+    if (quality == AnimationExportQuality::Xq) {
+        // Sparse, near-pixel point detail defeats VideoToolbox's fixed-rate
+        // controller between keyframes. Quality mode 75 measured within
+        // 0.001 SSIM of x265 HQ for both Thin colour and matte; it is
+        // intentionally a larger-file opt-in rather than replacing the much
+        // more efficient fixed-rate Base preset.
+        *command << " -q:v 75";
+    } else if (highQuality) {
+        *command << (alphaMatte
+                         ? " -b:v 90000k -maxrate 135000k"
+                         : " -b:v 300000k -maxrate 450000k");
+    } else {
+        *command << (alphaMatte
+                         ? " -b:v 30000k -maxrate 45000k"
+                         : " -b:v 80000k -maxrate 120000k");
+    }
+    if (highQuality) {
+        // A bounded GOP prevents long temporal error runs on moving points.
+        *command << " -g 15 -keyint_min 15";
+    }
+}
+
+int X265ColorCrf(AnimationExportQuality quality) {
+    if (quality == AnimationExportQuality::Xq) {
+        return 12;
+    }
+    return quality == AnimationExportQuality::Hq ? 14 : 18;
+}
+
+int X265MatteCrf(AnimationExportQuality quality) {
+    if (quality == AnimationExportQuality::Xq) {
+        return 10;
+    }
+    return quality == AnimationExportQuality::Hq ? 12 : 16;
+}
+
+}  // namespace
+
 std::string BuildFfmpegMp4ColorCommand(
     const std::filesystem::path& executablePath,
     std::uint32_t width,
@@ -1679,13 +1729,9 @@ std::string BuildFfmpegMp4ColorCommand(
         command << " -vf format=" << videoToolboxPixelFormat
                 << " -c:v hevc_videotoolbox";
         if (hq) {
-            command << " -profile:v main42210"
-                    << " -b:v 300000k"
-                    << " -maxrate 450000k";
-        } else {
-            command << " -b:v 80000k"
-                    << " -maxrate 120000k";
+            command << " -profile:v main42210";
         }
+        AppendVideoToolboxHevcRateControl(&command, quality, false);
         command << " -tag:v hvc1"
                 << " -pix_fmt " << videoToolboxPixelFormat
                 << " -allow_sw 1"
@@ -1698,7 +1744,7 @@ std::string BuildFfmpegMp4ColorCommand(
         command << " -vf format=" << (hq ? "yuv420p10le" : "yuv420p")
                 << " -c:v libx265"
                 << " -preset " << (hq ? "fast" : "medium")
-                << " -crf " << (hq ? "14" : "18");
+                << " -crf " << X265ColorCrf(quality);
         if (hq) {
             command << " -profile:v main10";
         }
@@ -1754,13 +1800,9 @@ std::string BuildFfmpegMp4AlphaMatteCommand(
     if (useVideoToolbox) {
         command << " -c:v hevc_videotoolbox";
         if (hq) {
-            command << " -profile:v main42210"
-                    << " -b:v 90000k"
-                    << " -maxrate 135000k";
-        } else {
-            command << " -b:v 30000k"
-                    << " -maxrate 45000k";
+            command << " -profile:v main42210";
         }
+        AppendVideoToolboxHevcRateControl(&command, quality, true);
         command << " -tag:v hvc1"
                 << " -pix_fmt " << videoToolboxPixelFormat
                 << " -allow_sw 1"
@@ -1772,7 +1814,7 @@ std::string BuildFfmpegMp4AlphaMatteCommand(
     } else {
         command << " -c:v libx265"
                 << " -preset " << (hq ? "fast" : "medium")
-                << " -crf " << (hq ? "12" : "16");
+                << " -crf " << X265MatteCrf(quality);
         if (hq) {
             command << " -profile:v main10";
         }
@@ -1822,13 +1864,9 @@ std::string BuildFfmpegMp4ColorAndAlphaMatteCommand(
     if (useVideoToolbox) {
         command << " -c:v hevc_videotoolbox";
         if (hq) {
-            command << " -profile:v main42210"
-                    << " -b:v 300000k"
-                    << " -maxrate 450000k";
-        } else {
-            command << " -b:v 80000k"
-                    << " -maxrate 120000k";
+            command << " -profile:v main42210";
         }
+        AppendVideoToolboxHevcRateControl(&command, quality, false);
         command << " -tag:v hvc1"
                 << " -pix_fmt " << colorPixelFormat
                 << " -allow_sw 1"
@@ -1840,7 +1878,7 @@ std::string BuildFfmpegMp4ColorAndAlphaMatteCommand(
     } else {
         command << " -c:v libx265"
                 << " -preset " << (hq ? "fast" : "medium")
-                << " -crf " << (hq ? "14" : "18");
+                << " -crf " << X265ColorCrf(quality);
         if (hq) {
             command << " -profile:v main10";
         }
@@ -1857,13 +1895,9 @@ std::string BuildFfmpegMp4ColorAndAlphaMatteCommand(
     if (useVideoToolbox) {
         command << " -c:v hevc_videotoolbox";
         if (hq) {
-            command << " -profile:v main42210"
-                    << " -b:v 90000k"
-                    << " -maxrate 135000k";
-        } else {
-            command << " -b:v 30000k"
-                    << " -maxrate 45000k";
+            command << " -profile:v main42210";
         }
+        AppendVideoToolboxHevcRateControl(&command, quality, true);
         command << " -tag:v hvc1"
                 << " -pix_fmt " << mattePixelFormat
                 << " -allow_sw 1"
@@ -1875,7 +1909,7 @@ std::string BuildFfmpegMp4ColorAndAlphaMatteCommand(
     } else {
         command << " -c:v libx265"
                 << " -preset " << (hq ? "fast" : "medium")
-                << " -crf " << (hq ? "12" : "16");
+                << " -crf " << X265MatteCrf(quality);
         if (hq) {
             command << " -profile:v main10";
         }

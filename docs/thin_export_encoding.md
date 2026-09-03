@@ -5,6 +5,41 @@ speckle over black at 4K - the hardest possible content for a hardware
 video encoder. This page records the 2026-09-02 measurements behind the
 encoder defaults and the recommended settings.
 
+## Current recommendation (2026-09-04)
+
+The export panel now offers three MP4 quality choices. Use **HQ (Base)**
+with VideoToolbox for the smooth Base pass. For Thin, keep using **HQ
+(Base)** with VideoToolbox off when file size matters, or use the new
+**Detail (Thin)** setting with VideoToolbox when a hardware-only encode is
+preferred and a much larger file is acceptable.
+
+The latest 120-frame, full-pipeline comparison used the real 4x
+supersampled export and lossless PNG ground truth:
+
+| Visual / encode | SSIM colour | SSIM matte | 12,601-frame estimate |
+|---|---:|---:|---:|
+| Thin, MP4 HQ VideoToolbox | 0.923 | 0.904 | 20 GB |
+| **Thin, MP4 HQ CPU (x265)** | **0.972** | **0.997** | **35 GB** |
+| Thin, ProRes 422 HQ | 0.952 | 0.985 | 90 GB |
+| Thin, ProRes 4444 | 0.9996 | 0.9998 | 573 GB |
+| **Base, MP4 HQ VideoToolbox** | **0.988** | **0.996** | **16 GB** |
+| Base, ProRes 422 HQ | 0.984 | 0.998 | 64 GB |
+
+For the new hardware Detail setting, a controlled 48-frame re-encode of
+the same Thin PNG ground truth selected VideoToolbox constant-quality 75
+and a 15-frame GOP. It measured 0.9719 colour and 0.9984 matte SSIM, versus
+0.972/0.997 for MP4 HQ CPU. The trade-off is approximately 85 GB for the
+complete 12,601-frame colour-plus-matte render. Encoder throughput was
+about 35 fps, so it remains hidden behind GPU capture. A 12-frame
+end-to-end check also improved over hardware HQ (0.944 versus 0.920 colour,
+0.962 versus 0.922 matte), although such a short run is sensitive to the
+render's cold first frame and is not the primary codec score.
+
+VideoToolbox does not expose frame-thread controls for this HEVC encoder.
+The useful temporal lever was the shorter 15-frame GOP: it limits error
+propagation across moving fine points. More CPU threads cannot accelerate
+GPU band submissions, which execute serially on the graphics queue.
+
 ## What the noise was
 
 Ground truth: a 120-frame PNG-stack export of Surface_05a frames
@@ -25,7 +60,13 @@ The content itself also "boils": consecutive lossless frames differ by
 mean |delta| ~39/255 under camera motion (thin points are ~1-2 px).
 That shimmer is render-side aliasing, not compression.
 
-## Measured options (same 4 s segment, full-render sizes extrapolated to 6301 frames)
+## Historical 2026-09-02 measurements
+
+These earlier measurements used a 6,301-frame duration and precede the
+current renderer and encoder settings. They are retained to show the
+failure mode rather than to supersede the current table above.
+
+### Measured options (same 4 s segment, full-render sizes extrapolated to 6301 frames)
 
 | Encode | SSIM colour | SSIM matte | Full render size | Encode speed |
 |---|---|---|---|---|

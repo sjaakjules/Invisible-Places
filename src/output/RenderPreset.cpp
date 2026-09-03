@@ -374,10 +374,6 @@ ExportPreset NormalizeExportPresetForCurrentSchema(ExportPreset preset) {
     } else if (preset.mode == AnimationExportMode::TestMp4) {
         preset.quality = AnimationExportQuality::Normal;
         preset.settings.framesPerSecond = std::max<std::uint32_t>(1U, preset.settings.framesPerSecond);
-    } else if (preset.mode == AnimationExportMode::FastPreviewMp4) {
-        if (preset.quality == AnimationExportQuality::Xq) {
-            preset.quality = AnimationExportQuality::Hq;
-        }
     } else if (preset.mode == AnimationExportMode::ProRes422Mov) {
         if (preset.quality == AnimationExportQuality::Xq) {
             preset.quality = AnimationExportQuality::Hq;
