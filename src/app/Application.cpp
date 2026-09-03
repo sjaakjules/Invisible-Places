@@ -25,6 +25,7 @@
 #include "io/PointCloudData.hpp"
 #include "io/PlyHeader.hpp"
 #include "output/ExrWriter.hpp"
+#include "output/ExportGpuBanding.hpp"
 #include "output/HoudiniCameraExport.hpp"
 #include "output/OfflinePointRenderer.hpp"
 #include "output/PngWriter.hpp"
@@ -2548,6 +2549,7 @@ struct OfflineRenderFrameSampleState {
     bool previewPassPending = false;
     bool gpuSampleInFlight = false;
     bool gpuSamplePreviewPass = false;
+    bool adaptiveGpuBandingSample = false;
     std::chrono::steady_clock::time_point gpuSampleSubmittedAt{};
     std::chrono::steady_clock::duration lastGpuSampleDuration{};
     std::chrono::steady_clock::duration lastReadbackDuration{};
@@ -2594,6 +2596,7 @@ struct OfflineRenderJobState {
     std::optional<std::chrono::steady_clock::time_point>
         firstFrameCompletedAt;
     OfflineRenderFrameSampleState frameSampleState{};
+    invisible_places::output::ExportGpuBandingState gpuBandingState{};
     std::uint32_t currentTile = 0;
     invisible_places::output::ExrImage image{};
     std::chrono::steady_clock::time_point startedAt{};
@@ -37673,8 +37676,10 @@ invisible_places::output::AnimationExportQuality NormalizeExportQualityForMode(
     if (mode == invisible_places::output::AnimationExportMode::TestMp4) {
         return invisible_places::output::AnimationExportQuality::Normal;
     }
-    if (mode == invisible_places::output::AnimationExportMode::FastPreviewMp4 ||
-        mode == invisible_places::output::AnimationExportMode::ProRes422Mov ||
+    if (mode == invisible_places::output::AnimationExportMode::FastPreviewMp4) {
+        return quality;
+    }
+    if (mode == invisible_places::output::AnimationExportMode::ProRes422Mov ||
         mode == invisible_places::output::AnimationExportMode::ProRes422AlphaMatteMov ||
         mode == invisible_places::output::AnimationExportMode::ProRes422VideoToolboxMov) {
         return quality == invisible_places::output::AnimationExportQuality::Xq
@@ -37781,8 +37786,15 @@ const char* AnimationExportQualityLabel(
         mode == invisible_places::output::AnimationExportMode::ProRes4444XqVideoToolboxMov) {
         return quality == invisible_places::output::AnimationExportQuality::Xq ? "XQ" : "Normal";
     }
-    if (mode == invisible_places::output::AnimationExportMode::FastPreviewMp4 ||
-        mode == invisible_places::output::AnimationExportMode::HevcAlphaMp4 ||
+    if (mode == invisible_places::output::AnimationExportMode::FastPreviewMp4) {
+        if (quality == invisible_places::output::AnimationExportQuality::Xq) {
+            return "Detail";
+        }
+        return quality == invisible_places::output::AnimationExportQuality::Hq
+                   ? "HQ"
+                   : "Normal";
+    }
+    if (mode == invisible_places::output::AnimationExportMode::HevcAlphaMp4 ||
         mode == invisible_places::output::AnimationExportMode::ProRes422Mov ||
         mode == invisible_places::output::AnimationExportMode::ProRes422HqMov ||
         mode == invisible_places::output::AnimationExportMode::ProRes422AlphaMatteMov ||
@@ -44990,6 +45002,13 @@ void ProcessOfflineRenderJobStep(
                 auto renderedImage = viewport->CompletePointCloudExrFrame();
                 const auto readbackEnd = std::chrono::steady_clock::now();
                 sampleState.lastGpuSampleDuration = readyAt - sampleState.gpuSampleSubmittedAt;
+                if (sampleState.adaptiveGpuBandingSample) {
+                    invisible_places::output::ObserveExportGpuSample(
+                        &job.gpuBandingState,
+                        std::chrono::duration<double>(
+                            sampleState.lastGpuSampleDuration)
+                            .count());
+                }
                 sampleState.lastReadbackDuration = readbackEnd - readyAt;
                 RecordExportGpuSampleDuration(&job, sampleState.lastGpuSampleDuration);
                 UpdateExportSortCounters(&job, *viewport);
@@ -45040,25 +45059,47 @@ void ProcessOfflineRenderJobStep(
                     targetHeight,
                     sampleTimeSeconds,
                     ExportReadbackMaskForPass(job, previewPass));
-                // Make the stored tile size real for GPU submission: large
-                // supersampled frames render as row bands, each its own
-                // queue submit, so the interactive UI is no longer parked
-                // behind one multi-second command buffer on the shared
-                // graphics queue. Small frames keep the single submission.
-                if (static_cast<std::uint64_t>(request.width) *
+                // This flag belongs to the request being submitted, not the
+                // whole output frame (an EXR job may follow its full-size
+                // sample with a smaller preview pass).
+                sampleState.adaptiveGpuBandingSample = false;
+                // The old 512-row policy replayed every point up to 17 times
+                // at 4x 4K. Screen sprites use one full-frame submission;
+                // world surfels alone get a protective split because each
+                // point expands to six vertices. Warm timings may add at most
+                // one further split or remove an unnecessary one.
+                const bool largeGpuFrame =
+                    static_cast<std::uint64_t>(request.width) *
                         request.height >=
-                    static_cast<std::uint64_t>(3840U) * 2160U * 2U) {
+                    static_cast<std::uint64_t>(3840U) * 2160U * 2U;
+                const bool containsWorldSurfels =
+                    std::any_of(
+                        request.renderState.pointCloudLayers.begin(),
+                        request.renderState.pointCloudLayers.end(),
+                        [](const auto& layer) {
+                            return layer.style.geometryMode ==
+                                   PointCloudGeometryMode::WorldSurfels;
+                        });
+                if (largeGpuFrame && containsWorldSurfels &&
+                    !request.renderState.eyeDomeLightingEnabled) {
+                    invisible_places::output::PrimeExportGpuBanding(
+                        &job.gpuBandingState,
+                        true);
                     request.gpuBandRows =
-                        std::max(512U, job.settings.tileSize);
+                        invisible_places::output::ExportGpuBandRows(
+                            job.gpuBandingState,
+                            request.height);
+                    sampleState.adaptiveGpuBandingSample = true;
                 }
                 // Test override: forces a band height, or 0 for the single
                 // historical submission, so banded and unbanded frames can
                 // be byte-compared from one binary.
                 if (const char* bandOverride =
                         std::getenv("INVISIBLE_PLACES_EXPORT_GPU_BAND_ROWS");
-                    bandOverride != nullptr && bandOverride[0] != ' ') {
+                    bandOverride != nullptr && bandOverride[0] != '\0') {
                     request.gpuBandRows = static_cast<std::uint32_t>(
                         std::strtoul(bandOverride, nullptr, 10));
+                    sampleState.adaptiveGpuBandingSample = false;
                 }
                 if (!viewport->BeginPointCloudExrFrame(request)) {
                     runtimeState->statusMessage = "Waiting for GPU export resources...";
@@ -46975,14 +47016,29 @@ void DrawAnimationExportSection(
             panel.exportMode == invisible_places::output::AnimationExportMode::ProRes4444XqMov ||
             panel.exportMode == invisible_places::output::AnimationExportMode::ProRes4444VideoToolboxMov ||
             panel.exportMode == invisible_places::output::AnimationExportMode::ProRes4444XqVideoToolboxMov;
+        const bool mp4 =
+            panel.exportMode == invisible_places::output::AnimationExportMode::FastPreviewMp4 ||
+            panel.exportMode == invisible_places::output::AnimationExportMode::HevcAlphaMp4;
         auto quality = NormalizeExportQualityForMode(panel.exportMode, viewedPreset.quality);
-        int qualityIndex = quality == invisible_places::output::AnimationExportQuality::Normal ? 0 : 1;
-        const char* qualityLabels[] = {"Normal", proRes4444 ? "XQ" : "HQ"};
+        int qualityIndex =
+            quality == invisible_places::output::AnimationExportQuality::Normal
+                ? 0
+                : quality == invisible_places::output::AnimationExportQuality::Xq
+                      ? (mp4 ? 2 : 1)
+                      : 1;
+        const char* qualityLabels[] = {
+            "Normal",
+            proRes4444 ? "XQ" : (mp4 ? "HQ (Base)" : "HQ"),
+            "Detail (Thin)",
+        };
+        const int qualityLabelCount = mp4 ? 3 : 2;
         if (!testMp4 &&
-            ImGui::Combo("Quality", &qualityIndex, qualityLabels, IM_ARRAYSIZE(qualityLabels))) {
+            ImGui::Combo("Quality", &qualityIndex, qualityLabels, qualityLabelCount)) {
             auto& preset = EditActiveExportPreset(runtimeState);
             preset.quality = qualityIndex == 0
                                  ? invisible_places::output::AnimationExportQuality::Normal
+                                 : (mp4 && qualityIndex == 2)
+                                       ? invisible_places::output::AnimationExportQuality::Xq
                                  : (proRes4444
                                         ? invisible_places::output::AnimationExportQuality::Xq
                                         : invisible_places::output::AnimationExportQuality::Hq);
@@ -47039,6 +47095,13 @@ void DrawAnimationExportSection(
                 useVideoToolbox,
                 externalAlphaMatte)
                 .c_str());
+        if (mp4 &&
+            quality == invisible_places::output::AnimationExportQuality::Xq) {
+            ImGui::TextDisabled(
+                useVideoToolbox
+                    ? "Detail preserves sparse Thin points; expect a much larger VideoToolbox file."
+                    : "Detail uses extra-low x265 CRF; HQ CPU is normally sufficient for Thin.");
+        }
     }
 
     if (panel.exportMode == invisible_places::output::AnimationExportMode::TestMp4) {
@@ -135321,7 +135384,7 @@ int RunAdaptiveHqSurfacePerformanceSmoke(
 // delivery preset. Driven by INVISIBLE_PLACES_EXPORT_SEGMENT_SPECS, a
 // semicolon-separated list of label,visual,mode,start,end entries where
 // mode is png / prores422hq / prores422 / prores4444xq / prores4444 /
-// mp4hq / mp4hq-cpu. The animation comes from
+// mp4hq / mp4detail / mp4hq-cpu. The animation comes from
 // INVISIBLE_PLACES_EXPORT_SEGMENT_ANIMATION (default Surface_05a). An optional
 // INVISIBLE_PLACES_EXPORT_SEGMENT_NORMAL_CULL_REFERENCE override accepts
 // to_camera / camera_axis / fixed_vertical. Optional depth-threshold,
@@ -135616,6 +135679,13 @@ int RunExportSegmentLabSmoke(
             return ExportBenchmarkVariant{
                 .mode = AnimationExportMode::FastPreviewMp4,
                 .quality = AnimationExportQuality::Hq,
+                .useVideoToolbox = true,
+            };
+        }
+        if (mode == "mp4detail") {
+            return ExportBenchmarkVariant{
+                .mode = AnimationExportMode::FastPreviewMp4,
+                .quality = AnimationExportQuality::Xq,
                 .useVideoToolbox = true,
             };
         }

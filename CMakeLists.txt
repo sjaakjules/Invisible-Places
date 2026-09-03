@@ -245,6 +245,7 @@ add_library(
     src/io/SceneDisplayDensityCache.cpp
     src/io/TransformMatrix.cpp
     src/output/ExrWriter.cpp
+    src/output/ExportGpuBanding.cpp
     src/output/EyeDomeLighting.cpp
     src/output/HoudiniCameraExport.cpp
     src/output/OfflinePointRenderer.cpp

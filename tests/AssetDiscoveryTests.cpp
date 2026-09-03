@@ -13,6 +13,7 @@
 #include "io/PlyHeader.hpp"
 #include "io/TransformMatrix.hpp"
 #include "output/ExrWriter.hpp"
+#include "output/ExportGpuBanding.hpp"
 #include "output/EyeDomeLighting.hpp"
 #include "output/HoudiniCameraExport.hpp"
 #include "output/OfflinePointRenderer.hpp"
@@ -12309,6 +12310,53 @@ TEST_CASE("Point-cloud EXR readback masks keep AOV channels independent", "[rend
     CHECK(HasPointCloudExrReadback(defaultRequest.readbackMask, PointCloudExrReadbackMask::Albedo));
 }
 
+TEST_CASE("GPU export banding keeps warm screen-sprite frames on one submission", "[output][export][banding]") {
+    invisible_places::output::ExportGpuBandingState state;
+    invisible_places::output::PrimeExportGpuBanding(&state, false);
+
+    CHECK(state.bandCount == 1U);
+    CHECK(invisible_places::output::ExportGpuBandRows(state, 8640U) == 0U);
+
+    // A cold sort/allocation spike must not poison a long export.
+    invisible_places::output::ObserveExportGpuSample(&state, 20.0);
+    CHECK(state.bandCount == 1U);
+    invisible_places::output::ObserveExportGpuSample(&state, 0.78);
+    invisible_places::output::ObserveExportGpuSample(&state, 0.82);
+    CHECK(state.bandCount == 1U);
+
+    // Only repeated warm multi-second submissions enable a split.
+    invisible_places::output::ObserveExportGpuSample(&state, 1.7);
+    CHECK(state.bandCount == 1U);
+    invisible_places::output::ObserveExportGpuSample(&state, 1.8);
+    CHECK(state.bandCount == 2U);
+    CHECK(invisible_places::output::ExportGpuBandRows(state, 8640U) == 4320U);
+}
+
+TEST_CASE("GPU export banding protects world surfels and removes unnecessary splits", "[output][export][banding]") {
+    invisible_places::output::ExportGpuBandingState state;
+    invisible_places::output::PrimeExportGpuBanding(&state, true);
+
+    CHECK(state.bandCount == 2U);
+    CHECK(invisible_places::output::ExportGpuBandRows(state, 8641U) == 4321U);
+
+    // Ignore the cold sample, then merge after sustained fast total times.
+    invisible_places::output::ObserveExportGpuSample(&state, 12.0);
+    for (int sample = 0; sample < 3; ++sample) {
+        invisible_places::output::ObserveExportGpuSample(&state, 0.9);
+        CHECK(state.bandCount == 2U);
+    }
+    invisible_places::output::ObserveExportGpuSample(&state, 0.9);
+    CHECK(state.bandCount == 1U);
+
+    // Invalid measurements neither advance nor perturb the controller.
+    const auto completedSamples = state.completedSamples;
+    invisible_places::output::ObserveExportGpuSample(
+        &state,
+        std::numeric_limits<double>::quiet_NaN());
+    CHECK(state.completedSamples == completedSamples);
+    CHECK(state.bandCount == 1U);
+}
+
 TEST_CASE("Built-in export presets use compact codec settings with legacy aliases", "[output][video]") {
     const auto presets = invisible_places::output::BuiltInExportPresets();
     const auto findPreset = [&presets](std::string_view name) {
@@ -12372,6 +12420,11 @@ TEST_CASE("Built-in export presets use compact codec settings with legacy aliase
     CHECK(mp4->quality == invisible_places::output::AnimationExportQuality::Normal);
     CHECK(mp4->useVideoToolbox);
     CHECK(mp4->externalAlphaMatte);
+    auto mp4Detail = *mp4;
+    mp4Detail.quality = invisible_places::output::AnimationExportQuality::Xq;
+    mp4Detail = invisible_places::output::NormalizeExportPresetForCurrentSchema(
+        std::move(mp4Detail));
+    CHECK(mp4Detail.quality == invisible_places::output::AnimationExportQuality::Xq);
     const auto testMp4 = findPreset(invisible_places::output::kTestMp4PresetName);
     REQUIRE(testMp4 != presets.end());
     CHECK(testMp4->mode == invisible_places::output::AnimationExportMode::TestMp4);
@@ -12658,6 +12711,7 @@ TEST_CASE("Legacy HEVC alpha helpers map to MP4 HQ color plus matte pair", "[out
     CHECK(colorCommand.find("-pix_fmt p210le") != std::string::npos);
     CHECK(colorCommand.find("-allow_sw 1") != std::string::npos);
     CHECK(colorCommand.find("-prio_speed 0") != std::string::npos);
+    CHECK(colorCommand.find("-g 15 -keyint_min 15") != std::string::npos);
     CHECK(colorCommand.find("-color_primaries bt709") != std::string::npos);
     CHECK(colorCommand.find("-color_trc iec61966-2-1") != std::string::npos);
     CHECK(colorCommand.find("-colorspace bt709") != std::string::npos);
@@ -12678,6 +12732,7 @@ TEST_CASE("Legacy HEVC alpha helpers map to MP4 HQ color plus matte pair", "[out
     CHECK(matteCommand.find("-maxrate 135000k") != std::string::npos);
     CHECK(matteCommand.find("-pix_fmt p210le") != std::string::npos);
     CHECK(matteCommand.find("-prio_speed 0") != std::string::npos);
+    CHECK(matteCommand.find("-g 15 -keyint_min 15") != std::string::npos);
     CHECK(matteCommand.find("-color_range pc") != std::string::npos);
     CHECK(matteCommand.find("'/tmp/Invisible Places/final alpha matte.mp4'") != std::string::npos);
 
@@ -12700,11 +12755,49 @@ TEST_CASE("Legacy HEVC alpha helpers map to MP4 HQ color plus matte pair", "[out
     CHECK(combinedCommand.find("-b:v 300000k") != std::string::npos);
     CHECK(combinedCommand.find("-b:v 90000k") != std::string::npos);
     CHECK(combinedCommand.find("-prio_speed 0") != std::string::npos);
+    CHECK(combinedCommand.find("-g 15 -keyint_min 15") != std::string::npos);
     CHECK(combinedCommand.find("'/tmp/Invisible Places/final color.mp4'") != std::string::npos);
     CHECK(combinedCommand.find("'/tmp/Invisible Places/final alpha matte.mp4'") != std::string::npos);
     CHECK(combinedCommand.find("-i -") == combinedCommand.rfind("-i -"));
 
     std::filesystem::remove_all(outputDirectory);
+}
+
+TEST_CASE("MP4 Detail uses VideoToolbox quality mode for sparse point colour and matte", "[output][video]") {
+    const auto colorCommand = invisible_places::output::BuildFfmpegMp4ColorCommand(
+        "/opt/homebrew/bin/ffmpeg",
+        3840,
+        2160,
+        30,
+        "/tmp/detail-color.mp4",
+        invisible_places::output::AnimationExportQuality::Xq,
+        true);
+    CHECK(colorCommand.find("-profile:v main42210") != std::string::npos);
+    CHECK(colorCommand.find("-q:v 75") != std::string::npos);
+    CHECK(colorCommand.find("-g 15 -keyint_min 15") != std::string::npos);
+    CHECK(colorCommand.find("-b:v 300000k") == std::string::npos);
+
+    const auto matteCommand = invisible_places::output::BuildFfmpegMp4AlphaMatteCommand(
+        "/opt/homebrew/bin/ffmpeg",
+        3840,
+        2160,
+        30,
+        "/tmp/detail-alpha.mp4",
+        invisible_places::output::AnimationExportQuality::Xq,
+        true);
+    CHECK(matteCommand.find("-q:v 75") != std::string::npos);
+    CHECK(matteCommand.find("-b:v 90000k") == std::string::npos);
+
+    const auto cpuCommand = invisible_places::output::BuildFfmpegMp4ColorCommand(
+        "/opt/homebrew/bin/ffmpeg",
+        3840,
+        2160,
+        30,
+        "/tmp/detail-cpu.mp4",
+        invisible_places::output::AnimationExportQuality::Xq,
+        false);
+    CHECK(cpuCommand.find("-c:v libx265") != std::string::npos);
+    CHECK(cpuCommand.find("-crf 12") != std::string::npos);
 }
 
 TEST_CASE("ProRes 4444 output paths and ffmpeg command preserve alpha", "[output][video]") {
