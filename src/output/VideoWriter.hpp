@@ -11,6 +11,13 @@
 
 namespace invisible_places::output {
 
+// Large supersampled exports run their row-parallel pixel conversions at
+// utility priority so the interactive UI keeps performance cores; small/fast
+// exports keep user-initiated priority because there conversion, not GPU
+// capture, can be the bottleneck. Image quality is unaffected either way.
+void SetVideoConversionBackgroundPriority(bool enabled);
+[[nodiscard]] bool VideoConversionBackgroundPriority();
+
 constexpr std::uint32_t kTestMp4OutputFramesPerSecond = 30U;
 
 std::filesystem::path DefaultFfmpegExecutablePath();

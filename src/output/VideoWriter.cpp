@@ -1,5 +1,7 @@
 #include "output/VideoWriter.hpp"
 
+#include <atomic>
+
 #include <Imath/half.h>
 
 #include <algorithm>
@@ -54,6 +56,8 @@ std::size_t PreferredImageWorkerCount(std::uint32_t rowCount) {
     return std::min<std::size_t>(availableWorkers, rowCount);
 }
 
+std::atomic<bool> gVideoConversionBackgroundPriority{false};
+
 template <typename Function>
 void ParallelForRows(std::uint32_t rowCount, Function&& function) {
     const auto taskCount = PreferredImageWorkerCount(rowCount);
@@ -79,10 +83,16 @@ void ParallelForRows(std::uint32_t rowCount, Function&& function) {
     };
 
 #if defined(__APPLE__)
-    // User-initiated GCD work favors performance cores without pinning threads.
+    // User-initiated GCD work favors performance cores without pinning
+    // threads; the responsive-export toggle demotes the same work to
+    // utility so a heavy supersampled export leaves the UI responsive.
     ::dispatch_apply_f(
         taskCount,
-        ::dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+        ::dispatch_get_global_queue(
+            gVideoConversionBackgroundPriority.load(std::memory_order_relaxed)
+                ? QOS_CLASS_UTILITY
+                : QOS_CLASS_USER_INITIATED,
+            0),
         &context,
         runTask);
 #else
@@ -1634,6 +1644,17 @@ std::string BuildFfmpegHevcColorMp4Command(
 // CRF16 while "slow" ran 0.5 fps (an hours-long encode for a full render)
 // and "fast" 3.4 fps - faster than GPU capture, so the encoder never
 // bottlenecks the export. See docs/thin_export_encoding.md.
+void SetVideoConversionBackgroundPriority(bool enabled) {
+    gVideoConversionBackgroundPriority.store(
+        enabled,
+        std::memory_order_relaxed);
+}
+
+bool VideoConversionBackgroundPriority() {
+    return gVideoConversionBackgroundPriority.load(
+        std::memory_order_relaxed);
+}
+
 std::string BuildFfmpegMp4ColorCommand(
     const std::filesystem::path& executablePath,
     std::uint32_t width,
