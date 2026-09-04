@@ -13,7 +13,6 @@
 #include "io/PlyHeader.hpp"
 #include "io/TransformMatrix.hpp"
 #include "output/ExrWriter.hpp"
-#include "output/ExportGpuBanding.hpp"
 #include "output/ExportEstimates.hpp"
 #include "output/EyeDomeLighting.hpp"
 #include "output/HoudiniCameraExport.hpp"
@@ -12311,53 +12310,7 @@ TEST_CASE("Point-cloud EXR readback masks keep AOV channels independent", "[rend
     CHECK(HasPointCloudExrReadback(defaultRequest.readbackMask, PointCloudExrReadbackMask::Depth));
     CHECK(HasPointCloudExrReadback(defaultRequest.readbackMask, PointCloudExrReadbackMask::Normal));
     CHECK(HasPointCloudExrReadback(defaultRequest.readbackMask, PointCloudExrReadbackMask::Albedo));
-}
-
-TEST_CASE("GPU export banding keeps warm screen-sprite frames on one submission", "[output][export][banding]") {
-    invisible_places::output::ExportGpuBandingState state;
-    invisible_places::output::PrimeExportGpuBanding(&state, false);
-
-    CHECK(state.bandCount == 1U);
-    CHECK(invisible_places::output::ExportGpuBandRows(state, 8640U) == 0U);
-
-    // A cold sort/allocation spike must not poison a long export.
-    invisible_places::output::ObserveExportGpuSample(&state, 20.0);
-    CHECK(state.bandCount == 1U);
-    invisible_places::output::ObserveExportGpuSample(&state, 0.78);
-    invisible_places::output::ObserveExportGpuSample(&state, 0.82);
-    CHECK(state.bandCount == 1U);
-
-    // Only repeated warm multi-second submissions enable a split.
-    invisible_places::output::ObserveExportGpuSample(&state, 1.7);
-    CHECK(state.bandCount == 1U);
-    invisible_places::output::ObserveExportGpuSample(&state, 1.8);
-    CHECK(state.bandCount == 2U);
-    CHECK(invisible_places::output::ExportGpuBandRows(state, 8640U) == 4320U);
-}
-
-TEST_CASE("GPU export banding protects world surfels and removes unnecessary splits", "[output][export][banding]") {
-    invisible_places::output::ExportGpuBandingState state;
-    invisible_places::output::PrimeExportGpuBanding(&state, true);
-
-    CHECK(state.bandCount == 2U);
-    CHECK(invisible_places::output::ExportGpuBandRows(state, 8641U) == 4321U);
-
-    // Ignore the cold sample, then merge after sustained fast total times.
-    invisible_places::output::ObserveExportGpuSample(&state, 12.0);
-    for (int sample = 0; sample < 3; ++sample) {
-        invisible_places::output::ObserveExportGpuSample(&state, 0.9);
-        CHECK(state.bandCount == 2U);
-    }
-    invisible_places::output::ObserveExportGpuSample(&state, 0.9);
-    CHECK(state.bandCount == 1U);
-
-    // Invalid measurements neither advance nor perturb the controller.
-    const auto completedSamples = state.completedSamples;
-    invisible_places::output::ObserveExportGpuSample(
-        &state,
-        std::numeric_limits<double>::quiet_NaN());
-    CHECK(state.completedSamples == completedSamples);
-    CHECK(state.bandCount == 1U);
+    CHECK(defaultRequest.gpuBandRows == 0U);
 }
 
 TEST_CASE("Export history persists, trims, and survives bad files", "[output][export][estimates]") {

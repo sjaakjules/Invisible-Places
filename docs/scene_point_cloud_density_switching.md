@@ -297,18 +297,19 @@ Stored-normal **Back-Face Fade** also exposes its direction reference. `Point to
 
 Delivery-format validation on 2026-09-02 rendered Surface_05a frames 2638–2667 independently at 4K/2x AA with the complete 1 mm Scene3 bundle, `Surface_05_Base_v2`, Full Animation sorting, and `World +Z` normal fading. Raising the core threshold from `0.35` to `0.50` reduced the motion-compensated centre-region matte residual by roughly 25–40%; the changed pixels followed the same curved ROCK overlap boundary in colour and alpha. MP4 HQ CPU (VideoToolbox off) and ProRes 422 HQ produced nearly identical decoded temporal traces (0.9969 correlation), so MP4 HQ CPU is an appropriate primary delivery check and ProRes remains a useful reference/editing alternative.
 
-Large-frame GPU export no longer divides every point render into fixed
-512-row bands. At 4x 4K that policy produced 17 submissions, and each
-submission replayed the complete point vertex stage even though its scissor
-rectangle covered only one band. In a 120-frame Base measurement this was
-the difference between roughly 4.26 seconds per captured frame and 0.83
-seconds on the single-submit path. Screen sprites therefore stay unbanded.
-World surfels, which expand every source point to six vertices and can make
-the shared graphics queue unresponsive, begin with two coarse submissions;
-warm GPU timings may adapt between one and three. The cold allocation/sort
-sample is ignored. This is a responsiveness compromise for world surfels,
-not a threading mechanism: the Metal queue remains serial and extra bands
-necessarily repeat vertex work.
+Large-frame GPU export uses one full-frame submission by default. The old
+512-row policy produced 17 submissions at 4x 4K, and each submission replayed
+the complete point vertex stage even though its scissor rectangle covered only
+one band. In a 120-frame Base measurement this was the difference between
+roughly 4.26 seconds per captured frame and 0.83 seconds on the single-submit
+path. The later adaptive world-surfel policy still created a deterministic
+speed cliff: once two banded frames crossed its threshold it added a third
+complete vertex replay and could not merge again. Screen sprites and
+four-vertex-strip world surfels therefore both stay unbanded for export
+throughput. `INVISIBLE_PLACES_EXPORT_GPU_BAND_ROWS` remains an explicit
+diagnostic/responsiveness override; any nonzero row height trades throughput
+for more opportunities to submit live-view work between bands. The Metal queue
+is serial, so row bands are not a threading mechanism.
 
 The completed 60 fps `Surface_05_Thin_a` render is a different case: it used 1 px Gaussian points, field-mapped opacity of approximately `0.25..0.50`, 4x spatial AA, and no temporal samples; Soft-Edge Depth Prepass and GPU sorting were both disabled. Its stored `0.49725` threshold therefore did not participate in rendering. Matte shimmer in that profile is dominated by subpixel point coverage plus delivery compression and belongs to the thin-profile/temporal-sampling path. Its exact colour residual spike at output frame 5288 (authored frame 2644) is the hard activation boundary of `Fine Dimples`; the matte has no corresponding one-frame spike, so that event is not culling or projection math.
 

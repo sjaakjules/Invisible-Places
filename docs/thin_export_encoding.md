@@ -48,7 +48,8 @@ render's cold first frame and is not the primary codec score.
 VideoToolbox does not expose frame-thread controls for this HEVC encoder.
 The useful temporal lever was the shorter 15-frame GOP: it limits error
 propagation across moving fine points. More CPU threads cannot accelerate
-GPU band submissions, which execute serially on the graphics queue.
+the GPU capture; its default full-frame submission executes serially on the
+graphics queue.
 
 ## What the noise was
 

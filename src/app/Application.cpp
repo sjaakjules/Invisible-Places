@@ -25,7 +25,6 @@
 #include "io/PointCloudData.hpp"
 #include "io/PlyHeader.hpp"
 #include "output/ExrWriter.hpp"
-#include "output/ExportGpuBanding.hpp"
 #include "output/ExportEstimates.hpp"
 #include "output/HoudiniCameraExport.hpp"
 #include "output/OfflinePointRenderer.hpp"
@@ -2550,7 +2549,6 @@ struct OfflineRenderFrameSampleState {
     bool previewPassPending = false;
     bool gpuSampleInFlight = false;
     bool gpuSamplePreviewPass = false;
-    bool adaptiveGpuBandingSample = false;
     std::chrono::steady_clock::time_point gpuSampleSubmittedAt{};
     std::chrono::steady_clock::duration lastGpuSampleDuration{};
     std::chrono::steady_clock::duration lastReadbackDuration{};
@@ -2597,7 +2595,6 @@ struct OfflineRenderJobState {
     std::optional<std::chrono::steady_clock::time_point>
         firstFrameCompletedAt;
     OfflineRenderFrameSampleState frameSampleState{};
-    invisible_places::output::ExportGpuBandingState gpuBandingState{};
     std::uint32_t currentTile = 0;
     invisible_places::output::ExrImage image{};
     std::chrono::steady_clock::time_point startedAt{};
@@ -45118,13 +45115,6 @@ void ProcessOfflineRenderJobStep(
                 auto renderedImage = viewport->CompletePointCloudExrFrame();
                 const auto readbackEnd = std::chrono::steady_clock::now();
                 sampleState.lastGpuSampleDuration = readyAt - sampleState.gpuSampleSubmittedAt;
-                if (sampleState.adaptiveGpuBandingSample) {
-                    invisible_places::output::ObserveExportGpuSample(
-                        &job.gpuBandingState,
-                        std::chrono::duration<double>(
-                            sampleState.lastGpuSampleDuration)
-                            .count());
-                }
                 sampleState.lastReadbackDuration = readbackEnd - readyAt;
                 RecordExportGpuSampleDuration(&job, sampleState.lastGpuSampleDuration);
                 UpdateExportSortCounters(&job, *viewport);
@@ -45175,48 +45165,17 @@ void ProcessOfflineRenderJobStep(
                     targetHeight,
                     sampleTimeSeconds,
                     ExportReadbackMaskForPass(job, previewPass));
-                // This flag belongs to the request being submitted, not the
-                // whole output frame (an EXR job may follow its full-size
-                // sample with a smaller preview pass).
-                sampleState.adaptiveGpuBandingSample = false;
-                // The old 512-row policy replayed every point up to 17 times
-                // at 4x 4K. Screen sprites use one full-frame submission;
-                // world surfels alone get a protective split because each
-                // point expands to a four-vertex strip. Warm timings may add at
-                // most
-                // one further split or remove an unnecessary one.
-                const bool largeGpuFrame =
-                    static_cast<std::uint64_t>(request.width) *
-                        request.height >=
-                    static_cast<std::uint64_t>(3840U) * 2160U * 2U;
-                const bool containsWorldSurfels =
-                    std::any_of(
-                        request.renderState.pointCloudLayers.begin(),
-                        request.renderState.pointCloudLayers.end(),
-                        [](const auto& layer) {
-                            return layer.style.geometryMode ==
-                                   PointCloudGeometryMode::WorldSurfels;
-                        });
-                if (largeGpuFrame && containsWorldSurfels &&
-                    !request.renderState.eyeDomeLightingEnabled) {
-                    invisible_places::output::PrimeExportGpuBanding(
-                        &job.gpuBandingState,
-                        true);
-                    request.gpuBandRows =
-                        invisible_places::output::ExportGpuBandRows(
-                            job.gpuBandingState,
-                            request.height);
-                    sampleState.adaptiveGpuBandingSample = true;
-                }
-                // Test override: forces a band height, or 0 for the single
-                // historical submission, so banded and unbanded frames can
-                // be byte-compared from one binary.
+                // Throughput-first default: one full-frame submission. A row
+                // band only clips fragments; it still re-records and replays
+                // every point's vertex work. Adaptive splitting therefore
+                // created a self-amplifying 2-to-3-band speed cliff on long
+                // 4x-4K world-surfel exports. Keep explicit row banding as a
+                // diagnostic/interactive-responsiveness override only.
                 if (const char* bandOverride =
                         std::getenv("INVISIBLE_PLACES_EXPORT_GPU_BAND_ROWS");
                     bandOverride != nullptr && bandOverride[0] != '\0') {
                     request.gpuBandRows = static_cast<std::uint32_t>(
                         std::strtoul(bandOverride, nullptr, 10));
-                    sampleState.adaptiveGpuBandingSample = false;
                 }
                 if (!viewport->BeginPointCloudExrFrame(request)) {
                     runtimeState->statusMessage = "Waiting for GPU export resources...";
